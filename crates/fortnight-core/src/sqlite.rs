@@ -1188,7 +1188,14 @@ mod tests {
     }
 
     /// The GUI and the CLI may write at the same time: with immediate
-    /// write transactions and the busy timeout, none of these fail.
+    /// write transactions, a writer waits for the lock instead of failing
+    /// on a read-to-write upgrade (which no busy timeout can rescue).
+    ///
+    /// SQLite's busy handler polls rather than queues, so under this much
+    /// contention one thread can be starved for longer than the app's 5 s
+    /// timeout on a slow disk (Windows CI). The test therefore opens every
+    /// connection up front and gives it a generous timeout: it checks that
+    /// writers wait, not how long the wait takes.
     #[test]
     fn concurrent_writers_wait_instead_of_failing() {
         let path = std::env::temp_dir().join(format!(
@@ -1202,11 +1209,18 @@ mod tests {
             .add_task(new_task("shared"))
             .unwrap()
             .id;
-        let threads: Vec<_> = (0..4)
-            .map(|n| {
-                let path = path.clone();
+        let stores: Vec<_> = (0..4)
+            .map(|_| {
+                let s = SqliteStore::open(&path).unwrap();
+                s.conn.busy_timeout(Duration::from_secs(120)).unwrap();
+                s
+            })
+            .collect();
+        let threads: Vec<_> = stores
+            .into_iter()
+            .enumerate()
+            .map(|(n, s)| {
                 std::thread::spawn(move || {
-                    let s = SqliteStore::open(&path).unwrap();
                     let mut failures = 0;
                     for i in 0..100 {
                         let mut t = s.get_task(id).unwrap().unwrap();
