@@ -712,7 +712,7 @@ fn is_retryable(e: &LlmError) -> bool {
     }
 }
 
-fn transport_error(e: reqwest::Error) -> LlmError {
+pub(crate) fn transport_error(e: reqwest::Error) -> LlmError {
     if e.is_timeout() {
         LlmError::Timeout
     } else if e.is_body() || e.is_decode() {
@@ -724,7 +724,7 @@ fn transport_error(e: reqwest::Error) -> LlmError {
 }
 
 /// `e` and its sources, joined with ": ".
-fn error_chain(e: &dyn std::error::Error) -> String {
+pub(crate) fn error_chain(e: &dyn std::error::Error) -> String {
     let mut out = e.to_string();
     let mut source = e.source();
     while let Some(s) = source {
@@ -738,7 +738,7 @@ fn error_chain(e: &dyn std::error::Error) -> String {
     out
 }
 
-fn truncate_chars(s: &str, max: usize) -> String {
+pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
         Some((i, _)) => format!("{}…", &s[..i]),
         None => s.to_string(),

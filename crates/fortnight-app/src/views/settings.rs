@@ -26,7 +26,13 @@
 //! the summary prompt and are folded in for good once that prompt is saved.
 //!
 //! Picking a provider fills in its default URL (unless one was typed);
-//! Ollama also loads its model list. Reasoning models (DeepSeek-R1, Qwen3,
+//! Ollama also loads its model list. Ollama on this machine is checked at
+//! launch and when Settings opens (`SettingsData::ollama`): an Ollama block
+//! on the default address shows Running / Not running and lists its models
+//! without Load, tagged "thinking" or "decision". Decision models (Ollama's
+//! Jev-style `/v1/systemone`) are offered only for Recommendations; picking
+//! one saves that block as `Protocol::OllamaDecision`. On a first run with
+//! Ollama running, Model starts on Ollama with its first chat model. Reasoning models (DeepSeek-R1, Qwen3,
 //! gpt-oss) work like any other: the client drops their thinking.
 //!
 //! Secrets (API key, password) live in the form as `String` only while
@@ -39,6 +45,7 @@
 //! parked: the setting is kept but not shown.
 
 use fortnight_core::domain::{AppIcon, LlmSettings, Protocol, Schedule, Settings};
+use fortnight_core::ollama::{self, DEFAULT_BASE_URL as OLLAMA_BASE_URL, ModelKind, OllamaModel};
 use fortnight_core::report::{DEFAULT_PLAN_PROMPT, DEFAULT_SUMMARY_PROMPT};
 use fortnight_core::vault::MIN_PASSWORD_LEN;
 use iced::widget::{
@@ -186,11 +193,15 @@ pub struct SettingsData {
     /// shown near the key controls. `Err` for failures such as a wrong
     /// password.
     pub key_message: Option<Result<String, String>>,
-    /// Result of the last model-list fetch: `Ok(ids)` (may be empty when the
-    /// endpoint can't say; fall back to free text) or `Err(message)`.
-    pub models: Option<Result<Vec<String>, String>>,
+    /// Result of the last model-list fetch: `Ok(models)` (may be empty when
+    /// the endpoint can't say; fall back to free text) or `Err(message)`.
+    /// Only Ollama says what kind each model is; others list `Chat`.
+    pub models: Option<Result<Vec<OllamaModel>, String>>,
     /// A model-list fetch is in flight.
     pub listing_models: bool,
+    /// The Ollama on this machine: its models, or why it didn't answer;
+    /// `None` until checked.
+    pub ollama: Option<Result<Vec<OllamaModel>, String>>,
 }
 
 /// Monday to Sunday.
@@ -304,7 +315,29 @@ enum ModelsState<'a> {
     /// The endpoint answered but listed no models.
     Empty,
     Error(&'a str),
-    List(&'a [String]),
+    /// The models this block can use (no decision models for Model).
+    List(Vec<OllamaModel>),
+}
+
+/// A listed model in the Choose list: its name, tagged with what it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelChoice(OllamaModel);
+
+impl fmt::Display for ModelChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0.kind {
+            ModelKind::Chat => f.write_str(&self.0.name),
+            ModelKind::Thinking => write!(f, "{} · thinking", self.0.name),
+            ModelKind::Decision => write!(f, "{} · decision", self.0.name),
+        }
+    }
+}
+
+/// `url` is the Ollama that `SettingsData::ollama` checked
+/// (`ollama::local_base_url`: the default port, or `OLLAMA_HOST`).
+fn is_local_ollama(url: &str) -> bool {
+    let root = |u: &str| ollama::root_url(u).replace("://localhost", "://127.0.0.1");
+    root(url) == root(&ollama::local_base_url())
 }
 
 /// What the Provider picker offers. Ollama is the OpenAI-compatible
@@ -346,6 +379,9 @@ struct Endpoint {
     provider: Provider,
     base_url: String,
     model: String,
+    /// An Ollama decision model (`Protocol::OllamaDecision`), only ever in
+    /// the Recommendations block.
+    decision: bool,
 }
 
 impl Endpoint {
@@ -354,6 +390,7 @@ impl Endpoint {
     fn from_llm(llm: &LlmSettings) -> Self {
         let provider = match llm.protocol {
             Protocol::Anthropic => Provider::Anthropic,
+            Protocol::OllamaDecision => Provider::Ollama,
             Protocol::OpenAi if llm.keyless || llm.base_url.contains(":11434") => Provider::Ollama,
             Protocol::OpenAi => Provider::OpenAi,
         };
@@ -361,6 +398,7 @@ impl Endpoint {
             provider,
             base_url: llm.base_url.clone(),
             model: llm.model.clone(),
+            decision: llm.protocol == Protocol::OllamaDecision,
         }
     }
 
@@ -368,6 +406,7 @@ impl Endpoint {
         LlmSettings {
             protocol: match self.provider {
                 Provider::Anthropic => Protocol::Anthropic,
+                Provider::Ollama if self.decision => Protocol::OllamaDecision,
                 Provider::Ollama | Provider::OpenAi => Protocol::OpenAi,
             },
             base_url: self.base_url.trim().to_string(),
@@ -382,6 +421,9 @@ impl Endpoint {
         let url = self.base_url.trim();
         if url.is_empty() || Provider::ALL.iter().any(|p| p.default_url() == url) {
             self.base_url = provider.default_url().into();
+        }
+        if provider != Provider::Ollama {
+            self.decision = false;
         }
         self.provider = provider;
     }
@@ -593,13 +635,16 @@ pub struct SettingsView {
     key_target: Which,
     /// Local validation error for the key forms.
     key_error: Option<String>,
-    models: Option<Result<Vec<String>, String>>,
+    models: Option<Result<Vec<OllamaModel>, String>>,
     listing_models: bool,
     /// The endpoint of the last "Load models" request, to hide a list that
     /// belongs to an endpoint the form no longer names.
     listed_for: Option<(Which, Provider, String)>,
     /// "Use a different model" for recommendations is ticked.
     decision_on: bool,
+    ollama: Option<Result<Vec<OllamaModel>, String>>,
+    /// The first-run Ollama prefill was done (or wasn't wanted).
+    ollama_prefilled: bool,
     /// The section whose Test button was pressed last; its result shows there.
     tested: Which,
     /// The password pop-up is open (after Save key).
@@ -627,6 +672,8 @@ impl Default for SettingsView {
             listing_models: false,
             listed_for: None,
             decision_on: false,
+            ollama: None,
+            ollama_prefilled: false,
             tested: Which::Main,
             password_prompt: false,
             summary_editor: text_editor::Content::new(),
@@ -665,6 +712,38 @@ impl SettingsView {
         self.key_message = data.key_message;
         self.models = data.models;
         self.listing_models = data.listing_models;
+        self.ollama = data.ollama;
+        self.prefill_ollama();
+    }
+
+    /// First run: no model set up and Ollama is running, so the Model block
+    /// starts on Ollama with its first chat model (saved only on Save).
+    fn prefill_ollama(&mut self) {
+        let Some(Ok(models)) = &self.ollama else {
+            return;
+        };
+        if self.ollama_prefilled {
+            return;
+        }
+        self.ollama_prefilled = true;
+        let unset = !self.loaded.as_ref().is_some_and(|s| s.llm.is_configured());
+        if unset && self.form.main == Endpoint::default() {
+            let first = models.iter().find(|m| m.kind != ModelKind::Decision);
+            self.form.main.set_provider(Provider::Ollama);
+            self.form.main.base_url = ollama::local_base_url();
+            self.form.main.model = first.map(|m| m.name.clone()).unwrap_or_default();
+        }
+    }
+
+    /// What `name` is, if this block's model list knows it.
+    fn kind_of_model(&self, which: Which, name: &str) -> Option<ModelKind> {
+        match self.models_state(which) {
+            ModelsState::List(models) => models
+                .iter()
+                .find(|m| m.name == name.trim())
+                .map(|m| m.kind),
+            _ => None,
+        }
     }
 
     /// The settings the form would save, if they differ from the loaded
@@ -691,25 +770,48 @@ impl SettingsView {
         !self.form.endpoint(which).base_url.trim().is_empty() && !self.listing_models
     }
 
+    /// The models this block can pick from: the last Load for it, or the
+    /// local Ollama check when the block is on Ollama's default address. A
+    /// list for the other block or another endpoint isn't shown.
     fn models_state(&self, which: Which) -> ModelsState<'_> {
         let e = self.form.endpoint(which);
-        match &self.listed_for {
-            Some((w, provider, base_url))
-                if *w == which && *provider == e.provider && *base_url == e.base_url.trim() => {}
-            // The list belongs to the other section or an endpoint the form
-            // no longer names.
-            Some(_) => return ModelsState::Hidden,
-            None => {}
+        let usable = |models: &[OllamaModel]| -> Vec<OllamaModel> {
+            models
+                .iter()
+                .filter(|m| which == Which::Decision || m.kind != ModelKind::Decision)
+                .cloned()
+                .collect()
+        };
+        let listed_here = self.listed_for.as_ref().is_some_and(|(w, provider, url)| {
+            *w == which && *provider == e.provider && *url == e.base_url.trim()
+        });
+        if listed_here {
+            if self.listing_models {
+                return ModelsState::Busy;
+            }
+            match &self.models {
+                Some(Ok(models)) => {
+                    let list = usable(models);
+                    return if list.is_empty() {
+                        ModelsState::Empty
+                    } else {
+                        ModelsState::List(list)
+                    };
+                }
+                Some(Err(e)) => return ModelsState::Error(e),
+                None => {}
+            }
         }
-        if self.listing_models {
-            return ModelsState::Busy;
+        if e.provider == Provider::Ollama
+            && is_local_ollama(&e.base_url)
+            && let Some(Ok(models)) = &self.ollama
+        {
+            let list = usable(models);
+            if !list.is_empty() {
+                return ModelsState::List(list);
+            }
         }
-        match &self.models {
-            None => ModelsState::Hidden,
-            Some(Ok(ids)) if ids.is_empty() => ModelsState::Empty,
-            Some(Ok(ids)) => ModelsState::List(ids),
-            Some(Err(e)) => ModelsState::Error(e),
-        }
+        ModelsState::Hidden
     }
 
     pub fn update(&mut self, message: Message) -> Action {
@@ -730,7 +832,14 @@ impl SettingsView {
                 }
             }
             Message::BaseUrl(w, s) => form.endpoint_mut(w).base_url = s,
-            Message::Model(w, s) | Message::PickModel(w, s) => form.endpoint_mut(w).model = s,
+            Message::Model(w, s) | Message::PickModel(w, s) => {
+                // Only a model the list calls a decision model counts as one.
+                let decision =
+                    w == Which::Decision && self.kind_of_model(w, &s) == Some(ModelKind::Decision);
+                let e = self.form.endpoint_mut(w);
+                e.model = s;
+                e.decision = decision;
+            }
             Message::FocusHours(s) => form.focus_hours = s,
             Message::LoadModels(w) => {
                 if self.can_list_models(w) {
@@ -1024,28 +1133,47 @@ impl SettingsView {
     /// for one endpoint, as label/field rows.
     fn endpoint_grid(&self, which: Which) -> Element<'_, Message> {
         let f = self.form.endpoint(which);
-        let provider = pick_list(Provider::ALL, Some(f.provider), move |p| {
+        let picker_list = pick_list(Provider::ALL, Some(f.provider), move |p| {
             Message::Provider(which, p)
         })
         .padding([8, 12])
         .text_size(theme::TEXT_BODY)
         .width(240)
         .style(picker);
+        let mut provider = row![picker_list].spacing(theme::SPACING).align_y(Center);
+        if f.provider == Provider::Ollama && is_local_ollama(&f.base_url) {
+            provider = provider.push(match &self.ollama {
+                Some(Ok(_)) => text("Running").size(theme::TEXT_SMALL).style(success),
+                Some(Err(_)) => text("Not running")
+                    .size(theme::TEXT_SMALL)
+                    .style(theme::muted),
+                None => text("Checking…")
+                    .size(theme::TEXT_SMALL)
+                    .style(theme::muted),
+            });
+        }
         let url = input(f.provider.default_url(), &f.base_url)
             .on_input(move |s| Message::BaseUrl(which, s));
 
         let model_input = input("Model name", &f.model).on_input(move |s| Message::Model(which, s));
         let state = self.models_state(which);
+        let error = match &state {
+            ModelsState::Error(e) => Some(shorten(e, 120)),
+            _ => None,
+        };
         let pick: Element<'_, Message> = match state {
-            ModelsState::List(ids) => {
-                let selected = ids.iter().find(|id| **id == f.model.trim()).cloned();
-                pick_list(ids, selected, move |m| Message::PickModel(which, m))
-                    .placeholder("Choose")
-                    .padding([8, 12])
-                    .text_size(theme::TEXT_BODY)
-                    .width(200)
-                    .style(picker)
-                    .into()
+            ModelsState::List(models) => {
+                let choices: Vec<ModelChoice> = models.into_iter().map(ModelChoice).collect();
+                let selected = choices.iter().find(|c| c.0.name == f.model.trim()).cloned();
+                pick_list(choices, selected, move |c: ModelChoice| {
+                    Message::PickModel(which, c.0.name)
+                })
+                .placeholder("Choose")
+                .padding([8, 12])
+                .text_size(theme::TEXT_BODY)
+                .width(200)
+                .style(picker)
+                .into()
             }
             ModelsState::Busy => button(text("Loading…").size(theme::TEXT_BODY))
                 .padding([8, 14])
@@ -1066,8 +1194,8 @@ impl SettingsView {
                 .align_y(Center)
         ]
         .spacing(theme::SPACING / 3.0);
-        if let ModelsState::Error(e) = state {
-            model = model.push(error_text(shorten(e, 120)));
+        if let Some(e) = error {
+            model = model.push(error_text(e));
         }
 
         let testing_here = self.testing && self.tested == which;
@@ -1410,9 +1538,6 @@ fn primary<'a>(label: &'a str, message: Message) -> Element<'a, Message> {
         .into()
 }
 
-/// Ollama's OpenAI-compatible endpoint on its default port.
-const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
-
 fn secondary<'a>(label: &'a str, message: Message) -> Element<'a, Message> {
     button(text(label).size(theme::TEXT_BODY))
         .padding([8, 14])
@@ -1631,7 +1756,87 @@ mod tests {
             key_message: None,
             models: None,
             listing_models: false,
+            ollama: None,
         }
+    }
+
+    fn chat(name: &str) -> OllamaModel {
+        OllamaModel {
+            name: name.into(),
+            kind: ModelKind::Chat,
+        }
+    }
+
+    fn model(name: &str, kind: ModelKind) -> OllamaModel {
+        OllamaModel {
+            name: name.into(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn local_ollama_lists_models_by_kind_and_decision_only_for_recommendations() {
+        let mut v = loaded(KeyState::NoKey);
+        let found = vec![
+            model("deepseek-r1:8b", ModelKind::Thinking),
+            model("llama3.2", ModelKind::Chat),
+            model("nimble", ModelKind::Decision),
+        ];
+        let mut d = data(Settings::default(), KeyState::NoKey);
+        d.ollama = Some(Ok(found.clone()));
+        v.load(d.clone());
+        // First run: Model starts on Ollama with its first chat model.
+        assert_eq!(v.form.main.provider, Provider::Ollama);
+        assert_eq!(v.form.main.model, "deepseek-r1:8b");
+        assert_eq!(
+            v.models_state(Which::Main),
+            ModelsState::List(found[..2].to_vec())
+        );
+        let Action::Save(saved) = v.update(Message::Save) else {
+            panic!("expected Save");
+        };
+        assert!(saved.llm.keyless);
+        assert_eq!(saved.llm.protocol, Protocol::OpenAi);
+
+        let mut d2 = d.clone();
+        d2.settings = saved;
+        v.load(d2);
+        v.update(Message::Separate(true));
+        // Recommendations lists the local models straight away, the
+        // decision model too.
+        assert_eq!(
+            v.models_state(Which::Decision),
+            ModelsState::List(found.clone())
+        );
+        v.update(Message::PickModel(Which::Decision, "nimble".into()));
+        let Action::Save(saved) = v.update(Message::Save) else {
+            panic!("expected Save");
+        };
+        assert_eq!(saved.decision_llm.protocol, Protocol::OllamaDecision);
+        assert_eq!(saved.decision_llm.model, "nimble");
+        // It loads back as Ollama with the decision model.
+        v.load(data(saved.clone(), KeyState::NoKey));
+        assert_eq!(v.form.decision.provider, Provider::Ollama);
+        assert!(v.form.decision.decision);
+        assert!(!v.is_dirty());
+        // Typing a name it doesn't know as a decision model makes it a chat
+        // model again.
+        v.update(Message::Model(Which::Decision, "qwen3".into()));
+        assert!(!v.form.decision.llm().protocol.eq(&Protocol::OllamaDecision));
+    }
+
+    #[test]
+    fn ollama_prefill_leaves_a_configured_model_alone() {
+        let mut configured = Settings::default();
+        configured.llm.base_url = "https://api.openai.com/v1".into();
+        configured.llm.model = "gpt-4o".into();
+        let mut d = data(configured, KeyState::NoKey);
+        d.ollama = Some(Ok(vec![chat("llama3.2")]));
+        let mut v = SettingsView::new();
+        v.load(d);
+        assert_eq!(v.form.main.provider, Provider::OpenAi);
+        assert_eq!(v.form.main.model, "gpt-4o");
+        assert!(!v.is_dirty());
     }
 
     fn loaded(key_state: KeyState) -> SettingsView {
@@ -2162,9 +2367,9 @@ mod tests {
             ModelsState::Error("404 Not Found")
         );
 
-        let ids = vec!["llama3.2".to_string(), "qwen3".to_string()];
+        let ids = vec![chat("llama3.2"), chat("qwen3")];
         v.load(with(Ok(ids.clone())));
-        assert_eq!(v.models_state(Which::Main), ModelsState::List(&ids));
+        assert_eq!(v.models_state(Which::Main), ModelsState::List(ids.clone()));
         v.update(Message::PickModel(Which::Main, "qwen3".into()));
         assert_eq!(v.form.main.model, "qwen3");
         // Free text still works after picking.
@@ -2179,7 +2384,7 @@ mod tests {
         v.update(Message::Provider(Which::Main, Provider::Anthropic));
         assert_eq!(v.models_state(Which::Main), ModelsState::Hidden);
         v.update(Message::Provider(Which::Main, Provider::OpenAi));
-        assert_eq!(v.models_state(Which::Main), ModelsState::List(&ids));
+        assert_eq!(v.models_state(Which::Main), ModelsState::List(ids));
     }
 
     #[test]

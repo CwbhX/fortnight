@@ -160,6 +160,7 @@ pub fn connect(protocol: Protocol, config: LlmConfig) -> Result<Arc<dyn LlmClien
     Ok(match protocol {
         Protocol::OpenAi => Arc::new(crate::openai::OpenAiClient::new(config)?),
         Protocol::Anthropic => Arc::new(crate::anthropic::AnthropicClient::new(config)?),
+        Protocol::OllamaDecision => Arc::new(crate::decision::DecisionClient::new(config)?),
     })
 }
 

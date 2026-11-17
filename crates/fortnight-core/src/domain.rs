@@ -356,16 +356,29 @@ pub enum Protocol {
     OpenAi,
     /// Anthropic Messages: `POST {base_url}/v1/messages`.
     Anthropic,
+    /// An Ollama decision model (Jev-style, Ollama 0.35+):
+    /// `POST {root}/v1/systemone`, which answers questions with choices and
+    /// probabilities, not text. Only recommended tasks can use it (see
+    /// `decision`). `base_url` is the same as for Ollama's OpenAI endpoint,
+    /// e.g. `http://localhost:11434/v1`.
+    #[serde(rename = "ollama_decision")]
+    OllamaDecision,
 }
 
 impl Protocol {
-    pub const ALL: [Protocol; 2] = [Protocol::OpenAi, Protocol::Anthropic];
+    pub const ALL: [Protocol; 3] = [
+        Protocol::OpenAi,
+        Protocol::Anthropic,
+        Protocol::OllamaDecision,
+    ];
 
-    /// `openai` or `anthropic` (settings JSON, `FORTNIGHT_LLM_PROTOCOL`).
+    /// `openai`, `anthropic` or `ollama_decision` (settings JSON,
+    /// `FORTNIGHT_LLM_PROTOCOL`).
     pub fn as_str(self) -> &'static str {
         match self {
             Protocol::OpenAi => "openai",
             Protocol::Anthropic => "anthropic",
+            Protocol::OllamaDecision => "ollama_decision",
         }
     }
 
@@ -373,22 +386,24 @@ impl Protocol {
         match s.trim().to_ascii_lowercase().as_str() {
             "openai" => Some(Protocol::OpenAi),
             "anthropic" => Some(Protocol::Anthropic),
+            "ollama_decision" | "ollama-decision" | "decision" => Some(Protocol::OllamaDecision),
             _ => None,
         }
     }
 
-    /// For the UI: "OpenAI-compatible" or "Anthropic".
+    /// For the UI.
     pub fn label(self) -> &'static str {
         match self {
             Protocol::OpenAi => "OpenAI-compatible",
             Protocol::Anthropic => "Anthropic",
+            Protocol::OllamaDecision => "Ollama decision",
         }
     }
 
     /// A placeholder base URL for the settings form.
     pub fn example_base_url(self) -> &'static str {
         match self {
-            Protocol::OpenAi => "http://localhost:11434/v1",
+            Protocol::OpenAi | Protocol::OllamaDecision => "http://localhost:11434/v1",
             Protocol::Anthropic => "https://api.anthropic.com",
         }
     }

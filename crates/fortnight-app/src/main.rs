@@ -31,7 +31,7 @@ use fortnight_app::views::settings::{
 use fortnight_app::views::week::{self, WeekData, WeekView};
 use fortnight_core::datadir::{self, DataLock};
 use fortnight_core::domain::{
-    DeletedTask, Event, EventId, LlmSettings, ReportId, ReportKey, ReportKind, Settings,
+    DeletedTask, Event, EventId, LlmSettings, Protocol, ReportId, ReportKey, ReportKind, Settings,
     Task as CoreTask, TaskId, TaskStatus, WeekRef,
 };
 use fortnight_core::export::{self, ExportFormat};
@@ -39,6 +39,7 @@ use fortnight_core::fallback::{self, FallbackClient};
 use fortnight_core::llm::{
     self, ChatEvent, ChatRequest, ChatResponse, LlmClient, LlmConfig, LlmError,
 };
+use fortnight_core::ollama::{self, ModelKind, OllamaModel};
 use fortnight_core::report::{self, Prepared};
 use fortnight_core::secure;
 use fortnight_core::sqlite::SqliteStore;
@@ -98,7 +99,9 @@ enum Message {
     /// The stream for this report ended (after `Done` or an error, or early).
     StreamEnded(ReportKey, u64),
     Tested(Result<String, String>),
-    Models(Result<Vec<String>, String>),
+    Models(Result<Vec<OllamaModel>, String>),
+    /// The local Ollama check: its models, or why it didn't answer.
+    OllamaDetected(Result<Vec<OllamaModel>, String>),
     /// A keyboard shortcut (applied only where it makes sense).
     Key(Shortcut),
     /// The export dialog finished: the path written, `None` if cancelled.
@@ -215,7 +218,10 @@ struct Ready {
     testing: bool,
     test_result: Option<Result<String, String>>,
     key_message: Option<Result<String, String>>,
-    models: Option<Result<Vec<String>, String>>,
+    models: Option<Result<Vec<OllamaModel>, String>>,
+    /// The local Ollama (`ollama::DEFAULT_BASE_URL`): its models, or why it
+    /// didn't answer. Checked at launch and when Settings opens.
+    ollama: Option<Result<Vec<OllamaModel>, String>>,
     listing_models: bool,
     error: Option<String>,
     /// A short, dismissable message (export result, lock warning).
@@ -252,6 +258,7 @@ impl App {
                         operation::focus(top_bar::QUICK_ADD_ID)
                     },
                     start,
+                    detect_ollama(),
                     shoot_after_delay(),
                 ]);
                 let mut app = App::Ready(ready, forced_theme());
@@ -428,6 +435,7 @@ impl Ready {
             test_result: None,
             key_message: None,
             models: None,
+            ollama: None,
             listing_models: false,
             error: None,
             notice,
@@ -622,6 +630,7 @@ impl Ready {
                 testing: self.testing,
                 key_message: self.key_message.clone(),
                 models: self.models.clone(),
+                ollama: self.ollama.clone(),
                 listing_models: self.listing_models,
             });
         }
@@ -1141,6 +1150,10 @@ impl Ready {
                 self.test_result = Some(result);
                 Task::none()
             }
+            Message::OllamaDetected(result) => {
+                self.ollama = Some(result);
+                Task::none()
+            }
             Message::Models(result) => {
                 self.listing_models = false;
                 if !self.testing {
@@ -1279,7 +1292,11 @@ impl Ready {
             }
             top_bar::Message::Settings => {
                 self.settings_open = !self.settings_open;
-                Task::none()
+                if self.settings_open {
+                    detect_ollama()
+                } else {
+                    Task::none()
+                }
             }
         }
     }
@@ -1505,7 +1522,7 @@ impl Ready {
             }
             Shortcut::Settings => {
                 self.settings_open = true;
-                Task::none()
+                detect_ollama()
             }
             Shortcut::Undo => {
                 self.undo();
@@ -1598,12 +1615,37 @@ impl Ready {
                     Task::none()
                 }
             },
+            // Ollama (keyless, or a decision model): ask it directly, which
+            // also says what each model can do.
+            settings::Action::ListModels(llm, _)
+                if llm.keyless || llm.protocol == Protocol::OllamaDecision =>
+            {
+                self.listing_models = true;
+                self.models = None;
+                Task::perform(
+                    async move {
+                        ollama::detect(&llm.base_url, Duration::from_secs(10))
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    Message::Models,
+                )
+            }
             settings::Action::ListModels(llm, which) => match self.settings_client(&llm, which) {
                 Ok((client, _)) => {
                     self.listing_models = true;
                     self.models = None;
                     let (task, handle) = Task::perform(
-                        async move { client.list_models().await.map_err(|e| e.to_string()) },
+                        async move {
+                            let ids = client.list_models().await.map_err(|e| e.to_string())?;
+                            Ok(ids
+                                .into_iter()
+                                .map(|name| OllamaModel {
+                                    name,
+                                    kind: ModelKind::Chat,
+                                })
+                                .collect())
+                        },
                         Message::Models,
                     )
                     .abortable();
@@ -1885,6 +1927,18 @@ fn restore_snapshot(
 }
 
 /// Runs blocking work (Argon2) off the UI thread.
+/// Checks for Ollama on this machine (`Message::OllamaDetected`).
+fn detect_ollama() -> Task<Message> {
+    Task::perform(
+        async {
+            ollama::detect(&ollama::local_base_url(), Duration::from_secs(2))
+                .await
+                .map_err(|e| e.to_string())
+        },
+        Message::OllamaDetected,
+    )
+}
+
 /// A key `SetKey` saved, and the other key if the password opened it.
 #[derive(Debug, Clone)]
 struct SavedKey {
@@ -1936,7 +1990,13 @@ fn shoot_after_delay() -> Task<Message> {
     if std::env::var_os("FORTNIGHT_SCREENSHOT").is_none() {
         return Task::none();
     }
-    Task::perform(tokio::time::sleep(Duration::from_secs(2)), |_| {
+    // `FORTNIGHT_SCREENSHOT_DELAY` (seconds) waits longer, e.g. for the
+    // Ollama check.
+    let secs = std::env::var("FORTNIGHT_SCREENSHOT_DELAY")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(2);
+    Task::perform(tokio::time::sleep(Duration::from_secs(secs)), |_| {
         Message::Shoot
     })
 }
