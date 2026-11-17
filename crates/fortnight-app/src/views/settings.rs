@@ -63,8 +63,10 @@ impl SettingsView {
         Self::default()
     }
 
-    /// Replaces what the view shows. Called by `main.rs` when data changes.
-    /// Must not discard unsaved form edits unless `settings` changed.
+    /// Replaces what the view shows. `main.rs` calls this after EVERY
+    /// message, so it must be cheap. It must not discard unsaved form edits
+    /// (typed URL, model, key, passwords) unless `settings` itself changed
+    /// from what was last loaded.
     pub fn load(&mut self, _data: SettingsData) {}
 
     pub fn update(&mut self, message: Message) -> Action {

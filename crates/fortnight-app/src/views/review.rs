@@ -47,8 +47,11 @@ impl ReviewView {
         Self::default()
     }
 
-    /// Replaces what the view shows. Called by `main.rs` whenever the data
-    /// changes (week switched, report generated, edit saved...).
+    /// Replaces what the view shows. `main.rs` calls this after EVERY
+    /// message (and on the minute tick), so it must be cheap: if `data`
+    /// equals what the view already has, return early. It must keep
+    /// in-progress UI state (an open editor, typed text) unless the thing it
+    /// belongs to changed (a different week or report id).
     pub fn load(&mut self, _data: ReviewData) {}
 
     pub fn update(&mut self, message: Message) -> Action {
