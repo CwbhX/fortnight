@@ -496,6 +496,12 @@ impl Default for Schedule {
 #[serde(default)]
 pub struct Settings {
     pub llm: LlmSettings,
+    /// Optional "decision" model for recommended tasks only, such as a
+    /// reasoning model on a local Ollama. Empty (not configured) means
+    /// recommended tasks use `llm`; so does any failure to reach it before
+    /// it starts answering (see `fallback::FallbackClient`). It gets the API
+    /// key only when it is on the same host as `llm`.
+    pub decision_llm: LlmSettings,
     pub schedule: Schedule,
     /// Free-form extra instructions for the summary (length, tone, ...).
     pub summary_instructions: String,
@@ -517,6 +523,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             llm: LlmSettings::default(),
+            decision_llm: LlmSettings::default(),
             schedule: Schedule::default(),
             summary_instructions: String::new(),
             focus_minutes_per_day: DEFAULT_FOCUS_MINUTES,
@@ -552,6 +559,7 @@ mod tests {
         assert_eq!(s.summary_instructions, "short");
         assert_eq!(s.focus_minutes_per_day, DEFAULT_FOCUS_MINUTES);
         assert!(!s.notifications);
+        assert!(!s.decision_llm.is_configured());
     }
 
     #[test]

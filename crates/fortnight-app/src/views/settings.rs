@@ -84,19 +84,21 @@ pub enum PromptKind {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Protocol(Protocol),
-    BaseUrl(String),
-    Model(String),
+    Protocol(Which, Protocol),
+    BaseUrl(Which, String),
+    Model(Which, String),
     /// Ask the endpoint for its model list.
-    LoadModels,
+    LoadModels(Which),
     /// A model picked from the listed ones.
-    PickModel(String),
+    PickModel(Which, String),
     /// Fill in a local Ollama server's endpoint and load its models.
-    UseOllama,
+    UseOllama(Which),
+    /// Empty the decision model fields (recommendations use the main LLM).
+    ClearDecision,
     FocusHours(String),
     Close,
     Save,
-    Test,
+    Test(Which),
     WeekStart(Weekday),
     SummaryDay(Weekday),
     SummaryTime(String),
@@ -125,6 +127,14 @@ pub enum Message {
     CancelKey,
 }
 
+/// Which endpoint a field, button or request is for: the main LLM, or the
+/// optional decision model used for recommended tasks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Which {
+    Main,
+    Decision,
+}
+
 /// What `main.rs` must do.
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -132,12 +142,14 @@ pub enum Action {
     /// Close the overlay (the close button or Escape).
     Close,
     /// Fetch the endpoint's model list using these endpoint fields and the
-    /// current key. The result arrives as `SettingsData::models`.
-    ListModels(LlmSettings),
+    /// current key (for `Which::Decision`, the key only if it is on the main
+    /// endpoint's host). The result arrives as `SettingsData::models`.
+    ListModels(LlmSettings, Which),
     /// Save these settings (endpoint, schedule, capacity, prompts).
     Save(Settings),
-    /// Send a test request using these endpoint fields and the current key.
-    Test(LlmSettings),
+    /// Send a test request using these endpoint fields and the current key
+    /// (same rule as `ListModels`).
+    Test(LlmSettings, Which),
     /// Encrypt and store a new API key (replacing any existing one).
     SetKey {
         api_key: SecretString,
@@ -265,11 +277,37 @@ enum ModelsState<'a> {
     List(&'a [String]),
 }
 
+/// One endpoint's fields as typed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Endpoint {
+    protocol: Protocol,
+    base_url: String,
+    model: String,
+}
+
+impl Endpoint {
+    fn from_llm(llm: &LlmSettings) -> Self {
+        Endpoint {
+            protocol: llm.protocol,
+            base_url: llm.base_url.clone(),
+            model: llm.model.clone(),
+        }
+    }
+
+    fn llm(&self) -> LlmSettings {
+        LlmSettings {
+            protocol: self.protocol,
+            base_url: self.base_url.trim().to_string(),
+            model: self.model.trim().to_string(),
+        }
+    }
+}
+
 /// The editable copy of the non-secret settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Form {
-    base_url: String,
-    model: String,
+    main: Endpoint,
+    decision: Endpoint,
     week_start: Weekday,
     summary_day: Weekday,
     summary_time: String,
@@ -277,7 +315,6 @@ struct Form {
     plan_time: String,
     /// Indexed Monday = 0.
     working_days: [bool; 7],
-    protocol: Protocol,
     /// Decimal hours as typed, e.g. `5.5`.
     focus_hours: String,
     /// Parked: carried through unchanged.
@@ -310,15 +347,14 @@ impl Form {
             summary_shown.push_str(extra);
         }
         Form {
-            base_url: s.llm.base_url.clone(),
-            model: s.llm.model.clone(),
+            main: Endpoint::from_llm(&s.llm),
+            decision: Endpoint::from_llm(&s.decision_llm),
             week_start: sched.week_start,
             summary_day: sched.summary_day,
             summary_time: format_time(sched.summary_time),
             plan_day: sched.plan_day,
             plan_time: format_time(sched.plan_time),
             working_days: WEEK.map(|d| sched.working_days.contains(&d)),
-            protocol: s.llm.protocol,
             focus_hours: format_hours(s.focus_minutes_per_day),
             notifications: s.notifications,
             summary_prompt: summary_shown.clone(),
@@ -343,7 +379,8 @@ impl Form {
             )
         };
         Some(Settings {
-            llm: self.llm(),
+            llm: self.main.llm(),
+            decision_llm: self.decision.llm(),
             schedule: Schedule {
                 week_start: self.week_start,
                 summary_day: self.summary_day,
@@ -365,11 +402,17 @@ impl Form {
         })
     }
 
-    fn llm(&self) -> LlmSettings {
-        LlmSettings {
-            protocol: self.protocol,
-            base_url: self.base_url.trim().to_string(),
-            model: self.model.trim().to_string(),
+    fn endpoint(&self, which: Which) -> &Endpoint {
+        match which {
+            Which::Main => &self.main,
+            Which::Decision => &self.decision,
+        }
+    }
+
+    fn endpoint_mut(&mut self, which: Which) -> &mut Endpoint {
+        match which {
+            Which::Main => &mut self.main,
+            Which::Decision => &mut self.decision,
         }
     }
 }
@@ -460,7 +503,9 @@ pub struct SettingsView {
     listing_models: bool,
     /// The endpoint of the last "Load models" request, to hide a list that
     /// belongs to an endpoint the form no longer names.
-    listed_for: Option<(Protocol, String)>,
+    listed_for: Option<(Which, Protocol, String)>,
+    /// The section whose Test button was pressed last; its result shows there.
+    tested: Which,
     /// The password pop-up is open (after Save key).
     password_prompt: bool,
     summary_editor: text_editor::Content,
@@ -483,6 +528,7 @@ impl Default for SettingsView {
             models: None,
             listing_models: false,
             listed_for: None,
+            tested: Which::Main,
             password_prompt: false,
             summary_editor: text_editor::Content::new(),
             plan_editor: text_editor::Content::new(),
@@ -533,22 +579,26 @@ impl SettingsView {
         self.form != Form::from_settings(&loaded)
     }
 
-    fn can_test(&self) -> bool {
-        self.form.llm().is_configured() && !self.testing
+    fn can_test(&self, which: Which) -> bool {
+        self.form.endpoint(which).llm().is_configured() && !self.testing
     }
 
-    fn can_list_models(&self) -> bool {
-        !self.form.base_url.trim().is_empty() && !self.listing_models
+    fn can_list_models(&self, which: Which) -> bool {
+        !self.form.endpoint(which).base_url.trim().is_empty() && !self.listing_models
     }
 
-    fn models_state(&self) -> ModelsState<'_> {
+    fn models_state(&self, which: Which) -> ModelsState<'_> {
+        let e = self.form.endpoint(which);
+        match &self.listed_for {
+            Some((w, protocol, base_url))
+                if *w == which && *protocol == e.protocol && *base_url == e.base_url.trim() => {}
+            // The list belongs to the other section or an endpoint the form
+            // no longer names.
+            Some(_) => return ModelsState::Hidden,
+            None => {}
+        }
         if self.listing_models {
             return ModelsState::Busy;
-        }
-        if let Some((protocol, base_url)) = &self.listed_for
-            && (*protocol != self.form.protocol || *base_url != self.form.base_url.trim())
-        {
-            return ModelsState::Hidden;
         }
         match &self.models {
             None => ModelsState::Hidden,
@@ -561,20 +611,22 @@ impl SettingsView {
     pub fn update(&mut self, message: Message) -> Action {
         let form = &mut self.form;
         match message {
-            Message::Protocol(p) => form.protocol = p,
-            Message::BaseUrl(s) => form.base_url = s,
-            Message::Model(s) | Message::PickModel(s) => form.model = s,
+            Message::Protocol(w, p) => form.endpoint_mut(w).protocol = p,
+            Message::BaseUrl(w, s) => form.endpoint_mut(w).base_url = s,
+            Message::Model(w, s) | Message::PickModel(w, s) => form.endpoint_mut(w).model = s,
+            Message::ClearDecision => form.decision = Endpoint::default(),
             Message::FocusHours(s) => form.focus_hours = s,
-            Message::UseOllama => {
-                form.protocol = Protocol::OpenAi;
-                form.base_url = OLLAMA_BASE_URL.into();
-                return self.update(Message::LoadModels);
+            Message::UseOllama(w) => {
+                let e = form.endpoint_mut(w);
+                e.protocol = Protocol::OpenAi;
+                e.base_url = OLLAMA_BASE_URL.into();
+                return self.update(Message::LoadModels(w));
             }
-            Message::LoadModels => {
-                if self.can_list_models() {
-                    let llm = self.form.llm();
-                    self.listed_for = Some((llm.protocol, llm.base_url.clone()));
-                    return Action::ListModels(llm);
+            Message::LoadModels(w) => {
+                if self.can_list_models(w) {
+                    let llm = self.form.endpoint(w).llm();
+                    self.listed_for = Some((w, llm.protocol, llm.base_url.clone()));
+                    return Action::ListModels(llm, w);
                 }
             }
             Message::Close => {
@@ -621,9 +673,10 @@ impl SettingsView {
                     return Action::Save(settings);
                 }
             }
-            Message::Test => {
-                if self.can_test() {
-                    return Action::Test(self.form.llm());
+            Message::Test(w) => {
+                if self.can_test(w) {
+                    self.tested = w;
+                    return Action::Test(self.form.endpoint(w).llm(), w);
                 }
             }
             Message::Secret(field, Typed(value)) => {
@@ -737,6 +790,7 @@ impl SettingsView {
         let content = column![
             self.endpoint_section(),
             self.key_section(),
+            self.decision_section(),
             self.schedule_section(),
             self.capacity_section(),
             self.prompts_section(),
@@ -810,24 +864,62 @@ impl SettingsView {
     }
 
     fn endpoint_section(&self) -> Element<'_, Message> {
-        let f = &self.form;
+        section("LLM", self.endpoint_fields(Which::Main))
+    }
+
+    fn decision_section(&self) -> Element<'_, Message> {
+        let d = &self.form.decision;
+        let blank = d.base_url.trim().is_empty() && d.model.trim().is_empty();
+        let clear = button(text("Clear").size(theme::TEXT_SMALL))
+            .padding([4, 10])
+            .style(theme::secondary_button)
+            .on_press_maybe((!blank).then_some(Message::ClearDecision));
+        let about = row![
+            container(small_muted(
+                "Optional. Used for Recommended tasks instead of the LLM above, such as a \
+                 reasoning model on a local Ollama. When it isn't set, or can't be reached, the \
+                 LLM above is used. It gets the API key only on the same host as the LLM above."
+            ))
+            .width(Fill),
+            clear
+        ]
+        .spacing(theme::SPACING)
+        .align_y(Center);
+        section(
+            "Decision model",
+            column![about, self.endpoint_fields(Which::Decision)].spacing(theme::SPACING),
+        )
+    }
+
+    /// Protocol, base URL, model (with its list) and Test for one endpoint.
+    fn endpoint_fields(&self, which: Which) -> Element<'_, Message> {
+        let f = self.form.endpoint(which);
         let protocol = labelled(
             "Protocol",
-            pick_list(Protocol::ALL, Some(f.protocol), Message::Protocol)
-                .padding([8, 12])
-                .text_size(theme::TEXT_BODY)
-                .width(Fill)
-                .style(picker),
+            pick_list(Protocol::ALL, Some(f.protocol), move |p| {
+                Message::Protocol(which, p)
+            })
+            .padding([8, 12])
+            .text_size(theme::TEXT_BODY)
+            .width(Fill)
+            .style(picker),
         );
         let base_url = labelled(
             "Base URL",
-            input(f.protocol.example_base_url(), &f.base_url).on_input(Message::BaseUrl),
+            input(f.protocol.example_base_url(), &f.base_url)
+                .on_input(move |s| Message::BaseUrl(which, s)),
         );
-        let model_placeholder = match f.protocol {
-            Protocol::OpenAi => "Model name, such as llama3.2",
-            Protocol::Anthropic => "Model name, such as claude-opus-5-5",
+        let model_placeholder = match (which, f.protocol) {
+            (Which::Decision, Protocol::OpenAi) => "Model name, such as deepseek-r1 or qwen3",
+            (Which::Main, Protocol::OpenAi) => "Model name, such as llama3.2",
+            (_, Protocol::Anthropic) => "Model name, such as claude-opus-5-5",
         };
-        let load_label = if self.listing_models {
+        let listing_here = self.listing_models
+            && self
+                .listed_for
+                .as_ref()
+                .is_some_and(|(w, _, _)| *w == which);
+        let load_label = if listing_here {
             "Loading…"
         } else {
             "Load models"
@@ -835,17 +927,20 @@ impl SettingsView {
         let load = button(text(load_label).size(theme::TEXT_BODY))
             .padding([8, 14])
             .style(theme::secondary_button)
-            .on_press_maybe(self.can_list_models().then_some(Message::LoadModels));
+            .on_press_maybe(
+                self.can_list_models(which)
+                    .then_some(Message::LoadModels(which)),
+            );
         let model = labelled(
             "Model",
             row![
-                input(model_placeholder, &f.model).on_input(Message::Model),
+                input(model_placeholder, &f.model).on_input(move |s| Message::Model(which, s)),
                 load
             ]
             .spacing(theme::SPACING / 2.0)
             .align_y(Center),
         );
-        let models: Element<'_, Message> = match self.models_state() {
+        let models: Element<'_, Message> = match self.models_state(which) {
             ModelsState::Hidden => Space::new().into(),
             ModelsState::Busy => small_muted("Asking the endpoint for its models…"),
             ModelsState::Empty => {
@@ -865,7 +960,7 @@ impl SettingsView {
                     ))
                     .size(theme::TEXT_SMALL)
                     .style(theme::muted),
-                    pick_list(ids, selected, Message::PickModel)
+                    pick_list(ids, selected, move |m| Message::PickModel(which, m))
                         .placeholder("Choose a model")
                         .padding([6, 12])
                         .text_size(theme::TEXT_BODY)
@@ -877,8 +972,9 @@ impl SettingsView {
                 .into()
             }
         };
+        let local = is_local_endpoint(&f.base_url);
         let hint_text = match f.protocol {
-            _ if is_local_endpoint(&f.base_url) => {
+            _ if local => {
                 "A local endpoint: no API key needed. Reasoning models work; their thinking is hidden."
             }
             Protocol::OpenAi => {
@@ -893,13 +989,14 @@ impl SettingsView {
             .style(theme::secondary_button)
             .on_press_maybe(
                 (f.protocol != Protocol::OpenAi || f.base_url.trim() != OLLAMA_BASE_URL)
-                    .then_some(Message::UseOllama),
+                    .then_some(Message::UseOllama(which)),
             );
         let hint = row![container(small_muted(hint_text)).width(Fill), use_ollama]
             .spacing(theme::SPACING)
             .align_y(Center);
 
-        let test_label = if self.testing {
+        let testing_here = self.testing && self.tested == which;
+        let test_label = if testing_here {
             "Testing…"
         } else {
             "Test connection"
@@ -907,48 +1004,53 @@ impl SettingsView {
         let test = button(text(test_label).size(theme::TEXT_BODY))
             .padding([8, 18])
             .style(theme::secondary_button)
-            .on_press_maybe(self.can_test().then_some(Message::Test));
+            .on_press_maybe(self.can_test(which).then_some(Message::Test(which)));
         let mut test_row = row![test].spacing(theme::SPACING).align_y(Center);
-        if !self.testing {
-            match &self.test_result {
-                Some(Ok(reply)) => {
-                    test_row = test_row.push(
-                        text(format!("Connected. {}", shorten(reply, 80)))
-                            .size(theme::TEXT_SMALL)
-                            .style(success)
-                            .width(Fill),
-                    )
-                }
-                Some(Err(e)) => {
-                    test_row = test_row.push(
-                        text(shorten(e, 160))
-                            .size(theme::TEXT_SMALL)
-                            .style(theme::danger)
-                            .width(Fill),
-                    )
-                }
-                None if self.key_state == KeyState::Locked && !is_local_endpoint(&f.base_url) => {
-                    test_row = test_row.push(small_muted("The key is locked. Unlock it first."))
-                }
-                None => {}
+        let result = if self.tested == which && !self.testing {
+            self.test_result.as_ref()
+        } else {
+            None
+        };
+        match result {
+            Some(Ok(reply)) => {
+                test_row = test_row.push(
+                    text(format!("Connected. {}", shorten(reply, 80)))
+                        .size(theme::TEXT_SMALL)
+                        .style(success)
+                        .width(Fill),
+                )
             }
+            Some(Err(e)) => {
+                test_row = test_row.push(
+                    text(shorten(e, 160))
+                        .size(theme::TEXT_SMALL)
+                        .style(theme::danger)
+                        .width(Fill),
+                )
+            }
+            None if which == Which::Main
+                && !self.testing
+                && self.key_state == KeyState::Locked
+                && !local =>
+            {
+                test_row = test_row.push(small_muted("The key is locked. Unlock it first."))
+            }
+            None => {}
         }
 
-        section(
-            "LLM",
-            column![
-                row![
-                    container(protocol).width(Length::FillPortion(2)),
-                    container(base_url).width(Length::FillPortion(3))
-                ]
-                .spacing(theme::SPACING),
-                hint,
-                model,
-                models,
-                test_row
+        column![
+            row![
+                container(protocol).width(Length::FillPortion(2)),
+                container(base_url).width(Length::FillPortion(3))
             ]
             .spacing(theme::SPACING),
-        )
+            hint,
+            model,
+            models,
+            test_row
+        ]
+        .spacing(theme::SPACING)
+        .into()
     }
 
     fn key_section(&self) -> Element<'_, Message> {
@@ -1468,29 +1570,35 @@ mod tests {
     #[test]
     fn load_keeps_edits_when_settings_unchanged() {
         let mut v = loaded(KeyState::NoKey);
-        v.update(Message::BaseUrl("http://localhost:11434/v1".into()));
+        v.update(Message::BaseUrl(
+            Which::Main,
+            "http://localhost:11434/v1".into(),
+        ));
         typed(&mut v, SecretField::ApiKey, "sk-abc");
         v.load(data(Settings::default(), KeyState::NoKey));
-        assert_eq!(v.form.base_url, "http://localhost:11434/v1");
+        assert_eq!(v.form.main.base_url, "http://localhost:11434/v1");
         assert_eq!(v.secrets.api_key, "sk-abc");
     }
 
     #[test]
     fn load_resets_form_when_settings_change() {
         let mut v = loaded(KeyState::NoKey);
-        v.update(Message::BaseUrl("typed".into()));
+        v.update(Message::BaseUrl(Which::Main, "typed".into()));
         let mut s = Settings::default();
         s.llm.model = "gpt-4o".into();
         v.load(data(s, KeyState::NoKey));
-        assert_eq!(v.form.base_url, "");
-        assert_eq!(v.form.model, "gpt-4o");
+        assert_eq!(v.form.main.base_url, "");
+        assert_eq!(v.form.main.model, "gpt-4o");
     }
 
     #[test]
     fn save_emits_full_settings_with_parsed_times() {
         let mut v = loaded(KeyState::NoKey);
-        v.update(Message::BaseUrl(" https://api.openai.com/v1 ".into()));
-        v.update(Message::Model("gpt-4o".into()));
+        v.update(Message::BaseUrl(
+            Which::Main,
+            " https://api.openai.com/v1 ".into(),
+        ));
+        v.update(Message::Model(Which::Main, "gpt-4o".into()));
         v.update(Message::SummaryDay(Weekday::Thursday));
         v.update(Message::SummaryTime("9:30".into()));
         v.update(Message::PlanTime("07:05".into()));
@@ -1529,7 +1637,7 @@ mod tests {
     #[test]
     fn invalid_time_blocks_save() {
         let mut v = loaded(KeyState::NoKey);
-        v.update(Message::Model("m".into()));
+        v.update(Message::Model(Which::Main, "m".into()));
         v.update(Message::PlanTime("25:00".into()));
         assert!(matches!(v.update(Message::Save), Action::None));
         v.update(Message::PlanTime("8am".into()));
@@ -1623,7 +1731,7 @@ mod tests {
         assert!(!v.is_dirty());
         assert!(matches!(v.update(Message::Save), Action::None));
         // Any other change keeps them as they are.
-        v.update(Message::Model("m".into()));
+        v.update(Message::Model(Which::Main, "m".into()));
         let Action::Save(saved) = v.update(Message::Save) else {
             panic!("expected Save");
         };
@@ -1644,23 +1752,64 @@ mod tests {
     #[test]
     fn use_ollama_fills_the_endpoint_and_lists_models() {
         let mut v = loaded(KeyState::Locked);
-        v.update(Message::Protocol(Protocol::Anthropic));
-        let Action::ListModels(llm) = v.update(Message::UseOllama) else {
+        v.update(Message::Protocol(Which::Main, Protocol::Anthropic));
+        let Action::ListModels(llm, Which::Main) = v.update(Message::UseOllama(Which::Main)) else {
             panic!("expected ListModels");
         };
         assert_eq!(llm.protocol, Protocol::OpenAi);
         assert_eq!(llm.base_url, OLLAMA_BASE_URL);
-        assert_eq!(v.form.base_url, OLLAMA_BASE_URL);
-        assert_eq!(v.form.protocol, Protocol::OpenAi);
+        assert_eq!(v.form.main.base_url, OLLAMA_BASE_URL);
+        assert_eq!(v.form.main.protocol, Protocol::OpenAi);
+    }
+
+    #[test]
+    fn decision_model_saves_tests_and_clears_on_its_own() {
+        let mut v = loaded(KeyState::NoKey);
+        v.update(Message::BaseUrl(
+            Which::Main,
+            "https://api.openai.com/v1".into(),
+        ));
+        v.update(Message::Model(Which::Main, "gpt-4o".into()));
+        let Action::ListModels(llm, Which::Decision) =
+            v.update(Message::UseOllama(Which::Decision))
+        else {
+            panic!("expected ListModels for the decision model");
+        };
+        assert_eq!(llm.base_url, OLLAMA_BASE_URL);
+        // The list belongs to the decision section only.
+        assert_eq!(v.models_state(Which::Main), ModelsState::Hidden);
+        v.update(Message::PickModel(Which::Decision, "deepseek-r1:8b".into()));
+        let Action::Test(llm, Which::Decision) = v.update(Message::Test(Which::Decision)) else {
+            panic!("expected Test for the decision model");
+        };
+        assert_eq!(llm.model, "deepseek-r1:8b");
+
+        let Action::Save(saved) = v.update(Message::Save) else {
+            panic!("expected Save");
+        };
+        assert_eq!(saved.llm.model, "gpt-4o");
+        assert_eq!(saved.decision_llm.base_url, OLLAMA_BASE_URL);
+        assert_eq!(saved.decision_llm.model, "deepseek-r1:8b");
+
+        v.load(data(saved, KeyState::NoKey));
+        v.update(Message::ClearDecision);
+        let Action::Save(cleared) = v.update(Message::Save) else {
+            panic!("expected Save");
+        };
+        assert!(!cleared.decision_llm.is_configured());
+        assert_eq!(cleared.llm.model, "gpt-4o");
     }
 
     #[test]
     fn test_emits_current_fields() {
         let mut v = loaded(KeyState::NoKey);
-        assert!(matches!(v.update(Message::Test), Action::None));
-        v.update(Message::BaseUrl("http://localhost:11434/v1".into()));
-        v.update(Message::Model("llama3.2".into()));
-        let Action::Test(llm) = v.update(Message::Test) else {
+        assert!(matches!(v.update(Message::Test(Which::Main)), Action::None));
+        v.update(Message::BaseUrl(
+            Which::Main,
+            "http://localhost:11434/v1".into(),
+        ));
+        v.update(Message::Model(Which::Main, "llama3.2".into()));
+        let Action::Test(llm, Which::Main) = v.update(Message::Test(Which::Main)) else {
             panic!("expected Test");
         };
         assert_eq!(llm.base_url, "http://localhost:11434/v1");
@@ -1669,7 +1818,7 @@ mod tests {
         let mut d = data(Settings::default(), KeyState::NoKey);
         d.testing = true;
         v.load(d);
-        assert!(matches!(v.update(Message::Test), Action::None));
+        assert!(matches!(v.update(Message::Test(Which::Main)), Action::None));
     }
 
     #[test]
@@ -1740,9 +1889,12 @@ mod tests {
     fn protocol_and_focus_hours_round_trip_through_save() {
         let mut v = loaded(KeyState::NoKey);
         assert_eq!(v.form.focus_hours, "6");
-        v.update(Message::Protocol(Protocol::Anthropic));
-        v.update(Message::BaseUrl("https://api.anthropic.com".into()));
-        v.update(Message::Model("claude-x".into()));
+        v.update(Message::Protocol(Which::Main, Protocol::Anthropic));
+        v.update(Message::BaseUrl(
+            Which::Main,
+            "https://api.anthropic.com".into(),
+        ));
+        v.update(Message::Model(Which::Main, "claude-x".into()));
         v.update(Message::FocusHours(" 5.5 ".into()));
         let Action::Save(s) = v.update(Message::Save) else {
             panic!("expected Save");
@@ -1752,7 +1904,7 @@ mod tests {
         // Saved settings come back from main.rs: the form matches them and
         // there is nothing left to save.
         v.load(data(s.clone(), KeyState::NoKey));
-        assert_eq!(v.form.protocol, Protocol::Anthropic);
+        assert_eq!(v.form.main.protocol, Protocol::Anthropic);
         assert_eq!(v.form.focus_hours, "5.5");
         assert!(!v.is_dirty());
         assert!(matches!(v.update(Message::Save), Action::None));
@@ -1769,7 +1921,7 @@ mod tests {
         round1.summary_instructions = "Short.".into();
         let mut v = SettingsView::new();
         v.load(data(round1.clone(), KeyState::NoKey));
-        assert_eq!(v.form.protocol, Protocol::OpenAi);
+        assert_eq!(v.form.main.protocol, Protocol::OpenAi);
         assert_eq!(v.form.focus_hours, "6");
         assert!(!v.is_dirty());
         v.update(Message::FocusHours("6.5".into()));
@@ -1818,11 +1970,18 @@ mod tests {
     fn list_models_carries_current_fields() {
         let mut v = loaded(KeyState::NoKey);
         // Needs a base URL.
-        assert!(matches!(v.update(Message::LoadModels), Action::None));
-        v.update(Message::Protocol(Protocol::Anthropic));
-        v.update(Message::BaseUrl(" https://api.anthropic.com ".into()));
-        v.update(Message::Model("typed".into()));
-        let Action::ListModels(llm) = v.update(Message::LoadModels) else {
+        assert!(matches!(
+            v.update(Message::LoadModels(Which::Main)),
+            Action::None
+        ));
+        v.update(Message::Protocol(Which::Main, Protocol::Anthropic));
+        v.update(Message::BaseUrl(
+            Which::Main,
+            " https://api.anthropic.com ".into(),
+        ));
+        v.update(Message::Model(Which::Main, "typed".into()));
+        let Action::ListModels(llm, Which::Main) = v.update(Message::LoadModels(Which::Main))
+        else {
             panic!("expected ListModels");
         };
         assert_eq!(llm.protocol, Protocol::Anthropic);
@@ -1832,16 +1991,22 @@ mod tests {
         let mut d = data(Settings::default(), KeyState::NoKey);
         d.listing_models = true;
         v.load(d);
-        assert_eq!(v.models_state(), ModelsState::Busy);
-        assert!(matches!(v.update(Message::LoadModels), Action::None));
+        assert_eq!(v.models_state(Which::Main), ModelsState::Busy);
+        assert!(matches!(
+            v.update(Message::LoadModels(Which::Main)),
+            Action::None
+        ));
     }
 
     #[test]
     fn models_result_handling() {
         let mut v = loaded(KeyState::NoKey);
-        v.update(Message::BaseUrl("http://localhost:11434/v1".into()));
-        assert_eq!(v.models_state(), ModelsState::Hidden);
-        v.update(Message::LoadModels);
+        v.update(Message::BaseUrl(
+            Which::Main,
+            "http://localhost:11434/v1".into(),
+        ));
+        assert_eq!(v.models_state(Which::Main), ModelsState::Hidden);
+        v.update(Message::LoadModels(Which::Main));
 
         let with = |models| {
             let mut d = data(Settings::default(), KeyState::NoKey);
@@ -1849,39 +2014,42 @@ mod tests {
             d
         };
         v.load(with(Ok(vec![])));
-        assert_eq!(v.models_state(), ModelsState::Empty);
+        assert_eq!(v.models_state(Which::Main), ModelsState::Empty);
 
         v.load(with(Err("404 Not Found".into())));
-        assert_eq!(v.models_state(), ModelsState::Error("404 Not Found"));
+        assert_eq!(
+            v.models_state(Which::Main),
+            ModelsState::Error("404 Not Found")
+        );
 
         let ids = vec!["llama3.2".to_string(), "qwen3".to_string()];
         v.load(with(Ok(ids.clone())));
-        assert_eq!(v.models_state(), ModelsState::List(&ids));
-        v.update(Message::PickModel("qwen3".into()));
-        assert_eq!(v.form.model, "qwen3");
+        assert_eq!(v.models_state(Which::Main), ModelsState::List(&ids));
+        v.update(Message::PickModel(Which::Main, "qwen3".into()));
+        assert_eq!(v.form.main.model, "qwen3");
         // Free text still works after picking.
-        v.update(Message::Model("qwen3:8b".into()));
-        assert_eq!(v.form.model, "qwen3:8b");
+        v.update(Message::Model(Which::Main, "qwen3:8b".into()));
+        assert_eq!(v.form.main.model, "qwen3:8b");
         let Action::Save(s) = v.update(Message::Save) else {
             panic!("expected Save");
         };
         assert_eq!(s.llm.model, "qwen3:8b");
 
         // A list for another endpoint is hidden.
-        v.update(Message::Protocol(Protocol::Anthropic));
-        assert_eq!(v.models_state(), ModelsState::Hidden);
-        v.update(Message::Protocol(Protocol::OpenAi));
-        assert_eq!(v.models_state(), ModelsState::List(&ids));
+        v.update(Message::Protocol(Which::Main, Protocol::Anthropic));
+        assert_eq!(v.models_state(Which::Main), ModelsState::Hidden);
+        v.update(Message::Protocol(Which::Main, Protocol::OpenAi));
+        assert_eq!(v.models_state(Which::Main), ModelsState::List(&ids));
     }
 
     #[test]
     fn close_emits_close_and_keeps_edits() {
         let mut v = loaded(KeyState::NoKey);
         assert!(matches!(v.update(Message::Close), Action::Close));
-        v.update(Message::Model("unsaved".into()));
+        v.update(Message::Model(Which::Main, "unsaved".into()));
         assert!(matches!(v.update(Message::Close), Action::Close));
         v.load(data(Settings::default(), KeyState::NoKey));
-        assert_eq!(v.form.model, "unsaved");
+        assert_eq!(v.form.main.model, "unsaved");
     }
 
     #[test]

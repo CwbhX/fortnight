@@ -9,7 +9,8 @@ use fortnight_core::domain::{
     NewTask, Report, ReportKind, ReportStatus, Settings, Task, TaskId, TaskStatus, WeekRef,
 };
 use fortnight_core::export::{self, ExportFormat};
-use fortnight_core::llm::{ChatEvent, ChatResponse, LlmError};
+use fortnight_core::fallback::FallbackClient;
+use fortnight_core::llm::{ChatEvent, ChatResponse, LlmClient, LlmError};
 use fortnight_core::parse;
 use fortnight_core::report::{self, Prepared};
 use fortnight_core::store::Store;
@@ -22,6 +23,7 @@ use jiff::tz::TimeZone;
 use std::cmp::{Ordering, Reverse};
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------- time
 
@@ -346,7 +348,20 @@ pub async fn generate_report(
     llm: &LlmHandle,
     out: &mut dyn Write,
 ) -> CliResult<Report> {
-    let mut stream = llm.client.chat_stream(prepared.request.clone());
+    // Recommended tasks go to the decision model, if any, falling back to
+    // the main endpoint.
+    let decision = match (&llm.decision, prepared.kind) {
+        (Some((client, host)), ReportKind::Plan) => Some((
+            Arc::new(FallbackClient::new(client.clone(), llm.client.clone())),
+            host.clone(),
+        )),
+        _ => None,
+    };
+    let client: Arc<dyn LlmClient> = match &decision {
+        Some((fc, _)) => fc.clone(),
+        None => llm.client.clone(),
+    };
+    let mut stream = client.chat_stream(prepared.request.clone());
     let mut text = String::new();
     let mut model = None;
     let mut failure = None;
@@ -376,12 +391,13 @@ pub async fn generate_report(
         (None, Some(model)) => Ok(ChatResponse { text, model }),
         (None, None) => Err(LlmError::Truncated),
     };
-    let new = report::finish(
-        prepared,
-        result,
-        llm.client.model(),
-        llm.endpoint_host.clone(),
-    );
+    let (requested_model, host) = match &decision {
+        Some((fc, decision_host)) if !fc.used_fallback() => {
+            (fc.model().to_string(), decision_host.clone())
+        }
+        _ => (llm.client.model().to_string(), llm.endpoint_host.clone()),
+    };
+    let new = report::finish(prepared, result, &requested_model, host);
     Ok(store.insert_report(new)?)
 }
 

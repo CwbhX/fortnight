@@ -65,8 +65,9 @@ fn execute(cli: Cli, out: &mut dyn Write) -> CliResult<()> {
         Command::Log { task, words } => commands::log(store, task, &words, out),
         Command::Export(a) => commands::export(store, a.format, today, a.out.as_deref(), out),
         Command::Summary(a) => block_on(async {
-            let saved = store.load_settings()?.llm;
-            let make = || llm_setup::connect_from_settings(&saved, &a.llm, &dir);
+            let saved = store.load_settings()?;
+            let make =
+                || llm_setup::connect_from_settings(&saved.llm, &saved.decision_llm, &a.llm, &dir);
             commands::report_command(
                 store,
                 ReportKind::Summary,
@@ -79,8 +80,9 @@ fn execute(cli: Cli, out: &mut dyn Write) -> CliResult<()> {
             .await
         }),
         Command::Plan(a) => block_on(async {
-            let saved = store.load_settings()?.llm;
-            let make = || llm_setup::connect_from_settings(&saved, &a.llm, &dir);
+            let saved = store.load_settings()?;
+            let make =
+                || llm_setup::connect_from_settings(&saved.llm, &saved.decision_llm, &a.llm, &dir);
             commands::report_command(
                 store,
                 ReportKind::Plan,
@@ -93,8 +95,9 @@ fn execute(cli: Cli, out: &mut dyn Write) -> CliResult<()> {
             .await
         }),
         Command::RunDue(llm) => block_on(async {
-            let saved = store.load_settings()?.llm;
-            let make = || llm_setup::connect_from_settings(&saved, &llm, &dir);
+            let saved = store.load_settings()?;
+            let make =
+                || llm_setup::connect_from_settings(&saved.llm, &saved.decision_llm, &llm, &dir);
             commands::run_due(store, &now, &make, out).await
         }),
     }

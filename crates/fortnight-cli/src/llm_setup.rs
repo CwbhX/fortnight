@@ -8,6 +8,7 @@
 use crate::args::LlmArgs;
 use crate::error::{CliError, CliResult};
 use fortnight_core::domain::LlmSettings;
+use fortnight_core::fallback;
 use fortnight_core::llm::{self, LlmClient, LlmConfig};
 use fortnight_core::secure;
 use fortnight_core::vault::{self, VaultError};
@@ -21,6 +22,9 @@ use std::sync::Arc;
 pub struct LlmHandle {
     pub client: Arc<dyn LlmClient>,
     pub endpoint_host: Option<String>,
+    /// The decision model for recommended tasks, and its host, if one is
+    /// saved (`Settings::decision_llm`). `client` is its fallback.
+    pub decision: Option<(Arc<dyn LlmClient>, Option<String>)>,
 }
 
 /// Saved settings, then the environment (`var`), then the flags.
@@ -97,16 +101,45 @@ pub fn build_client(llm: &LlmSettings, api_key: Option<SecretString>) -> CliResu
     Ok(LlmHandle {
         client,
         endpoint_host,
+        decision: None,
     })
 }
 
+/// Adds the saved decision model to `handle`, unless it isn't configured
+/// or can't be built. `main` is the endpoint `handle` talks to; the
+/// decision model gets `key` only on that host.
+pub fn with_decision(
+    mut handle: LlmHandle,
+    decision: &LlmSettings,
+    main: &LlmSettings,
+    key: Option<SecretString>,
+) -> LlmHandle {
+    if decision.is_configured() {
+        let config = fallback::decision_config(decision, main, key);
+        let host = config.endpoint_host();
+        handle.decision = llm::connect(decision.protocol, config)
+            .ok()
+            .map(|c| (c, host));
+    }
+    handle
+}
+
 /// Everything from settings to client, used by the real program. Checks the
-/// endpoint is configured before asking for a password.
+/// endpoint is configured before asking for a password. The saved decision
+/// model is added unless the flags name an endpoint (then that endpoint
+/// does everything).
 pub fn connect_from_settings(
     saved: &LlmSettings,
+    decision: &LlmSettings,
     flags: &LlmArgs,
     data_dir: &Path,
 ) -> CliResult<LlmHandle> {
+    let decision = if flags.protocol.is_none() && flags.base_url.is_none() && flags.model.is_none()
+    {
+        decision.clone()
+    } else {
+        LlmSettings::default()
+    };
     let llm = effective_settings(saved, |n| std::env::var(n).ok(), flags);
     if !llm.is_configured() {
         return Err(CliError::usage(
@@ -118,7 +151,12 @@ pub fn connect_from_settings(
     // A local endpoint (Ollama, LM Studio) needs no key: don't ask for the
     // password. `FORTNIGHT_LLM_API_KEY` still applies, for a local proxy.
     if env_key.is_none() && secure::is_local_endpoint(&llm.base_url) {
-        return build_client(&llm, None);
+        return Ok(with_decision(
+            build_client(&llm, None)?,
+            &decision,
+            &llm,
+            None,
+        ));
     }
     let stdin = std::io::stdin();
     let key = resolve_key(
@@ -128,7 +166,8 @@ pub fn connect_from_settings(
         &mut stdin.lock(),
         &mut || rpassword::prompt_password("API key password: "),
     )?;
-    build_client(&llm, key)
+    let handle = build_client(&llm, key.clone())?;
+    Ok(with_decision(handle, &decision, &llm, key))
 }
 
 #[cfg(test)]
@@ -309,7 +348,7 @@ mod tests {
             return; // a developer's own environment; nothing to check
         }
         let dir = temp_dir("cfg");
-        let err = connect_from_settings(&saved, &LlmArgs::default(), &dir)
+        let err = connect_from_settings(&saved, &LlmSettings::default(), &LlmArgs::default(), &dir)
             .err()
             .unwrap();
         assert_eq!(err.code, 2);

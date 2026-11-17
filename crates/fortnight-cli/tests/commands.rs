@@ -48,6 +48,7 @@ fn handle(mock: &Arc<MockClient>) -> LlmHandle {
     LlmHandle {
         client: mock.clone(),
         endpoint_host: Some("mock.test".into()),
+        decision: None,
     }
 }
 
@@ -404,6 +405,81 @@ async fn plan_defaults_to_this_week_and_stores() {
         .unwrap()
         .unwrap();
     assert_eq!(report.status, ReportStatus::Ready);
+}
+
+/// `handle(main)` with `decision` as the decision model on `decision.test`.
+fn with_decision(main: &Arc<MockClient>, decision: &Arc<MockClient>) -> LlmHandle {
+    LlmHandle {
+        decision: Some((decision.clone(), Some("decision.test".into()))),
+        ..handle(main)
+    }
+}
+
+#[tokio::test]
+async fn plan_uses_the_decision_model_and_summary_does_not() {
+    let s = seeded();
+    let main = Arc::new(MockClient::new("from main"));
+    let decision = Arc::new(MockClient::new("from decision"));
+    let mut out = Vec::new();
+    let make = || Ok(with_decision(&main, &decision));
+    commands::report_command(
+        &s,
+        ReportKind::Plan,
+        None,
+        false,
+        &now(wednesday()),
+        &make,
+        &mut out,
+    )
+    .await
+    .unwrap();
+    let plan = s
+        .latest_report(ReportKind::Plan, date(2026, 11, 16))
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.content_md.as_deref(), Some("from decision"));
+    assert_eq!(plan.endpoint_host.as_deref(), Some("decision.test"));
+    assert!(main.requests.lock().unwrap().is_empty());
+
+    commands::report_command(
+        &s,
+        ReportKind::Summary,
+        None,
+        false,
+        &now(wednesday()),
+        &make,
+        &mut Vec::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(main.requests.lock().unwrap().len(), 1);
+    assert_eq!(decision.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn plan_falls_back_to_the_main_endpoint() {
+    let s = seeded();
+    let main = Arc::new(MockClient::new("from main"));
+    let decision = Arc::new(MockClient::new("unused"));
+    decision.push_reply(Err(LlmError::Connection("connection refused".into())));
+    commands::report_command(
+        &s,
+        ReportKind::Plan,
+        None,
+        false,
+        &now(wednesday()),
+        &|| Ok(with_decision(&main, &decision)),
+        &mut Vec::new(),
+    )
+    .await
+    .unwrap();
+    let plan = s
+        .latest_report(ReportKind::Plan, date(2026, 11, 16))
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.status, ReportStatus::Ready);
+    assert_eq!(plan.content_md.as_deref(), Some("from main"));
+    assert_eq!(plan.endpoint_host.as_deref(), Some("mock.test"));
 }
 
 #[tokio::test]

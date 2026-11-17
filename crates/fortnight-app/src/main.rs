@@ -34,6 +34,7 @@ use fortnight_core::domain::{
     Task as CoreTask, TaskId, TaskStatus, WeekRef,
 };
 use fortnight_core::export::{self, ExportFormat};
+use fortnight_core::fallback::{self, FallbackClient};
 use fortnight_core::llm::{
     self, ChatEvent, ChatRequest, ChatResponse, LlmClient, LlmConfig, LlmError,
 };
@@ -131,6 +132,10 @@ struct Generation {
     text: String,
     requested_model: String,
     host: Option<String>,
+    /// Recommended tasks sent to the decision model: its client, to ask
+    /// whether it fell back, and the main endpoint's host, recorded instead
+    /// if it did.
+    decision: Option<(Arc<FallbackClient>, Option<String>)>,
     /// Started by the schedule: badge the Week tab when it is ready.
     scheduled: bool,
     /// Aborts the request (Lock stops requests that hold the key).
@@ -422,6 +427,31 @@ impl Ready {
     /// LM Studio) works without: it gets the key only if it is unlocked.
     fn key_locked_for(&self, llm: &LlmSettings) -> bool {
         self.key_exists && self.api_key.is_none() && !secure::is_local_endpoint(&llm.base_url)
+    }
+
+    /// The client for the decision model (`Settings::decision_llm`) with
+    /// these fields, and its host. It gets the key only on the main
+    /// endpoint's host (`fallback::decision_config`).
+    fn decision_client_for(
+        &self,
+        llm: &LlmSettings,
+    ) -> Result<(Arc<dyn LlmClient>, Option<String>), String> {
+        let config = fallback::decision_config(llm, &self.settings.llm, self.api_key.clone());
+        let host = config.endpoint_host();
+        let client = llm::connect(llm.protocol, config).map_err(|e| e.to_string())?;
+        Ok((client, host))
+    }
+
+    /// The client a Settings Test or Load models button asks for.
+    fn settings_client(
+        &self,
+        llm: &LlmSettings,
+        which: settings::Which,
+    ) -> Result<(Arc<dyn LlmClient>, Option<String>), String> {
+        match which {
+            settings::Which::Main => self.client_for(llm),
+            settings::Which::Decision => self.decision_client_for(llm),
+        }
     }
 
     fn client_for(
@@ -737,6 +767,22 @@ impl Ready {
                 return Task::none();
             }
         };
+        // Recommended tasks go to the decision model when one is set (and
+        // can be built), falling back to the main endpoint.
+        let decision = self.settings.decision_llm.clone();
+        let (client, host, decision) = match kind {
+            ReportKind::Plan if decision.is_configured() => {
+                match self.decision_client_for(&decision) {
+                    Ok((primary, decision_host)) => {
+                        let fc = Arc::new(FallbackClient::new(primary, client));
+                        let as_client: Arc<dyn LlmClient> = fc.clone();
+                        (as_client, decision_host, Some((fc, host)))
+                    }
+                    Err(_) => (client, host, None),
+                }
+            }
+            _ => (client, host, None),
+        };
         let prepared = self.prepare(kind, week);
         let stream = client.chat_stream(prepared.request.clone());
         self.next_generation += 1;
@@ -751,6 +797,7 @@ impl Ready {
                 text: String::new(),
                 requested_model: client.model().to_string(),
                 host,
+                decision,
                 scheduled,
                 abort,
                 id,
@@ -781,7 +828,13 @@ impl Ready {
         } else {
             *self.failures.entry(key).or_insert(0) += 1;
         }
-        let new = report::finish(g.prepared, result, &g.requested_model, g.host);
+        let (requested_model, host) = match &g.decision {
+            Some((fc, main_host)) if fc.used_fallback() => {
+                (fc.fallback_model().to_string(), main_host.clone())
+            }
+            _ => (g.requested_model, g.host),
+        };
+        let new = report::finish(g.prepared, result, &requested_model, host);
         if let Err(e) = self.store.insert_report(new) {
             self.error = Some(e.to_string());
             return Task::none();
@@ -1421,7 +1474,7 @@ impl Ready {
                 }
                 Task::batch([self.run_due(), self.update_week_reports()])
             }
-            settings::Action::Test(llm) => match self.client_for(&llm) {
+            settings::Action::Test(llm, which) => match self.settings_client(&llm, which) {
                 Ok((client, _)) => {
                     self.testing = true;
                     self.test_result = None;
@@ -1444,7 +1497,7 @@ impl Ready {
                     Task::none()
                 }
             },
-            settings::Action::ListModels(llm) => match self.client_for(&llm) {
+            settings::Action::ListModels(llm, which) => match self.settings_client(&llm, which) {
                 Ok((client, _)) => {
                     self.listing_models = true;
                     self.models = None;

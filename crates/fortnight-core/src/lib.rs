@@ -4,6 +4,7 @@ pub mod anthropic;
 pub mod datadir;
 pub mod domain;
 pub mod export;
+pub mod fallback;
 pub mod llm;
 pub mod openai;
 pub mod parse;
