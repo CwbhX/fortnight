@@ -186,8 +186,6 @@ Not changed, because they are product or legal choices rather than defects:
 - **`fortnight-cli log --task`** writes task log lines the GUI never shows (they still feed the summary). Kept as is.
 - **No `LICENSE` file** although `Cargo.toml` says MIT, and release archives omit the Inter font licence.
 - **`release.yml`** does a redundant third macOS build and hand-patches the bundle instead of `cargo xtask bundle --universal`. Untestable from here, so left alone.
-- **`CLAUDE.md` rules** ("frozen files", "do not push") describe the original build rounds and no longer match how the repo is worked on. Only its factual errors were corrected.
-
 - **Saved settings with no working days** (possible before this change) now block Save until a day is ticked; the "Working days" label turns red, with no message.
 - **CLI changes scripts may notice**: `plan --week` is gone; every command but `add` fails on a missing data folder instead of creating one; connect errors other than "not configured" exit 1, not 2; `--protocol` accepts only `openai` or `anthropic`; `list --today` includes carried-over tasks; `summary`, `plan` and `run-due` skip the model when there is nothing to report.
 

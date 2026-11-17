@@ -1,35 +1,35 @@
-# Fortnight — rules for agents
+# Fortnight
 
-Read ORCHESTRATION.md (scope, file ownership; round 2 is the second half) and the PLAN.md sections your task names.
+A Rust workspace: `crates/fortnight-core` (logic, storage, LLM clients), `crates/fortnight-app` (the iced GUI, binary `Fortnight`), `crates/fortnight-cli`, and `xtask` (bundling).
 
-1. **Edit only the files you own.** Your task lists them. Nothing else, including Cargo.toml, Cargo.lock and other agents' files.
-2. **Frozen files never change** (refrozen after round 2 step 1):
-   - `crates/fortnight-core/src/{domain,store,llm}.rs`
-   - in `crates/fortnight-app/src/views/*.rs`: the `Action` enums, the `*Data` structs, `day::LogLine`, `report_panel::ReportSlot`, and `views::NavKey` (in `views/mod.rs`).
-   - Each view's `Message` enum is internal: add variants freely. Its `load`/`update`/`view` signatures stay as stubbed.
-   If a frozen item is wrong, stop and say so in your report instead of working around it.
-3. **Orchestrator-owned**: `main.rs`, `top_bar.rs`, `theme.rs`, `views/mod.rs`, `lib.rs`s, the workspace `Cargo.toml`. A view may add private style helpers in its own file.
-4. **No new dependencies.** Use what is in the workspace `Cargo.toml` (round 2 added `clap`, `rpassword`, `eventsource-stream`, `futures-util`, reqwest `stream`).
-5. **Use the real docs, not memory.** iced is 0.14 and jiff is 1.0; both changed a lot.
-   - iced 0.14 source: `~/.cargo/registry/src/index.crates.io-*/iced*-0.14*/` (`iced_widget` and `iced_core` hold most of the API). The examples (`todos`, `markdown`, `editor`, `styling`, `modal`) are in the iced repository at tag `0.14.0`.
-   - Crate sources for everything else: `~/.cargo/registry/src/index.crates.io-*/<crate>-<version>/`. `cargo doc -p <crate> --no-deps` also works.
-   - jiff 1.0 gotchas: `Zoned` is now `jiff::ZonedDateTime`; `civil::Weekday` has no serde impl.
-6. **Existing data must survive.** Round 1 data folders (schema `user_version = 1`, settings JSON without the new fields) must open with nothing lost. `crates/fortnight-core/tests/fixtures/round1.db` is a real round 1 database.
-7. **Never use a real API key.** Test LLM clients against `wiremock` mock servers.
-8. **Done means** these pass from the repo root:
-   ```
-   export PATH="$HOME/.cargo/bin:$PATH"
-   cargo fmt --check
-   cargo clippy --all-targets -- -D warnings
-   cargo test
-   ```
-9. Prototype scope: simple over thorough. Note what you skip.
+## How to work here
 
-Commit your work on your branch when done. Do not push.
+- Work on `main`. Commit and push to `main` whenever work is done, without asking first. Don't push other branches unless the user names one.
+- Don't stop to ask for permission or confirmation. Make the sensible call, carry on, and say what you chose.
+
+## Checks
+
+Run from the repo root before committing:
+
+```
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+## Notes
+
+- iced is 0.14 and jiff is 1.0; both changed a lot, so read the source instead of relying on memory.
+  - iced 0.14 source: `~/.cargo/registry/src/index.crates.io-*/iced*-0.14*/` (`iced_widget` and `iced_core` hold most of the API). The examples (`todos`, `markdown`, `editor`, `styling`, `modal`) are in the iced repository at tag `0.14.0`.
+  - Other crates: `~/.cargo/registry/src/index.crates.io-*/<crate>-<version>/`, or `cargo doc -p <crate> --no-deps`.
+  - jiff 1.0: `Zoned` is now `jiff::ZonedDateTime`; `civil::Weekday` has no serde impl.
+- Old data folders must keep opening with nothing lost: the database migrates on open, and settings JSON may lack newer fields. `crates/fortnight-core/tests/fixtures/round1.db` is a real schema-version-1 database used by the tests.
+- LLM client tests run against `wiremock` mock servers, never a real endpoint or key.
 
 ## Seeing the GUI without a screen
 
-Run the app with `FORTNIGHT_SCREENSHOT=/path/out.raw`; it screenshots its own window after two seconds, writes `<w> <h>\n` + RGBA, and exits. Convert with `python3 -I tools/raw2png.py out.raw out.png`, then view the PNG.
+Run the app with `FORTNIGHT_SCREENSHOT=/path/out.raw`; it screenshots its own window after two seconds, writes `<w> <h>\n` + RGBA, and exits. Convert with `python3 -I tools/raw2png.py out.raw out.png`, then view the PNG. If the machine is busy the capture can come out half-drawn; `FORTNIGHT_SCREENSHOT_DELAY=5` waits longer.
 
 Useful environment: `--data-dir <folder>` (use a scratch folder outside the repo, never the repo), `FORTNIGHT_PAGE=today|week|month|settings`, `FORTNIGHT_THEME=light|dark`.
 
