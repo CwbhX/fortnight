@@ -8,6 +8,7 @@ Write my weekly update for the week Monday 2026-11-09 to Sunday 2026-11-15.
 {
   "week_start": "2026-11-09",
   "week_end": "2026-11-15",
+  "as_of": "2026-11-15",
   "completed": [
     {
       "id": 1,

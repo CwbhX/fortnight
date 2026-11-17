@@ -21,9 +21,9 @@ Everything in `completed`, grouped by project. Mention notes only when they add 
 ## In progress
 Tasks in `in_progress`.
 ## Risks and blockers
-Tasks in `missed`: due on or before the week's end and still open. Say how many days overdue when `days_overdue` is above zero. Include blockers mentioned in notes.
+Tasks in `missed`: still open and due on or before `as_of`. Say how many days overdue when `days_overdue` is above zero. Include blockers mentioned in notes.
 ## Next week
-Tasks in `next_week`, with their due weekday.
+Tasks in `next_week` (still open, due after `as_of` and by the end of next week), with their due weekday.
 
 If a section has no facts, write "- Nothing to report." under it.
 

@@ -200,8 +200,8 @@ impl Ready {
         let settings = store.load_settings().map_err(|e| e.to_string())?;
         let tasks = store.list_tasks().map_err(|e| e.to_string())?;
         let tz = TimeZone::system();
-        let today = Timestamp::now().to_zoned_datetime(tz.clone()).date();
-        let review_week = week_containing(today, settings.schedule.week_start);
+        let review_week =
+            latest_summary_week(&Timestamp::now().to_zoned_datetime(tz.clone()), &settings);
         let key_exists = vault::key_path(&dir).exists();
         let page = match std::env::var("FORTNIGHT_PAGE").as_deref() {
             Ok("week") => Page::Week,
@@ -289,7 +289,7 @@ impl Ready {
         let today = self.today();
         let current = self.current_week();
 
-        let summary_facts = report::summary_facts(&self.tasks, self.review_week, &self.tz);
+        let summary_facts = report::summary_facts(&self.tasks, self.review_week, today, &self.tz);
         let summary = self.latest(ReportKind::Summary, self.review_week);
         self.review_view.load(ReviewData {
             week: self.review_week,
@@ -369,7 +369,7 @@ impl Ready {
         };
         let prepared = match kind {
             ReportKind::Summary => {
-                report::prepare_summary(&self.tasks, week, &self.tz, &self.settings)
+                report::prepare_summary(&self.tasks, week, self.today(), &self.tz, &self.settings)
             }
             ReportKind::Plan => {
                 report::prepare_plan(&self.tasks, week, self.today(), &self.settings)
@@ -701,6 +701,16 @@ fn nav_active(theme: &Theme, status: button::Status) -> button::Style {
                 .unwrap_or(iced::Background::Color(iced::Color::TRANSPARENT)),
         )
     }
+}
+
+/// The week the Review page opens on: the most recent week whose summary
+/// is due (last week until Friday 16:00 by default, then this week).
+fn latest_summary_week(now: &ZonedDateTime, settings: &Settings) -> WeekRef {
+    due_reports(now, &settings.schedule, &[])
+        .into_iter()
+        .find(|job| job.kind == ReportKind::Summary)
+        .map(|job| job.week)
+        .unwrap_or_else(|| week_containing(now.date(), settings.schedule.week_start))
 }
 
 /// Runs blocking work (Argon2) off the UI thread.
