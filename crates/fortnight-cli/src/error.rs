@@ -16,9 +16,6 @@ pub enum ErrorKind {
     /// No LLM endpoint is configured (exit 2). `run-due` treats this one
     /// as "nothing to do", not as a failure.
     NotConfigured,
-    /// Standard output was closed (`fortnight-cli export | head -1`):
-    /// exit 0 with no message.
-    BrokenPipe,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,30 +67,8 @@ impl From<StoreError> for CliError {
 
 impl From<std::io::Error> for CliError {
     fn from(e: std::io::Error) -> Self {
-        let kind = if e.kind() == std::io::ErrorKind::BrokenPipe {
-            ErrorKind::BrokenPipe
-        } else {
-            ErrorKind::Other
-        };
-        CliError {
-            kind,
-            ..CliError::failure(e.to_string())
-        }
+        CliError::failure(e.to_string())
     }
 }
 
 pub type CliResult<T> = Result<T, CliError>;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_closed_pipe_is_its_own_kind() {
-        let e = CliError::from(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
-        assert_eq!(e.kind, ErrorKind::BrokenPipe);
-        let e = CliError::from(std::io::Error::other("disk full"));
-        assert_eq!(e.kind, ErrorKind::Other);
-        assert_eq!(e.code, EXIT_FAILURE);
-    }
-}

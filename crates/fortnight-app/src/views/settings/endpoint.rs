@@ -190,6 +190,14 @@ impl SettingsView {
         self.form.endpoint(which).llm().is_configured() && !self.testing
     }
 
+    /// Whether the last Test result is shown under `which`: it was for this
+    /// block, it is in, and the form still names the endpoint it tested.
+    fn shows_test_result(&self, which: Which) -> bool {
+        self.tested == which
+            && !self.testing
+            && self.tested_llm.as_ref() == Some(&self.form.endpoint(which).llm())
+    }
+
     pub(super) fn can_list_models(&self, which: Which) -> bool {
         !self.form.endpoint(which).base_url.trim().is_empty() && !self.listing_models
     }
@@ -314,7 +322,7 @@ impl SettingsView {
                 .style(theme::secondary_button)
                 .on_press_maybe(self.can_test(which).then_some(Message::Test(which)));
         let mut test_row = row![test].spacing(theme::SPACING).align_y(Center);
-        if self.tested == which && !self.testing && self.tested_llm.as_ref() == Some(&f.llm()) {
+        if self.shows_test_result(which) {
             match &self.test_result {
                 Some(Ok(reply)) => {
                     test_row = test_row.push(
@@ -600,8 +608,7 @@ mod tests {
         let mut d = data(Settings::default(), KeyState::NoKey);
         d.test_result = Some(Err("404 Not Found".into()));
         v.load(d);
-        let shown =
-            |v: &SettingsView| v.tested_llm.as_ref() == Some(&v.form.endpoint(Which::Main).llm());
+        let shown = |v: &SettingsView| v.shows_test_result(Which::Main);
         assert!(shown(&v));
         // Fixing the URL hides the old result; a trimmed-equal URL doesn't.
         v.update(Message::BaseUrl(

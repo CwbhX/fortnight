@@ -29,6 +29,8 @@ use std::time::Duration;
 /// How long the primary may take to send its first item (text, the end of
 /// the reply, or an error), or to answer a `chat`, before the fallback is
 /// asked instead. Generous, so a slow but working model isn't abandoned.
+/// A primary on this machine gets `LOCAL_TIMEOUT` instead (see
+/// `PlanRoute::new`): a local reasoning model sends nothing while it thinks.
 pub const PRIMARY_FIRST_ITEM_DEADLINE: Duration = Duration::from_secs(120);
 
 /// The config for the decision endpoint. A keyless one gets no key. It
@@ -85,7 +87,6 @@ impl FallbackClient {
         }
     }
 
-    #[cfg(test)]
     fn with_first_item_deadline(mut self, deadline: Duration) -> Self {
         self.first_item_deadline = deadline;
         self
@@ -167,6 +168,9 @@ impl LlmClient for FallbackClient {
                         match item {
                             Err(_) if !started => {
                                 used.store(true, Ordering::SeqCst);
+                                // Ends the primary's request (it may still
+                                // be open after a missed deadline).
+                                drop(stream);
                                 let mut stream = fallback.chat_stream(req);
                                 let item = stream.next().await?;
                                 Some((item, Phase::Fallback(stream)))
@@ -230,10 +234,21 @@ impl PlanRoute {
     /// and could be built; otherwise everything goes to `main`.
     pub fn new(main: Endpoint, decision: Option<Endpoint>) -> Self {
         let decision = decision.map(|d| {
-            (
-                Arc::new(FallbackClient::new(d.client, main.client.clone())),
-                d.host,
-            )
+            // A model on this machine may think for minutes before its
+            // first token (and sends nothing meanwhile), so it gets the
+            // local timeout rather than the short deadline.
+            let local = d
+                .host
+                .as_deref()
+                .is_some_and(|h| crate::secure::is_local_endpoint(&format!("http://{h}")));
+            let deadline = if local {
+                crate::llm_http::LOCAL_TIMEOUT
+            } else {
+                PRIMARY_FIRST_ITEM_DEADLINE
+            };
+            let client = FallbackClient::new(d.client, main.client.clone())
+                .with_first_item_deadline(deadline);
+            (Arc::new(client), d.host)
         });
         PlanRoute { main, decision }
     }
@@ -449,6 +464,29 @@ mod tests {
             .unwrap();
         assert_eq!(reply.text, "a");
         assert!(!c.used_fallback());
+    }
+
+    #[test]
+    fn a_local_decision_model_gets_the_local_timeout() {
+        let endpoint = |host: &str| Endpoint {
+            client: Arc::new(MockClient::new("x")),
+            host: Some(host.into()),
+        };
+        let deadline = |host: &str| {
+            let route = PlanRoute::new(endpoint("main.example"), Some(endpoint(host)));
+            route.decision.unwrap().0.first_item_deadline
+        };
+        for local in [
+            "localhost:11434",
+            "127.0.0.1:1234",
+            "[::1]:11434",
+            "localhost",
+        ] {
+            assert_eq!(deadline(local), crate::llm_http::LOCAL_TIMEOUT, "{local}");
+        }
+        for remote in ["api.openai.com", "10.0.0.5:8000"] {
+            assert_eq!(deadline(remote), PRIMARY_FIRST_ITEM_DEADLINE, "{remote}");
+        }
     }
 
     #[tokio::test]

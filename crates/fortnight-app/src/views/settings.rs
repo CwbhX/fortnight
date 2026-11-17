@@ -598,9 +598,29 @@ impl SettingsView {
                 checkbox(f.working_days[i])
                     .label(short_weekday(*day))
                     .text_size(theme::TEXT_BODY)
-                    .on_toggle_maybe((!last).then_some(move |on| Message::WorkingDay(i, on))),
+                    .on_toggle_maybe((!last).then_some(move |on| Message::WorkingDay(i, on)))
+                    // The locked box keeps the look of a ticked one.
+                    .style(|theme, status| {
+                        checkbox::primary(
+                            theme,
+                            match status {
+                                checkbox::Status::Disabled { is_checked } => {
+                                    checkbox::Status::Active { is_checked }
+                                }
+                                status => status,
+                            },
+                        )
+                    }),
             );
         }
+        // Older settings may hold no working day: mark the row, as other
+        // fields that stop a save are marked.
+        let days_label = text("Working days").size(theme::TEXT_SMALL);
+        let days_label = if ticked == 0 {
+            days_label.style(theme::danger)
+        } else {
+            days_label
+        };
         let mut hours = column![
             text("Work hours per day").size(theme::TEXT_SMALL),
             input("8", &f.focus_hours)
@@ -618,8 +638,7 @@ impl SettingsView {
         section(
             "Capacity",
             column![
-                column![text("Working days").size(theme::TEXT_SMALL), days]
-                    .spacing(theme::SPACING / 2.0),
+                column![days_label, days].spacing(theme::SPACING / 2.0),
                 hours,
             ]
             .spacing(theme::SPACING * 1.25),

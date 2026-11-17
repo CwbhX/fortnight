@@ -3,7 +3,7 @@
 
 use crate::args::{Cli, Command};
 use crate::commands;
-use crate::error::{CliError, CliResult, ErrorKind};
+use crate::error::{CliError, CliResult};
 use crate::llm_setup;
 use fortnight_core::datadir;
 use fortnight_core::domain::ReportKind;
@@ -51,12 +51,53 @@ pub fn open_store(flag: Option<PathBuf>, create: bool) -> CliResult<(SqliteStore
     Ok((store, dir))
 }
 
-/// Runs one command and returns the process exit code. A closed standard
-/// output (`fortnight-cli export | head -1`) is a quiet success.
+/// Standard output that goes quiet once its reader has gone
+/// (`fortnight-cli export | head -1`): later writes are dropped instead of
+/// failing, so a command still finishes its work and reports its real
+/// result. Any other write error is passed on.
+struct UntilClosed<W: Write> {
+    inner: W,
+    closed: bool,
+}
+
+impl<W: Write> UntilClosed<W> {
+    fn quiet<T>(&mut self, result: std::io::Result<T>, done: T) -> std::io::Result<T> {
+        match result {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                self.closed = true;
+                Ok(done)
+            }
+            other => other,
+        }
+    }
+}
+
+impl<W: Write> Write for UntilClosed<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.closed {
+            return Ok(buf.len());
+        }
+        let result = self.inner.write(buf);
+        self.quiet(result, buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        let result = self.inner.flush();
+        self.quiet(result, ())
+    }
+}
+
+/// Runs one command and returns the process exit code.
 pub fn main_with(cli: Cli) -> i32 {
-    match execute(cli, &mut std::io::stdout().lock()) {
+    let mut out = UntilClosed {
+        inner: std::io::stdout().lock(),
+        closed: false,
+    };
+    match execute(cli, &mut out) {
         Ok(()) => 0,
-        Err(e) if e.kind == ErrorKind::BrokenPipe => 0,
         Err(e) => {
             eprintln!("fortnight-cli: {}", e.message);
             e.code

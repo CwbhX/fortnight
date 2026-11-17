@@ -584,6 +584,8 @@ impl DayView {
                     && let Some(data) = &self.data
                 {
                     self.editing = Some(open_form(task, &data.tasks, data.week_start));
+                    // The form replaces the card, which sends no exit.
+                    self.hovered = None;
                 }
                 Action::None
             }
@@ -595,6 +597,7 @@ impl DayView {
                     form.calendar = None;
                 } else if self.editing.is_some() {
                     self.editing = None;
+                    self.hovered = None;
                 } else {
                     self.selected = None;
                 }

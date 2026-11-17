@@ -74,15 +74,16 @@ pub fn effective_settings(
             .map_err(|e| CliError::usage(format!("FORTNIGHT_LLM_PROTOCOL: {e}")))?;
     }
     let mut out = llm::with_overrides(saved, &var);
-    let flag_url = flags.base_url.as_deref().filter(|v| !v.trim().is_empty());
-    if get("FORTNIGHT_LLM_BASE_URL").is_some() || flag_url.is_some() {
-        out.keyless = false;
-    }
     if let Some(p) = flags.protocol {
         out.protocol = p;
     }
-    if let Some(url) = flag_url {
+    if let Some(url) = flags.base_url.as_deref().filter(|v| !v.trim().is_empty()) {
         out.base_url = url.trim().to_string();
+    }
+    // A different endpoint is assumed to need a key; naming the saved one
+    // again keeps its setting.
+    if out.base_url.trim() != saved.base_url.trim() {
+        out.keyless = false;
     }
     if let Some(model) = flags.model.as_deref().filter(|v| !v.trim().is_empty()) {
         out.model = model.trim().to_string();
@@ -719,6 +720,15 @@ mod tests {
         };
         assert!(
             effective_settings(&saved, |_| None, &model_only)
+                .unwrap()
+                .keyless
+        );
+        // Naming the saved URL again (as a cron script might) keeps it.
+        let same = |n: &str| {
+            (n == "FORTNIGHT_LLM_BASE_URL").then(|| " http://localhost:11434/v1 ".to_string())
+        };
+        assert!(
+            effective_settings(&saved, same, &LlmArgs::default())
                 .unwrap()
                 .keyless
         );
