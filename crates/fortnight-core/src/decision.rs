@@ -16,10 +16,15 @@
 //! `noul` question and replies "OK". Any other request (a weekly summary)
 //! is refused with `Malformed`, so a fallback can take it.
 //!
+//! `suggest_priority` asks which priority a new task deserves from its
+//! title and notes: one `choice` between low, medium and high (the task
+//! dialog's three levels, stored as 0, 1 and 2).
+//!
 //! Skipped for the prototype: retries (the fallback to the main endpoint
 //! covers failures), the custom recommendations prompt (a decision model
 //! gets the built-in rule as its question), and `score` questions.
 
+use crate::domain::Priority;
 use crate::llm::{BoxFuture, ChatRequest, ChatResponse, LlmClient, LlmConfig, LlmError};
 use secrecy::ExposeSecret;
 use serde::Deserialize;
@@ -76,6 +81,76 @@ impl DecisionClient {
         self.timeout = timeout;
         self
     }
+
+    fn request(&self) -> reqwest::RequestBuilder {
+        let url = format!(
+            "{}/v1/systemone",
+            crate::ollama::root_url(&self.config.base_url)
+        );
+        let builder = self.http.post(url).timeout(self.timeout);
+        match &self.config.api_key {
+            Some(key) => builder.bearer_auth(key.expose_secret()),
+            None => builder,
+        }
+    }
+
+    /// The priority a task with this title and notes deserves: 0 low,
+    /// 1 medium, 2 high (the most likely of the three).
+    pub fn suggest_priority(
+        &self,
+        title: &str,
+        notes: &str,
+    ) -> BoxFuture<Result<Priority, LlmError>> {
+        let model = self.config.model.trim().to_string();
+        let mut state = format!("Task: {}", title.trim());
+        if !notes.trim().is_empty() {
+            state.push_str(&format!("\nNotes: {}", notes.trim()));
+        }
+        let body = json!({
+            "model": model,
+            "state": state,
+            "questions": {
+                "priority": {
+                    "type": "choice",
+                    "instructions": "How important and urgent is this task?",
+                    "criteria": {
+                        "low": "Can wait: no deadline pressure, little consequence if it slips.",
+                        "medium": "Normal work that should get done soon.",
+                        "high": "Urgent or important: a near deadline, a blocker, people waiting, money, health or safety.",
+                    }
+                }
+            }
+        });
+        let builder = self.request();
+        let key = self.config.api_key.clone();
+        Box::pin(async move {
+            let reply = ask(builder, body, &model)
+                .await
+                .map_err(|e| crate::secure::redact(e, key.as_ref()))?;
+            let answer = reply.answers.get("priority");
+            let best = answer
+                .and_then(|a| a.get("probabilities"))
+                .and_then(Value::as_object)
+                .and_then(|p| {
+                    p.iter()
+                        .filter_map(|(k, v)| v.as_f64().map(|v| (k.as_str(), v)))
+                        .max_by(|a, b| a.1.total_cmp(&b.1))
+                        .map(|(k, _)| k.to_string())
+                })
+                .or_else(|| {
+                    answer
+                        .and_then(|a| a.get("choice"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
+            match best.as_deref() {
+                Some("low") => Ok(0),
+                Some("medium") => Ok(1),
+                Some("high") => Ok(2),
+                _ => Err(LlmError::Malformed("no priority in the answer".into())),
+            }
+        })
+    }
 }
 
 impl LlmClient for DecisionClient {
@@ -85,14 +160,7 @@ impl LlmClient for DecisionClient {
 
     fn chat(&self, req: ChatRequest) -> BoxFuture<Result<ChatResponse, LlmError>> {
         let model = self.config.model.trim().to_string();
-        let url = format!(
-            "{}/v1/systemone",
-            crate::ollama::root_url(&self.config.base_url)
-        );
-        let mut builder = self.http.post(url).timeout(self.timeout);
-        if let Some(key) = &self.config.api_key {
-            builder = builder.bearer_auth(key.expose_secret());
-        }
+        let builder = self.request();
         let key = self.config.api_key.clone();
         Box::pin(async move {
             let result = if req == ChatRequest::test() {
@@ -496,6 +564,33 @@ mod tests {
             user: "<facts>{}</facts>".into(),
         };
         assert!(matches!(c.chat(summary).await, Err(LlmError::Malformed(_))));
+    }
+
+    #[tokio::test]
+    async fn suggest_priority_picks_the_most_likely_level() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .and(body_partial_json(json!({
+                "state": "Task: Pay the overdue invoice\nNotes: Supplier stops service Friday",
+                "questions": { "priority": { "type": "choice" } }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "nimble",
+                "answers": { "priority": {
+                    "type": "choice",
+                    "choice": "high",
+                    "probabilities": { "low": 0.05, "medium": 0.2, "high": 0.75 },
+                    "confidence": 0.75
+                } }
+            })))
+            .mount(&server)
+            .await;
+        let p = client(&server)
+            .suggest_priority(" Pay the overdue invoice ", "Supplier stops service Friday")
+            .await
+            .unwrap();
+        assert_eq!(p, 2);
     }
 
     #[tokio::test]

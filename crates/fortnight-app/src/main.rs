@@ -30,9 +30,10 @@ use fortnight_app::views::settings::{
 };
 use fortnight_app::views::week::{self, WeekData, WeekView};
 use fortnight_core::datadir::{self, DataLock};
+use fortnight_core::decision::DecisionClient;
 use fortnight_core::domain::{
-    DeletedTask, Event, EventId, LlmSettings, Protocol, ReportId, ReportKey, ReportKind, Settings,
-    Task as CoreTask, TaskId, TaskStatus, WeekRef,
+    DeletedTask, Event, EventId, LlmSettings, Priority, Protocol, ReportId, ReportKey, ReportKind,
+    Settings, Task as CoreTask, TaskId, TaskStatus, WeekRef,
 };
 use fortnight_core::export::{self, ExportFormat};
 use fortnight_core::fallback::{self, FallbackClient};
@@ -102,6 +103,10 @@ enum Message {
     Models(Result<Vec<OllamaModel>, String>),
     /// The local Ollama check: its models, or why it didn't answer.
     OllamaDetected(Result<Vec<OllamaModel>, String>),
+    /// Typing in a new task's dialog paused: ask the decision model for a
+    /// priority, if this is still the latest edit (`suggest_seq`).
+    SuggestPriority(u64),
+    PrioritySuggested(u64, Option<Priority>),
     /// A keyboard shortcut (applied only where it makes sense).
     Key(Shortcut),
     /// The export dialog finished: the path written, `None` if cancelled.
@@ -215,6 +220,11 @@ struct Ready {
     /// Identifies a generation, so a late message from an earlier stream for
     /// the same report can't finish a newer one.
     next_generation: u64,
+    /// Bumped by each edit of a new task's title or notes, so only the
+    /// latest priority suggestion lands.
+    suggest_seq: u64,
+    /// Tasks were reloaded during this message (a change was made).
+    tasks_changed: bool,
     testing: bool,
     test_result: Option<Result<String, String>>,
     key_message: Option<Result<String, String>>,
@@ -431,6 +441,8 @@ impl Ready {
             failures: HashMap::new(),
             prompt_changed: HashMap::new(),
             next_generation: 0,
+            suggest_seq: 0,
+            tasks_changed: false,
             testing: false,
             test_result: None,
             key_message: None,
@@ -488,6 +500,26 @@ impl Ready {
     /// these fields, and its host. It uses its own key if one is saved, and
     /// otherwise the main key only on the main endpoint's host
     /// (`fallback::decision_config`).
+    /// The saved recommendations model is an Ollama decision model.
+    fn decision_active(&self) -> bool {
+        let d = &self.settings.decision_llm;
+        d.protocol == Protocol::OllamaDecision && d.is_configured()
+    }
+
+    /// The saved decision model's client, for priority suggestions.
+    fn decision_model(&self) -> Option<DecisionClient> {
+        if !self.decision_active() {
+            return None;
+        }
+        let config = fallback::decision_config(
+            &self.settings.decision_llm,
+            &self.settings.llm,
+            self.api_key.clone(),
+            self.decision_key.clone(),
+        );
+        DecisionClient::new(config).ok()
+    }
+
     fn decision_client_for(
         &self,
         llm: &LlmSettings,
@@ -542,6 +574,7 @@ impl Ready {
     // ---- data flow ----
 
     fn reload_tasks(&mut self) {
+        self.tasks_changed = true;
         match self.store.list_tasks() {
             Ok(tasks) => self.tasks = tasks,
             Err(e) => self.error = Some(e.to_string()),
@@ -922,6 +955,10 @@ impl Ready {
         if ok && g.scheduled && self.tab != Tab::Week {
             self.week_badge = true;
         }
+        // Tasks may have changed while it ran: catch up straight away.
+        if key.kind == ReportKind::Plan && self.decision_active() {
+            return self.update_week_reports();
+        }
         Task::none()
     }
 
@@ -1150,6 +1187,31 @@ impl Ready {
                 self.test_result = Some(result);
                 Task::none()
             }
+            Message::SuggestPriority(seq) => {
+                let Some(dialog) = self.dialog.as_ref().filter(|d| d.task.is_none()) else {
+                    return Task::none();
+                };
+                let title = dialog.form.title.trim().to_string();
+                if seq != self.suggest_seq || title.is_empty() {
+                    return Task::none();
+                }
+                let notes = dialog.form.notes.text();
+                let Some(client) = self.decision_model() else {
+                    return Task::none();
+                };
+                Task::perform(
+                    async move { client.suggest_priority(&title, &notes).await.ok() },
+                    move |p| Message::PrioritySuggested(seq, p),
+                )
+            }
+            Message::PrioritySuggested(seq, priority) => {
+                if seq == self.suggest_seq
+                    && let Some(dialog) = self.dialog.as_mut().filter(|d| d.task.is_none())
+                {
+                    dialog.form.suggested = priority;
+                }
+                Task::none()
+            }
             Message::OllamaDetected(result) => {
                 self.ollama = Some(result);
                 Task::none()
@@ -1234,6 +1296,10 @@ impl Ready {
             }
         };
         self.refresh();
+        // A decision model is quick: recommendations follow every change.
+        if std::mem::take(&mut self.tasks_changed) && self.decision_active() {
+            return Task::batch([task, self.update_week_reports()]);
+        }
         task
     }
 
@@ -1303,6 +1369,7 @@ impl Ready {
 
     /// Opens the task dialog for a new task on `day` and focuses its title.
     fn open_new_task(&mut self, day: Date) -> Task<Message> {
+        self.suggest_seq += 1;
         self.dialog = Some(TaskDialog {
             day: Some(day),
             form: day::EditForm::blank(&self.tasks, self.settings.schedule.week_start),
@@ -1331,6 +1398,19 @@ impl Ready {
             return Task::none();
         };
         if dialog.form.handle(&message, today) {
+            // A new task's title or notes changed: suggest a priority once
+            // typing pauses.
+            let text_edit = matches!(
+                message,
+                day::Message::EditTitle(_) | day::Message::EditNotes(_)
+            );
+            if dialog.task.is_none() && text_edit && self.decision_active() {
+                self.suggest_seq += 1;
+                let seq = self.suggest_seq;
+                return Task::perform(tokio::time::sleep(Duration::from_millis(500)), move |_| {
+                    Message::SuggestPriority(seq)
+                });
+            }
             return Task::none();
         }
         match (message, dialog.task) {

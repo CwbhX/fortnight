@@ -442,6 +442,9 @@ pub struct EditForm {
     /// The estimate as first shown, so an untouched field is not re-parsed.
     pub original_estimate: String,
     pub priority: Priority,
+    /// The priority the decision model suggests for a new task, shown as
+    /// a faint outline on that option. Set by `main.rs`.
+    pub suggested: Option<Priority>,
     pub subtasks: Vec<Subtask>,
     pub new_subtask: String,
     /// The notes without the subtasks.
@@ -468,6 +471,7 @@ impl EditForm {
             estimate: estimate.clone(),
             original_estimate: estimate,
             priority: priority_level(task.priority),
+            suggested: None,
             subtasks: subtasks.clone(),
             new_subtask: String::new(),
             notes: text_editor::Content::with_text(&text),
@@ -1264,19 +1268,33 @@ fn field<'a>(
         .style(theme::input)
 }
 
-/// Low, Medium, High as a segmented control.
-fn priority_picker<'a>(current: Priority) -> Element<'a, Message> {
-    let buttons = PRIORITIES.into_iter().map(|(label, p)| {
-        button(text(label).size(theme::TEXT_SMALL))
+/// Low, Medium, High as a segmented control. A `suggested` level other
+/// than the current one gets a faint accent outline.
+fn priority_picker<'a>(current: Priority, suggested: Option<Priority>) -> Element<'a, Message> {
+    let buttons = PRIORITIES.into_iter().map(move |(label, p)| {
+        let hint = p != current && suggested.map(priority_level) == Some(p);
+        let b = button(text(label).size(theme::TEXT_SMALL))
             .padding(theme::tab_padding())
-            .style(theme::tab_button(current == p))
-            .on_press(Message::SetPriority(p))
-            .into()
+            .on_press(Message::SetPriority(p));
+        if hint {
+            b.style(suggested_tab).into()
+        } else {
+            b.style(theme::tab_button(current == p)).into()
+        }
     });
     container(Row::with_children(buttons).spacing(2))
         .padding(3)
         .style(theme::tab_bar)
         .into()
+}
+
+/// An unselected priority the decision model suggests: a faint outline.
+fn suggested_tab(t: &Theme, status: button::Status) -> button::Style {
+    let mut style = theme::tab_button(false)(t, status);
+    style.border = border::rounded(theme::RADIUS - 2.0)
+        .color(theme::ACCENT.scale_alpha(0.6))
+        .width(1.0);
+    style
 }
 
 /// The due-date field: a button showing the date that opens the calendar.
@@ -1429,7 +1447,10 @@ fn form_fields<'a>(
     ]
     .spacing(theme::SPACING);
 
-    body = body.push(labelled("Priority", priority_picker(form.priority)));
+    body = body.push(labelled(
+        "Priority",
+        priority_picker(form.priority, form.suggested),
+    ));
     if let Some(error) = &form.error {
         body = body.push(text(error).size(theme::TEXT_SMALL).style(theme::danger));
     }
