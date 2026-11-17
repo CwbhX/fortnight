@@ -150,13 +150,57 @@ fn read_file(path: &Path) -> Option<LockInfo> {
     serde_json::from_str(&text).ok()
 }
 
+/// The same machine, allowing for macOS adding or dropping `.local` from its
+/// host name depending on the network.
+fn same_host(a: &str, b: &str) -> bool {
+    let base = |s: &str| s.trim().trim_end_matches(".local").to_ascii_lowercase();
+    a != "unknown" && base(a) == base(b)
+}
+
+/// Whether a process with this id is running on this machine. When it
+/// can't tell, it says yes (so the warning is kept).
+fn process_running(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_or(true, |s| s.success())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_or(true, |o| {
+                String::from_utf8_lossy(&o.stdout).contains(&pid.to_string())
+            })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 /// Takes the lock, replacing any existing lock file. Returns the lock and,
 /// if a lock file already existed (another instance, another machine, or a
 /// crash), what it said, so the caller can warn. An unreadable existing
 /// file is reported as a `LockInfo` with host "unknown".
+///
+/// A lock left by this machine whose process has gone is not reported: the
+/// app was closed without running its clean-up (macOS's Cmd+Q ends the
+/// process without dropping the app state) or crashed.
 pub fn acquire_lock(dir: &Path) -> Result<(DataLock, Option<LockInfo>), DataDirError> {
     let path = lock_path(dir);
     let now = jiff::Timestamp::now();
+    let host = host_name();
+    let pid = std::process::id();
     let previous = match path.try_exists() {
         Ok(false) => None,
         // Exists (or cannot tell): report what it says, or "unknown".
@@ -166,8 +210,8 @@ pub fn acquire_lock(dir: &Path) -> Result<(DataLock, Option<LockInfo>), DataDirE
             since: now,
         })),
     };
-    let host = host_name();
-    let pid = std::process::id();
+    let previous = previous
+        .filter(|p| !(same_host(&p.host, &host) && p.pid != pid && !process_running(p.pid)));
     let mut since = now;
     // Keep our info distinguishable from a previous lock of this same
     // process (a coarse clock could otherwise repeat the timestamp).
@@ -336,6 +380,51 @@ mod tests {
         drop(second);
         assert!(!lock_path(&dir).exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hosts_match_with_or_without_local() {
+        assert!(same_host(
+            "Clements-MacBook-Pro.local",
+            "clements-macbook-pro"
+        ));
+        assert!(!same_host("a.local", "b.local"));
+        assert!(!same_host("unknown", "unknown"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_left_by_a_finished_process_here_is_ignored() {
+        let dir = temp_dir("lock-stale");
+        ensure(&dir).unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let write = |pid: u32| {
+            let info = LockInfo {
+                host: host_name(),
+                pid,
+                since: jiff::Timestamp::now(),
+            };
+            std::fs::write(lock_path(&dir), serde_json::to_string(&info).unwrap()).unwrap();
+        };
+        write(dead);
+        let (lock, previous) = acquire_lock(&dir).unwrap();
+        assert_eq!(previous, None);
+        drop(lock);
+
+        // A running process on this machine is still reported.
+        let mut live = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        write(live.id());
+        let (lock, previous) = acquire_lock(&dir).unwrap();
+        assert_eq!(previous.map(|p| p.pid), Some(live.id()));
+        let _ = live.kill();
+        let _ = live.wait();
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
