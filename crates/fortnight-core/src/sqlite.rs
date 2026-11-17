@@ -24,7 +24,9 @@ use crate::domain::{
 use crate::store::{Store, StoreError, StoreResult};
 use jiff::Timestamp;
 use jiff::civil::Date;
-use rusqlite::{Connection, OptionalExtension, Params, Row, params};
+use rusqlite::{
+    Connection, OptionalExtension, Params, Row, Transaction, TransactionBehavior, params,
+};
 use std::path::Path;
 use std::time::Duration;
 
@@ -161,7 +163,9 @@ impl SqliteStore {
 /// Applies every migration past the current `user_version`, all in one
 /// transaction.
 fn migrate(conn: &mut Connection) -> StoreResult<()> {
-    let tx = conn.transaction().map_err(db)?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db)?;
     let current: i64 = tx
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .map_err(db)?;
@@ -441,6 +445,13 @@ fn insert_event(
 }
 
 impl SqliteStore {
+    /// A write transaction that takes the write lock up front (`BEGIN
+    /// IMMEDIATE`), so a busy database waits out the busy timeout instead of
+    /// failing on a read-to-write upgrade when the GUI and CLI write at once.
+    fn write_tx(&self) -> StoreResult<Transaction<'_>> {
+        Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate).map_err(db)
+    }
+
     fn report_by_id(&self, id: ReportId) -> StoreResult<Option<Report>> {
         self.conn
             .query_row(
@@ -479,7 +490,7 @@ impl Store for SqliteStore {
 
     fn add_task(&self, new: NewTask) -> StoreResult<Task> {
         let now = ts_to_sql(Timestamp::now());
-        let tx = self.conn.unchecked_transaction().map_err(db)?;
+        let tx = self.write_tx()?;
         let id: i64 = tx
             .query_row(
                 "INSERT INTO tasks (title, notes, status, project, due_on, planned_for,
@@ -518,7 +529,7 @@ impl Store for SqliteStore {
     }
 
     fn update_task(&self, task: &Task) -> StoreResult<()> {
-        let tx = self.conn.unchecked_transaction().map_err(db)?;
+        let tx = self.write_tx()?;
         let old = query_task(&tx, task.id)?.ok_or(StoreError::TaskNotFound(task.id))?;
 
         let mut events = Vec::new();
@@ -581,7 +592,7 @@ impl Store for SqliteStore {
     }
 
     fn set_status(&self, id: TaskId, status: TaskStatus) -> StoreResult<()> {
-        let tx = self.conn.unchecked_transaction().map_err(db)?;
+        let tx = self.write_tx()?;
         let old: String = tx
             .query_row("SELECT status FROM tasks WHERE id = ?1", [id], |r| r.get(0))
             .optional()
@@ -609,7 +620,7 @@ impl Store for SqliteStore {
     }
 
     fn delete_task(&self, id: TaskId) -> StoreResult<DeletedTask> {
-        let tx = self.conn.unchecked_transaction().map_err(db)?;
+        let tx = self.write_tx()?;
         let task = query_task(&tx, id)?.ok_or(StoreError::TaskNotFound(id))?;
         let events = query_events(&tx, "WHERE task_id = ?1", [id])?;
         // Events first: they reference the task.
@@ -623,7 +634,7 @@ impl Store for SqliteStore {
 
     fn restore_task(&self, deleted: &DeletedTask) -> StoreResult<()> {
         let t = &deleted.task;
-        let tx = self.conn.unchecked_transaction().map_err(db)?;
+        let tx = self.write_tx()?;
         tx.execute(
             &format!(
                 "INSERT INTO tasks ({TASK_COLUMNS})
@@ -664,7 +675,7 @@ impl Store for SqliteStore {
     }
 
     fn add_log(&self, task_id: Option<TaskId>, text: &str) -> StoreResult<Event> {
-        let tx = self.conn.unchecked_transaction().map_err(db)?;
+        let tx = self.write_tx()?;
         if let Some(id) = task_id
             && !task_exists(&tx, id)?
         {
@@ -1155,6 +1166,43 @@ mod tests {
         let half: Timestamp = "2026-11-16T10:00:00.5Z".parse().unwrap();
         assert!(ts_to_sql(whole) < ts_to_sql(half));
         assert_eq!(ts_from_sql(&ts_to_sql(half)).unwrap(), half);
+    }
+
+    /// The GUI and the CLI may write at the same time: with immediate
+    /// write transactions and the busy timeout, none of these fail.
+    #[test]
+    fn concurrent_writers_wait_instead_of_failing() {
+        let path = std::env::temp_dir().join(format!(
+            "fortnight-sqlite-concurrent-{}-{}.db",
+            std::process::id(),
+            Timestamp::now().as_nanosecond()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let id = SqliteStore::open(&path)
+            .unwrap()
+            .add_task(new_task("shared"))
+            .unwrap()
+            .id;
+        let threads: Vec<_> = (0..4)
+            .map(|n| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let s = SqliteStore::open(&path).unwrap();
+                    let mut failures = 0;
+                    for i in 0..100 {
+                        let mut t = s.get_task(id).unwrap().unwrap();
+                        t.notes = format!("{n}-{i}");
+                        if s.update_task(&t).is_err() {
+                            failures += 1;
+                        }
+                    }
+                    failures
+                })
+            })
+            .collect();
+        let failures: i32 = threads.into_iter().map(|t| t.join().unwrap()).sum();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(failures, 0);
     }
 
     #[test]

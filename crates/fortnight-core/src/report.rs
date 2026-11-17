@@ -136,6 +136,61 @@ impl LocalWeek<'_> {
         }
         before.or(after).unwrap_or(task.status)
     }
+
+    /// The task's deadline at the end of the week, by the same rule as
+    /// `status_at_end`.
+    fn due_at_end(&self, task: &Task, history: &[&Event]) -> Option<Date> {
+        let end = self.week.end();
+        let mut before = None;
+        let mut after = None;
+        for e in history {
+            if let EventKind::DueChanged { from, to } = e.kind {
+                if self.date(e.at) <= end {
+                    before = Some(to);
+                } else if after.is_none() {
+                    after = Some(from);
+                }
+            }
+        }
+        before.or(after).unwrap_or(task.due_on)
+    }
+
+    /// When the task was completed in this week: it was `Done` at the end of
+    /// the week and its last change to `Done` falls in the week. Without
+    /// status history, the stored `completed_at`.
+    fn completed_in_week(&self, task: &Task, history: &[&Event]) -> Option<Timestamp> {
+        let end = self.week.end();
+        let has_status_history = history
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::StatusChanged { .. }));
+        if !has_status_history {
+            let ts = task.completed_at.filter(|_| task.is_done())?;
+            return self.week.contains(self.date(ts)).then_some(ts);
+        }
+        if self.status_at_end(task, history) != TaskStatus::Done {
+            return None;
+        }
+        history
+            .iter()
+            .filter(|e| self.date(e.at) <= end)
+            .rev()
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    EventKind::StatusChanged {
+                        to: TaskStatus::Done,
+                        ..
+                    }
+                )
+            })
+            .map(|e| e.at)
+            .filter(|at| self.week.contains(self.date(*at)))
+    }
+
+    /// The task existed by the end of the week.
+    fn existed(&self, task: &Task) -> bool {
+        self.date(task.created_at) <= self.week.end()
+    }
 }
 
 /// `Some((from, to))` when the event moved a deadline later.
@@ -147,6 +202,27 @@ fn later_move(kind: &EventKind) -> Option<(Date, Date)> {
         } if to > from => Some((from, to)),
         _ => None,
     }
+}
+
+/// How many times the deadline moved later, net of moves back earlier (an
+/// undone move does not count).
+fn net_deadline_moves(history: &[&Event]) -> usize {
+    let mut later = 0usize;
+    let mut earlier = 0usize;
+    for e in history {
+        if let EventKind::DueChanged {
+            from: Some(from),
+            to: Some(to),
+        } = e.kind
+        {
+            if to > from {
+                later += 1;
+            } else if to < from {
+                earlier += 1;
+            }
+        }
+    }
+    later.saturating_sub(earlier)
 }
 
 /// Tasks that may be sent: every task not marked private.
@@ -340,12 +416,15 @@ pub fn summary_facts(
     let tasks = shareable(tasks);
     let history = History::new(&tasks, events);
 
+    // Judged as of the end of the week, so a catch-up run or a later
+    // regeneration describes the week as it was, not as things are now.
     let mut done: Vec<(&Task, Timestamp, Date)> = tasks
         .iter()
         .copied()
-        .filter(|t| t.is_done())
-        .filter_map(|t| t.completed_at.map(|ts| (t, ts, lw.date(ts))))
-        .filter(|(_, _, d)| week.contains(*d))
+        .filter_map(|t| {
+            lw.completed_in_week(t, history.of(t.id))
+                .map(|ts| (t, ts, lw.date(ts)))
+        })
         .collect();
     done.sort_by_key(|(t, ts, _)| (*ts, t.id));
     let completed: Vec<CompletedTask> = done
@@ -401,15 +480,21 @@ pub fn summary_facts(
         .collect();
     let progressed_ids: BTreeSet<TaskId> = progressed.iter().map(|p| p.id).collect();
 
-    let open: Vec<&Task> = ordered
+    // Open at the end of the week, with the deadline it had then.
+    let open: Vec<(&Task, Option<Date>, TaskStatus)> = ordered
         .iter()
         .copied()
-        .filter(|t| t.status.is_open())
+        .filter(|t| lw.existed(t))
+        .map(|t| {
+            let all = history.of(t.id);
+            (t, lw.due_at_end(t, all), lw.status_at_end(t, all))
+        })
+        .filter(|(_, _, status)| status.is_open())
         .collect();
 
     let missed: Vec<MissedTask> = open
         .iter()
-        .filter_map(|t| t.due_on.filter(|d| *d <= as_of).map(|d| (t, d)))
+        .filter_map(|(t, due, _)| due.filter(|d| *d <= as_of).map(|d| (t, d)))
         .map(|(t, d)| MissedTask {
             id: t.id,
             title: clean_title(&t.title),
@@ -423,9 +508,8 @@ pub fn summary_facts(
 
     let next_week: Vec<DueTask> = open
         .iter()
-        .filter_map(|t| {
-            t.due_on
-                .filter(|d| *d > as_of && *d <= next.end())
+        .filter_map(|(t, due, _)| {
+            due.filter(|d| *d > as_of && *d <= next.end())
                 .map(|d| (t, d))
         })
         .map(|(t, d)| DueTask {
@@ -439,18 +523,18 @@ pub fn summary_facts(
 
     let in_progress: Vec<OpenTask> = open
         .iter()
-        .filter(|t| !progressed_ids.contains(&t.id))
-        .filter(|t| !t.due_on.is_some_and(|d| d <= next.end()))
-        .filter(|t| {
-            t.status == TaskStatus::Doing
+        .filter(|(t, _, _)| !progressed_ids.contains(&t.id))
+        .filter(|(_, due, _)| !due.is_some_and(|d| d <= next.end()))
+        .filter(|(t, _, status)| {
+            *status == TaskStatus::Doing
                 || (week.contains(lw.date(t.updated_at)) && lw.date(t.created_at) < week.start)
         })
-        .map(|t| OpenTask {
+        .map(|(t, due, _)| OpenTask {
             id: t.id,
             title: clean_title(&t.title),
             project: t.project.clone(),
-            due_on: t.due_on,
-            due_weekday: t.due_on.map(|d| weekday_name(d.weekday())),
+            due_on: *due,
+            due_weekday: due.map(|d| weekday_name(d.weekday())),
             notes: trim_notes(&t.notes),
         })
         .collect();
@@ -459,11 +543,26 @@ pub fn summary_facts(
     let mut dropped: Vec<(Timestamp, DroppedTask)> = Vec::new();
     for t in &tasks {
         let in_week = lw.events(history.of(t.id));
-        let moves: Vec<(Timestamp, Date, Date)> = in_week
+        // Net change over the week: a deadline moved later and back again
+        // did not slip.
+        let changes: Vec<(Timestamp, Option<Date>, Option<Date>)> = in_week
             .iter()
-            .filter_map(|e| later_move(&e.kind).map(|(from, to)| (e.at, from, to)))
+            .filter_map(|e| match e.kind {
+                EventKind::DueChanged { from, to } => Some((e.at, from, to)),
+                _ => None,
+            })
             .collect();
-        if let (Some(&(at, from, _)), Some(&(_, _, to))) = (moves.first(), moves.last()) {
+        let moves: Vec<_> = in_week
+            .iter()
+            .filter(|e| later_move(&e.kind).is_some())
+            .collect();
+        let net = match (changes.first(), changes.last()) {
+            (Some(&(at, Some(from), _)), Some(&(_, _, Some(to)))) if to > from => {
+                Some((at, from, to))
+            }
+            _ => None,
+        };
+        if let Some((at, from, to)) = net {
             slipped.push((
                 at,
                 SlippedTask {
@@ -700,11 +799,7 @@ pub fn plan_facts(
             estimate_minutes: t.estimate_minutes,
             estimate_hours: t.estimate_minutes.map(hours),
             priority: t.priority,
-            deadline_moves: history
-                .of(t.id)
-                .iter()
-                .filter(|e| later_move(&e.kind).is_some())
-                .count(),
+            deadline_moves: net_deadline_moves(history.of(t.id)),
             notes: trim_notes(&t.notes),
         }
     };
@@ -2065,6 +2160,99 @@ mod tests {
                 (date(2026, 11, 14), "Ran the team retro"),
             ]
         );
+    }
+
+    #[test]
+    fn catch_up_reports_the_week_as_it_was() {
+        // Due Thu 12 Nov, still open at the end of that week, finished on
+        // Mon 16 Nov before the catch-up summary for the 9 Nov week ran.
+        let late = done_at(
+            due(task(1, "Late report"), date(2026, 11, 12)),
+            "2026-11-16T10:00:00Z",
+        );
+        let events = vec![status(
+            1,
+            1,
+            "2026-11-16T10:00:00Z",
+            TaskStatus::Todo,
+            TaskStatus::Done,
+        )];
+        let today = date(2026, 11, 16);
+        let f = summary_facts(&[late], &events, summary_week(), today, &TimeZone::UTC);
+        assert!(f.completed.is_empty());
+        assert_eq!(f.missed.len(), 1, "{f:?}");
+        assert_eq!(f.missed[0].title, "Late report");
+
+        // Completed in the week and reopened later: still completed that week.
+        let reopened = due(task(2, "Reopened"), date(2026, 11, 20));
+        let events = vec![
+            status(
+                1,
+                2,
+                "2026-11-11T10:00:00Z",
+                TaskStatus::Todo,
+                TaskStatus::Done,
+            ),
+            status(
+                2,
+                2,
+                "2026-11-17T10:00:00Z",
+                TaskStatus::Done,
+                TaskStatus::Todo,
+            ),
+        ];
+        let f = summary_facts(&[reopened], &events, summary_week(), today, &TimeZone::UTC);
+        assert_eq!(f.completed.len(), 1);
+        assert_eq!(f.completed[0].completed_on, date(2026, 11, 11));
+
+        // Created after the week: not part of it.
+        let new = created(
+            due(task(3, "Brand new"), date(2026, 11, 13)),
+            "2026-11-16T09:00:00Z",
+        );
+        let f = summary_facts(&[new], &[], summary_week(), today, &TimeZone::UTC);
+        assert!(f.missed.is_empty());
+    }
+
+    #[test]
+    fn a_deadline_moved_and_moved_back_did_not_slip() {
+        let t = due(task(1, "Report"), date(2026, 11, 20));
+        let events = vec![
+            due_moved(
+                1,
+                1,
+                "2026-11-10T09:00:00Z",
+                Some(date(2026, 11, 20)),
+                Some(date(2026, 11, 23)),
+            ),
+            due_moved(
+                2,
+                1,
+                "2026-11-10T09:01:00Z",
+                Some(date(2026, 11, 23)),
+                Some(date(2026, 11, 20)),
+            ),
+        ];
+        assert!(
+            summary_of(std::slice::from_ref(&t), &events)
+                .slipped
+                .is_empty()
+        );
+        let plan = plan_facts(
+            &[t],
+            &events,
+            WeekRef::new(date(2026, 11, 16)),
+            date(2026, 11, 16),
+            &Settings::default(),
+        );
+        let all: Vec<&PlanTask> = plan
+            .overdue
+            .iter()
+            .chain(&plan.due_this_week)
+            .chain(&plan.due_soon)
+            .chain(&plan.undated)
+            .collect();
+        assert_eq!(all[0].deadline_moves, 0);
     }
 
     #[test]

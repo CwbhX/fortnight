@@ -23,8 +23,8 @@ use fortnight_app::views::settings::{
 use fortnight_app::views::week::{self, WeekData, WeekView};
 use fortnight_core::datadir::{self, DataLock};
 use fortnight_core::domain::{
-    DeletedTask, Event, LlmSettings, ReportId, ReportKey, ReportKind, Settings, Task as CoreTask,
-    TaskId, TaskStatus, WeekRef,
+    DeletedTask, Event, EventId, LlmSettings, ReportId, ReportKey, ReportKind, Settings,
+    Task as CoreTask, TaskId, TaskStatus, WeekRef,
 };
 use fortnight_core::export::{self, ExportFormat};
 use fortnight_core::llm::{
@@ -49,8 +49,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// A failed automatic generation is not retried for this long.
+/// A failed automatic generation is retried after this long, doubling after
+/// each further failure in a row, up to `RETRY_MAX_MINUTES`.
 const RETRY_AFTER_MINUTES: i64 = 10;
+const RETRY_MAX_MINUTES: i64 = 24 * 60;
 
 pub fn main() -> iced::Result {
     iced::application(App::boot, App::update, App::view)
@@ -80,9 +82,9 @@ enum Message {
     Tick,
     ThemeMode(iced::theme::Mode),
     /// A piece of a streamed report.
-    Stream(ReportKey, Result<ChatEvent, LlmError>),
+    Stream(ReportKey, u64, Result<ChatEvent, LlmError>),
     /// The stream for this report ended (after `Done` or an error, or early).
-    StreamEnded(ReportKey),
+    StreamEnded(ReportKey, u64),
     Tested(Result<String, String>),
     Models(Result<Vec<String>, String>),
     /// A keyboard shortcut (applied only where it makes sense).
@@ -125,17 +127,22 @@ struct Generation {
     scheduled: bool,
     /// Aborts the request (Lock stops requests that hold the key).
     abort: iced::task::Handle,
+    id: u64,
 }
 
 /// One change that Ctrl/Cmd+Z can take back.
 #[derive(Debug, Clone)]
 enum Undo {
-    /// A task was added: delete it.
+    /// A task was added: delete it (only while it has no other history).
     Added(TaskId),
-    /// A task's status changed from this one.
-    Status(TaskId, TaskStatus),
-    /// A task was edited; this is how it was before.
-    Edited(Box<CoreTask>),
+    /// A task's status or fields changed. Undo puts the task back exactly as
+    /// it was (including `completed_at`) and drops the events the change
+    /// wrote (ids above `last_event`), keeping log lines.
+    Changed {
+        before: Box<CoreTask>,
+        last_event: EventId,
+        what: &'static str,
+    },
     /// A task was deleted; put it back with its history.
     Deleted(Box<DeletedTask>),
 }
@@ -173,6 +180,11 @@ struct Ready {
 
     generating: HashMap<ReportKey, Generation>,
     last_attempt: HashMap<ReportKey, Timestamp>,
+    /// Scheduled failures in a row per report, for the retry backoff.
+    failures: HashMap<ReportKey, u32>,
+    /// Identifies a generation, so a late message from an earlier stream for
+    /// the same report can't finish a newer one.
+    next_generation: u64,
     testing: bool,
     test_result: Option<Result<String, String>>,
     key_message: Option<Result<String, String>>,
@@ -340,6 +352,8 @@ impl Ready {
             api_key: None,
             generating: HashMap::new(),
             last_attempt: HashMap::new(),
+            failures: HashMap::new(),
+            next_generation: 0,
             testing: false,
             test_result: None,
             key_message: None,
@@ -600,8 +614,10 @@ impl Ready {
         };
         let prepared = self.prepare(kind, week);
         let stream = client.chat_stream(prepared.request.clone());
-        let (task, abort) = Task::run(stream, move |item| Message::Stream(key, item))
-            .chain(Task::done(Message::StreamEnded(key)))
+        self.next_generation += 1;
+        let id = self.next_generation;
+        let (task, abort) = Task::run(stream, move |item| Message::Stream(key, id, item))
+            .chain(Task::done(Message::StreamEnded(key, id)))
             .abortable();
         self.generating.insert(
             key,
@@ -612,6 +628,7 @@ impl Ready {
                 host,
                 scheduled,
                 abort,
+                id,
             },
         );
         self.last_attempt.insert(key, Timestamp::now());
@@ -621,11 +638,34 @@ impl Ready {
     /// Stores the finished (or failed) report and forgets the generation.
     /// A scheduled report that became ready sets the Week badge and, if
     /// enabled, shows an OS notification.
-    fn finish(&mut self, key: ReportKey, result: Result<ChatResponse, LlmError>) -> Task<Message> {
+    fn finish(
+        &mut self,
+        key: ReportKey,
+        id: u64,
+        result: Result<ChatResponse, LlmError>,
+    ) -> Task<Message> {
+        if self.generating.get(&key).is_none_or(|g| g.id != id) {
+            return Task::none();
+        }
         let Some(g) = self.generating.remove(&key) else {
             return Task::none();
         };
         let ok = result.is_ok();
+        if g.scheduled {
+            if ok {
+                self.failures.remove(&key);
+                // The CLI's `run-due` may have stored one meanwhile.
+                if self
+                    .store
+                    .ready_report_keys()
+                    .is_ok_and(|keys| keys.contains(&key))
+                {
+                    return Task::none();
+                }
+            } else {
+                *self.failures.entry(key).or_insert(0) += 1;
+            }
+        }
         let new = report::finish(g.prepared, result, &g.requested_model, g.host);
         if let Err(e) = self.store.insert_report(new) {
             self.error = Some(e.to_string());
@@ -675,20 +715,62 @@ impl Ready {
             self.notice = Some("Nothing to undo.".into());
             return;
         };
-        let (result, what) = match last {
-            Undo::Added(id) => (
-                self.store.delete_task(id).map(|_| ()),
-                "Removed the new task.",
-            ),
-            Undo::Status(id, before) => (self.store.set_status(id, before), "Status restored."),
-            Undo::Edited(before) => (self.store.update_task(&before), "Edit undone."),
-            Undo::Deleted(deleted) => (self.store.restore_task(&deleted), "Task restored."),
+        let result = match &last {
+            Undo::Added(id) => self.undo_add(*id),
+            Undo::Changed {
+                before,
+                last_event,
+                what,
+            } => self.undo_change(before, *last_event).map(|()| *what),
+            Undo::Deleted(deleted) => self
+                .store
+                .restore_task(deleted)
+                .map(|()| "Task restored.")
+                .map_err(|e| e.to_string()),
         };
         match result {
-            Ok(()) => self.notice = Some(what.into()),
-            Err(e) => self.error = Some(format!("Could not undo: {e}")),
+            Ok(what) => self.notice = Some(what.into()),
+            Err(e) => {
+                self.error = Some(format!("Could not undo: {e}"));
+                // Keep the entry (and its saved copy) for another try.
+                if !matches!(last, Undo::Added(_)) {
+                    self.undo.push(last);
+                }
+            }
         }
         self.reload_tasks();
+    }
+
+    /// Deletes a task just added, unless it has since gained history (a log
+    /// line, an edit), which deleting would lose.
+    fn undo_add(&mut self, id: TaskId) -> Result<&'static str, String> {
+        let events = self.store.task_events(id).map_err(|e| e.to_string())?;
+        if events
+            .iter()
+            .any(|e| !matches!(e.kind, fortnight_core::domain::EventKind::Created { .. }))
+        {
+            return Err("the new task has changed since; delete it instead".into());
+        }
+        self.store
+            .delete_task(id)
+            .map(|_| "Removed the new task.")
+            .map_err(|e| e.to_string())
+    }
+
+    fn undo_change(&mut self, before: &CoreTask, last_event: EventId) -> Result<(), String> {
+        restore_snapshot(&self.store, before, last_event)
+    }
+
+    /// Remembers `before` (the task as it is now) for undo of a change about
+    /// to be made.
+    fn snapshot(&self, id: TaskId, what: &'static str) -> Option<Undo> {
+        let before = self.task(id)?.clone();
+        let last_event = self.events.iter().map(|e| e.id).max().unwrap_or(0);
+        Some(Undo::Changed {
+            before: Box::new(before),
+            last_event,
+            what,
+        })
     }
 
     fn task(&self, id: TaskId) -> Option<&CoreTask> {
@@ -697,7 +779,8 @@ impl Ready {
 
     /// The schedule: generates whatever is due (PLAN.md section 8). Runs at
     /// launch and every minute. Waits quietly while locked or unconfigured;
-    /// a failed attempt is retried after `RETRY_AFTER_MINUTES`.
+    /// a failed attempt is retried after `RETRY_AFTER_MINUTES`, doubling with
+    /// each further failure.
     fn run_due(&mut self) -> Task<Message> {
         if self.blocked().is_some() || self.tasks.is_empty() {
             return Task::none();
@@ -717,9 +800,14 @@ impl Ready {
                 kind: job.kind,
                 week_start: job.week.start,
             };
-            let recently_tried = self.last_attempt.get(&key).is_some_and(|t| {
-                now.duration_since(*t) < SignedDuration::from_mins(RETRY_AFTER_MINUTES)
-            });
+            let failures = self.failures.get(&key).copied().unwrap_or(0);
+            let wait = RETRY_AFTER_MINUTES
+                .saturating_mul(1 << failures.saturating_sub(1).min(10))
+                .min(RETRY_MAX_MINUTES);
+            let recently_tried = self
+                .last_attempt
+                .get(&key)
+                .is_some_and(|t| now.duration_since(*t) < SignedDuration::from_mins(wait));
             if !recently_tried {
                 tasks.push(self.generate(job.kind, job.week, true));
             }
@@ -779,7 +867,7 @@ impl Ready {
                 UnlockAction::Unlock(password) => self.unlock(password),
             },
             Message::Tick => self.run_due(),
-            Message::Stream(key, item) => match item {
+            Message::Stream(key, id, item) => match item {
                 Ok(ChatEvent::Delta(d)) if self.generating.contains_key(&key) => {
                     if let Some(g) = self.generating.get_mut(&key) {
                         g.text.push_str(&d);
@@ -792,14 +880,14 @@ impl Ready {
                         .get(&key)
                         .map(|g| g.text.clone())
                         .unwrap_or_default();
-                    self.finish(key, Ok(ChatResponse { text, model }))
+                    self.finish(key, id, Ok(ChatResponse { text, model }))
                 }
-                Err(e) => self.finish(key, Err(e)),
+                Err(e) => self.finish(key, id, Err(e)),
                 Ok(ChatEvent::Delta(_)) => Task::none(),
             },
-            Message::StreamEnded(key) => {
+            Message::StreamEnded(key, id) => {
                 // Only still generating if the stream ended without `Done`.
-                self.finish(key, Err(LlmError::Truncated))
+                self.finish(key, id, Err(LlmError::Truncated))
             }
             Message::Tested(result) => {
                 self.testing = false;
@@ -936,11 +1024,12 @@ impl Ready {
     }
 
     fn set_status(&mut self, id: TaskId, status: TaskStatus) {
-        let before = self.task(id).map(|t| t.status);
+        let changed = self.task(id).is_some_and(|t| t.status != status);
+        let undo = self.snapshot(id, "Status restored.");
         match self.store.set_status(id, status) {
             Ok(()) => {
-                if let Some(before) = before.filter(|b| *b != status) {
-                    self.remember(Undo::Status(id, before));
+                if let (true, Some(undo)) = (changed, undo) {
+                    self.remember(undo);
                 }
             }
             Err(e) => self.error = Some(e.to_string()),
@@ -956,10 +1045,10 @@ impl Ready {
                 return Task::none();
             }
             day::Action::Update(task) => {
-                let before = self.task(task.id).cloned();
+                let undo = self.snapshot(task.id, "Edit undone.");
                 let r = self.store.update_task(&task);
-                if let (Ok(()), Some(before)) = (&r, before) {
-                    self.remember(Undo::Edited(Box::new(before)));
+                if let (Ok(()), Some(undo)) = (&r, undo) {
+                    self.remember(undo);
                 }
                 r
             }
@@ -1327,6 +1416,31 @@ fn forced_theme() -> Option<bool> {
     }
 }
 
+/// Undo of a change: puts a task back exactly as `before`, dropping the
+/// events written since `last_event` except log lines. Done as delete +
+/// restore, which the store does with the original ids; if the restore
+/// fails, the current state is put back so the task is never lost.
+fn restore_snapshot(
+    store: &impl Store,
+    before: &CoreTask,
+    last_event: EventId,
+) -> Result<(), String> {
+    let current = store.delete_task(before.id).map_err(|e| e.to_string())?;
+    let restored = DeletedTask {
+        task: before.clone(),
+        events: current
+            .events
+            .iter()
+            .filter(|e| e.id <= last_event || e.kind.is_log())
+            .cloned()
+            .collect(),
+    };
+    store.restore_task(&restored).map_err(|e| {
+        let _ = store.restore_task(&current);
+        e.to_string()
+    })
+}
+
 /// Runs blocking work (Argon2) off the UI thread.
 fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, VaultError> + Send + 'static,
@@ -1383,6 +1497,34 @@ fn save_screenshot(shot: iced::window::Screenshot) -> Task<Message> {
 mod tests {
     use super::*;
     use keyboard::Modifiers;
+
+    /// Undoing "uncheck" must not move the completion into this week, and
+    /// leaves no extra history (correctness review, finding 1).
+    #[test]
+    fn undo_restores_the_task_and_drops_the_change_events() {
+        use fortnight_core::domain::NewTask;
+        let store = SqliteStore::open_in_memory().unwrap();
+        let t = store
+            .add_task(NewTask {
+                title: "t".into(),
+                ..NewTask::default()
+            })
+            .unwrap();
+        store.set_status(t.id, TaskStatus::Done).unwrap();
+        let before = store.get_task(t.id).unwrap().unwrap();
+        let events_before = store.task_events(t.id).unwrap();
+        let last_event = events_before.iter().map(|e| e.id).max().unwrap();
+
+        store.set_status(t.id, TaskStatus::Todo).unwrap();
+        store.add_log(Some(t.id), "kept").unwrap();
+        restore_snapshot(&store, &before, last_event).unwrap();
+
+        let after = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(after, before);
+        let events_after = store.task_events(t.id).unwrap();
+        assert_eq!(events_after.len(), events_before.len() + 1);
+        assert!(events_after.last().unwrap().kind.is_log());
+    }
 
     #[test]
     fn shortcuts_follow_plan_4_4() {

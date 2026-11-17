@@ -428,9 +428,36 @@ pub async fn run_due(
         writeln!(out, "Nothing is due.")?;
         return Ok(());
     }
-    let llm = make_client()?;
+    let llm = match make_client() {
+        Ok(llm) => llm,
+        // PLAN.md 8: with no LLM configured nothing fails; the facts are
+        // there in the app and through `summary --facts`.
+        Err(e) if e.code == crate::error::EXIT_USAGE => {
+            writeln!(
+                out,
+                "{} due, but no LLM endpoint is configured; nothing generated. ({e})",
+                jobs.len()
+            )?;
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
     let mut failed = 0;
     for job in &jobs {
+        // The app may have generated it meanwhile.
+        let key = fortnight_core::domain::ReportKey {
+            kind: job.kind,
+            week_start: job.week.start,
+        };
+        if store.ready_report_keys()?.contains(&key) {
+            writeln!(
+                out,
+                "{} {}: already ready",
+                job.kind.as_str(),
+                job.week.start
+            )?;
+            continue;
+        }
         let prepared = prepare(store, job.kind, job.week, now, &settings)?;
         let stored = generate_report(store, prepared, &llm, &mut std::io::sink()).await?;
         match stored.status {
