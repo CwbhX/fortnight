@@ -3,7 +3,8 @@
 //! One column per working day, in week order, all the same width and
 //! height. Each column has a heading (weekday and date; click to open the
 //! day in the Today tab), a load line once a task that day has an estimate
-//! ("3.5h of 8h · 1h done", red when over capacity, "+2 unestimated"), then
+//! ("3.5h of 8h · 1h done", a warning sign when over capacity, "+2
+//! unestimated"), then
 //! the day's tasks: open ones first, done ones dimmed after them. A task is
 //! placed by `Task::day()` (planned day, else deadline). Non-working days
 //! share one extra column ("Sat–Sun"), shown only when one of them has
@@ -510,7 +511,8 @@ struct LoadLine {
     fraction: Option<f32>,
     /// Done estimates over capacity, 0–1 (at most `fraction`).
     done_fraction: Option<f32>,
-    over: bool,
+    /// Minutes booked beyond capacity, when there are any.
+    over_by: Option<u32>,
     /// "3.5h of 8h", or "2h" without capacity.
     label: String,
     /// "1h done", when some done tasks have estimates.
@@ -539,7 +541,7 @@ fn load_line(loads: &[&DayLoad], done: u32) -> Option<LoadLine> {
     Some(LoadLine {
         fraction: share(total),
         done_fraction: share(done),
-        over: capacity > 0 && total > capacity,
+        over_by: (capacity > 0 && total > capacity).then(|| total - capacity),
         label,
         done: (done > 0).then(|| format!("{} done", duration(done))),
         unestimated: (unestimated > 0).then(|| format!("+{unestimated} unestimated")),
@@ -749,26 +751,34 @@ fn load_view<'a>(line: LoadLine) -> Element<'a, Message> {
     if let Some(f) = line.fraction {
         // The track with the whole share, then the done part on top.
         col = col.push(stack![
-            progress_bar(0.0..=1.0, f)
-                .girth(6)
-                .style(theme::load_bar(line.over)),
+            progress_bar(0.0..=1.0, f).girth(6).style(theme::load_bar),
             progress_bar(0.0..=1.0, line.done_fraction.unwrap_or(0.0))
                 .girth(6)
                 .style(theme::load_bar_done),
         ]);
     }
-    let label_style: fn(&Theme) -> text::Style = if line.over {
-        theme::danger
-    } else {
-        theme::muted
-    };
     let mut labels = row![
         text(line.label)
             .size(theme::TEXT_SMALL)
-            .style(label_style)
+            .style(theme::muted)
             .wrapping(Wrapping::None)
     ]
-    .spacing(6);
+    .spacing(6)
+    .align_y(Center);
+    if let Some(over) = line.over_by {
+        labels = labels.push(tooltip(
+            theme::icon(theme::Icon::Warning)
+                .width(14)
+                .height(14)
+                .style(|theme: &Theme, _| iced::widget::svg::Style {
+                    color: Some(theme.palette().warning),
+                }),
+            container(text(format!("Over by {}", duration(over))).size(theme::TEXT_SMALL))
+                .padding([4, 8])
+                .style(theme::card),
+            tooltip::Position::Bottom,
+        ));
+    }
     if let Some(d) = line.done {
         labels = labels.push(
             text(format!("· {d}"))
@@ -1130,7 +1140,7 @@ mod tests {
 
         let line = load_line(&[&load(d, 210, 480, 0)], 0).unwrap();
         assert_eq!(line.label, "3.5h of 8h");
-        assert!(!line.over);
+        assert_eq!(line.over_by, None);
         assert_eq!(line.fraction, Some(210.0 / 480.0));
         assert_eq!(line.done_fraction, Some(0.0));
         assert_eq!(line.done, None);
@@ -1138,12 +1148,15 @@ mod tests {
 
         let line = load_line(&[&load(d, 540, 480, 2)], 0).unwrap();
         assert_eq!(line.label, "9h of 8h");
-        assert!(line.over);
+        assert_eq!(line.over_by, Some(60));
         assert_eq!(line.fraction, Some(1.0));
         assert_eq!(line.unestimated.as_deref(), Some("+2 unestimated"));
 
         // Exactly at capacity is not over.
-        assert!(!load_line(&[&load(d, 480, 480, 0)], 0).unwrap().over);
+        assert_eq!(
+            load_line(&[&load(d, 480, 480, 0)], 0).unwrap().over_by,
+            None
+        );
 
         // Done tasks stay in the share, and their part is marked done.
         let line = load_line(&[&load(d, 120, 480, 0)], 60).unwrap();
@@ -1156,7 +1169,10 @@ mod tests {
         assert_eq!(line.fraction, Some(90.0 / 480.0));
         assert_eq!(line.done_fraction, Some(90.0 / 480.0));
         // Done counts towards over capacity too.
-        assert!(load_line(&[&load(d, 420, 480, 0)], 120).unwrap().over);
+        assert_eq!(
+            load_line(&[&load(d, 420, 480, 0)], 120).unwrap().over_by,
+            Some(60)
+        );
 
         // Non-working days: no capacity, no bar, never "over".
         let sat = load(date(2026, 11, 21), 60, 0, 0);
@@ -1164,7 +1180,7 @@ mod tests {
         let line = load_line(&[&sat, &sun], 0).unwrap();
         assert_eq!(line.label, "1.5h");
         assert_eq!(line.fraction, None);
-        assert!(!line.over);
+        assert_eq!(line.over_by, None);
         assert_eq!(line.unestimated.as_deref(), Some("+1 unestimated"));
     }
 

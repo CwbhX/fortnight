@@ -65,7 +65,7 @@
 //! - [`calendar_cell`]: a Month grid cell, by [`Cell`] (today, weekend,
 //!   outside the month).
 //! - [`load_bar`] + [`load_bar_done`]: `progress_bar` styles for the Week
-//!   load bar: capacity track, gray task share (red when over), accent done.
+//!   load bar: capacity track, gray task share, accent done.
 //! - [`backdrop`] + [`overlay_panel`]: the dimmed layer and the panel of an
 //!   overlay (Settings).
 //! - [`priority_color`]: the colour of a priority marker.
@@ -450,6 +450,7 @@ pub enum Icon {
     ChevronRight,
     Close,
     Plus,
+    Warning,
 }
 
 impl Icon {
@@ -462,6 +463,7 @@ impl Icon {
             Icon::ChevronRight => include_bytes!("../../../assets/icons/chevron-right.svg"),
             Icon::Close => include_bytes!("../../../assets/icons/close.svg"),
             Icon::Plus => include_bytes!("../../../assets/icons/plus.svg"),
+            Icon::Warning => include_bytes!("../../../assets/icons/warning.svg"),
         }
     }
 }
@@ -545,18 +547,14 @@ pub fn calendar_cell(cell: Cell) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
-/// A load bar's track (`progress_bar(0.0..=1.0, share).style(theme::load_bar(over))`):
+/// A load bar's track (`progress_bar(0.0..=1.0, share).style(theme::load_bar)`):
 /// the gray track is the day's capacity, the fill the estimated tasks'
 /// share of it in a gray that stands out from the track (lighter in dark
-/// mode), red when the day is over capacity. [`load_bar_done`] goes on top.
-pub fn load_bar(over: bool) -> impl Fn(&Theme) -> progress_bar::Style {
-    move |theme| progress_bar::Style {
+/// mode). [`load_bar_done`] goes on top.
+pub fn load_bar(theme: &Theme) -> progress_bar::Style {
+    progress_bar::Style {
         background: Background::Color(tint(theme, 0.10)),
-        bar: Background::Color(if over {
-            danger_color(theme)
-        } else {
-            tint(theme, 0.30)
-        }),
+        bar: Background::Color(tint(theme, 0.30)),
         border: border::rounded(999),
     }
 }
