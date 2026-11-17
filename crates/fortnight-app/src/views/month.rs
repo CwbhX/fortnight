@@ -183,6 +183,8 @@ fn lines_that_fit(height: f32) -> usize {
     }
 }
 
+/// How far a title may run into a card's right padding ([`PILL_PAD_X`]).
+const TITLE_OVERHANG: f32 = 4.0;
 /// Width of the due-tasks dropdown.
 const DROPDOWN_WIDTH: f32 = 230.0;
 /// Text size of the completion badge.
@@ -203,8 +205,10 @@ fn grid(data: &MonthData, open: Option<Date>, size: Size) -> Element<'_, Message
     let lines = lines_that_fit(row_height).min(MAX_TITLES + 1);
 
     let cell_width = (size.width - OUTER_PAD_X * 2.0 - LABEL_WIDTH - GAP * 7.0) / 7.0;
-    // Room for a title (and its marks) inside a card.
-    let max_width = cell_width - CELL_PAD_X * 2.0 - PILL_PAD_X * 2.0;
+    // Room for a title (and its marks) inside a card. It may run a few
+    // pixels into the card's right padding, so one more letter fits rather
+    // than leaving a visible gap before the marks.
+    let max_width = cell_width - CELL_PAD_X * 2.0 - PILL_PAD_X * 2.0 + TITLE_OVERHANG;
 
     let mut header = Row::new()
         .spacing(GAP)
@@ -479,7 +483,10 @@ fn due_dropdown<'a>(due: Vec<&Task>, today: Date) -> Element<'a, Message> {
             overdue: t.is_overdue(today),
             priority: t.priority,
         };
-        list = list.push(task_pill(&line, DROPDOWN_WIDTH - 20.0 - PILL_PAD_X * 2.0));
+        list = list.push(task_pill(
+            &line,
+            DROPDOWN_WIDTH - 20.0 - PILL_PAD_X * 2.0 + TITLE_OVERHANG,
+        ));
     }
     container(list.width(Fill))
         .padding(10)
@@ -672,8 +679,6 @@ fn fit_cached(s: &str, max_width: f32) -> String {
 /// `s` as it fits in `max_width`: whole when it does, otherwise the
 /// longest start that fits with "…" after it (at least "…").
 fn fit(s: &str, max_width: f32, width: impl Fn(&str) -> f32) -> String {
-    // A pixel of slack so rounding never pushes the last glyph past the clip.
-    let max_width = max_width - 1.0;
     if width(s) <= max_width {
         return s.to_string();
     }
@@ -884,11 +889,11 @@ mod tests {
 
     #[test]
     fn titles_truncate_with_an_ellipsis() {
-        // Every character 10 px wide, plus the 1 px slack.
+        // Every character 10 px wide.
         let w = |s: &str| s.chars().count() as f32 * 10.0;
-        assert_eq!(fit("short", 51.0, w), "short");
-        assert_eq!(fit("exactly10!", 101.0, w), "exactly10!");
-        assert_eq!(fit("Write the Q4 report", 101.0, w), "Write the…");
+        assert_eq!(fit("short", 50.0, w), "short");
+        assert_eq!(fit("exactly10!", 100.0, w), "exactly10!");
+        assert_eq!(fit("Write the Q4 report", 100.0, w), "Write the…");
         assert_eq!(fit("Write the Q4 report", 5.0, w), "…");
         // Narrow letters fit more: width decides, not the character count.
         let narrow = |s: &str| s.chars().map(|c| if c == 'i' { 3.0 } else { 10.0 }).sum();
