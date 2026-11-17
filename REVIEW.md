@@ -4,6 +4,21 @@ A full read of the workspace at commit `a433428` (25k lines of Rust, CI, docs). 
 
 Line numbers refer to `a433428` and drift as fixes land; function names are the stable reference.
 
+## Outcome
+
+Everything in the plan below was carried out and is on `main`, except the items under "Left for the owner" and "Deferred". `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` pass (441 tests, up from 366); Today, Week, Month and Settings were compared by screenshot before and after each wave.
+
+What differs from the plan as written:
+
+- **L11**: the HTTP client is shared per thread, not per process (a process-wide one leaked pooled connections between test runtimes). Same effect in the app and CLI.
+- **L16**: `report.rs` is split into `report/{history,summary,plan,recommend,format}.rs`, but `summary_facts` was not cut into one helper per list (the lists share intermediate state).
+- **S12**: `get_report` was dropped; its only caller was the dead export path removed in wave 1.
+- **M3**: done conservatively. Messages that only change what a view keeps (typing, drag bookkeeping, timers, stream chunks) skip the refresh; one `invalidate()` clears every cache on any reload, save, stored report or minute tick.
+- **M15**: `main.rs` (2,500 → 890 lines) now sits over `shell/{reports,keys,edits,recommend,settings_panel,shortcuts,refresh,suggest,dialog,dev}.rs`, with `Keys`, `Reports`, `LaterDays`, `UndoStack` and `Suggestions` as their own structs.
+- **Extra finding, fixed**: `LlmConfig::endpoint_host` had the same hand-rolled URL parsing as S3, so `https://evil.example\@api.openai.com/v1` as the Recommendations endpoint would have been lent the main API key.
+
+A regression review of the merged result (three fresh reviewers over the whole diff) found no high-severity problems. What it found, all fixed: the new fallback deadline (L5) cut off a local reasoning model that was still thinking, so a decision model on this machine now gets the local timeout; an abandoned primary request stayed open; a closed pipe cut `done`/`run-due` short; naming the saved base URL again dropped its keyless flag; the locked last working day looked unticked; a cancelled unlock could leave its error behind; backoff counted from the start of an attempt.
+
 ## Verdict
 
 The layering is sound: `fortnight-core` holds all logic behind a small `Store` trait and one `LlmClient` trait, views return `Action`s and never touch the store or the network, and the SQLite layer, vault crypto and date maths are careful and well tested. The problems are the ones a fast multi-agent build leaves behind:
@@ -143,7 +158,7 @@ Severity: **high / med / low** are bugs; **perf**, **dead**, **debt** as named.
 
 ## Fix plan
 
-Six waves. Within a wave agents work in separate worktrees on disjoint files; each wave is merged, checked (`fmt`, `clippy -D warnings`, `test`) and pushed before the next starts.
+Six waves. Within a wave, agents worked in separate worktrees on disjoint files; each wave was merged, checked (`fmt`, `clippy -D warnings`, `test`) and pushed before the next started.
 
 | Wave | Agent | Owns | Findings |
 |---|---|---|---|
@@ -173,4 +188,9 @@ Not changed, because they are product or legal choices rather than defects:
 - **`release.yml`** does a redundant third macOS build and hand-patches the bundle instead of `cargo xtask bundle --universal`. Untestable from here, so left alone.
 - **`CLAUDE.md` rules** ("frozen files", "do not push") describe the original build rounds and no longer match how the repo is worked on. Only its factual errors were corrected.
 
-Deferred as not worth the risk now: a shared drag module for Today and Week (two different position schemes), a generic SSE driver over both protocols, incremental event reads (`events_between(MIN, MAX)` on every reload; measure first), provider inference from Settings into core.
+- **Saved settings with no working days** (possible before this change) now block Save until a day is ticked; the "Working days" label turns red, with no message.
+- **CLI changes scripts may notice**: `plan --week` is gone; every command but `add` fails on a missing data folder instead of creating one; connect errors other than "not configured" exit 1, not 2; `--protocol` accepts only `openai` or `anthropic`; `list --today` includes carried-over tasks; `summary`, `plan` and `run-due` skip the model when there is nothing to report.
+
+## Deferred
+
+Not worth the risk now: a shared drag module for Today and Week (two different position schemes), a generic SSE driver over both protocols, incremental event reads (`events_between(MIN, MAX)` on every reload; measure first), provider inference from Settings into core, one `labelled` form helper for Today and Settings.
