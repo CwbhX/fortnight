@@ -718,7 +718,7 @@ fn month_abbr(d: Date) -> &'static str {
 }
 
 /// The week number shown on the label: the ISO week of `start + 3 days`,
-/// the same rule as `week::week_label`.
+/// the same rule as `week::week_number`.
 fn week_number(week: WeekRef) -> i8 {
     week.start.saturating_add(3.days()).iso_week_date().week()
 }

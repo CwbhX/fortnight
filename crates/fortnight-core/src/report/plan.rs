@@ -169,7 +169,7 @@ pub fn plan_facts(
             days_until_due: days,
             overdue: days.is_some_and(|n| n < 0),
             planned_for: t.planned_for,
-            on_today_list: t.planned_for.is_some_and(|d| d <= today),
+            on_today_list: t.on_today_list(today),
             planned_weekday: t.planned_for.map(|d| weekday_name(d.weekday())),
             estimate_minutes: t.estimate_minutes,
             estimate_hours: t.estimate_minutes.map(hours),
@@ -195,7 +195,7 @@ pub fn plan_facts(
     // Tasks on today's list are always listed, so they can be recommended;
     // the cap applies to the rest. Stable: today's list first, then planned
     // this week, list order otherwise.
-    let on_today_list = |t: &Task| t.planned_for.is_some_and(|d| d <= today);
+    let on_today_list = |t: &Task| t.on_today_list(today);
     undated_tasks.sort_by_key(|t| (!on_today_list(t), !planned_this_week(t)));
     let on_today = undated_tasks.iter().filter(|t| on_today_list(t)).count();
     let undated: Vec<PlanTask> = undated_tasks
