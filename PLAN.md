@@ -1,5 +1,7 @@
 # Fortnight — implementation plan
 
+> **Historical.** This is the original design, written before the prototype was built. The app has since changed in many places. For how it works now, the code and [README.md](README.md) are the reference.
+
 A local, cross-platform todo app in Rust. It keeps your tasks on your own machine, and it uses an LLM endpoint you supply to do two things: write a weekly summary of your work for your manager, and give you feedback on how to fit the coming week's tasks into their deadlines.
 
 The name fits the product: the app looks at a fortnight — the week behind you (review) and the week ahead (plan).

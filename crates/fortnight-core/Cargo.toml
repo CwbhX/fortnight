@@ -17,9 +17,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 futures-util.workspace = true
 eventsource-stream.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
 wiremock.workspace = true
 insta.workspace = true

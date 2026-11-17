@@ -66,7 +66,7 @@ const DEFAULT_M_COST_KIB: u32 = 19_456;
 const DEFAULT_T_COST: u32 = 2;
 const DEFAULT_P_COST: u32 = 1;
 
-/// Upper bounds accepted by `unlock`: 1 GiB, 64 passes, 16 lanes.
+/// Upper bounds accepted by `unlock`: 256 MiB, 10 passes, 4 lanes.
 const MAX_M_COST_KIB: u32 = 256 * 1024;
 const MAX_T_COST: u32 = 10;
 const MAX_P_COST: u32 = 4;
@@ -101,20 +101,6 @@ pub fn save(
 pub fn unlock(path: &Path, password: &SecretString) -> Result<SecretString, VaultError> {
     let bytes = fs::read(path).map_err(|e| io_error("read", path, &e))?;
     open(&bytes, password)
-}
-
-/// Decrypts with `old` and re-encrypts with `new`.
-pub fn change_password(
-    path: &Path,
-    old: &SecretString,
-    new: &SecretString,
-) -> Result<(), VaultError> {
-    // Check the new password first so a too-short one costs no KDF run.
-    if new.expose_secret().chars().count() < MIN_PASSWORD_LEN {
-        return Err(VaultError::PasswordTooShort(MIN_PASSWORD_LEN));
-    }
-    let api_key = unlock(path, old)?;
-    save(path, &api_key, new)
 }
 
 /// Deletes the key file. Not an error if it does not exist.
@@ -489,33 +475,6 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(names, vec!["llm-key".to_string()]);
-    }
-
-    #[test]
-    fn change_password_switches_passwords() {
-        let (_dir, path) = saved();
-        change_password(&path, &s(PASSWORD), &s("new password!")).unwrap();
-        assert_eq!(
-            unlock(&path, &s(PASSWORD)).unwrap_err(),
-            VaultError::WrongPassword
-        );
-        assert_eq!(
-            unlock(&path, &s("new password!")).unwrap().expose_secret(),
-            API_KEY
-        );
-    }
-
-    #[test]
-    fn change_password_with_wrong_old_password_keeps_file() {
-        let (_dir, path) = saved();
-        assert_eq!(
-            change_password(&path, &s("not the password"), &s("new password!")).unwrap_err(),
-            VaultError::WrongPassword
-        );
-        assert_eq!(
-            unlock(&path, &s(PASSWORD)).unwrap().expose_secret(),
-            API_KEY
-        );
     }
 
     #[test]

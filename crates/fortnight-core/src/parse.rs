@@ -76,17 +76,6 @@ pub fn parse_quick_add(input: &str, today: Date) -> QuickAdd {
     out
 }
 
-/// Parses a whole string as one date (`fri`, `tomorrow`, `nov 20`, `+3d`,
-/// `2026-11-20`, ...). Used by the task edit form. `None` if not a date.
-pub fn parse_date(input: &str, today: Date) -> Option<Date> {
-    let tokens: Vec<&str> = input.split_whitespace().collect();
-    match tokens.as_slice() {
-        [one] => single_date(one, today),
-        [a, b] => month_day(a, b, today),
-        _ => None,
-    }
-}
-
 /// Parses an estimate such as `~2h`, `30m`, `1h30m` or `1.5h`. The leading
 /// `~` is optional and surrounding whitespace is ignored. `None` for empty,
 /// zero, unparseable or over seven days. Used by the task edit form.
@@ -307,19 +296,9 @@ mod tests {
             ("+0d", Some(date(2026, 11, 16))),
             ("+2w", Some(date(2026, 11, 30))),
             ("+1W", Some(date(2026, 11, 23))),
-            ("nov 20", Some(date(2026, 11, 20))),
-            ("20 nov", Some(date(2026, 11, 20))),
-            ("november 20", Some(date(2026, 11, 20))),
-            ("Nov 16", Some(date(2026, 11, 16))),
-            ("sept 3", Some(date(2027, 9, 3))),
-            // Already past this year: next year.
-            ("nov 15", Some(date(2027, 11, 15))),
-            ("jan 5", Some(date(2027, 1, 5))),
-            ("dec 31", Some(date(2026, 12, 31))),
             // Not dates.
             ("", None),
             ("   ", None),
-            ("feb 30", None),
             ("2026-02-30", None),
             ("2026-1-5", None),
             ("+d", None),
@@ -328,11 +307,32 @@ mod tests {
             ("nov", None),
             ("20", None),
             ("fr", None),
-            ("nov 20 extra", None),
             ("hello", None),
         ];
         for &(input, want) in cases {
-            assert_eq!(parse_date(input, TODAY), want, "input {input:?}");
+            assert_eq!(single_date(input, TODAY), want, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn month_day_pairs() {
+        let cases: &[((&str, &str), Option<Date>)] = &[
+            (("nov", "20"), Some(date(2026, 11, 20))),
+            (("20", "nov"), Some(date(2026, 11, 20))),
+            (("november", "20"), Some(date(2026, 11, 20))),
+            (("Nov", "16"), Some(date(2026, 11, 16))),
+            (("sept", "3"), Some(date(2027, 9, 3))),
+            // Already past this year: next year.
+            (("nov", "15"), Some(date(2027, 11, 15))),
+            (("jan", "5"), Some(date(2027, 1, 5))),
+            (("dec", "31"), Some(date(2026, 12, 31))),
+            // Not dates.
+            (("feb", "30"), None),
+            (("nov", "nov"), None),
+            (("20", "20"), None),
+        ];
+        for &((a, b), want) in cases {
+            assert_eq!(month_day(a, b, TODAY), want, "input {a:?} {b:?}");
         }
     }
 
@@ -393,10 +393,10 @@ mod tests {
     #[test]
     fn month_day_on_leap_day() {
         // Feb 29 is invalid in 2026 and 2027: not a date.
-        assert_eq!(parse_date("feb 29", TODAY), None);
+        assert_eq!(month_day("feb", "29", TODAY), None);
         // From 2027-11-16, Feb 29 next year (2028) is valid.
         assert_eq!(
-            parse_date("feb 29", date(2027, 11, 16)),
+            month_day("feb", "29", date(2027, 11, 16)),
             Some(date(2028, 2, 29))
         );
     }

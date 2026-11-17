@@ -1,4 +1,5 @@
-//! Key-safety rules shared by both LLM clients (round 2 security review).
+//! Key-safety rules shared by every LLM client (OpenAI-compatible,
+//! Anthropic, decision) and the Ollama probe (round 2 security review).
 //!
 //! - Redirects are never followed: a redirect to another host would carry
 //!   the prompt, and for Anthropic the `x-api-key` header, with it.
@@ -162,7 +163,11 @@ mod tests {
             )
             .mount(&gateway)
             .await;
-        for protocol in Protocol::ALL {
+        for protocol in [
+            Protocol::OpenAi,
+            Protocol::Anthropic,
+            Protocol::OllamaDecision,
+        ] {
             let client = connect(protocol, cfg(&format!("{}/v1", gateway.uri()), true)).unwrap();
             let err = collect_stream(client.chat_stream(ChatRequest::test()))
                 .await

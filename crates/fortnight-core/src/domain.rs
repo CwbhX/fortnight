@@ -278,13 +278,6 @@ impl Report {
     pub fn text(&self) -> Option<&str> {
         self.edited_md.as_deref().or(self.content_md.as_deref())
     }
-
-    pub fn key(&self) -> ReportKey {
-        ReportKey {
-            kind: self.kind,
-            week_start: self.week_start,
-        }
-    }
 }
 
 /// What the store needs to insert a report. `created_at` is set by the store.
@@ -366,22 +359,6 @@ pub enum Protocol {
 }
 
 impl Protocol {
-    pub const ALL: [Protocol; 3] = [
-        Protocol::OpenAi,
-        Protocol::Anthropic,
-        Protocol::OllamaDecision,
-    ];
-
-    /// `openai`, `anthropic` or `ollama_decision` (settings JSON,
-    /// `FORTNIGHT_LLM_PROTOCOL`).
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Protocol::OpenAi => "openai",
-            Protocol::Anthropic => "anthropic",
-            Protocol::OllamaDecision => "ollama_decision",
-        }
-    }
-
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "openai" => Some(Protocol::OpenAi),
@@ -389,29 +366,6 @@ impl Protocol {
             "ollama_decision" | "ollama-decision" | "decision" => Some(Protocol::OllamaDecision),
             _ => None,
         }
-    }
-
-    /// For the UI.
-    pub fn label(self) -> &'static str {
-        match self {
-            Protocol::OpenAi => "OpenAI-compatible",
-            Protocol::Anthropic => "Anthropic",
-            Protocol::OllamaDecision => "Ollama decision",
-        }
-    }
-
-    /// A placeholder base URL for the settings form.
-    pub fn example_base_url(self) -> &'static str {
-        match self {
-            Protocol::OpenAi | Protocol::OllamaDecision => "http://localhost:11434/v1",
-            Protocol::Anthropic => "https://api.anthropic.com",
-        }
-    }
-}
-
-impl std::fmt::Display for Protocol {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.label())
     }
 }
 
@@ -527,9 +481,6 @@ pub struct Settings {
     /// Focus time available on each working day, in minutes (shown as
     /// hours). The capacity the load bars and plan facts compare against.
     pub focus_minutes_per_day: u32,
-    /// Show an OS notification when a report is ready. Parked: not shown
-    /// in the app and not acted on.
-    pub notifications: bool,
     /// The system prompt for the work summary. Empty means the built-in
     /// one (`report::DEFAULT_SUMMARY_PROMPT`).
     pub summary_prompt: String,
@@ -606,7 +557,6 @@ impl Default for Settings {
             schedule: Schedule::default(),
             summary_instructions: String::new(),
             focus_minutes_per_day: DEFAULT_FOCUS_MINUTES,
-            notifications: false,
             summary_prompt: String::new(),
             plan_prompt: String::new(),
             app_icon: AppIcon::System,
@@ -671,9 +621,17 @@ mod tests {
         assert_eq!(s.schedule.working_days.len(), 4);
         assert_eq!(s.summary_instructions, "short");
         assert_eq!(s.focus_minutes_per_day, DEFAULT_FOCUS_MINUTES);
-        assert!(!s.notifications);
         assert!(!s.decision_llm.is_configured());
         assert!(!s.llm.keyless);
+    }
+
+    #[test]
+    fn settings_json_with_the_removed_notifications_field_still_loads() {
+        let json = r#"{"llm":{"base_url":"http://x/v1","model":"m"},"notifications":true,"summary_instructions":"short","accent":"teal"}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.llm.base_url, "http://x/v1");
+        assert_eq!(s.summary_instructions, "short");
+        assert_eq!(s.accent, Accent::Teal);
     }
 
     #[test]

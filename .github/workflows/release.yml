@@ -50,6 +50,7 @@ jobs:
         shell: pwsh
         run: |
           ./ci/check-deps.ps1 target/${{ matrix.target }}/release/Fortnight.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           ./ci/check-deps.ps1 target/${{ matrix.target }}/release/fortnight-cli.exe
 
       - name: Package

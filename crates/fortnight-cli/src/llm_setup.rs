@@ -51,33 +51,6 @@ pub fn effective_settings(
     out
 }
 
-/// The API key for this run, if there is one.
-///
-/// `env_key` is `FORTNIGHT_LLM_API_KEY`. If the key file exists, the password
-/// is one line of `stdin` when `password_stdin` is set, otherwise whatever
-/// `prompt` returns (the terminal prompt in the real program).
-pub fn resolve_key(
-    data_dir: &Path,
-    env_key: Option<SecretString>,
-    password_stdin: bool,
-    stdin: &mut dyn BufRead,
-    prompt: &mut dyn FnMut() -> std::io::Result<String>,
-) -> CliResult<Option<SecretString>> {
-    let needs = KeyNeeds {
-        main: true,
-        decision: false,
-    };
-    let (key, _) = resolve_keys(
-        data_dir,
-        needs,
-        (env_key, None),
-        password_stdin,
-        stdin,
-        prompt,
-    )?;
-    Ok(key)
-}
-
 /// Which saved keys a run needs: a local endpoint needs none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyNeeds {
@@ -85,12 +58,13 @@ pub struct KeyNeeds {
     pub decision: bool,
 }
 
-/// The main key and the decision model's key for this run, like
-/// `resolve_key`: an environment key (`env` = `FORTNIGHT_LLM_API_KEY`,
-/// `FORTNIGHT_DECISION_API_KEY`) wins; otherwise each needed key file that
-/// exists is opened with one password, asked for once. Both files share
-/// that password (the app keeps them so). It fails only if the password
-/// opens none of them.
+/// The main key and the decision model's key for this run. An environment
+/// key (`env` = `FORTNIGHT_LLM_API_KEY`, `FORTNIGHT_DECISION_API_KEY`) wins;
+/// otherwise each needed key file that exists is opened with one password,
+/// asked for once: one line of `stdin` when `password_stdin` is set,
+/// otherwise whatever `prompt` returns (the terminal prompt in the real
+/// program). Both files share that password (the app keeps them so). It
+/// fails only if the password opens none of them.
 pub fn resolve_keys(
     data_dir: &Path,
     needs: KeyNeeds,
@@ -275,6 +249,29 @@ mod tests {
 
     fn no_prompt() -> impl FnMut() -> std::io::Result<String> {
         || panic!("must not prompt")
+    }
+
+    /// `resolve_keys` for the main key only.
+    fn resolve_key(
+        data_dir: &Path,
+        env_key: Option<SecretString>,
+        password_stdin: bool,
+        stdin: &mut dyn BufRead,
+        prompt: &mut dyn FnMut() -> std::io::Result<String>,
+    ) -> CliResult<Option<SecretString>> {
+        let needs = KeyNeeds {
+            main: true,
+            decision: false,
+        };
+        let (key, _) = resolve_keys(
+            data_dir,
+            needs,
+            (env_key, None),
+            password_stdin,
+            stdin,
+            prompt,
+        )?;
+        Ok(key)
     }
 
     #[test]

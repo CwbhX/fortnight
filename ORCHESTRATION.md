@@ -1,5 +1,7 @@
 # Fortnight — 24-hour prototype build
 
+> **Historical.** This records how the prototype was planned and built, in rounds of sub-agents. The app has changed a lot since. For how it works now, the code and [README.md](README.md) are the reference.
+
 A working prototype on macOS within a day: one orchestrator, nine sub-agent runs, three steps. [PLAN.md](PLAN.md) remains the full design; this builds the smallest slice of it that does the real job.
 
 ## What the prototype does

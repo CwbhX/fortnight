@@ -49,7 +49,6 @@
 //! - [`secondary_button`]: other actions; soft neutral fill.
 //! - [`text_button`]: link-like; muted text, no fill.
 //! - [`danger_button`]: destructive action as red text, no fill.
-//! - [`row_button`]: a whole list row; invisible until hovered.
 //!
 //! # Inputs
 //!
@@ -68,10 +67,18 @@
 //! - [`load_bar`] + [`load_bar_done`]: `progress_bar` styles for the Week
 //!   load bar: capacity track, gray task share, accent done.
 //! - [`backdrop`] + [`overlay_panel`]: the dimmed layer and the panel of an
-//!   overlay (Settings).
-//! - [`priority_color`]: the colour of a priority marker.
+//!   overlay (Settings); [`dialog_backdrop`]: the darker one of the task
+//!   dialog.
+//!
+//! # Shared helpers
+//!
+//! - [`tint`] and [`mix`]: neutral fills mixed from the theme's colours.
+//! - [`tip`]: a tooltip's bubble.
+//! - [`FONT_BOLD`]: Inter, bold.
+//! - [`title_with_marks`] and [`priority_marks`]: a task title with its
+//!   priority marks.
 
-use fortnight_core::domain::Accent;
+use fortnight_core::domain::{Accent, Priority};
 use iced::border::{self, Border};
 use iced::theme::{Palette, palette};
 use iced::widget::{
@@ -122,6 +129,12 @@ pub fn accent_color() -> Color {
 /// `Font::default()` is the generic sans-serif family, whose bold falls
 /// back to a monospace face on macOS.
 pub const FONT: iced::Font = iced::Font::with_name("Inter");
+
+/// [`FONT`] in bold.
+pub const FONT_BOLD: iced::Font = iced::Font {
+    weight: iced::font::Weight::Bold,
+    ..FONT
+};
 
 /// Standard spacing unit, in logical pixels.
 pub const SPACING: f32 = 12.0;
@@ -200,8 +213,8 @@ fn extended(palette: Palette) -> palette::Extended {
     ext
 }
 
-/// `a` moved `amount` (0–1) towards `b`.
-fn mix(a: Color, b: Color, amount: f32) -> Color {
+/// `a` moved `amount` (0–1) towards `b`, opaque.
+pub fn mix(a: Color, b: Color, amount: f32) -> Color {
     Color::from_rgb(
         a.r + (b.r - a.r) * amount,
         a.g + (b.g - a.g) * amount,
@@ -223,7 +236,7 @@ pub fn danger_color(theme: &Theme) -> Color {
 
 /// The background moved `amount` (0–1) towards the text colour: a neutral
 /// fill that works the same way in light and dark.
-fn tint(theme: &Theme, amount: f32) -> Color {
+pub fn tint(theme: &Theme, amount: f32) -> Color {
     let p = theme.palette();
     mix(p.background, p.text, amount)
 }
@@ -364,15 +377,6 @@ pub fn danger_button(theme: &Theme, status: button::Status) -> button::Style {
             base.with_background(red.scale_alpha(0.12))
         }
         button::Status::Disabled => faded(base),
-    }
-}
-
-/// A whole list row: no fill until hovered.
-pub fn row_button(theme: &Theme, status: button::Status) -> button::Style {
-    let base = button_base(None, theme.palette().text);
-    match status {
-        button::Status::Active | button::Status::Disabled => base,
-        button::Status::Hovered | button::Status::Pressed => base.with_background(soft_fill(theme)),
     }
 }
 
@@ -635,6 +639,15 @@ pub fn backdrop(_theme: &Theme) -> container::Style {
     }
 }
 
+/// The task dialog's backdrop: darker than Settings' so the page
+/// behind recedes. (iced 0.14 has no backdrop blur.)
+pub fn dialog_backdrop(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Color::BLACK.scale_alpha(0.55).into()),
+        ..container::Style::default()
+    }
+}
+
 /// The panel of an overlay: the plain background, rounded, with a shadow.
 pub fn overlay_panel(theme: &Theme) -> container::Style {
     container::Style {
@@ -651,38 +664,55 @@ pub fn overlay_panel(theme: &Theme) -> container::Style {
 
 /// The colour of a priority marker (`!` or `!!`): the accent, `None` for
 /// normal priority.
-pub fn priority_color(_theme: &Theme, priority: u8) -> Option<Color> {
+fn priority_color(priority: Priority) -> Option<Color> {
     (priority > 0).then(accent_color)
 }
 
-/// A task title followed by its priority marks ("Write report !!") in the
-/// priority colour, the same on every tab; `level` 0 shows the title alone.
-/// A non-breaking space keeps the marks on the last word's line. Rich text
-/// spans only take fixed colours and both colours here come from the theme,
-/// so two copies of the same text are stacked (same text, same layout): one
-/// draws the title with the marks hidden, the other only the marks. `build`
-/// sets size, width, wrapping and so on, alike for both.
+/// The marks after a title for `priority`: a non-breaking space then `!`
+/// (Medium) or `!!` (High, and old data's 3); empty for Low (0).
+pub fn priority_marks(priority: Priority) -> String {
+    match priority.min(2) {
+        0 => String::new(),
+        level => format!("\u{a0}{}", "!".repeat(usize::from(level))),
+    }
+}
+
+/// A task title followed by its priority marks ("Write report !!",
+/// [`priority_marks`]) in the priority colour, the same on every tab;
+/// `priority` 0 shows the title alone. The non-breaking space keeps the
+/// marks on the last word's line. Rich text spans only take fixed colours
+/// and both colours here come from the theme, so two copies of the same
+/// text are stacked (same text, same layout): one draws the title with the
+/// marks hidden, the other only the marks. `build` sets size, width,
+/// wrapping and so on, alike for both.
 pub fn title_with_marks<'a, M: 'a>(
     title: impl text::IntoFragment<'a>,
-    level: u8,
+    priority: Priority,
     title_style: impl Fn(&Theme) -> text::Style + Clone + 'a,
     build: impl Fn(text::Rich<'a, (), M>) -> text::Rich<'a, (), M>,
 ) -> Element<'a, M> {
     let title = title.into_fragment();
-    if level == 0 {
+    let marks = priority_marks(priority);
+    if marks.is_empty() {
         return build(rich_text([span(title)]).style(title_style)).into();
     }
-    let marks = format!("\u{a0}{}", "!".repeat(usize::from(level)));
     let hidden = Some(Color::TRANSPARENT);
     let title_layer = rich_text([span(title.clone()), span(marks.clone()).color_maybe(hidden)])
         .style(title_style);
     let marks_layer =
-        rich_text([span(title).color_maybe(hidden), span(marks)]).style(move |theme: &Theme| {
+        rich_text([span(title).color_maybe(hidden), span(marks)]).style(move |_: &Theme| {
             text::Style {
-                color: priority_color(theme, level),
+                color: priority_color(priority),
             }
         });
     stack![build(title_layer), build(marks_layer)].into()
+}
+
+/// A tooltip's bubble: small text on a [`card`].
+pub fn tip<'a, M: 'a>(label: impl text::IntoFragment<'a>) -> container::Container<'a, M, Theme> {
+    container(text(label).size(TEXT_SMALL))
+        .padding([4, 8])
+        .style(card)
 }
 
 /// A due/overdue/muted label colour helper for text: `theme::danger` when

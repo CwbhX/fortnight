@@ -981,18 +981,18 @@ mod tests {
     }
 
     #[test]
-    fn set_done_sets_then_clears_completed_at() {
+    fn set_status_done_sets_then_clears_completed_at() {
         let s = store();
         let t = s.add_task(new_task("t")).unwrap();
 
-        s.set_done(t.id, true).unwrap();
+        s.set_status(t.id, TaskStatus::Done).unwrap();
         let done = s.get_task(t.id).unwrap().unwrap();
         assert!(done.is_done());
         let completed = done.completed_at.expect("completed_at set");
         assert!(completed >= t.created_at);
         assert_eq!(done.updated_at, completed);
 
-        s.set_done(t.id, false).unwrap();
+        s.set_status(t.id, TaskStatus::Todo).unwrap();
         let open = s.get_task(t.id).unwrap().unwrap();
         assert_eq!(open.status, TaskStatus::Todo);
         assert_eq!(open.completed_at, None);
@@ -1006,7 +1006,10 @@ mod tests {
         ghost.title = "y".into();
         let id = ghost.id;
         assert_eq!(s.update_task(&ghost), Err(StoreError::TaskNotFound(id)));
-        assert_eq!(s.set_done(id, true), Err(StoreError::TaskNotFound(id)));
+        assert_eq!(
+            s.set_status(id, TaskStatus::Done),
+            Err(StoreError::TaskNotFound(id))
+        );
         assert_eq!(
             s.set_status(id, TaskStatus::Dropped),
             Err(StoreError::TaskNotFound(id))
@@ -1825,14 +1828,13 @@ mod tests {
 
         // Already done: nothing changes.
         s.set_status(t.id, Done).unwrap();
-        s.set_done(t.id, true).unwrap();
         assert_eq!(s.get_task(t.id).unwrap(), Some(done.clone()));
 
         s.set_status(t.id, Dropped).unwrap();
         let dropped = s.get_task(t.id).unwrap().unwrap();
         assert_eq!((dropped.status, dropped.completed_at), (Dropped, None));
 
-        s.set_done(t.id, false).unwrap();
+        s.set_status(t.id, Todo).unwrap();
         let ev = s.task_events(t.id).unwrap();
         assert_eq!(
             kinds(&ev),

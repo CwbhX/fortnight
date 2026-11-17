@@ -31,11 +31,6 @@ pub fn week_label(week: WeekRef) -> String {
     format!("Week {number} · {range}")
 }
 
-/// The first day of `date`'s month.
-pub fn month_start(date: Date) -> Date {
-    date.first_of_month()
-}
-
 /// The weeks a month calendar shows: from the week containing the 1st to
 /// the week containing the last day (four to six weeks).
 pub fn month_weeks(date: Date, week_start: Weekday) -> Vec<WeekRef> {
@@ -160,7 +155,6 @@ mod month_tests {
         assert_eq!(add_months(date(2026, 1, 31), 1), date(2026, 2, 28));
         assert_eq!(add_months(date(2026, 3, 15), -1), date(2026, 2, 15));
         assert_eq!(month_label(date(2026, 11, 16)), "November 2026");
-        assert_eq!(month_start(date(2026, 11, 16)), date(2026, 11, 1));
     }
 }
 

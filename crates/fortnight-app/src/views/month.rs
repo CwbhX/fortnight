@@ -36,7 +36,7 @@ use iced::widget::{
     Column, Row, Space, button, column, container, mouse_area, pin, responsive, row, scrollable,
     space, stack, text, tooltip,
 };
-use iced::{Color, Element, Fill, Font, Length, Point, Size, Theme};
+use iced::{Element, Fill, Font, Length, Point, Size, Theme};
 use jiff::ToSpan;
 use jiff::civil::{Date, Weekday};
 
@@ -360,15 +360,15 @@ fn day_cell(data: &MonthData, day: Date, lines: usize, max_width: f32) -> Elemen
 /// faint on a fainter fill.
 fn task_pill<'a>(t: &TitleLine, max_width: f32) -> Element<'a, Message> {
     let (done, overdue) = (t.done, t.overdue);
-    let level = if done { 0 } else { t.priority.min(2) };
+    let priority = if done { 0 } else { t.priority };
     // The marks keep their own measured width; the title gets the rest.
-    let marks = match level {
-        0 => 0.0,
-        _ => measure(&format!("\u{a0}{}", "!".repeat(usize::from(level)))),
+    let marks = match theme::priority_marks(priority) {
+        m if m.is_empty() => 0.0,
+        m => measure(&m),
     };
     let line = theme::title_with_marks(
         fit_cached(&t.title, max_width - marks),
-        level,
+        priority,
         move |theme: &Theme| text::Style {
             color: Some(if overdue {
                 theme::danger_color(theme)
@@ -389,11 +389,10 @@ fn task_pill<'a>(t: &TitleLine, max_width: f32) -> Element<'a, Message> {
         .width(Fill)
         .clip(true)
         .style(move |theme: &Theme| {
-            let p = theme.palette();
             let fill = if overdue {
                 theme::danger_color(theme).scale_alpha(0.14)
             } else {
-                mix(p.background, p.text, if done { 0.06 } else { 0.11 })
+                theme::tint(theme, if done { 0.06 } else { 0.11 })
             };
             container::Style {
                 background: Some(fill.into()),
@@ -426,9 +425,7 @@ fn completion_badge<'a>(day: Date, done: DueDone, today: Date) -> Element<'a, Me
     .on_press(Message::ToggleDue(day));
     tooltip(
         badge,
-        container(text(done.describe()).size(theme::TEXT_SMALL))
-            .padding([4, 8])
-            .style(theme::card),
+        theme::tip(done.describe()),
         tooltip::Position::Bottom,
     )
     .into()
@@ -502,7 +499,7 @@ fn cell_button(cell: theme::Cell) -> impl Fn(&Theme, button::Status) -> button::
         let p = theme.palette();
         let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
         let background = match (base.background, hovered) {
-            (Some(iced::Background::Color(c)), true) => Some(mix(c, p.text, 0.05).into()),
+            (Some(iced::Background::Color(c)), true) => Some(theme::mix(c, p.text, 0.05).into()),
             (None, true) => Some(p.text.scale_alpha(0.04).into()),
             (bg, false) => bg,
             (bg, true) => bg,
@@ -517,16 +514,6 @@ fn cell_button(cell: theme::Cell) -> impl Fn(&Theme, button::Status) -> button::
             ..button::Style::default()
         }
     }
-}
-
-/// `a` moved `amount` (0–1) towards `b`.
-fn mix(a: Color, b: Color, amount: f32) -> Color {
-    Color::from_rgba(
-        a.r + (b.r - a.r) * amount,
-        a.g + (b.g - a.g) * amount,
-        a.b + (b.b - a.b) * amount,
-        a.a,
-    )
 }
 
 // ---------------------------------------------------------- pure helpers

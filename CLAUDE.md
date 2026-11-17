@@ -9,7 +9,7 @@ Read ORCHESTRATION.md (scope, file ownership; round 2 is the second half) and th
    - Each view's `Message` enum is internal: add variants freely. Its `load`/`update`/`view` signatures stay as stubbed.
    If a frozen item is wrong, stop and say so in your report instead of working around it.
 3. **Orchestrator-owned**: `main.rs`, `top_bar.rs`, `theme.rs`, `views/mod.rs`, `lib.rs`s, the workspace `Cargo.toml`. A view may add private style helpers in its own file.
-4. **No new dependencies.** Use what is in the workspace `Cargo.toml` (round 2 added `clap`, `rpassword`, `eventsource-stream`, `futures-util`, `rfd`, reqwest `stream`).
+4. **No new dependencies.** Use what is in the workspace `Cargo.toml` (round 2 added `clap`, `rpassword`, `eventsource-stream`, `futures-util`, reqwest `stream`).
 5. **Use the real docs, not memory.** iced is 0.14 and jiff is 1.0; both changed a lot.
    - iced 0.14 source: `~/.cargo/registry/src/index.crates.io-*/iced*-0.14*/` (`iced_widget` and `iced_core` hold most of the API). The examples (`todos`, `markdown`, `editor`, `styling`, `modal`) are in the iced repository at tag `0.14.0`.
    - Crate sources for everything else: `~/.cargo/registry/src/index.crates.io-*/<crate>-<version>/`. `cargo doc -p <crate> --no-deps` also works.

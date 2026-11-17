@@ -29,7 +29,7 @@
 //!
 //! Section titles show the count only (no estimate totals).
 //!
-//! The quick-add bar and the date navigation live in the top bar.
+//! The date navigation lives in the top bar.
 //!
 //! Clicking a row (or `Enter` on the selected row) expands it in place into
 //! an edit form, one row at a time: title, project (with a list of the
@@ -41,9 +41,8 @@
 //! they need no schema change and reach the summary with the notes.
 //! `↑` `↓` move a selection highlight through the visible rows (stopping at
 //! the ends), `Space` toggles done and `Escape` collapses the form, then
-//! clears the selection. Closing a form with the mouse (Save, Close, or a
-//! click on its row) clears the selection too, so no accent ring is left
-//! behind.
+//! clears the selection. Closing a form with the mouse (Save or Close)
+//! clears the selection too, so no accent ring is left behind.
 //!
 //! The statuses `Doing` (in progress) are shown as plain open tasks; the app
 //! no longer sets it.
@@ -61,7 +60,7 @@
 use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 
-use fortnight_core::domain::{EventId, NewTask, Priority, Task, TaskId, TaskStatus};
+use fortnight_core::domain::{NewTask, Priority, Task, TaskId, TaskStatus};
 use fortnight_core::parse;
 use fortnight_core::week::add_months;
 use iced::widget::overlay::menu;
@@ -70,7 +69,6 @@ use iced::widget::{
     scrollable, stack, text, text_editor, text_input,
 };
 use iced::{Center, Color, Element, Fill, Point, Theme, border, mouse};
-use jiff::Timestamp;
 use jiff::civil::{Date, Weekday};
 use jiff::tz::TimeZone;
 
@@ -191,35 +189,22 @@ pub enum Action {
     Update(Task),
     /// Remove a task for good (Delete forever).
     Delete(TaskId),
-    /// Add a log line: attached to a task, or free-standing (`None`).
-    /// `main.rs` stamps it with the current time.
-    AddLog {
-        task_id: Option<TaskId>,
-        text: String,
-    },
-    DeleteLog(EventId),
     /// Create a task (the add-a-task input). `main.rs` records it for undo.
     Add(NewTask),
     /// The Tasks section was rearranged: set each task's position.
     Reorder(Vec<(TaskId, f64)>),
 }
 
-/// A task the model recommends doing today.
+/// A task the model recommends doing on the shown day.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recommended {
     pub id: TaskId,
-    /// A few words on why.
-    pub why: String,
 }
 
-/// A log line, as the view needs it.
+/// A free-standing log line, as the view needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogLine {
-    pub id: EventId,
-    /// `None` for a free-standing log line.
-    pub task_id: Option<TaskId>,
-    pub at: Timestamp,
-    /// The local date of `at`.
+    /// The local date it was written on.
     pub date: Date,
     pub text: String,
 }
@@ -237,12 +222,13 @@ pub struct DayData {
     pub tasks: Vec<Task>,
     /// The first day of the week (Settings), for the due-date calendar.
     pub week_start: Weekday,
-    /// The model's recommended tasks for today, most important first (from
-    /// this week's Recommended tasks report). Shown only on today.
+    /// The model's recommended tasks for the shown day, most important
+    /// first: on today from this week's Recommended tasks report, on a later
+    /// day worked out for it. Not shown on past days.
     pub recommended: Vec<Recommended>,
     /// Recommendations are being worked out.
     pub recommending: bool,
-    /// Every log line, oldest first. Only free-standing ones are shown.
+    /// Every free-standing log line, oldest first.
     pub logs: Vec<LogLine>,
 }
 
@@ -274,7 +260,7 @@ pub struct DayView {
 
 /// Where a task is shown on the Today tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Section {
+enum Section {
     /// Today only: the model's top three open tasks, most important first.
     /// They are left out of the sections below.
     Recommended,
@@ -287,9 +273,8 @@ pub enum Section {
 }
 
 impl Section {
-    /// Display order of the task sections (side work sits between Overdue
-    /// and Done).
-    pub const ALL: [Section; 6] = [
+    /// Display order of the task sections.
+    const ALL: [Section; 6] = [
         Section::Recommended,
         Section::Day,
         Section::Overdue,
@@ -299,18 +284,14 @@ impl Section {
     ];
 }
 
-/// The local date a done task was completed on; its day if the completion
-/// time is missing.
+/// The local date a done task was completed on, if known.
 fn completed_on(task: &Task, tz: &TimeZone) -> Option<Date> {
-    match task.completed_at {
-        Some(at) => Some(tz.to_datetime(at).date()),
-        None => task.day(),
-    }
+    task.completed_at.map(|at| tz.to_datetime(at).date())
 }
 
 /// The section `task` belongs in when `day` is shown, or `None` if it is not
 /// on screen. See the module doc for the rules.
-pub fn section_of(task: &Task, day: Date, today: Date, tz: &TimeZone) -> Option<Section> {
+fn section_of(task: &Task, day: Date, today: Date, tz: &TimeZone) -> Option<Section> {
     match task.status {
         TaskStatus::Dropped => return Some(Section::Deleted),
         // Counted as done on the day it sits on (as on the Week tab), not
@@ -345,7 +326,7 @@ fn open_order(a: &Task, b: &Task) -> Ordering {
 }
 
 /// How many recommended tasks the Today tab shows.
-pub const MAX_RECOMMENDED: usize = 3;
+const MAX_RECOMMENDED: usize = 3;
 
 /// The recommended tasks shown: on today and later days (not past ones),
 /// those still open, at most [`MAX_RECOMMENDED`], in the model's order.
@@ -377,7 +358,7 @@ fn placed_section(data: &DayData, task: &Task) -> Option<Section> {
 /// Overdue: oldest deadline first, then [`open_order`]. The day: manual
 /// order (`position`). No date: [`open_order`]. Completed: most recently finished first. Deleted:
 /// most recently deleted first.
-pub fn section_tasks(data: &DayData, section: Section) -> Vec<&Task> {
+fn section_tasks(data: &DayData, section: Section) -> Vec<&Task> {
     if section == Section::Recommended {
         return recommended_tasks(data);
     }
@@ -402,7 +383,7 @@ pub fn section_tasks(data: &DayData, section: Section) -> Vec<&Task> {
 
 /// The rows the keyboard moves through, top to bottom, skipping collapsed
 /// sections and Deleted.
-pub fn visible_rows(data: &DayData, show_done: bool, show_no_date: bool) -> Vec<TaskId> {
+fn visible_rows(data: &DayData, show_done: bool, show_no_date: bool) -> Vec<TaskId> {
     Section::ALL
         .into_iter()
         .filter(|s| match s {
@@ -426,7 +407,7 @@ fn days_between(today: Date, date: Date) -> i64 {
 /// A short relative label for a due date:
 /// `Yesterday`, `3d ago`, `Today`, `Tomorrow`, `Fri` (2–6 days),
 /// `in 9d` (7–13 days), then `Nov 20`, with the year if it differs.
-pub fn due_label(due: Date, today: Date) -> String {
+fn due_label(due: Date, today: Date) -> String {
     match days_between(today, due) {
         -1 => "Yesterday".to_string(),
         d if d < -1 => format!("{}d ago", -d),
@@ -452,7 +433,7 @@ fn toggled(status: TaskStatus) -> TaskStatus {
 
 /// The three priorities the app offers, and the value each stores. Old
 /// data's 3 (`!!!`) shows as High.
-pub const PRIORITIES: [(&str, Priority); 3] = [("Low", 0), ("Medium", 1), ("High", 2)];
+const PRIORITIES: [(&str, Priority); 3] = [("Low", 0), ("Medium", 1), ("High", 2)];
 
 /// The stored priority as Low (0), Medium (1) or High (2).
 fn priority_level(p: Priority) -> Priority {
@@ -463,9 +444,9 @@ fn priority_level(p: Priority) -> Priority {
 
 /// A checklist item kept in the notes as `- [ ] text` or `- [x] text`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Subtask {
-    pub done: bool,
-    pub text: String,
+struct Subtask {
+    done: bool,
+    text: String,
 }
 
 /// One notes line as a subtask, if it is a checklist line.
@@ -485,7 +466,7 @@ fn subtask_line(line: &str) -> Option<Subtask> {
 }
 
 /// Splits notes into their subtasks and the remaining text.
-pub fn split_notes(notes: &str) -> (Vec<Subtask>, String) {
+fn split_notes(notes: &str) -> (Vec<Subtask>, String) {
     let mut subtasks = Vec::new();
     let mut rest = Vec::new();
     for line in notes.lines() {
@@ -499,7 +480,7 @@ pub fn split_notes(notes: &str) -> (Vec<Subtask>, String) {
 
 /// Joins notes text and subtasks back into one notes string: the text, a
 /// blank line, then the checklist.
-pub fn join_notes(subtasks: &[Subtask], text: &str) -> String {
+fn join_notes(subtasks: &[Subtask], text: &str) -> String {
     let list: Vec<String> = subtasks
         .iter()
         .map(|s| format!("- [{}] {}", if s.done { "x" } else { " " }, s.text))
@@ -543,7 +524,7 @@ pub struct EditForm {
     /// The priority the decision model suggests for a new task, shown as
     /// a faint outline on that option. Set by `main.rs`.
     pub suggested: Option<Priority>,
-    pub subtasks: Vec<Subtask>,
+    subtasks: Vec<Subtask>,
     pub new_subtask: String,
     /// The notes without the subtasks.
     pub notes: text_editor::Content,
@@ -636,7 +617,7 @@ impl EditForm {
 }
 
 /// The distinct projects of open tasks, sorted case-insensitively.
-pub fn open_projects(tasks: &[Task]) -> Vec<String> {
+fn open_projects(tasks: &[Task]) -> Vec<String> {
     let mut out: Vec<String> = tasks
         .iter()
         .filter(|t| t.status.is_open())
@@ -1319,7 +1300,7 @@ fn section_title<'a>(
 
 /// `No Tasks`, `1 Task`, `5 Tasks`: a count and a noun, plural unless the
 /// count is 1.
-pub fn count_label(n: usize, noun: &str) -> String {
+fn count_label(n: usize, noun: &str) -> String {
     match n {
         0 => format!("No {noun}s"),
         1 => format!("1 {noun}"),
@@ -1330,27 +1311,17 @@ pub fn count_label(n: usize, noun: &str) -> String {
 /// A day's notes: the free-standing log lines dated `day`, oldest first,
 /// one per line. (Side work logged before the notes existed shows up as
 /// lines of them.)
-pub fn day_notes(data: &DayData, day: Date) -> String {
+fn day_notes(data: &DayData, day: Date) -> String {
     data.logs
         .iter()
-        .filter(|l| l.task_id.is_none() && l.date == day)
+        .filter(|l| l.date == day)
         .map(|l| l.text.trim_end())
         .collect::<Vec<_>>()
         .join("\n")
 }
 
 /// How long typing must pause before Today's Notes are saved.
-pub const NOTES_SAVE_DELAY: Duration = Duration::from_millis(1200);
-
-/// The background moved `amount` (0–1) towards the text colour.
-fn tinted(theme: &Theme, amount: f32) -> Color {
-    let p = theme.palette();
-    Color::from_rgb(
-        p.background.r + (p.text.r - p.background.r) * amount,
-        p.background.g + (p.text.g - p.background.g) * amount,
-        p.background.b + (p.text.b - p.background.b) * amount,
-    )
-}
+const NOTES_SAVE_DELAY: Duration = Duration::from_millis(1200);
 
 /// A task card, as in the Week tab: a raised fill, lighter on hover,
 /// quieter when done, with an accent ring when selected.
@@ -1364,7 +1335,7 @@ fn task_card_style(done: bool, selected: bool) -> impl Fn(&Theme, button::Status
             (false, true) => 0.095,
         };
         button::Style {
-            background: Some(tinted(theme, amount).into()),
+            background: Some(theme::tint(theme, amount).into()),
             text_color: theme.palette().text,
             border: border::rounded(theme::RADIUS).width(1).color(if selected {
                 theme::accent_color().scale_alpha(0.7)
@@ -1390,14 +1361,14 @@ fn card_content(task: &Task, today: Date, rank: Option<usize>) -> Row<'_, Messag
         line = line.push(rank_badge(rank));
     }
     // The title, then `!` for Medium or `!!` for High (open tasks only).
-    let (level, style): (u8, fn(&Theme) -> text::Style) = if open {
-        (priority_level(task.priority), text::default)
+    let (priority, style): (Priority, fn(&Theme) -> text::Style) = if open {
+        (task.priority, text::default)
     } else {
         (0, theme::muted)
     };
     line = line.push(theme::title_with_marks(
         task.title.as_str(),
-        level,
+        priority,
         style,
         |t| t.size(theme::TEXT_BODY),
     ));
@@ -1511,7 +1482,7 @@ fn drop_line<'a>(show: bool) -> Element<'a, Message> {
 /// Tasks section as shown): 1, 2, 3, … top to bottom, only for the tasks
 /// whose position changes. `None` if `dragged` isn't in the list or
 /// nothing moves.
-pub fn reorder(order: &[&Task], dragged: TaskId, spot: Spot) -> Option<Vec<(TaskId, f64)>> {
+fn reorder(order: &[&Task], dragged: TaskId, spot: Spot) -> Option<Vec<(TaskId, f64)>> {
     let moving = order.iter().find(|t| t.id == dragged)?;
     let mut ids: Vec<&Task> = order.iter().copied().filter(|t| t.id != dragged).collect();
     let at = match spot {
@@ -1525,10 +1496,7 @@ pub fn reorder(order: &[&Task], dragged: TaskId, spot: Spot) -> Option<Vec<(Task
         .map(|(i, t)| (t.id, (i + 1) as f64))
         .filter(|(id, pos)| order.iter().any(|t| t.id == *id && t.position != *pos))
         .collect();
-    let moved = ids.iter().map(|t| t.id).ne(order.iter().map(|t| t.id));
-    (moved || !changes.is_empty())
-        .then_some(changes)
-        .filter(|c| !c.is_empty())
+    (!changes.is_empty()).then_some(changes)
 }
 
 /// A small round number in the accent colour: a recommended task's rank.
@@ -1588,7 +1556,7 @@ fn project_chip(project: &str) -> Element<'_, Message> {
     container(text(format!("#{project}")).size(theme::TEXT_SMALL))
         .padding(theme::chip_padding())
         .style(|theme: &Theme| container::Style {
-            background: Some(tinted(theme, 0.13).into()),
+            background: Some(theme::tint(theme, 0.13).into()),
             ..theme::chip(theme)
         })
         .into()
@@ -1666,7 +1634,7 @@ fn due_button(due: Option<Date>, today: Date) -> Element<'static, Message> {
 fn field_button(theme: &Theme, status: button::Status) -> button::Style {
     let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
     button::Style {
-        background: Some(tinted(theme, if hovered { 0.11 } else { 0.075 }).into()),
+        background: Some(theme::tint(theme, if hovered { 0.11 } else { 0.075 }).into()),
         text_color: theme.palette().text,
         border: border::rounded(theme::RADIUS),
         ..button::Style::default()
@@ -1676,7 +1644,7 @@ fn field_button(theme: &Theme, status: button::Status) -> button::Style {
 /// A subtask's card: the input fill, quieter when done.
 fn subtask_card(done: bool) -> impl Fn(&Theme) -> container::Style {
     move |theme| container::Style {
-        background: Some(tinted(theme, if done { 0.05 } else { 0.075 }).into()),
+        background: Some(theme::tint(theme, if done { 0.05 } else { 0.075 }).into()),
         border: border::rounded(theme::RADIUS),
         ..container::Style::default()
     }
@@ -1735,7 +1703,7 @@ fn project_field(form: &EditForm) -> Element<'_, Message> {
 fn project_menu(theme: &Theme) -> menu::Style {
     let p = theme.palette();
     menu::Style {
-        background: tinted(theme, 0.06).into(),
+        background: theme::tint(theme, 0.06).into(),
         border: border::rounded(theme::RADIUS)
             .width(1)
             .color(theme::muted_color(theme).scale_alpha(0.25)),
@@ -2350,10 +2318,7 @@ mod tests {
         let mut data = data_for(today(), tasks);
         data.recommended = [6, 4, 2, 9, 1, 3]
             .into_iter()
-            .map(|id| Recommended {
-                id,
-                why: String::new(),
-            })
+            .map(|id| Recommended { id })
             .collect();
         // Done and missing ids are skipped; at most three.
         fn ids(data: &DayData, s: Section) -> Vec<TaskId> {
@@ -2433,18 +2398,15 @@ mod tests {
     #[test]
     fn todays_notes_load_and_save_after_a_pause() {
         let mut data = data_for(today(), vec![]);
-        let line = |id, date, text: &str| LogLine {
-            id,
-            task_id: None,
-            at: Timestamp::UNIX_EPOCH,
+        let line = |date, text: &str| LogLine {
             date,
             text: text.into(),
         };
         // Old side work lines become lines of the notes; other days' don't.
         data.logs = vec![
-            line(1, today(), "helped Sam"),
-            line(2, date(2026, 11, 15), "Sunday"),
-            line(3, today(), "standup ran long"),
+            line(today(), "helped Sam"),
+            line(date(2026, 11, 15), "Sunday"),
+            line(today(), "standup ran long"),
         ];
         let mut view = DayView::new();
         view.load(data.clone());
@@ -2497,9 +2459,6 @@ mod tests {
     fn view_builds_in_every_state() {
         let mut data = data_for(today(), mixed());
         data.logs = vec![LogLine {
-            id: 1,
-            task_id: None,
-            at: Timestamp::UNIX_EPOCH,
             date: today(),
             text: "side".into(),
         }];

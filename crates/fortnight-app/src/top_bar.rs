@@ -184,9 +184,7 @@ pub fn view<'a>(bar: Bar<'a>) -> Element<'a, Message> {
                 .padding(theme::ICON_PADDING)
                 .style(theme::icon_button)
                 .on_press(message),
-            container(text(tip).size(theme::TEXT_SMALL))
-                .padding([4, 8])
-                .style(theme::card),
+            theme::tip(tip),
             tooltip::Position::Bottom,
         )
     };
@@ -197,10 +195,7 @@ pub fn view<'a>(bar: Bar<'a>) -> Element<'a, Message> {
     let date = container(
         text(period_label(bar.tab, bar.selected, bar.today, bar.schedule))
             .size(theme::TEXT_BODY)
-            .font(iced::Font {
-                weight: iced::font::Weight::Bold,
-                ..theme::FONT
-            })
+            .font(theme::FONT_BOLD)
             .wrapping(iced::widget::text::Wrapping::None),
     )
     .padding([5, 10])

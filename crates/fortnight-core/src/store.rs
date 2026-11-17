@@ -65,18 +65,6 @@ pub trait Store {
     /// dragging cards within a day.)
     fn set_position(&self, id: TaskId, position: f64) -> StoreResult<()>;
 
-    /// Round 1 shorthand: `set_status(id, Done)` or `set_status(id, Todo)`.
-    fn set_done(&self, id: TaskId, done: bool) -> StoreResult<()> {
-        self.set_status(
-            id,
-            if done {
-                TaskStatus::Done
-            } else {
-                TaskStatus::Todo
-            },
-        )
-    }
-
     /// Deletes a task permanently, with its events, and returns both.
     /// Errors with `TaskNotFound` if absent.
     fn delete_task(&self, id: TaskId) -> StoreResult<DeletedTask>;

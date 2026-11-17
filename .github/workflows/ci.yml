@@ -38,10 +38,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # No apt packages are needed on Linux. Everything the GUI talks to
-      # (X11, Wayland, Vulkan/EGL, xkbcommon) is dlopen'd at run time, the
-      # file dialog (rfd, xdg-portal) and notifications (notify-rust, zbus) are
-      # pure Rust over D-Bus, and SQLite and aws-lc are built from bundled C
-      # source with the runner's gcc.
+      # (X11, Wayland, Vulkan/EGL, xkbcommon) is dlopen'd at run time, and
+      # SQLite and aws-lc are built from bundled C source with the runner's gcc.
 
       - name: Format
         run: cargo fmt --check
@@ -77,4 +75,5 @@ jobs:
         shell: pwsh
         run: |
           ./ci/check-deps.ps1 target/release/Fortnight.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           ./ci/check-deps.ps1 target/release/fortnight-cli.exe

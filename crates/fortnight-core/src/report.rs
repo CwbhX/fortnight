@@ -17,7 +17,7 @@ use crate::domain::{
     Event, EventKind, NewReport, Priority, ReportKind, ReportStatus, Settings, Task, TaskId,
     TaskStatus, WeekRef,
 };
-use crate::llm::{ChatRequest, ChatResponse, LlmClient, LlmError};
+use crate::llm::{ChatRequest, ChatResponse, LlmError};
 use jiff::Timestamp;
 use jiff::ToSpan;
 use jiff::civil::{Date, Weekday};
@@ -25,7 +25,6 @@ use jiff::tz::TimeZone;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::sync::Arc;
 
 /// Bump when a prompt changes.
 pub const PROMPT_VERSION: i64 = 8;
@@ -341,7 +340,7 @@ pub struct MissedTask {
     pub project: Option<String>,
     pub due_on: Date,
     pub due_weekday: &'static str,
-    /// Days between the due date and the week's end; 0 = due on the last day.
+    /// Days between the due date and `as_of`; 0 = due on `as_of`.
     pub days_overdue: i32,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub notes: String,
@@ -654,8 +653,8 @@ pub struct PlanDay {
     /// Focus time available (`Settings::focus_minutes_per_day`).
     pub capacity_minutes: u32,
     pub capacity_hours: f64,
-    /// Sum of the estimates of open tasks whose day (`planned_for`, else
-    /// `due_on`) is this date.
+    /// Sum of the estimates of open tasks whose day (`Task::day`, the
+    /// planned day) is this date.
     pub load_minutes: u32,
     pub load_hours: f64,
     /// Open tasks on this day with no estimate (not in `load_minutes`).
@@ -684,7 +683,7 @@ pub struct PlanTask {
     pub estimate_minutes: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimate_hours: Option<f64>,
-    /// 0 normal, 1 to 3 increasingly high.
+    /// 0 low, 1 medium, 2 or more high.
     pub priority: Priority,
     /// How many times the deadline has moved later, all time.
     pub deadline_moves: usize,
@@ -838,7 +837,7 @@ pub fn plan_facts(
 // Facts as Markdown
 // ---------------------------------------------------------------------------
 
-/// Facts as Markdown, for the "facts" panel beside a report.
+/// Facts as Markdown, for the CLI's `--facts-only`.
 pub fn summary_facts_markdown(facts: &SummaryFacts) -> String {
     let mut md = format!(
         "**Week:** {} to {} {}\n",
@@ -1300,22 +1299,10 @@ pub fn prepare_plan(
     }
 }
 
-/// Calls the model and returns a report row to insert: `Ready` with the
-/// content on success, `Failed` with the error message otherwise. Never
-/// panics on a client error. The app streams instead (`chat_stream`) and
-/// calls `finish`; the CLI uses this.
-pub async fn generate(
-    client: Arc<dyn LlmClient>,
-    prepared: Prepared,
-    endpoint_host: Option<String>,
-) -> NewReport {
-    let result = client.chat(prepared.request.clone()).await;
-    finish(prepared, result, client.model(), endpoint_host)
-}
-
 /// The report row for a finished call: `Ready` with the reply, or `Failed`
 /// with the error message. `requested_model` is recorded when the call
-/// failed (there is no reported model then).
+/// failed (there is no reported model then). The app and the CLI stream the
+/// reply (`chat_stream`) and call this with the result.
 pub fn finish(
     prepared: Prepared,
     result: Result<ChatResponse, LlmError>,
@@ -1350,24 +1337,13 @@ pub fn finish(
     }
 }
 
-/// Exactly what a request sends, for "what will be sent": the system
-/// prompt, then the user message (which holds the facts).
-pub fn request_preview(request: &ChatRequest) -> String {
-    format!(
-        "System prompt\n-------------\n{}\n\nUser message\n------------\n{}",
-        request.system, request.user
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Recommended tasks
 // ---------------------------------------------------------------------------
 
-/// The model's recommended tasks for a week, parsed from a `Plan` report.
+/// The model's recommended tasks, parsed from a `Plan` report.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Recommendation {
-    /// One short sentence on what the week is about (may be empty).
-    pub focus: String,
     /// In the order to do them.
     pub tasks: Vec<RecommendedTask>,
 }
@@ -1375,16 +1351,14 @@ pub struct Recommendation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecommendedTask {
     pub id: TaskId,
-    /// The working day suggested for it, if the model gave a valid one.
-    pub day: Option<Date>,
     /// A few words on why.
     pub why: String,
 }
 
+/// Unknown keys (such as `focus` and `day`, which older prompt versions
+/// asked for) are ignored.
 #[derive(serde::Deserialize)]
 struct RawRecommendation {
-    #[serde(default)]
-    focus: String,
     #[serde(default)]
     tasks: Vec<RawTask>,
 }
@@ -1392,8 +1366,6 @@ struct RawRecommendation {
 #[derive(serde::Deserialize)]
 struct RawTask {
     id: serde_json::Value,
-    #[serde(default)]
-    day: Option<String>,
     #[serde(default)]
     why: String,
 }
@@ -1420,28 +1392,21 @@ pub fn parse_recommendations(text: &str) -> Option<Recommendation> {
             };
             seen.insert(id).then(|| RecommendedTask {
                 id,
-                day: t.day.as_deref().and_then(|d| d.trim().parse().ok()),
                 why: t.why.trim().to_string(),
             })
         })
         .collect();
-    Some(Recommendation {
-        focus: raw.focus.trim().to_string(),
-        tasks,
-    })
+    Some(Recommendation { tasks })
 }
 
-/// A `Plan` report as plain Markdown, for the terminal and exports: the
-/// focus line, then a numbered list of the recommended tasks that still
-/// exist. Text that isn't the expected JSON is returned as it is.
+/// A `Plan` report as plain Markdown, for the terminal: a numbered list of
+/// the recommended tasks that still exist. Text that isn't the expected
+/// JSON is returned as it is.
 pub fn recommendations_markdown(text: &str, tasks: &[Task]) -> String {
     let Some(rec) = parse_recommendations(text) else {
         return text.to_string();
     };
     let mut md = String::new();
-    if !rec.focus.is_empty() {
-        let _ = writeln!(md, "{}\n", rec.focus);
-    }
     let mut n = 0;
     for r in &rec.tasks {
         let Some(task) = tasks.iter().find(|t| t.id == r.id) else {
@@ -1449,9 +1414,6 @@ pub fn recommendations_markdown(text: &str, tasks: &[Task]) -> String {
         };
         n += 1;
         let _ = write!(md, "{n}. {}", task.title);
-        if let Some(day) = r.day {
-            let _ = write!(md, " ({})", day.strftime("%a %-d %b"));
-        }
         if !r.why.is_empty() {
             let _ = write!(md, ": {}", r.why);
         }
@@ -1464,7 +1426,8 @@ pub fn recommendations_markdown(text: &str, tasks: &[Task]) -> String {
 }
 
 /// True when the week has nothing to summarise (no completed, progressed,
-/// open-in-progress, missed, slipped or added tasks and no log lines).
+/// missed, slipped or added tasks and no log lines). Tasks only in progress
+/// don't count.
 pub fn summary_is_empty(facts: &SummaryFacts) -> bool {
     facts.completed.is_empty()
         && facts.progressed.is_empty()
@@ -1639,7 +1602,6 @@ fn trim_notes(notes: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::{LlmError, MockClient};
     use jiff::civil::date;
     use jiff::tz;
 
@@ -2452,9 +2414,11 @@ mod tests {
         let plan_md =
             plan_facts_markdown(&plan_facts(&tasks, &events, plan_week(), plan_today(), &s));
         for text in [
-            request_preview(&summary.request),
+            summary.request.system.clone(),
+            summary.request.user.clone(),
             summary.digest_json.clone(),
-            request_preview(&plan.request),
+            plan.request.system.clone(),
+            plan.request.user.clone(),
             plan.digest_json.clone(),
             summary_md,
             plan_md,
@@ -2815,24 +2779,21 @@ mod tests {
 
     #[test]
     fn recommendations_parse_leniently() {
-        let text = "Here you go:\n```json\n{\"focus\": \" Ship the report \", \"tasks\": [\
-            {\"id\": 3, \"day\": \"2026-11-18\", \"why\": \"due Thu\"},\
-            {\"id\": \"7\", \"day\": \"someday\"},\
-            {\"id\": 3, \"day\": \"2026-11-19\"},\
+        let text = "Here you go:\n```json\n{\"tasks\": [\
+            {\"id\": 3, \"why\": \" due Thu \"},\
+            {\"id\": \"7\"},\
+            {\"id\": 3, \"why\": \"again\"},\
             {\"id\": null}]}\n```";
         let rec = parse_recommendations(text).unwrap();
-        assert_eq!(rec.focus, "Ship the report");
         assert_eq!(
             rec.tasks,
             vec![
                 RecommendedTask {
                     id: 3,
-                    day: Some(date(2026, 11, 18)),
                     why: "due Thu".into()
                 },
                 RecommendedTask {
                     id: 7,
-                    day: None,
                     why: String::new()
                 },
             ]
@@ -2843,9 +2804,32 @@ mod tests {
         let tasks = vec![task(3, "Write report")];
         assert_eq!(
             recommendations_markdown(text, &tasks),
-            "Ship the report\n\n1. Write report (Wed 18 Nov): due Thu\n"
+            "1. Write report: due Thu\n"
         );
         assert_eq!(recommendations_markdown("plain", &tasks), "plain");
+    }
+
+    /// Plans stored by older prompt versions also have `focus` and a `day`
+    /// per task; those keys are ignored.
+    #[test]
+    fn stored_recommendations_with_focus_and_day_still_parse() {
+        let text = "{\"focus\": \"Ship the report\", \"tasks\": [\
+            {\"id\": 3, \"day\": \"2026-11-18\", \"why\": \"due Thu\"},\
+            {\"id\": \"7\", \"day\": \"someday\"}]}";
+        let rec = parse_recommendations(text).unwrap();
+        assert_eq!(
+            rec.tasks,
+            vec![
+                RecommendedTask {
+                    id: 3,
+                    why: "due Thu".into()
+                },
+                RecommendedTask {
+                    id: 7,
+                    why: String::new()
+                },
+            ]
+        );
     }
 
     #[test]
@@ -2953,17 +2937,10 @@ mod tests {
         });
     }
 
-    // --- generate ----------------------------------------------------------
-
-    fn runtime() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("runtime")
-    }
+    // --- finish ------------------------------------------------------------
 
     #[test]
-    fn generate_success_is_ready() {
-        let mock = Arc::new(MockClient::new("## Highlights\n- Shipped login."));
+    fn finish_success_is_ready() {
         let p = prepare_summary(
             &summary_fixture(),
             &summary_events(),
@@ -2973,8 +2950,14 @@ mod tests {
             &Settings::default(),
         );
         let digest = p.digest_json.clone();
-        let client: Arc<dyn LlmClient> = mock.clone();
-        let r = runtime().block_on(generate(client, p, Some("localhost:11434".into())));
+        let user = p.request.user.clone();
+        assert!(user.contains(&format!("<facts>\n{digest}\n</facts>")));
+        assert!(user.contains("Ship login page"));
+        let reply = ChatResponse {
+            text: "## Highlights\n- Shipped login.".into(),
+            model: "reported".into(),
+        };
+        let r = finish(p, Ok(reply), "requested", Some("localhost:11434".into()));
         assert_eq!(r.status, ReportStatus::Ready);
         assert_eq!(r.kind, ReportKind::Summary);
         assert_eq!(r.week_start, date(2026, 11, 9));
@@ -2982,24 +2965,16 @@ mod tests {
             r.content_md.as_deref(),
             Some("## Highlights\n- Shipped login.")
         );
-        assert_eq!(r.model.as_deref(), Some("mock"));
+        assert_eq!(r.model.as_deref(), Some("reported"));
         assert_eq!(r.endpoint_host.as_deref(), Some("localhost:11434"));
         assert_eq!(r.prompt_version, PROMPT_VERSION);
         assert_eq!(r.prompt_version, 8);
         assert_eq!(r.error, None);
         assert_eq!(r.digest_json, digest);
-
-        let requests = mock.requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        let user = &requests[0].user;
-        assert!(user.contains(&format!("<facts>\n{digest}\n</facts>")));
-        assert!(user.contains("Ship login page"));
     }
 
     #[test]
-    fn generate_error_is_failed() {
-        let mock = Arc::new(MockClient::new("unused"));
-        mock.push_reply(Err(LlmError::Unauthorized));
+    fn finish_error_is_failed() {
         let p = prepare_plan(
             &plan_fixture(),
             &plan_events(),
@@ -3007,11 +2982,12 @@ mod tests {
             plan_today(),
             &Settings::default(),
         );
-        let r = runtime().block_on(generate(mock, p, None));
+        let r = finish(p, Err(LlmError::Unauthorized), "requested", None);
         assert_eq!(r.status, ReportStatus::Failed);
         assert_eq!(r.kind, ReportKind::Plan);
         assert_eq!(r.content_md, None);
-        assert_eq!(r.model.as_deref(), Some("mock"));
+        assert_eq!(r.model.as_deref(), Some("requested"));
+        assert_eq!(r.endpoint_host, None);
         assert_eq!(
             r.error.as_deref(),
             Some("the endpoint rejected the API key")

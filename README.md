@@ -5,7 +5,7 @@
 
 # Fortnight
 
-Fortnight is a portable todo app. It keeps your tasks and their history in a SQLite file on your machine. It sends that history to an LLM endpoint you choose, which writes a summary of your week and recommends what to work on next. Nothing else leaves your machine. It is built and tested on macOS. [PLAN.md](PLAN.md) is the full design.
+Fortnight is a portable todo app. It keeps your tasks and their history in a SQLite file on your machine. It sends that history to an LLM endpoint you choose, which writes a summary of your week and recommends what to work on next. Nothing else leaves your machine. It is built and tested on macOS. [PLAN.md](PLAN.md) is the original design document, kept for history.
 
 Created in [T3 Code](https://t3.codes).
 
@@ -53,10 +53,10 @@ Your data goes in a `fortnight-data` folder beside the program, here `target/rel
   - Today lists recommended tasks, the day's tasks, overdue tasks, notes, completed tasks, a collapsed No date inbox and a collapsed Deleted section. Drag a task card to reorder the Tasks section. Deleted holds every deleted task with Restore and Delete forever on each card, and Delete all in its header. A done task shows on the day it was planned for.
   - Week has a column per working day. Each column title bar has a load bar: estimated tasks take their estimate, tasks without one share the rest of the day, and done tasks are drawn in the accent colour. Hover it for the figures. A warning sign shows when estimates exceed the day's capacity. Drag a task card to another day or to a new place in its day. The Work Summary is below the columns.
   - Month is a calendar. A day with tasks due shows the share that is done, such as `67%`; click it to list those tasks. Click a day to open it, or a week label to open that week.
-- One quick-add bar is always visible. `Write Q4 report fri #work ~2h !` creates a task due Friday in project `work`, estimated at two hours, with priority 1. Dates can be `fri`, `tomorrow`, `nov 20` or `+3d`. Estimates can be `~2h`, `~30m` or `~1h30m`. `!`, `!!` and `!!!` set the priority, and cards show it as marks after the title.
-- A task has notes, an estimate, a priority, a planned day, and a status of to do, in progress, done or dropped. A private task is never sent to the LLM. While you type a title or notes in a task form, the app suggests a priority.
+- One quick-add bar is always visible. `Write Q4 report fri #work ~2h !` creates a task planned for Friday in project `work`, estimated at two hours, with priority 1. Dates can be `fri`, `tomorrow`, `nov 20` or `+3d`. Estimates can be `~2h`, `~30m` or `~1h30m`. `!`, `!!` and `!!!` set the priority, and cards show it as marks after the title.
+- A task has notes, an estimate, a priority, a planned day, a deadline and a status of to do, done or deleted. While you type a title or notes in a task form, the app suggests a priority.
 - Today's Notes is a free-text box. Notes can be written on any day. Each day's notes are stored as one log line and go into the weekly summary.
-- Every change to a task is recorded. The weekly summary uses that history and your notes to say what you finished, what progressed, which deadlines moved and what you dropped. It is shown as Work Summary, with a copy icon in its header.
+- Every change to a task is recorded. The weekly summary uses that history and your notes to say what you finished, what progressed, which deadlines moved and what is overdue. It is shown as Work Summary, with a copy icon in its header.
 - Recommended tasks are the top three open tasks, numbered, at the top of Today. Rust does the counting; the model picks the order. On today the list covers the day's tasks and all overdue tasks. On a later day it covers only the tasks planned for that day. Priority and lateness raise a task's rank. The list updates when tasks change.
 - The Work Summary updates on its own: when you open the Week tab, anything changed since the last update is sent once. After you edit on the Week tab, the summary reruns after 30 seconds. The previous result stays on screen until the new one is done. Both system prompts can be changed in Settings.
 - From Friday at 16:00 the summary is also kept up to date in the background. Fortnight checks at launch and every minute. A dot on the Week tab says when a background update is ready.
@@ -109,7 +109,7 @@ cargo xtask bundle              # for this Mac's architecture
 cargo xtask bundle --universal  # for Apple Silicon and Intel
 ```
 
-This builds the app and wraps it in `target/bundle/Fortnight.app`, so it starts without a terminal window. It replaces any existing bundle. `--universal` needs both Rust targets, which `rustup target add aarch64-apple-darwin x86_64-apple-darwin` installs. The icon is made from `assets/icon-light.svg` with tools that come with macOS. If that fails, the bundle has no icon. You can move `Fortnight.app` anywhere; keep the data folder beside it.
+This builds the app and wraps it in `target/bundle/Fortnight.app`, so it starts without a terminal window. It replaces any existing bundle. `--universal` needs both Rust targets, which `rustup target add aarch64-apple-darwin x86_64-apple-darwin` installs. The icon is made from `assets/icon-light.svg` with tools that come with macOS. If that fails, the bundle has no icon. You can move `Fortnight.app` anywhere; keep the data folder beside it. `fortnight-cli` is not in the bundle and uses the folder beside itself, so give it `--data-dir` to share the app's.
 
 ## Where your data lives
 
@@ -133,7 +133,7 @@ Fortnight picks the folder in this order:
 
 Fortnight writes nothing outside this folder. To move your data, copy the folder. A folder from an earlier version opens with nothing lost; Fortnight upgrades the database in place the first time.
 
-The app creates `fortnight.lock` while it runs and removes it on exit. If the folder is in a synced directory such as Dropbox or iCloud, open it on one machine at a time. The app warns if it finds a lock from another machine. The CLI never takes the lock, so it can run while the app is open.
+The app creates `fortnight.lock` while it runs and removes it on exit. If the folder is in a synced directory such as Dropbox or iCloud, open it on one machine at a time. The app warns if it finds a lock from another machine. The CLI never takes the lock, so it can run while the app is open. The app rereads tasks only at launch and after a change made in it, so a task the CLI adds or completes shows up there after your next change or a restart.
 
 `llm-key` and `llm-key-decision` hold your API keys, sealed with XChaCha20-Poly1305 under a key that Argon2id derives from your password. Someone who copies the data folder can't read the keys. While the app is unlocked the keys are in memory, where other software running as you could read it. `fortnight.db` is not encrypted. A forgotten password can't be recovered, so remove the keys in Settings and enter them again. If your endpoints need no key, as a local Ollama doesn't, Fortnight never creates the files and never asks for a password.
 
@@ -197,4 +197,4 @@ cargo test
 
 - Registering with the OS scheduler, such as launchd, systemd or Task Scheduler. It would be the only thing Fortnight writes outside its folder, and a scheduled job can't type the password for an encrypted key. You can run `fortnight-cli run-due` from your own scheduler against an endpoint that needs no key. Otherwise reports are made the next time you open and unlock the app.
 - Code signing. A build you make yourself isn't flagged, but a downloaded archive shows a one-time Gatekeeper or SmartScreen warning on each machine.
-- Notifications. The setting exists but is hidden, and nothing sends them yet.
+- Notifications. Fortnight doesn't send any.

@@ -1,4 +1,4 @@
-//! The Week tab (PLAN.md 4.2 "Week"). Owner: agent K (round 2).
+//! The Week tab (PLAN.md 4.2 "Week").
 //!
 //! One column per working day, in week order, all the same width and
 //! height. Each column has a title bar: the heading (weekday and date;
@@ -8,26 +8,25 @@
 //! accent (no text: hovering says "2h of 8h estimated · 3 without a time:
 //! 2h each · 2h done"; a warning sign when estimates exceed capacity). Then
 //! the day's tasks: open ones first, done ones dimmed after them. A task is
-//! placed by `Task::day()` (planned day, else deadline). Non-working days
+//! placed by `Task::day()` (its planned day). Non-working days
 //! share one extra column ("Sat–Sun"), shown only when one of them has
 //! tasks. Today's column has the accent ring. Overdue tasks from before the
 //! week are on the Today tab only. The whole tab scrolls.
 //!
 //! The AI part comes from the report panel and is generated automatically
-//! (see `report_panel`): the Work summary card. (Recommended tasks moved to
-//! the Today tab; `main.rs` no longer gives this tab a Plan slot, so the
-//! focus sentence, rank badges and Recommended card below stay hidden.)
+//! (see `report_panel`): the Work summary card. (Recommended tasks are on
+//! the Today tab.)
 //!
 //! Tasks are small cards. An open task's card can be dragged: a copy follows
 //! the pointer, the day under it is highlighted, and an accent line shows
 //! where it will land. Dropping on a card puts the task before it; dropping
 //! on a column's free space puts it after that day's open tasks. Another day
-//! becomes the task's due date (clearing an old planned day); within a day
-//! only the order (`Task::position`) changes. Dropping on the weekend
+//! becomes the task's planned day (its deadline stays as it is); within a
+//! day only the order (`Task::position`) changes. Dropping on the weekend
 //! column's free space uses its first day; letting go anywhere else cancels.
+//! A click on a card opens the task dialog.
 //!
-//! Skipped on purpose: deleted tasks (the Today tab has them) and editing in
-//! place (click a heading to edit the day).
+//! Skipped on purpose: deleted tasks (the Today tab has them).
 
 use crate::theme;
 use crate::views::report_panel::{self, ReportPanel, ReportPanelData};
@@ -229,7 +228,6 @@ impl WeekView {
             return text("Loading…").style(theme::muted).into();
         };
         let specs = columns(data);
-        let ranks = self.ranks();
         let dragging = self.dragging();
 
         // Equal heights: the backgrounds are pushed under the contents in a
@@ -255,7 +253,7 @@ impl WeekView {
                     .on_release(Message::DropOn(day, None));
             }
             backgrounds = backgrounds.push(free);
-            contents = contents.push(day_column(data, spec, &ranks, dragging));
+            contents = contents.push(day_column(data, spec, dragging));
         }
         let base = row![
             space().width(0).height(MIN_COLUMN_HEIGHT),
@@ -263,25 +261,7 @@ impl WeekView {
         ];
         let grid = stack![base].push_under(backgrounds).width(Fill);
 
-        let mut body = Column::new().spacing(theme::SPACING * 2.0);
-        if let Some(focus) = self
-            .panel
-            .recommendation()
-            .map(|r| r.focus.as_str())
-            .filter(|f| !f.is_empty())
-        {
-            body = body.push(text(focus).size(theme::TEXT_HEADING));
-        }
-        body = body.push(grid);
-        if self.panel.slot(ReportKind::Plan).is_some() {
-            body = body.push(card(
-                "Recommended tasks",
-                self.panel
-                    .status_view(ReportKind::Plan)
-                    .map(|e| e.map(Message::Panel)),
-                self.recommended(data),
-            ));
-        }
+        let mut body = Column::new().spacing(theme::SPACING * 2.0).push(grid);
         if self.panel.slot(ReportKind::Summary).is_some() {
             body = body.push(summary_card(
                 self.panel.summary_tools().map(|e| e.map(Message::Panel)),
@@ -300,7 +280,6 @@ impl WeekView {
                 task,
                 task.day().unwrap_or(data.today),
                 data.today,
-                None,
                 false,
             ))
             .width(200)
@@ -320,98 +299,6 @@ impl WeekView {
         }
         scrollable(area).height(Fill).into()
     }
-
-    /// Each recommended task that still exists and isn't deleted, with its
-    /// rank (1 = do first).
-    fn ranked<'a>(&'a self, data: &'a WeekData) -> Vec<(usize, &'a Task, Option<Date>, &'a str)> {
-        let Some(rec) = self.panel.recommendation() else {
-            return Vec::new();
-        };
-        rec.tasks
-            .iter()
-            .filter_map(|r| {
-                let task = data.tasks.iter().find(|t| t.id == r.id)?;
-                (task.status != TaskStatus::Dropped).then_some((task, r.day, r.why.as_str()))
-            })
-            .enumerate()
-            .map(|(i, (t, day, why))| (i + 1, t, day, why))
-            .collect()
-    }
-
-    /// Task id to rank, for the badges in the day columns.
-    fn ranks(&self) -> Vec<(TaskId, usize)> {
-        let Some(data) = &self.data else {
-            return Vec::new();
-        };
-        self.ranked(data)
-            .into_iter()
-            .map(|(rank, t, _, _)| (t.id, rank))
-            .collect()
-    }
-
-    /// The Recommended tasks list: rank, checkbox, title, suggested day and
-    /// why. Text the model returned in another shape is shown as it is.
-    fn recommended<'a>(&'a self, data: &'a WeekData) -> Element<'a, Message> {
-        if let Some(raw) = self.panel.unparsed_plan() {
-            return text(raw).size(theme::TEXT_BODY).into();
-        }
-        let ranked = self.ranked(data);
-        if ranked.is_empty() {
-            return Column::new().into();
-        }
-        Column::with_children(ranked.into_iter().map(|(rank, task, day, why)| {
-            let id = task.id;
-            let done = !task.status.is_open();
-            let mut line = row![
-                rank_badge(rank, done),
-                checkbox(task.is_done()).on_toggle(move |b| Message::Toggle(id, b)),
-                text(task.title.as_str())
-                    .size(theme::TEXT_BODY)
-                    .style(if done { theme::muted } else { text::default })
-                    .wrapping(Wrapping::WordOrGlyph),
-            ]
-            .spacing(theme::SPACING * 0.75)
-            .align_y(Center);
-            if let Some(day) = day {
-                line = line.push(
-                    container(text(day.strftime("%a").to_string()).size(theme::TEXT_SMALL))
-                        .padding(theme::chip_padding())
-                        .style(theme::chip),
-                );
-            }
-            if !why.is_empty() {
-                line = line.push(
-                    text(why)
-                        .size(theme::TEXT_SMALL)
-                        .style(theme::muted)
-                        .wrapping(Wrapping::WordOrGlyph),
-                );
-            }
-            line.into()
-        }))
-        .spacing(theme::SPACING * 0.75)
-        .into()
-    }
-}
-
-/// A titled card: the heading with its status line, then the body.
-fn card<'a>(
-    heading: &'a str,
-    status: Option<Element<'a, Message>>,
-    body: Element<'a, Message>,
-) -> Element<'a, Message> {
-    let mut head = row![text(heading).size(theme::TEXT_HEADING)]
-        .spacing(theme::SPACING)
-        .align_y(Center);
-    // The status ("Updated Mon 14:02") sits at the top right.
-    if let Some(status) = status {
-        head = head.push(space::horizontal()).push(status);
-    }
-    container(column![head, body].spacing(theme::SPACING * 1.25))
-        .padding(theme::SPACING * 1.5)
-        .width(Fill)
-        .style(theme::card)
-        .into()
 }
 
 /// The Work summary card. Its heading sits in a tinted bar of its own, in
@@ -422,13 +309,13 @@ fn summary_card<'a>(
     status: Option<Element<'a, Message>>,
     body: Element<'a, Message>,
 ) -> Element<'a, Message> {
-    let bold = iced::Font {
-        weight: iced::font::Weight::Bold,
-        ..theme::FONT
-    };
-    let mut head = row![text("Work Summary").size(theme::TEXT_HEADING).font(bold)]
-        .spacing(theme::SPACING / 2.0)
-        .align_y(Center);
+    let mut head = row![
+        text("Work Summary")
+            .size(theme::TEXT_HEADING)
+            .font(theme::FONT_BOLD)
+    ]
+    .spacing(theme::SPACING / 2.0)
+    .align_y(Center);
     if let Some(tools) = tools {
         head = head.push(tools);
     }
@@ -459,49 +346,16 @@ fn title_bar(radius: f32) -> impl Fn(&Theme) -> container::Style {
 }
 
 fn title_bar_style(theme: &Theme, radius: f32) -> container::Style {
-    let p = theme.palette();
-    let mix = |amount: f32| {
-        Color::from_rgb(
-            p.background.r + (p.text.r - p.background.r) * amount,
-            p.background.g + (p.text.g - p.background.g) * amount,
-            p.background.b + (p.text.b - p.background.b) * amount,
-        )
-    };
     container::Style {
-        background: Some(mix(0.08).into()),
+        background: Some(theme::tint(theme, 0.08).into()),
         border: iced::border::rounded(iced::border::top(radius)),
         shadow: iced::Shadow {
-            color: mix(0.16),
+            color: theme::tint(theme, 0.16),
             offset: iced::Vector::new(0.0, 1.0),
             blur_radius: 0.0,
         },
         ..container::Style::default()
     }
-}
-
-/// A small round number in the accent colour: a recommended task's rank.
-fn rank_badge<'a>(rank: usize, done: bool) -> Element<'a, Message> {
-    container(
-        text(rank.to_string())
-            .size(11)
-            .color(iced::Color::WHITE)
-            .align_x(Center),
-    )
-    .center_x(18)
-    .center_y(18)
-    .style(move |_: &Theme| container::Style {
-        background: Some(
-            if done {
-                theme::accent_color().scale_alpha(0.4)
-            } else {
-                theme::accent_color()
-            }
-            .into(),
-        ),
-        border: iced::border::rounded(999),
-        ..container::Style::default()
-    })
-    .into()
 }
 
 /// One column of the grid: the days it lists, in order.
@@ -540,7 +394,7 @@ fn columns(data: &WeekData) -> Vec<ColumnSpec> {
 
 /// Tasks whose `Task::day()` is `day`, without dropped ones: open first,
 /// then done; by position.
-pub fn tasks_on(tasks: &[Task], day: Date) -> Vec<&Task> {
+fn tasks_on(tasks: &[Task], day: Date) -> Vec<&Task> {
     let mut out: Vec<&Task> = tasks
         .iter()
         .filter(|t| t.day() == Some(day) && t.status != TaskStatus::Dropped)
@@ -623,7 +477,6 @@ fn due_corner(task: &Task, column_day: Date) -> Option<String> {
 fn day_column<'a>(
     data: &'a WeekData,
     spec: &ColumnSpec,
-    ranks: &[(TaskId, usize)],
     drag: Option<&Drag>,
 ) -> Element<'a, Message> {
     let dragged = drag.map(|d| d.id);
@@ -633,10 +486,6 @@ fn day_column<'a>(
         theme::accent
     } else {
         text::default
-    };
-    let bold = iced::Font {
-        weight: iced::font::Weight::Bold,
-        ..theme::FONT
     };
     let open_day = spec
         .days
@@ -649,7 +498,7 @@ fn day_column<'a>(
             text(name)
                 .size(theme::TEXT_BODY)
                 .style(name_style)
-                .font(bold)
+                .font(theme::FONT_BOLD)
                 .wrapping(Wrapping::None),
             text(dates)
                 .size(theme::TEXT_SMALL)
@@ -669,9 +518,7 @@ fn day_column<'a>(
             .padding(2)
             .style(theme::icon_button)
             .on_press(Message::AddTask(spec.days[0])),
-        container(text("Add a task").size(theme::TEXT_SMALL))
-            .padding([4, 8])
-            .style(theme::card),
+        theme::tip("Add a task"),
         tooltip::Position::Bottom,
     );
     // The heading sits in a title bar like the Work Summary's, inset by
@@ -734,12 +581,10 @@ fn day_column<'a>(
         let open = tasks.iter().filter(|t| t.status.is_open()).count();
         for (i, task) in tasks.into_iter().enumerate() {
             any = true;
-            let rank = ranks.iter().find(|(id, _)| *id == task.id).map(|r| r.1);
             list = list.push(task_row(
                 task,
                 *day,
                 data.today,
-                rank,
                 dragged.is_some().then_some(dragged == Some(task.id)),
                 shows_line(*day, Some(task.id)),
             ));
@@ -859,10 +704,8 @@ fn load_view<'a>(line: LoadLine) -> Element<'a, Message> {
     ];
     let mut row = row![tooltip(
         bar,
-        container(text(line.figures).size(theme::TEXT_SMALL))
-            .padding([4, 8])
-            .style(theme::card),
-        tooltip::Position::Bottom,
+        theme::tip(line.figures),
+        tooltip::Position::Bottom
     )]
     .spacing(6)
     .align_y(Center);
@@ -887,13 +730,12 @@ fn task_row<'a>(
     task: &'a Task,
     day: Date,
     today: Date,
-    rank: Option<usize>,
     dragging: Option<bool>,
     line_above: bool,
 ) -> Element<'a, Message> {
     let card = column![
         slot(line_above),
-        task_card(task, day, today, rank, dragging == Some(true))
+        task_card(task, day, today, dragging == Some(true))
     ];
     if !task.status.is_open() {
         return mouse_area(card)
@@ -950,7 +792,7 @@ fn slot<'a>(line: bool) -> Element<'a, Message> {
 /// Where task `id` goes when dropped on `day`, before the open task
 /// `before` (or after the day's open tasks): its new `position`, between its
 /// new neighbours. `None` when nothing would change (same day, same place).
-pub fn drop_position(tasks: &[Task], id: TaskId, day: Date, before: Option<TaskId>) -> Option<f64> {
+fn drop_position(tasks: &[Task], id: TaskId, day: Date, before: Option<TaskId>) -> Option<f64> {
     let task = tasks.iter().find(|t| t.id == id)?;
     let open: Vec<&Task> = tasks_on(tasks, day)
         .into_iter()
@@ -980,14 +822,8 @@ pub fn drop_position(tasks: &[Task], id: TaskId, day: Date, before: Option<TaskI
     Some(position)
 }
 
-/// The card itself: checkbox, rank badge, priority, title and the meta line.
-fn task_card<'a>(
-    task: &'a Task,
-    day: Date,
-    today: Date,
-    rank: Option<usize>,
-    faded: bool,
-) -> Element<'a, Message> {
+/// The card itself: checkbox, priority, title and the meta line.
+fn task_card<'a>(task: &'a Task, day: Date, today: Date, faded: bool) -> Element<'a, Message> {
     let id = task.id;
     let done = !task.status.is_open();
     let overdue = task.is_overdue(today);
@@ -999,14 +835,9 @@ fn task_card<'a>(
         text::default
     };
 
-    let mut title = Row::new().spacing(4);
-    if let Some(rank) = rank {
-        title = title.push(rank_badge(rank, done));
-    }
-    let level = if done { 0 } else { task.priority.min(2) };
-    title = title.push(theme::title_with_marks(
+    let title = Row::new().spacing(4).push(theme::title_with_marks(
         task.title.as_str(),
-        level,
+        if done { 0 } else { task.priority },
         title_style,
         |t| {
             t.size(theme::TEXT_SMALL)
@@ -1064,12 +895,7 @@ fn task_card<'a>(
 /// A raised, rounded card; quieter when done, see-through while dragged.
 fn card_style(theme: &Theme, done: bool, faded: bool) -> container::Style {
     let p = theme.palette();
-    let amount = if done { 0.05 } else { 0.1 };
-    let mut fill = Color::from_rgb(
-        p.background.r + (p.text.r - p.background.r) * amount,
-        p.background.g + (p.text.g - p.background.g) * amount,
-        p.background.b + (p.text.b - p.background.b) * amount,
-    );
+    let mut fill = theme::tint(theme, if done { 0.05 } else { 0.1 });
     if faded {
         fill = fill.scale_alpha(0.35);
     }
@@ -1139,7 +965,6 @@ mod tests {
             loads: Vec::new(),
             panel: ReportPanelData {
                 week,
-                week_label: "Week 47".into(),
                 slots: Vec::new(),
             },
         }
@@ -1449,7 +1274,7 @@ mod tests {
         let mut v = WeekView::new();
         let mut d = data(vec![]);
         d.panel.slots.push(report_panel::ReportSlot {
-            kind: ReportKind::Plan,
+            kind: ReportKind::Summary,
             versions: Vec::new(),
             streaming: None,
             blocked: None,
@@ -1460,45 +1285,10 @@ mod tests {
         v.load(d);
         assert_eq!(
             v.update(Message::Panel(report_panel::Message::Retry(
-                ReportKind::Plan
+                ReportKind::Summary
             ))),
-            Action::Panel(report_panel::Action::Generate(ReportKind::Plan, week))
+            Action::Panel(report_panel::Action::Generate(ReportKind::Summary, week))
         );
-    }
-
-    #[test]
-    fn recommended_tasks_are_ranked_skipping_missing_and_deleted() {
-        use fortnight_core::domain::{Report, ReportStatus};
-        let mut v = WeekView::new();
-        let mut d = data(vec![
-            task(1, Some(date(2026, 11, 17)), TaskStatus::Todo),
-            task(2, Some(date(2026, 11, 18)), TaskStatus::Dropped),
-            task(3, Some(date(2026, 11, 19)), TaskStatus::Done),
-        ]);
-        let plan = r#"{"focus":"F","tasks":[{"id":2},{"id":9},{"id":3,"day":"2026-11-18","why":"w"},{"id":1}]}"#;
-        d.panel.slots.push(report_panel::ReportSlot {
-            kind: ReportKind::Plan,
-            versions: vec![Report {
-                id: 1,
-                kind: ReportKind::Plan,
-                week_start: d.week.start,
-                status: ReportStatus::Ready,
-                digest_json: "{}".into(),
-                content_md: Some(plan.into()),
-                edited_md: None,
-                model: None,
-                endpoint_host: None,
-                prompt_version: 4,
-                error: None,
-                created_at: jiff::Timestamp::UNIX_EPOCH,
-            }],
-            streaming: None,
-            blocked: None,
-            empty: false,
-            stale: false,
-        });
-        v.load(d);
-        assert_eq!(v.ranks(), vec![(3, 1), (1, 2)]);
         let _ = v.view();
     }
 }

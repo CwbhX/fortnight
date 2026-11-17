@@ -57,8 +57,6 @@ pub enum ChatEvent {
 pub enum LlmError {
     #[error("no endpoint is configured")]
     NotConfigured,
-    #[error("the API key is locked; unlock it in Settings")]
-    Locked,
     #[error("could not connect: {0}")]
     Connection(String),
     #[error("the endpoint rejected the API key")]
@@ -141,6 +139,7 @@ pub trait LlmClient: Send + Sync {
 
 /// Collects a stream into a whole reply: the joined deltas and the model
 /// from `Done`. A stream that ends without `Done` is `Truncated`.
+#[cfg(test)]
 pub async fn collect_stream(
     mut stream: BoxStream<Result<ChatEvent, LlmError>>,
 ) -> Result<ChatResponse, LlmError> {
@@ -166,12 +165,8 @@ pub fn connect(protocol: Protocol, config: LlmConfig) -> Result<Arc<dyn LlmClien
 
 /// Environment overrides for one process (PLAN.md section 7.1), applied on
 /// top of saved settings: `FORTNIGHT_LLM_PROTOCOL`, `FORTNIGHT_LLM_BASE_URL`,
-/// `FORTNIGHT_LLM_MODEL`. Empty or unparseable values are ignored.
-pub fn with_env_overrides(llm: &LlmSettings) -> LlmSettings {
-    with_overrides(llm, |name| std::env::var(name).ok())
-}
-
-/// `with_env_overrides` with the environment supplied, for tests.
+/// `FORTNIGHT_LLM_MODEL`, read through `var` (the CLI passes the
+/// environment). Empty or unparseable values are ignored.
 pub fn with_overrides(llm: &LlmSettings, var: impl Fn(&str) -> Option<String>) -> LlmSettings {
     let mut out = llm.clone();
     let get = |name: &str| var(name).filter(|v| !v.trim().is_empty());

@@ -102,6 +102,7 @@ impl OpenAiClient {
     /// Time allowed for each attempt of `chat` and `list_models`; for
     /// `chat_stream`, for the response to start and for each gap between
     /// events (default 120 s, or 600 s for a local endpoint).
+    #[cfg(test)]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -109,6 +110,7 @@ impl OpenAiClient {
 
     /// Delay before the first retry; doubled before each later one
     /// (default 500 ms).
+    #[cfg(test)]
     pub fn with_backoff(mut self, backoff: Duration) -> Self {
         self.backoff = backoff;
         self

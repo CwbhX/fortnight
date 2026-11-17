@@ -3,7 +3,7 @@
 //! Settings opens as an overlay panel over the current tab. It is one
 //! scrollable column under a fixed header that holds the title, the single
 //! Save button (it saves the whole form: endpoint and protocol, schedule,
-//! capacity and the two prompts) and a close button. Closing with unsaved
+//! capacity, the two prompts and the appearance) and a close button. Closing with unsaved
 //! changes is allowed: the header says "Unsaved changes", and the edits stay
 //! in the form until the saved settings change.
 //!
@@ -41,8 +41,7 @@
 //!
 //! Skipped for the prototype: a "working…" indicator while Argon2 runs,
 //! selectable data-folder text (iced 0.14 has no selectable text widget),
-//! and a confirmation before closing with unsaved changes. Notifications are
-//! parked: the setting is kept but not shown.
+//! and a confirmation before closing with unsaved changes.
 
 use fortnight_core::domain::{Accent, AppIcon, LlmSettings, Protocol, Schedule, Settings};
 use fortnight_core::ollama::{self, DEFAULT_BASE_URL as OLLAMA_BASE_URL, ModelKind, OllamaModel};
@@ -153,13 +152,14 @@ pub enum Which {
 #[derive(Debug, Clone)]
 pub enum Action {
     None,
-    /// Close the overlay (the close button or Escape).
+    /// Close the overlay (the close button).
     Close,
     /// Fetch the endpoint's model list using these endpoint fields and the
     /// current key (for `Which::Decision`, the key only if it is on the main
     /// endpoint's host). The result arrives as `SettingsData::models`.
     ListModels(LlmSettings, Which),
-    /// Save these settings (endpoint, schedule, capacity, prompts).
+    /// Save these settings (endpoint, schedule, capacity, prompts,
+    /// appearance).
     Save(Settings),
     /// Send a test request using these endpoint fields and the current key
     /// (same rule as `ListModels`).
@@ -191,10 +191,9 @@ pub struct SettingsData {
     /// Result of the last Test: `Ok(model reply)` or `Err(message)`.
     pub test_result: Option<Result<String, String>>,
     pub testing: bool,
-    /// Result of the last key operation (set, remove, unlock),
-    /// shown near the key controls. `Err` for failures such as a wrong
-    /// password.
-    pub key_message: Option<Result<String, String>>,
+    /// Why the last key operation (saving or removing a key) failed, such
+    /// as a wrong password; shown near the key controls.
+    pub key_message: Option<String>,
     /// Result of the last model-list fetch: `Ok(models)` (may be empty when
     /// the endpoint can't say; fall back to free text) or `Err(message)`.
     /// Only Ollama says what kind each model is; others list `Chat`.
@@ -445,8 +444,6 @@ struct Form {
     working_days: [bool; 7],
     /// Decimal hours as typed, e.g. `5.5`.
     focus_hours: String,
-    /// Parked: carried through unchanged.
-    notifications: bool,
     app_icon: AppIcon,
     accent: Accent,
     /// The prompts as shown and edited.
@@ -486,7 +483,6 @@ impl Form {
             plan_time: format_time(sched.plan_time),
             working_days: WEEK.map(|d| sched.working_days.contains(&d)),
             focus_hours: format_hours(s.focus_minutes_per_day),
-            notifications: s.notifications,
             app_icon: s.app_icon,
             accent: s.accent,
             summary_prompt: summary_shown.clone(),
@@ -528,7 +524,6 @@ impl Form {
             },
             summary_instructions,
             focus_minutes_per_day: parse_hours(&self.focus_hours)?,
-            notifications: self.notifications,
             app_icon: self.app_icon,
             accent: self.accent,
             summary_prompt,
@@ -631,7 +626,7 @@ pub struct SettingsView {
     key_state: KeyState,
     test_result: Option<Result<String, String>>,
     testing: bool,
-    key_message: Option<Result<String, String>>,
+    key_message: Option<String>,
     secrets: Secrets,
     key_mode: KeyMode,
     decision_key_state: KeyState,
@@ -1283,12 +1278,8 @@ impl SettingsView {
         };
         let error = if !here || self.password_prompt {
             None
-        } else if let Some(e) = &self.key_error {
-            Some(e.clone())
-        } else if let Some(Err(e)) = &self.key_message {
-            Some(e.clone())
         } else {
-            None
+            self.key_error.clone().or_else(|| self.key_message.clone())
         };
         match error {
             Some(e) => column![line, error_text(e)]
@@ -1492,9 +1483,7 @@ fn swatch<'a>(accent: Accent, picked: bool) -> Element<'a, Message> {
             .padding(3)
             .style(ring)
             .on_press(Message::Accent(accent)),
-        container(text(accent.label()).size(theme::TEXT_SMALL))
-            .padding([4, 8])
-            .style(theme::card),
+        theme::tip(accent.label()),
         tooltip::Position::Bottom,
     )
     .into()
@@ -1644,23 +1633,16 @@ fn divider(theme: &Theme) -> rule::Style {
 /// A pick list styled like [`theme::input`].
 fn picker(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
     let p = theme.palette();
-    let mix = |amount: f32| {
-        Color::from_rgb(
-            p.background.r + (p.text.r - p.background.r) * amount,
-            p.background.g + (p.text.g - p.background.g) * amount,
-            p.background.b + (p.text.b - p.background.b) * amount,
-        )
-    };
     let ring = match status {
         pick_list::Status::Opened { .. } => theme::accent_color(),
-        pick_list::Status::Hovered => mix(0.15),
+        pick_list::Status::Hovered => theme::tint(theme, 0.15),
         pick_list::Status::Active => Color::TRANSPARENT,
     };
     pick_list::Style {
         text_color: p.text,
         placeholder_color: theme::muted_color(theme),
         handle_color: theme::muted_color(theme),
-        background: Background::Color(mix(0.075)),
+        background: Background::Color(theme::tint(theme, 0.075)),
         border: Border {
             radius: theme::RADIUS.into(),
             width: 1.0,
@@ -2310,9 +2292,9 @@ mod tests {
 
     #[test]
     fn round1_settings_load_with_defaults_and_save_unchanged() {
-        // Round 1 settings JSON has no protocol, focus minutes or
-        // notifications; core's serde defaults fill them in (tested in
-        // `domain`), which gives this value.
+        // Round 1 settings JSON has no protocol or focus minutes; core's
+        // serde defaults fill them in (tested in `domain`), which gives this
+        // value.
         let mut round1 = Settings::default();
         round1.llm.base_url = "http://localhost:11434/v1".into();
         round1.llm.model = "llama3.2".into();
@@ -2334,7 +2316,6 @@ mod tests {
         assert!(s.llm.keyless);
         assert_eq!(s.schedule, round1.schedule);
         assert_eq!(s.focus_minutes_per_day, DEFAULT_FOCUS_MINUTES + 30);
-        assert!(!s.notifications);
         assert_eq!(s.summary_instructions, "Short.");
     }
 

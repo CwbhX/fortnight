@@ -3,20 +3,20 @@
 //! the minute tick that generates due reports.
 //!
 //! Layout (PLAN.md 4.2): the top bar (tabs, period navigation over one
-//! shared selected date, lock, gear, quick-add), then the active tab. Settings
-//! opens over the current view.
+//! shared selected date, lock, gear), then the active tab. Settings opens
+//! over the current view.
 //!
 //! Also here: undo (Ctrl/Cmd+Z, silent: the last add, status change, edit
 //! or delete), the keyboard shortcuts of PLAN.md 4.4, Lock and the unlock
 //! prompt (from the lock icon; the app never asks at launch), the data-folder
-//! lock file, the export dialog and the model list.
+//! lock file and the model list.
 //!
-//! The Week tab's Recommended tasks and Work summary update on their own:
-//! when the Week tab is shown, when its week changes and on the minute tick
-//! while it is showing, each report whose facts (or prompt) changed since its
-//! newest version is generated once. The summary is also kept up to date in
-//! the background from its scheduled day and time. An edited summary is
-//! never regenerated.
+//! The Week tab's Work summary and the Today tab's Recommended tasks update
+//! on their own: when their tab is shown, when the shown week or day
+//! changes and on the minute tick while it is showing, each report whose
+//! facts (or prompt) changed since its newest version is generated once.
+//! The summary is also kept up to date in the background from its scheduled
+//! day and time. An edited summary is never regenerated.
 
 use fortnight_app::app_icon;
 use fortnight_app::theme;
@@ -32,10 +32,9 @@ use fortnight_app::views::week::{self, WeekData, WeekView};
 use fortnight_core::datadir::{self, DataLock};
 use fortnight_core::decision::DecisionClient;
 use fortnight_core::domain::{
-    DeletedTask, Event, EventId, LlmSettings, Priority, Protocol, ReportId, ReportKey, ReportKind,
-    Settings, Task as CoreTask, TaskId, TaskStatus, WeekRef,
+    DeletedTask, Event, EventId, LlmSettings, Priority, Protocol, ReportKey, ReportKind, Settings,
+    Task as CoreTask, TaskId, TaskStatus, WeekRef,
 };
-use fortnight_core::export::{self, ExportFormat};
 use fortnight_core::fallback::{self, FallbackClient};
 use fortnight_core::llm::{
     self, ChatEvent, ChatRequest, ChatResponse, LlmClient, LlmConfig, LlmError,
@@ -46,7 +45,7 @@ use fortnight_core::secure;
 use fortnight_core::sqlite::SqliteStore;
 use fortnight_core::store::Store;
 use fortnight_core::vault::{self, VaultError};
-use fortnight_core::week::{add_months, due_reports, week_containing, week_label};
+use fortnight_core::week::{add_months, due_reports, week_containing};
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{
     button, center, column, container, mouse_area, opaque, operation, row, stack, text,
@@ -122,8 +121,6 @@ enum Message {
     PrioritySuggested(u64, Option<Priority>),
     /// A keyboard shortcut (applied only where it makes sense).
     Key(Shortcut),
-    /// The export dialog finished: the path written, `None` if cancelled.
-    Exported(Result<Option<PathBuf>, String>),
     DismissNotice,
     /// The main key and the decision model's key, each if it exists and
     /// opened with the password.
@@ -180,7 +177,6 @@ enum Undo {
     Changed {
         before: Box<CoreTask>,
         last_event: EventId,
-        what: &'static str,
     },
     /// Tasks were deleted for good (one, or all of Deleted at once); put
     /// them back with their history.
@@ -248,14 +244,15 @@ struct Ready {
     summary_wait: Option<Timestamp>,
     testing: bool,
     test_result: Option<Result<String, String>>,
-    key_message: Option<Result<String, String>>,
+    /// Why the last key save or removal failed.
+    key_message: Option<String>,
     models: Option<Result<Vec<OllamaModel>, String>>,
     /// The local Ollama (`ollama::DEFAULT_BASE_URL`): its models, or why it
     /// didn't answer. Checked at launch and when Settings opens.
     ollama: Option<Result<Vec<OllamaModel>, String>>,
     listing_models: bool,
     error: Option<String>,
-    /// A short, dismissable message (export result, lock warning).
+    /// A short, dismissable message (the lock warning).
     notice: Option<String>,
     undo: Vec<Undo>,
     /// A report became ready while the Week tab wasn't showing.
@@ -291,11 +288,7 @@ impl App {
                 ready.refresh();
                 let tasks = Task::batch([
                     iced::system::theme().map(Message::ThemeMode),
-                    if ready.unlocking {
-                        UnlockView::focus().map(Message::Unlock)
-                    } else {
-                        operation::focus(top_bar::QUICK_ADD_ID)
-                    },
+                    operation::focus(top_bar::QUICK_ADD_ID),
                     start,
                     detect_ollama(),
                     shoot_after_delay(),
@@ -434,7 +427,6 @@ impl Ready {
             Ok("settings") => (Tab::Today, true),
             _ => (Tab::Today, false),
         };
-        let unlocking = false;
         // One writer at a time (PLAN.md 3.5): warn, never refuse.
         let (lock, notice) = match datadir::acquire_lock(&dir) {
             Ok((lock, None)) => (Some(lock), None),
@@ -475,7 +467,7 @@ impl Ready {
             month_view: MonthView::new(),
             settings_view: SettingsView::new(),
             unlock_view: UnlockView::new(),
-            unlocking,
+            unlocking: false,
             key_exists,
             api_key: None,
             decision_key_exists,
@@ -544,10 +536,6 @@ impl Ready {
             && !secure::is_local_endpoint(&llm.base_url)
     }
 
-    /// The client for the decision model (`Settings::decision_llm`) with
-    /// these fields, and its host. It uses its own key if one is saved, and
-    /// otherwise the main key only on the main endpoint's host
-    /// (`fallback::decision_config`).
     /// The saved recommendations model is an Ollama decision model.
     fn decision_active(&self) -> bool {
         let d = &self.settings.decision_llm;
@@ -607,6 +595,10 @@ impl Ready {
         })
     }
 
+    /// The client for the decision model (`Settings::decision_llm`) with
+    /// these fields, and its host. It uses its own key if one is saved, and
+    /// otherwise the main key only on the main endpoint's host
+    /// (`fallback::decision_config`).
     fn decision_client_for(
         &self,
         llm: &LlmSettings,
@@ -683,9 +675,6 @@ impl Ready {
                     .filter(|e| e.task_id.is_none())
                     .filter_map(|e| {
                         Some(LogLine {
-                            id: e.id,
-                            task_id: e.task_id,
-                            at: e.at,
                             date: self.tz.to_datetime(e.at).date(),
                             text: e.log_text()?.to_string(),
                         })
@@ -777,10 +766,8 @@ impl Ready {
         }
     }
 
-    /// Today's recommended tasks: the current week's newest ready
-    /// Recommended tasks report, parsed (empty if none or unreadable). A
-    /// failed newer attempt doesn't hide the last good one.
-    /// The recommended tasks: the newest ready version that still names an
+    /// Today's recommended tasks: the newest ready version of the current
+    /// week's Recommended tasks report that still names an
     /// open task on the Today list (planned for today or carried over from
     /// an earlier day) or overdue (a chat model may not keep to
     /// that rule). An overdue task stays eligible until it is done or
@@ -806,10 +793,7 @@ impl Ready {
                                 && (x.day().is_some_and(|d| d <= today) || x.is_overdue(today))
                         })
                     })
-                    .map(|t| day::Recommended {
-                        id: t.id,
-                        why: t.why,
-                    })
+                    .map(|t| day::Recommended { id: t.id })
                     .collect::<Vec<_>>()
             })
             .find(|list| !list.is_empty())
@@ -901,11 +885,7 @@ impl Ready {
                 stale,
             });
         }
-        ReportPanelData {
-            week,
-            week_label: week_label(week),
-            slots,
-        }
+        ReportPanelData { week, slots }
     }
 
     /// Generates the reports the shown tab needs that are out of date, once
@@ -1089,8 +1069,7 @@ impl Ready {
     }
 
     /// Stores the finished (or failed) report and forgets the generation.
-    /// A scheduled report that became ready sets the Week badge and, if
-    /// enabled, shows an OS notification.
+    /// A scheduled report that became ready sets the Week badge.
     fn finish(
         &mut self,
         key: ReportKey,
@@ -1147,11 +1126,7 @@ impl Ready {
         };
         let result = match &last {
             Undo::Added(id) => self.undo_add(*id),
-            Undo::Changed {
-                before,
-                last_event,
-                what,
-            } => self.undo_change(before, *last_event).map(|()| *what),
+            Undo::Changed { before, last_event } => self.undo_change(before, *last_event),
             Undo::Deleted(deleted) => {
                 // Put back what can be; keep the rest for another try.
                 let mut left = Vec::new();
@@ -1167,7 +1142,7 @@ impl Ready {
                     }
                 }
                 match failed {
-                    None => Ok("Task restored."),
+                    None => Ok(()),
                     Some(e) => {
                         self.undo.push(Undo::Deleted(left));
                         self.error = Some(format!("Could not undo: {e}"));
@@ -1177,14 +1152,11 @@ impl Ready {
                 }
             }
         };
-        match result {
-            Ok(_) => {}
-            Err(e) => {
-                self.error = Some(format!("Could not undo: {e}"));
-                // Keep the entry (and its saved copy) for another try.
-                if !matches!(last, Undo::Added(_)) {
-                    self.undo.push(last);
-                }
+        if let Err(e) = result {
+            self.error = Some(format!("Could not undo: {e}"));
+            // Keep the entry (and its saved copy) for another try.
+            if !matches!(last, Undo::Added(_)) {
+                self.undo.push(last);
             }
         }
         self.reload_tasks();
@@ -1192,7 +1164,7 @@ impl Ready {
 
     /// Deletes a task just added, unless it has since gained history (a log
     /// line, an edit), which deleting would lose.
-    fn undo_add(&mut self, id: TaskId) -> Result<&'static str, String> {
+    fn undo_add(&mut self, id: TaskId) -> Result<(), String> {
         let events = self.store.task_events(id).map_err(|e| e.to_string())?;
         if events
             .iter()
@@ -1202,7 +1174,7 @@ impl Ready {
         }
         self.store
             .delete_task(id)
-            .map(|_| "Removed the new task.")
+            .map(|_| ())
             .map_err(|e| e.to_string())
     }
 
@@ -1212,13 +1184,12 @@ impl Ready {
 
     /// Remembers `before` (the task as it is now) for undo of a change about
     /// to be made.
-    fn snapshot(&self, id: TaskId, what: &'static str) -> Option<Undo> {
+    fn snapshot(&self, id: TaskId) -> Option<Undo> {
         let before = self.task(id)?.clone();
         let last_event = self.events.iter().map(|e| e.id).max().unwrap_or(0);
         Some(Undo::Changed {
             before: Box::new(before),
             last_event,
-            what,
         })
     }
 
@@ -1229,8 +1200,8 @@ impl Ready {
     /// The schedule (PLAN.md section 8), at launch and every minute: from
     /// its day and time the summary is kept up to date (generated when
     /// missing or out of date); Recommended tasks are generated when
-    /// missing (otherwise only when the Week tab is shown). Waits quietly
-    /// while locked or unconfigured; failures back off.
+    /// missing (otherwise only while the Today tab shows today). Waits
+    /// quietly while locked or unconfigured; failures back off.
     fn run_due(&mut self) -> Task<Message> {
         if self.blocked().is_some() || self.tasks.is_empty() {
             return Task::none();
@@ -1312,7 +1283,7 @@ impl Ready {
                 week::Action::None => Task::none(),
                 week::Action::Move(id, day, position) => {
                     if let Some(task) = self.task(id).cloned() {
-                        let undo = self.snapshot(id, "Move undone.");
+                        let undo = self.snapshot(id);
                         let mut result = Ok(());
                         if task.day() != Some(day) {
                             // Dropping on a day plans it there; the
@@ -1396,10 +1367,7 @@ impl Ready {
                     .map(|rec| {
                         rec.tasks
                             .into_iter()
-                            .map(|t| day::Recommended {
-                                id: t.id,
-                                why: t.why,
-                            })
+                            .map(|t| day::Recommended { id: t.id })
                             .collect()
                     })
                     .unwrap_or_default();
@@ -1487,16 +1455,6 @@ impl Ready {
                 Task::none()
             }
             Message::Key(shortcut) => self.shortcut(shortcut),
-            Message::Exported(result) => {
-                match result {
-                    Ok(Some(path)) => {
-                        self.notice = Some(format!("Exported to {}", path.display()));
-                    }
-                    Ok(None) => {}
-                    Err(e) => self.error = Some(format!("Export failed: {e}")),
-                }
-                Task::none()
-            }
             Message::DismissNotice => {
                 self.notice = None;
                 Task::none()
@@ -1535,17 +1493,17 @@ impl Ready {
                         if saved.other.is_some() {
                             *other = saved.other;
                         }
-                        self.key_message = Some(Ok("Saved.".into()));
+                        self.key_message = None;
                     }
                     // Only the check against the other key can say this.
                     Err(VaultError::WrongPassword) => {
-                        self.key_message = Some(Err(
+                        self.key_message = Some(
                             "That isn't the password of your other saved key. Use the same \
                              one: it unlocks both."
                                 .into(),
-                        ))
+                        )
                     }
-                    Err(e) => self.key_message = Some(Err(e.to_string())),
+                    Err(e) => self.key_message = Some(e.to_string()),
                 }
                 Task::batch([self.run_due(), self.update_week_reports()])
             }
@@ -1553,8 +1511,9 @@ impl Ready {
                 self.error = None;
                 Task::none()
             }
+            // `App::handle` takes these before they get here.
             Message::ThemeMode(_) | Message::Shoot | Message::Shot(_) | Message::WindowOpened => {
-                Task::none()
+                return Task::none();
             }
         };
         self.refresh();
@@ -1716,7 +1675,7 @@ impl Ready {
 
     fn set_status(&mut self, id: TaskId, status: TaskStatus) {
         let changed = self.task(id).is_some_and(|t| t.status != status);
-        let undo = self.snapshot(id, "Status restored.");
+        let undo = self.snapshot(id);
         match self.store.set_status(id, status) {
             Ok(()) => {
                 if let (true, Some(undo)) = (changed, undo) {
@@ -1806,7 +1765,7 @@ impl Ready {
                 return Task::none();
             }
             day::Action::Update(task) => {
-                let undo = self.snapshot(task.id, "Edit undone.");
+                let undo = self.snapshot(task.id);
                 let r = self.store.update_task(&task);
                 if let (Ok(()), Some(undo)) = (&r, undo) {
                     self.remember(undo);
@@ -1820,8 +1779,6 @@ impl Ready {
                 }
                 Err(e) => Err(e),
             },
-            day::Action::AddLog { task_id, text } => self.store.add_log(task_id, &text).map(|_| ()),
-            day::Action::DeleteLog(id) => self.store.delete_log(id),
             day::Action::Add(new) => {
                 self.add_task(new);
                 return Task::none();
@@ -1854,43 +1811,7 @@ impl Ready {
                 Task::none()
             }
             report_panel::Action::Copy(text) => iced::clipboard::write(text),
-            report_panel::Action::Export(id, format) => self.export_report(id, format),
         }
-    }
-
-    /// Asks where to save one report version, then writes it.
-    fn export_report(&mut self, id: ReportId, format: ExportFormat) -> Task<Message> {
-        let report = match self.store.all_reports() {
-            Ok(all) => all.into_iter().find(|r| r.id == id),
-            Err(e) => {
-                self.error = Some(e.to_string());
-                return Task::none();
-            }
-        };
-        let Some(report) = report else {
-            self.error = Some(format!("Report {id} not found."));
-            return Task::none();
-        };
-        let name = export::report_file_name(format, &report);
-        let content = export::export_report(format, &report);
-        Task::perform(
-            async move {
-                let Some(file) = rfd::AsyncFileDialog::new()
-                    .set_title("Export report")
-                    .set_file_name(&name)
-                    .add_filter(format.extension(), &[format.extension()])
-                    .save_file()
-                    .await
-                else {
-                    return Ok(None);
-                };
-                let path = file.path().to_path_buf();
-                std::fs::write(&path, content)
-                    .map(|()| Some(path))
-                    .map_err(|e| e.to_string())
-            },
-            Message::Exported,
-        )
     }
 
     /// Applies a keyboard shortcut. While the unlock prompt or Settings is
@@ -2112,9 +2033,9 @@ impl Ready {
                     Ok(()) => {
                         *exists = false;
                         *key = None;
-                        self.key_message = Some(Ok("API key removed.".into()));
+                        self.key_message = None;
                     }
-                    Err(e) => self.key_message = Some(Err(e.to_string())),
+                    Err(e) => self.key_message = Some(e.to_string()),
                 }
                 Task::none()
             }
@@ -2220,7 +2141,7 @@ impl Ready {
                         container(opaque(panel))
                             .padding([32, 24])
                             .center(Fill)
-                            .style(dialog_backdrop)
+                            .style(theme::dialog_backdrop)
                     )
                     .on_press(Message::Dialog(day::Message::Close))
                 )
@@ -2260,15 +2181,6 @@ struct TaskDialog {
     form: day::EditForm,
     /// The task being edited; `None` for a new task.
     task: Option<TaskId>,
-}
-
-/// The task dialog's backdrop: darker than Settings' so the page
-/// behind recedes. (iced 0.14 has no backdrop blur.)
-fn dialog_backdrop(_theme: &iced::Theme) -> container::Style {
-    container::Style {
-        background: Some(iced::Color::BLACK.scale_alpha(0.55).into()),
-        ..container::Style::default()
-    }
 }
 
 /// The shortcut for a key press that no widget captured (PLAN.md 4.4).
@@ -2339,7 +2251,6 @@ fn restore_snapshot(
     })
 }
 
-/// Runs blocking work (Argon2) off the UI thread.
 /// Checks for Ollama on this machine (`Message::OllamaDetected`).
 fn detect_ollama() -> Task<Message> {
     Task::perform(
@@ -2377,6 +2288,7 @@ fn key_state(exists: bool, key: &Option<SecretString>) -> KeyState {
     }
 }
 
+/// Runs blocking work (Argon2) off the UI thread.
 fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, VaultError> + Send + 'static,
     done: fn(Result<T, VaultError>) -> Message,

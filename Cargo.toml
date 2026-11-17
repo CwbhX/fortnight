@@ -12,7 +12,7 @@ fortnight-core = { path = "crates/fortnight-core" }
 iced = { version = "0.14", features = ["tokio", "markdown", "svg", "advanced"] }
 rusqlite = { version = "0.43", features = ["bundled"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["time"] }
 jiff = { version = "1.0", features = ["serde"] }
 argon2 = "0.6"
 chacha20poly1305 = "0.11"
@@ -27,11 +27,9 @@ clap = { version = "4", features = ["derive"] }
 rpassword = "7.5"
 eventsource-stream = "0.2"
 futures-util = "0.3"
-notify-rust = "4.19"
-rfd = "0.18"
 # Renders the app icon SVG (already used by iced's svg feature).
 resvg = { version = "0.45", default-features = false }
-# macOS only: sets the Dock icon (already in the tree via rfd).
+# macOS only: sets the Dock icon.
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }

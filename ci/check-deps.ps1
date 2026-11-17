@@ -13,7 +13,9 @@ param(
 $ErrorActionPreference = 'Stop'
 
 if (-not (Test-Path -LiteralPath $Binary)) {
-    Write-Error "check-deps: $Binary does not exist"
+    # Write-Host, not Write-Error: under 'Stop', Write-Error ends the script
+    # with exit code 1 before `exit 2` runs.
+    Write-Host "check-deps: $Binary does not exist"
     exit 2
 }
 
@@ -32,7 +34,7 @@ $allowed = @(
 
 $out = & dumpbin /dependents $Binary
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "check-deps: dumpbin failed on $Binary"
+    Write-Host "check-deps: dumpbin failed on $Binary"
     exit 2
 }
 
@@ -47,7 +49,7 @@ foreach ($line in $out) {
 }
 
 if ($deps.Count -eq 0) {
-    Write-Error "check-deps: could not read any dependents from dumpbin output for $Binary"
+    Write-Host "check-deps: could not read any dependents from dumpbin output for $Binary"
     exit 2
 }
 

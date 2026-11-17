@@ -1,6 +1,11 @@
 //! `cargo xtask bundle`: wraps the macOS binary in a minimal `Fortnight.app`
 //! (PLAN.md section 3.6). std only, no dependencies.
+//!
+//! It builds with the `cargo` that runs it (`$CARGO`) and `--locked`, into
+//! `$CARGO_TARGET_DIR` if set, else `target/`. The bundle itself always goes
+//! to `target/bundle/` in the workspace.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -53,7 +58,10 @@ fn bundle(args: &[String]) -> Result<()> {
     let version = workspace_version(&manifest)
         .ok_or("no `version` under [workspace.package] in Cargo.toml")?;
 
-    let binary = build_binary(&root, universal)?;
+    let cwd = std::env::current_dir().map_err(|e| format!("reading the current folder: {e}"))?;
+    let target = target_dir(std::env::var_os("CARGO_TARGET_DIR"), &cwd, &root);
+    let cargo = cargo_program(std::env::var_os("CARGO"));
+    let binary = build_binary(&cargo, &root, &target, universal)?;
 
     let app = root.join("target/bundle/Fortnight.app");
     if app.exists() {
@@ -84,9 +92,52 @@ fn bundle(args: &[String]) -> Result<()> {
     println!("Bundled {}", app.display());
     println!(
         "The data folder sits beside the .app, not inside it: \
-         fortnight-data/ next to Fortnight.app, or use --data-dir / FORTNIGHT_DATA_DIR."
+         fortnight-data/ next to Fortnight.app, or use --data-dir / FORTNIGHT_DATA_DIR. \
+         fortnight-cli is not in the bundle and uses the folder beside itself, \
+         so give it --data-dir to share the app's."
     );
     Ok(())
+}
+
+/// Where cargo puts build output: `$CARGO_TARGET_DIR` (relative to the
+/// folder `cargo xtask` was run from, as cargo reads it) if set and not
+/// empty, else `<root>/target`.
+fn target_dir(env: Option<OsString>, cwd: &Path, root: &Path) -> PathBuf {
+    match env.filter(|v| !v.is_empty()) {
+        Some(dir) => cwd.join(dir),
+        None => root.join("target"),
+    }
+}
+
+/// The cargo that runs xtask (`$CARGO`), else `cargo` from PATH.
+fn cargo_program(env: Option<OsString>) -> OsString {
+    env.filter(|v| !v.is_empty())
+        .unwrap_or_else(|| OsString::from("cargo"))
+}
+
+/// `cargo build --release --locked -p fortnight-app`, into `target_dir`
+/// (passed explicitly, so the build lands where the bundle looks for it),
+/// for `triple` if given.
+fn build_command(cargo: &OsStr, root: &Path, target_dir: &Path, triple: Option<&str>) -> Command {
+    let mut command = Command::new(cargo);
+    command
+        .current_dir(root)
+        .args(["build", "--release", "--locked", "-p", "fortnight-app"])
+        .arg("--target-dir")
+        .arg(target_dir);
+    if let Some(triple) = triple {
+        command.args(["--target", triple]);
+    }
+    command
+}
+
+/// The executable a release build of the app leaves in `target_dir`.
+fn built_binary(target_dir: &Path, triple: Option<&str>) -> PathBuf {
+    let dir = match triple {
+        Some(triple) => target_dir.join(triple),
+        None => target_dir.to_path_buf(),
+    };
+    dir.join("release").join("Fortnight")
 }
 
 /// The folder holding the workspace `Cargo.toml` (xtask lives one level down).
@@ -98,15 +149,10 @@ fn workspace_root() -> PathBuf {
 }
 
 /// Builds the GUI and returns the path of the resulting executable.
-fn build_binary(root: &Path, universal: bool) -> Result<PathBuf> {
+fn build_binary(cargo: &OsStr, root: &Path, target_dir: &Path, universal: bool) -> Result<PathBuf> {
     if !universal {
-        run(Command::new("cargo").current_dir(root).args([
-            "build",
-            "--release",
-            "-p",
-            "fortnight-app",
-        ]))?;
-        return Ok(root.join("target/release/Fortnight"));
+        run(&mut build_command(cargo, root, target_dir, None))?;
+        return Ok(built_binary(target_dir, None));
     }
 
     let installed = installed_targets()?;
@@ -119,19 +165,13 @@ fn build_binary(root: &Path, universal: bool) -> Result<PathBuf> {
     }
     let mut outputs = Vec::new();
     for target in APP_TARGETS {
-        run(Command::new("cargo").current_dir(root).args([
-            "build",
-            "--release",
-            "-p",
-            "fortnight-app",
-            "--target",
-            target,
-        ]))?;
-        outputs.push(root.join("target").join(target).join("release/Fortnight"));
+        run(&mut build_command(cargo, root, target_dir, Some(target)))?;
+        outputs.push(built_binary(target_dir, Some(target)));
     }
-    let joined = root.join("target/release/fortnight-universal");
-    std::fs::create_dir_all(joined.parent().expect("has parent"))
-        .map_err(|e| format!("creating target/release: {e}"))?;
+    let joined = target_dir.join("release").join("fortnight-universal");
+    let joined_dir = joined.parent().expect("has parent");
+    std::fs::create_dir_all(joined_dir)
+        .map_err(|e| format!("creating {}: {e}", joined_dir.display()))?;
     run(Command::new("lipo")
         .arg("-create")
         .args(&outputs)
@@ -303,6 +343,80 @@ mod tests {
     #[test]
     fn plist_names_the_icon_only_when_present() {
         assert!(info_plist("0.1.0", true).contains("<key>CFBundleIconFile</key>"));
+    }
+
+    #[test]
+    fn target_dir_defaults_to_the_workspace_target() {
+        let (cwd, root) = (Path::new("/work/sub"), Path::new("/work"));
+        assert_eq!(target_dir(None, cwd, root), PathBuf::from("/work/target"));
+        assert_eq!(
+            target_dir(Some(OsString::new()), cwd, root),
+            PathBuf::from("/work/target")
+        );
+    }
+
+    #[test]
+    fn target_dir_follows_cargo_target_dir() {
+        let (cwd, root) = (Path::new("/work/sub"), Path::new("/work"));
+        assert_eq!(
+            target_dir(Some("/elsewhere/out".into()), cwd, root),
+            PathBuf::from("/elsewhere/out")
+        );
+        // Relative to where `cargo xtask` was run, as cargo reads it.
+        assert_eq!(
+            target_dir(Some("out".into()), cwd, root),
+            PathBuf::from("/work/sub/out")
+        );
+    }
+
+    #[test]
+    fn cargo_comes_from_the_environment() {
+        assert_eq!(cargo_program(None), OsString::from("cargo"));
+        assert_eq!(
+            cargo_program(Some(OsString::new())),
+            OsString::from("cargo")
+        );
+        assert_eq!(
+            cargo_program(Some("/toolchain/bin/cargo".into())),
+            OsString::from("/toolchain/bin/cargo")
+        );
+    }
+
+    #[test]
+    fn builds_are_locked_and_land_in_the_target_dir() {
+        let target = Path::new("/elsewhere/out");
+        let cargo = OsString::from("/toolchain/bin/cargo");
+        let command = build_command(
+            &cargo,
+            Path::new("/work"),
+            target,
+            Some("x86_64-apple-darwin"),
+        );
+        assert_eq!(command.get_program(), "/toolchain/bin/cargo");
+        assert_eq!(command.get_current_dir(), Some(Path::new("/work")));
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                "build",
+                "--release",
+                "--locked",
+                "-p",
+                "fortnight-app",
+                "--target-dir",
+                "/elsewhere/out",
+                "--target",
+                "x86_64-apple-darwin",
+            ]
+        );
+        assert_eq!(
+            built_binary(target, Some("x86_64-apple-darwin")),
+            PathBuf::from("/elsewhere/out/x86_64-apple-darwin/release/Fortnight")
+        );
+        assert_eq!(
+            built_binary(target, None),
+            PathBuf::from("/elsewhere/out/release/Fortnight")
+        );
     }
 
     #[test]

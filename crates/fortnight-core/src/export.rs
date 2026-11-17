@@ -55,38 +55,6 @@ pub fn export_all(
     }
 }
 
-/// One report version: Markdown is its text (the edit if any) under a
-/// heading naming the kind and week; JSON is the whole `Report`.
-pub fn export_report(format: ExportFormat, report: &Report) -> String {
-    match format {
-        ExportFormat::Markdown => {
-            let mut out = format!("# {}\n\n", report_heading(report));
-            push_report_body(&mut out, report);
-            out
-        }
-        ExportFormat::Json => {
-            let mut out = serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".into());
-            out.push('\n');
-            out
-        }
-    }
-}
-
-/// A file name for `export_report`, e.g. `fortnight-summary-2026-11-16.md`.
-pub fn report_file_name(format: ExportFormat, report: &Report) -> String {
-    format!(
-        "fortnight-{}-{}.{}",
-        report.kind.as_str(),
-        report.week_start,
-        format.extension()
-    )
-}
-
-/// A file name for `export_all`, e.g. `fortnight-export-2026-11-16.json`.
-pub fn all_file_name(format: ExportFormat, today: Date) -> String {
-    format!("fortnight-export-{today}.{}", format.extension())
-}
-
 // ------------------------------------------------------------------- JSON
 
 /// Field order here is the order in the file.
@@ -593,40 +561,13 @@ mod tests {
     }
 
     #[test]
-    fn export_report_markdown_and_json() {
-        let (_, _, reports) = sample();
-        let md = export_report(ExportFormat::Markdown, &reports[1]);
-        assert_eq!(
-            md,
-            "# Summary for the week of 2026-11-09\n\nmy edited text\n"
-        );
-        let failed = export_report(ExportFormat::Markdown, &reports[2]);
-        assert!(failed.starts_with("# Advice for the week of 2026-11-16\n"));
-        assert!(failed.contains("**Failed:** endpoint returned 500"));
-        let json = export_report(ExportFormat::Json, &reports[1]);
-        assert_eq!(serde_json::from_str::<Report>(&json).unwrap(), reports[1]);
-    }
-
-    #[test]
-    fn file_names_and_formats() {
-        let (_, _, reports) = sample();
-        assert_eq!(
-            report_file_name(ExportFormat::Markdown, &reports[1]),
-            "fortnight-summary-2026-11-09.md"
-        );
-        assert_eq!(
-            report_file_name(ExportFormat::Json, &reports[2]),
-            "fortnight-plan-2026-11-16.json"
-        );
-        assert_eq!(
-            all_file_name(ExportFormat::Json, TODAY),
-            "fortnight-export-2026-11-16.json"
-        );
+    fn formats_parse() {
         assert_eq!(
             ExportFormat::parse(" Markdown "),
             Some(ExportFormat::Markdown)
         );
         assert_eq!(ExportFormat::parse("JSON"), Some(ExportFormat::Json));
         assert_eq!(ExportFormat::parse("csv"), None);
+        assert_eq!(ExportFormat::Json.extension(), "json");
     }
 }
