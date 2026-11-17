@@ -19,23 +19,28 @@ use secrecy::SecretString;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// The config for the decision endpoint. It gets `key` (the main
-/// endpoint's API key) only when it is on the same host as `main`, so the
-/// key never goes to a provider it wasn't saved for.
+/// The config for the decision endpoint. It uses its own key
+/// (`decision_key`, from `vault::decision_key_path`) when there is one.
+/// Otherwise it borrows `main_key` only when it is on the same host as
+/// `main`, so a key never goes to a provider it wasn't saved for.
 pub fn decision_config(
     decision: &LlmSettings,
     main: &LlmSettings,
-    key: Option<SecretString>,
+    main_key: Option<SecretString>,
+    decision_key: Option<SecretString>,
 ) -> LlmConfig {
     let config = |llm: &LlmSettings, api_key| LlmConfig {
         base_url: llm.base_url.trim().to_string(),
         model: llm.model.trim().to_string(),
         api_key,
     };
+    if decision_key.is_some() {
+        return config(decision, decision_key);
+    }
     let main_host = config(main, None).endpoint_host();
     let mut out = config(decision, None);
     if main_host.is_some() && out.endpoint_host() == main_host {
-        out.api_key = key;
+        out.api_key = main_key;
     }
     out
 }
@@ -194,17 +199,36 @@ mod tests {
             base_url: url.into(),
             model: "m".into(),
         };
-        let key = || Some(SecretString::from("sk-1"));
+        use secrecy::ExposeSecret;
+        let key = |k: &str| Some(SecretString::from(k.to_string()));
         let main = llm("https://api.openai.com/v1");
-        let same = decision_config(&llm(" https://api.openai.com/v1 "), &main, key());
-        assert!(same.api_key.is_some());
+        let same = decision_config(
+            &llm(" https://api.openai.com/v1 "),
+            &main,
+            key("sk-1"),
+            None,
+        );
+        assert_eq!(same.api_key.unwrap().expose_secret(), "sk-1");
         assert_eq!(same.base_url, "https://api.openai.com/v1");
-        let other = decision_config(&llm("https://api.deepseek.com/v1"), &main, key());
+        let other = decision_config(
+            &llm("https://api.deepseek.com/v1"),
+            &main,
+            key("sk-1"),
+            None,
+        );
         assert!(other.api_key.is_none());
-        let local = decision_config(&llm("http://localhost:11434/v1"), &main, key());
+        let local = decision_config(&llm("http://localhost:11434/v1"), &main, key("sk-1"), None);
         assert!(local.api_key.is_none());
-        let unset = decision_config(&llm(""), &llm(""), key());
+        let unset = decision_config(&llm(""), &llm(""), key("sk-1"), None);
         assert!(unset.api_key.is_none());
+        // Its own key wins, on any host.
+        let own = decision_config(
+            &llm("https://api.deepseek.com/v1"),
+            &main,
+            key("sk-1"),
+            key("ds-2"),
+        );
+        assert_eq!(own.api_key.unwrap().expose_secret(), "ds-2");
     }
 
     #[tokio::test]

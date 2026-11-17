@@ -76,6 +76,13 @@ pub fn key_path(data_dir: &Path) -> PathBuf {
     data_dir.join("llm-key")
 }
 
+/// `<data_dir>/llm-key-decision`: the decision model's own API key
+/// (`Settings::decision_llm`), same format. The app and CLI keep it under
+/// the same password as `llm-key`, so one unlock opens both.
+pub fn decision_key_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("llm-key-decision")
+}
+
 /// Encrypts `api_key` under `password` and writes it atomically to `path`,
 /// replacing any existing file.
 pub fn save(

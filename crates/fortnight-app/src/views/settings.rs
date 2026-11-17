@@ -71,6 +71,8 @@ impl fmt::Debug for Typed {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretField {
     ApiKey,
+    /// The decision model's own API key.
+    DecisionKey,
     /// The password pop-up.
     Password,
 }
@@ -110,8 +112,8 @@ pub enum Message {
     /// Put the built-in prompt back in the editor.
     ResetPrompt(PromptKind),
     Secret(SecretField, Typed),
-    /// Submit the API key field: opens the password pop-up.
-    SaveKey,
+    /// Submit that key's field: opens the password pop-up.
+    SaveKey(Which),
     /// Submit the password pop-up.
     SubmitPassword,
     CancelPassword,
@@ -119,9 +121,9 @@ pub enum Message {
     Unlock,
     Lock,
     /// Open the replace-key form.
-    ShowReplace,
+    ShowReplace(Which),
     /// First click on Remove key: ask for confirmation.
-    AskRemove,
+    AskRemove(Which),
     ConfirmRemove,
     /// Close whichever key form or confirmation is open.
     CancelKey,
@@ -151,12 +153,15 @@ pub enum Action {
     /// Send a test request using these endpoint fields and the current key
     /// (same rule as `ListModels`).
     Test(LlmSettings, Which),
-    /// Encrypt and store a new API key (replacing any existing one).
+    /// Encrypt and store a new API key (replacing any existing one): the
+    /// main key, or the decision model's own. If the other key exists,
+    /// `password` must unlock it too: one password for both.
     SetKey {
         api_key: SecretString,
         password: SecretString,
+        which: Which,
     },
-    RemoveKey,
+    RemoveKey(Which),
     Lock,
     /// Show the unlock prompt.
     ShowUnlock,
@@ -170,6 +175,9 @@ pub struct SettingsData {
     pub settings: Settings,
     pub data_dir: PathBuf,
     pub key_state: KeyState,
+    /// The decision model's own key (`vault::decision_key_path`). It locks
+    /// and unlocks together with the main key.
+    pub decision_key_state: KeyState,
     /// Result of the last Test: `Ok(model reply)` or `Err(message)`.
     pub test_result: Option<Result<String, String>>,
     pub testing: bool,
@@ -464,6 +472,7 @@ enum KeyMode {
 #[derive(Default)]
 struct Secrets {
     api_key: String,
+    decision_key: String,
     password: String,
 }
 
@@ -477,12 +486,14 @@ impl Secrets {
     fn field(&mut self, field: SecretField) -> &mut String {
         match field {
             SecretField::ApiKey => &mut self.api_key,
+            SecretField::DecisionKey => &mut self.decision_key,
             SecretField::Password => &mut self.password,
         }
     }
 
     fn wipe_all(&mut self) {
         wipe(&mut self.api_key);
+        wipe(&mut self.decision_key);
         wipe(&mut self.password);
     }
 }
@@ -521,6 +532,10 @@ pub struct SettingsView {
     key_message: Option<Result<String, String>>,
     secrets: Secrets,
     key_mode: KeyMode,
+    decision_key_state: KeyState,
+    /// The key that `key_mode`, the password pop-up and `key_message`
+    /// belong to.
+    key_target: Which,
     /// Local validation error for the key forms.
     key_error: Option<String>,
     models: Option<Result<Vec<String>, String>>,
@@ -548,6 +563,8 @@ impl Default for SettingsView {
             key_message: None,
             secrets: Secrets::default(),
             key_mode: KeyMode::Idle,
+            decision_key_state: KeyState::NoKey,
+            key_target: Which::Main,
             key_error: None,
             models: None,
             listing_models: false,
@@ -576,8 +593,9 @@ impl SettingsView {
             self.plan_editor = text_editor::Content::with_text(&self.form.plan_prompt);
             self.loaded = Some(data.settings);
         }
-        if data.key_state != self.key_state {
+        if data.key_state != self.key_state || data.decision_key_state != self.decision_key_state {
             self.key_state = data.key_state;
+            self.decision_key_state = data.decision_key_state;
             self.key_mode = KeyMode::Idle;
             self.key_error = None;
             self.secrets.wipe_all();
@@ -709,8 +727,13 @@ impl SettingsView {
                 wipe(slot);
                 *slot = value;
             }
-            Message::SaveKey => {
-                if self.secrets.api_key.trim().is_empty() {
+            Message::SaveKey(which) => {
+                if self.key_target != which {
+                    // The other key's form or confirmation closes.
+                    self.key_mode = KeyMode::Idle;
+                    self.key_target = which;
+                }
+                if self.typed_key(which).trim().is_empty() {
                     self.key_error = Some("Enter the API key.".into());
                     return Action::None;
                 }
@@ -729,12 +752,13 @@ impl SettingsView {
                 self.close_key_form();
                 return Action::Lock;
             }
-            Message::ShowReplace => self.open_key_form(KeyMode::Replace),
-            Message::AskRemove => self.open_key_form(KeyMode::ConfirmRemove),
+            Message::ShowReplace(which) => self.open_key_form(which, KeyMode::Replace),
+            Message::AskRemove(which) => self.open_key_form(which, KeyMode::ConfirmRemove),
             Message::ConfirmRemove => {
                 if self.key_mode == KeyMode::ConfirmRemove {
+                    let which = self.key_target;
                     self.close_key_form();
-                    return Action::RemoveKey;
+                    return Action::RemoveKey(which);
                 }
             }
             Message::CancelKey => self.close_key_form(),
@@ -742,9 +766,26 @@ impl SettingsView {
         Action::None
     }
 
-    fn open_key_form(&mut self, mode: KeyMode) {
+    fn open_key_form(&mut self, which: Which, mode: KeyMode) {
         self.close_key_form();
+        self.key_target = which;
         self.key_mode = mode;
+    }
+
+    /// The key typed into `which`'s field.
+    fn typed_key(&self, which: Which) -> &str {
+        match which {
+            Which::Main => &self.secrets.api_key,
+            Which::Decision => &self.secrets.decision_key,
+        }
+    }
+
+    /// The state of `which`'s saved key.
+    fn key_state_of(&self, which: Which) -> KeyState {
+        match which {
+            Which::Main => self.key_state,
+            Which::Decision => self.decision_key_state,
+        }
     }
 
     fn close_key_form(&mut self) {
@@ -755,7 +796,8 @@ impl SettingsView {
     }
 
     fn save_key(&mut self) -> Action {
-        if self.secrets.api_key.trim().is_empty() {
+        let which = self.key_target;
+        if self.typed_key(which).trim().is_empty() {
             self.password_prompt = false;
             return Action::None;
         }
@@ -763,10 +805,14 @@ impl SettingsView {
             self.key_error = Some(e);
             return Action::None;
         }
-        let api_key = SecretString::from(self.secrets.api_key.trim().to_string());
+        let api_key = SecretString::from(self.typed_key(which).trim().to_string());
         let password = take_secret(&mut self.secrets.password);
         self.close_key_form();
-        Action::SetKey { api_key, password }
+        Action::SetKey {
+            api_key,
+            password,
+            which,
+        }
     }
 
     // ------------------------------------------------------------- view
@@ -859,9 +905,24 @@ impl SettingsView {
         .secure(true)
         .on_input(|s| Message::Secret(SecretField::Password, Typed(s)))
         .on_submit(Message::SubmitPassword);
+        let other = match self.key_target {
+            Which::Main => Which::Decision,
+            Which::Decision => Which::Main,
+        };
+        let (title, hint) = if self.key_state_of(other) == KeyState::NoKey {
+            (
+                "Choose a password",
+                "It encrypts the key. It can't be recovered if you forget it.",
+            )
+        } else {
+            (
+                "Enter your key password",
+                "Use the password of your other saved key: one password unlocks both.",
+            )
+        };
         let mut card = column![
-            text("Choose a password").size(theme::TEXT_HEADING),
-            small_muted("It encrypts the key. It can't be recovered if you forget it."),
+            text(title).size(theme::TEXT_HEADING),
+            small_muted(hint),
             field,
         ]
         .spacing(theme::SPACING);
@@ -904,16 +965,31 @@ impl SettingsView {
             container(small_muted(
                 "Optional. Used for Recommended tasks instead of the LLM above, such as a \
                  reasoning model on a local Ollama. When it isn't set, or can't be reached, the \
-                 LLM above is used. It gets the API key only on the same host as the LLM above."
+                 LLM above is used."
             ))
             .width(Fill),
             clear
         ]
         .spacing(theme::SPACING)
         .align_y(Center);
+        let key_hint = small_muted(if self.decision_key_state == KeyState::NoKey {
+            "Its API key, if it needs one. Without it, the key above is used only when the \
+             decision model is on the same host."
+        } else {
+            "Its API key. It locks and unlocks with the key above, under the same password."
+        });
         section(
             "Decision model",
-            column![about, self.endpoint_fields(Which::Decision)].spacing(theme::SPACING),
+            column![
+                about,
+                self.endpoint_fields(Which::Decision),
+                labelled(
+                    "API key",
+                    column![key_hint, self.key_controls(Which::Decision)]
+                        .spacing(theme::SPACING / 2.0)
+                ),
+            ]
+            .spacing(theme::SPACING),
         )
     }
 
@@ -1054,11 +1130,7 @@ impl SettingsView {
                         .width(Fill),
                 )
             }
-            None if which == Which::Main
-                && !self.testing
-                && self.key_state == KeyState::Locked
-                && !local =>
-            {
+            None if !self.testing && self.key_state_of(which) == KeyState::Locked && !local => {
                 test_row = test_row.push(small_muted("The key is locked. Unlock it first."))
             }
             None => {}
@@ -1080,14 +1152,22 @@ impl SettingsView {
     }
 
     fn key_section(&self) -> Element<'_, Message> {
+        section("API key", self.key_controls(Which::Main))
+    }
+
+    /// The saved-key state and its buttons, or the key field, for one key,
+    /// with the last key message if it is about this key.
+    fn key_controls(&self, which: Which) -> Element<'_, Message> {
         let mut body = column![].spacing(theme::SPACING);
         let state = |label: &'static str| {
             container(text(label).size(theme::TEXT_SMALL))
                 .padding(theme::chip_padding())
                 .style(theme::chip)
         };
+        let here = self.key_target == which;
+        let mode = if here { self.key_mode } else { KeyMode::Idle };
 
-        match (self.key_state, self.key_mode) {
+        match (self.key_state_of(which), mode) {
             (_, KeyMode::ConfirmRemove) => {
                 body = body.push(
                     row![
@@ -1102,16 +1182,16 @@ impl SettingsView {
                     .align_y(Center),
                 );
             }
-            (KeyState::NoKey, _) => body = body.push(self.key_input(false)),
-            (_, KeyMode::Replace) => body = body.push(self.key_input(true)),
+            (KeyState::NoKey, _) => body = body.push(self.key_input(which, false)),
+            (_, KeyMode::Replace) => body = body.push(self.key_input(which, true)),
             (KeyState::Locked, KeyMode::Idle) => {
                 body = body.push(
                     row![
                         state("Saved, locked"),
                         secondary("Unlock", Message::Unlock),
-                        secondary("Replace", Message::ShowReplace),
+                        secondary("Replace", Message::ShowReplace(which)),
                         Space::new().width(Fill),
-                        remove_button(),
+                        remove_button(which),
                     ]
                     .spacing(theme::SPACING)
                     .align_y(Center),
@@ -1122,9 +1202,9 @@ impl SettingsView {
                     row![
                         state("Saved, unlocked"),
                         secondary("Lock", Message::Lock),
-                        secondary("Replace", Message::ShowReplace),
+                        secondary("Replace", Message::ShowReplace(which)),
                         Space::new().width(Fill),
-                        remove_button(),
+                        remove_button(which),
                     ]
                     .spacing(theme::SPACING)
                     .align_y(Center),
@@ -1132,8 +1212,8 @@ impl SettingsView {
             }
         }
 
-        if self.password_prompt {
-            // The pop-up shows the error.
+        if !here || self.password_prompt {
+            // Another key's message, or the pop-up shows the error.
         } else if let Some(e) = &self.key_error {
             body = body.push(text(e).size(theme::TEXT_SMALL).style(theme::danger));
         } else {
@@ -1145,16 +1225,19 @@ impl SettingsView {
                 None => {}
             }
         }
-
-        section("API key", body)
+        body.into()
     }
 
-    /// The API key field and Save key (Enter works too).
-    fn key_input(&self, cancellable: bool) -> Element<'_, Message> {
+    /// A key field and Save key (Enter works too).
+    fn key_input(&self, which: Which, cancellable: bool) -> Element<'_, Message> {
+        let (placeholder, field) = match which {
+            Which::Main => ("sk-…", SecretField::ApiKey),
+            Which::Decision => ("Its own API key, if it needs one", SecretField::DecisionKey),
+        };
         let mut line = row![
-            secret_input("sk-…", &self.secrets.api_key, SecretField::ApiKey)
-                .on_submit(Message::SaveKey),
-            primary("Save key", Message::SaveKey),
+            secret_input(placeholder, self.typed_key(which), field)
+                .on_submit(Message::SaveKey(which)),
+            primary("Save key", Message::SaveKey(which)),
         ]
         .spacing(theme::SPACING / 2.0)
         .align_y(Center);
@@ -1392,11 +1475,11 @@ fn cancel_button<'a>() -> Element<'a, Message> {
         .into()
 }
 
-fn remove_button<'a>() -> Element<'a, Message> {
+fn remove_button<'a>(which: Which) -> Element<'a, Message> {
     button(text("Remove key").size(theme::TEXT_BODY))
         .padding([8, 14])
         .style(theme::danger_button)
-        .on_press(Message::AskRemove)
+        .on_press(Message::AskRemove(which))
         .into()
 }
 
@@ -1588,6 +1671,7 @@ mod tests {
             settings,
             data_dir: PathBuf::from("/tmp/fortnight-data"),
             key_state,
+            decision_key_state: KeyState::NoKey,
             test_result: None,
             testing: false,
             key_message: None,
@@ -1711,12 +1795,18 @@ mod tests {
     #[test]
     fn save_key_asks_for_a_password_then_emits() {
         let mut v = loaded(KeyState::NoKey);
-        assert!(matches!(v.update(Message::SaveKey), Action::None));
+        assert!(matches!(
+            v.update(Message::SaveKey(Which::Main)),
+            Action::None
+        ));
         assert!(v.key_error.is_some(), "no key typed");
         assert!(!v.password_prompt);
 
         typed(&mut v, SecretField::ApiKey, " sk-abc ");
-        assert!(matches!(v.update(Message::SaveKey), Action::FocusPassword));
+        assert!(matches!(
+            v.update(Message::SaveKey(Which::Main)),
+            Action::FocusPassword
+        ));
         assert!(v.password_prompt);
         typed(&mut v, SecretField::Password, "short");
         assert!(matches!(v.update(Message::SubmitPassword), Action::None));
@@ -1724,7 +1814,10 @@ mod tests {
         assert!(v.password_prompt, "stays open to fix it");
 
         typed(&mut v, SecretField::Password, "correct horse");
-        let Action::SetKey { api_key, password } = v.update(Message::SubmitPassword) else {
+        let Action::SetKey {
+            api_key, password, ..
+        } = v.update(Message::SubmitPassword)
+        else {
             panic!("expected SetKey");
         };
         assert_eq!(api_key.expose_secret(), "sk-abc");
@@ -1736,7 +1829,7 @@ mod tests {
 
         // Cancel keeps the typed key but drops the password.
         typed(&mut v, SecretField::ApiKey, "sk-2");
-        v.update(Message::SaveKey);
+        v.update(Message::SaveKey(Which::Main));
         typed(&mut v, SecretField::Password, "something long");
         v.update(Message::CancelPassword);
         assert!(!v.password_prompt);
@@ -1852,6 +1945,38 @@ mod tests {
     }
 
     #[test]
+    fn decision_key_has_its_own_field_and_actions() {
+        let mut v = loaded(KeyState::Unlocked);
+        typed(&mut v, SecretField::ApiKey, "sk-main-typed");
+        typed(&mut v, SecretField::DecisionKey, " ds-key ");
+        assert!(matches!(
+            v.update(Message::SaveKey(Which::Decision)),
+            Action::FocusPassword
+        ));
+        typed(&mut v, SecretField::Password, "correct horse");
+        let Action::SetKey {
+            api_key,
+            password,
+            which: Which::Decision,
+        } = v.update(Message::SubmitPassword)
+        else {
+            panic!("expected SetKey for the decision key");
+        };
+        assert_eq!(api_key.expose_secret(), "ds-key");
+        assert_eq!(password.expose_secret(), "correct horse");
+
+        let mut d = data(Settings::default(), KeyState::Unlocked);
+        d.decision_key_state = KeyState::Unlocked;
+        v.load(d);
+        v.update(Message::AskRemove(Which::Decision));
+        assert_eq!(v.key_target, Which::Decision);
+        assert!(matches!(
+            v.update(Message::ConfirmRemove),
+            Action::RemoveKey(Which::Decision)
+        ));
+    }
+
+    #[test]
     fn test_emits_current_fields() {
         let mut v = loaded(KeyState::NoKey);
         assert!(matches!(v.update(Message::Test(Which::Main)), Action::None));
@@ -1876,14 +2001,14 @@ mod tests {
     fn remove_key_needs_confirmation() {
         let mut v = loaded(KeyState::Unlocked);
         assert!(matches!(v.update(Message::ConfirmRemove), Action::None));
-        v.update(Message::AskRemove);
+        v.update(Message::AskRemove(Which::Main));
         assert_eq!(v.key_mode, KeyMode::ConfirmRemove);
         v.update(Message::CancelKey);
         assert_eq!(v.key_mode, KeyMode::Idle);
-        v.update(Message::AskRemove);
+        v.update(Message::AskRemove(Which::Main));
         assert!(matches!(
             v.update(Message::ConfirmRemove),
-            Action::RemoveKey
+            Action::RemoveKey(Which::Main)
         ));
         assert_eq!(v.key_mode, KeyMode::Idle);
     }
@@ -1899,7 +2024,7 @@ mod tests {
     #[test]
     fn key_state_change_closes_forms_and_wipes_secrets() {
         let mut v = loaded(KeyState::Unlocked);
-        v.update(Message::ShowReplace);
+        v.update(Message::ShowReplace(Which::Main));
         typed(&mut v, SecretField::ApiKey, "sk-abc");
         v.load(data(Settings::default(), KeyState::NoKey));
         assert_eq!(v.key_mode, KeyMode::Idle);

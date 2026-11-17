@@ -104,8 +104,10 @@ enum Message {
     /// The export dialog finished: the path written, `None` if cancelled.
     Exported(Result<Option<PathBuf>, String>),
     DismissNotice,
-    Unlocked(Result<SecretString, VaultError>),
-    KeySaved(Result<SecretString, VaultError>),
+    /// The main key and the decision model's key, each if it exists and
+    /// opened with the password.
+    Unlocked(Result<(Option<SecretString>, Option<SecretString>), VaultError>),
+    KeySaved(Result<SavedKey, VaultError>),
     DismissError,
     Shoot,
     Shot(iced::window::Screenshot),
@@ -195,6 +197,10 @@ struct Ready {
 
     key_exists: bool,
     api_key: Option<SecretString>,
+    /// The decision model's own key (`vault::decision_key_path`), under the
+    /// same password: unlocked and locked together with `api_key`.
+    decision_key_exists: bool,
+    decision_key: Option<SecretString>,
 
     generating: HashMap<ReportKey, Generation>,
     last_attempt: HashMap<ReportKey, Timestamp>,
@@ -360,6 +366,7 @@ impl Ready {
         let tz = TimeZone::system();
         let today = Timestamp::now().to_zoned_datetime(tz.clone()).date();
         let key_exists = vault::key_path(&dir).exists();
+        let decision_key_exists = vault::decision_key_path(&dir).exists();
         let (tab, settings_open) = match std::env::var("FORTNIGHT_PAGE").as_deref() {
             Ok("week") => (Tab::Week, false),
             Ok("month") => (Tab::Month, false),
@@ -410,6 +417,8 @@ impl Ready {
             unlocking,
             key_exists,
             api_key: None,
+            decision_key_exists,
+            decision_key: None,
             generating: HashMap::new(),
             last_attempt: HashMap::new(),
             failures: HashMap::new(),
@@ -464,13 +473,25 @@ impl Ready {
     }
 
     /// The client for the decision model (`Settings::decision_llm`) with
-    /// these fields, and its host. It gets the key only on the main
-    /// endpoint's host (`fallback::decision_config`).
+    /// these fields, and its host. It uses its own key if one is saved, and
+    /// otherwise the main key only on the main endpoint's host
+    /// (`fallback::decision_config`).
     fn decision_client_for(
         &self,
         llm: &LlmSettings,
     ) -> Result<(Arc<dyn LlmClient>, Option<String>), String> {
-        let config = fallback::decision_config(llm, &self.settings.llm, self.api_key.clone());
+        if self.decision_key_exists
+            && self.decision_key.is_none()
+            && !secure::is_local_endpoint(&llm.base_url)
+        {
+            return Err("The decision model's API key is locked. Unlock it first.".into());
+        }
+        let config = fallback::decision_config(
+            llm,
+            &self.settings.llm,
+            self.api_key.clone(),
+            self.decision_key.clone(),
+        );
         let host = config.endpoint_host();
         let client = llm::connect(llm.protocol, config).map_err(|e| e.to_string())?;
         Ok((client, host))
@@ -591,6 +612,7 @@ impl Ready {
                 settings: self.settings.clone(),
                 data_dir: self.data_dir.clone(),
                 key_state: self.key_state(),
+                decision_key_state: self.decision_key_state(),
                 test_result: self.test_result.clone(),
                 testing: self.testing,
                 key_message: self.key_message.clone(),
@@ -778,10 +800,20 @@ impl Ready {
     }
 
     fn key_state(&self) -> KeyState {
-        match (self.key_exists, self.api_key.is_some()) {
-            (false, _) => KeyState::NoKey,
-            (true, false) => KeyState::Locked,
-            (true, true) => KeyState::Unlocked,
+        key_state(self.key_exists, &self.api_key)
+    }
+
+    fn decision_key_state(&self) -> KeyState {
+        key_state(self.decision_key_exists, &self.decision_key)
+    }
+
+    /// Both keys together, for the top bar's lock: locked if either saved
+    /// key is.
+    fn any_key_state(&self) -> KeyState {
+        match (self.key_state(), self.decision_key_state()) {
+            (KeyState::NoKey, KeyState::NoKey) => KeyState::NoKey,
+            (KeyState::Locked, _) | (_, KeyState::Locked) => KeyState::Locked,
+            _ => KeyState::Unlocked,
         }
     }
 
@@ -1129,8 +1161,13 @@ impl Ready {
             }
             Message::Unlocked(result) => {
                 match result {
-                    Ok(key) => {
-                        self.api_key = Some(key);
+                    Ok((main, decision)) => {
+                        if main.is_some() {
+                            self.api_key = main;
+                        }
+                        if decision.is_some() {
+                            self.decision_key = decision;
+                        }
                         self.unlocking = false;
                         self.key_message = None;
                     }
@@ -1140,10 +1177,31 @@ impl Ready {
             }
             Message::KeySaved(result) => {
                 match result {
-                    Ok(key) => {
-                        self.api_key = Some(key);
-                        self.key_exists = true;
+                    Ok(saved) => {
+                        let (mine, other) = match saved.which {
+                            settings::Which::Main => {
+                                self.key_exists = true;
+                                (&mut self.api_key, &mut self.decision_key)
+                            }
+                            settings::Which::Decision => {
+                                self.decision_key_exists = true;
+                                (&mut self.decision_key, &mut self.api_key)
+                            }
+                        };
+                        *mine = Some(saved.key);
+                        // The password opened the other key too.
+                        if saved.other.is_some() {
+                            *other = saved.other;
+                        }
                         self.key_message = Some(Ok("Saved.".into()));
+                    }
+                    // Only the check against the other key can say this.
+                    Err(VaultError::WrongPassword) => {
+                        self.key_message = Some(Err(
+                            "That isn't the password of your other saved key. Use the same \
+                             one: it unlocks both."
+                                .into(),
+                        ))
                     }
                     Err(e) => self.key_message = Some(Err(e.to_string())),
                 }
@@ -1206,7 +1264,7 @@ impl Ready {
                 self.update_week_reports()
             }
             top_bar::Message::Lock => {
-                if self.api_key.is_some() {
+                if self.api_key.is_some() || self.decision_key.is_some() {
                     self.lock();
                     Task::none()
                 } else {
@@ -1475,6 +1533,7 @@ impl Ready {
     /// generates them again after the next unlock.
     fn lock(&mut self) {
         self.api_key = None; // dropping the SecretString zeroizes it
+        self.decision_key = None;
         for (_, g) in self.generating.drain() {
             g.abort.abort();
         }
@@ -1487,7 +1546,8 @@ impl Ready {
     }
 
     fn settings_action(&mut self, action: settings::Action) -> Task<Message> {
-        let key_path = vault::key_path(&self.data_dir);
+        let main_path = vault::key_path(&self.data_dir);
+        let decision_path = vault::decision_key_path(&self.data_dir);
         match action {
             settings::Action::None => Task::none(),
             settings::Action::Close => {
@@ -1550,18 +1610,48 @@ impl Ready {
                     Task::none()
                 }
             },
-            settings::Action::SetKey { api_key, password } => {
+            settings::Action::SetKey {
+                api_key,
+                password,
+                which,
+            } => {
                 self.key_message = None;
+                let (path, other) = match which {
+                    settings::Which::Main => {
+                        (main_path, self.decision_key_exists.then_some(decision_path))
+                    }
+                    settings::Which::Decision => {
+                        (decision_path, self.key_exists.then_some(main_path))
+                    }
+                };
                 blocking(
-                    move || vault::save(&key_path, &api_key, &password).map(|()| api_key),
+                    move || {
+                        // One password for both keys: it must open the
+                        // other one, if there is one.
+                        let other = other.map(|p| vault::unlock(&p, &password)).transpose()?;
+                        vault::save(&path, &api_key, &password)?;
+                        Ok(SavedKey {
+                            which,
+                            key: api_key,
+                            other,
+                        })
+                    },
                     Message::KeySaved,
                 )
             }
-            settings::Action::RemoveKey => {
-                match vault::remove(&key_path) {
+            settings::Action::RemoveKey(which) => {
+                let (path, exists, key) = match which {
+                    settings::Which::Main => (main_path, &mut self.key_exists, &mut self.api_key),
+                    settings::Which::Decision => (
+                        decision_path,
+                        &mut self.decision_key_exists,
+                        &mut self.decision_key,
+                    ),
+                };
+                match vault::remove(&path) {
                     Ok(()) => {
-                        self.key_exists = false;
-                        self.api_key = None;
+                        *exists = false;
+                        *key = None;
                         self.key_message = Some(Ok("API key removed.".into()));
                     }
                     Err(e) => self.key_message = Some(Err(e.to_string())),
@@ -1580,9 +1670,23 @@ impl Ready {
         }
     }
 
+    /// Opens both saved keys with `password`. Fails only if it opens
+    /// neither.
     fn unlock(&mut self, password: SecretString) -> Task<Message> {
-        let path = vault::key_path(&self.data_dir);
-        blocking(move || vault::unlock(&path, &password), Message::Unlocked)
+        let main = self.key_exists.then(|| vault::key_path(&self.data_dir));
+        let decision = self
+            .decision_key_exists
+            .then(|| vault::decision_key_path(&self.data_dir));
+        blocking(
+            move || {
+                let open = |p: Option<PathBuf>| p.map(|p| vault::unlock(&p, &password)).transpose();
+                match (open(main), open(decision)) {
+                    (Err(e), Err(_) | Ok(None)) | (Ok(None), Err(e)) => Err(e),
+                    (main, decision) => Ok((main.ok().flatten(), decision.ok().flatten())),
+                }
+            },
+            Message::Unlocked,
+        )
     }
 
     // ---- view ----
@@ -1602,7 +1706,7 @@ impl Ready {
             selected: self.selected,
             today,
             schedule: &self.settings.schedule,
-            lock: match self.key_state() {
+            lock: match self.any_key_state() {
                 KeyState::NoKey => None,
                 KeyState::Locked => Some(LockIcon::Locked),
                 KeyState::Unlocked => Some(LockIcon::Unlocked),
@@ -1780,6 +1884,22 @@ fn restore_snapshot(
 }
 
 /// Runs blocking work (Argon2) off the UI thread.
+/// A key `SetKey` saved, and the other key if the password opened it.
+#[derive(Debug, Clone)]
+struct SavedKey {
+    which: settings::Which,
+    key: SecretString,
+    other: Option<SecretString>,
+}
+
+fn key_state(exists: bool, key: &Option<SecretString>) -> KeyState {
+    match (exists, key.is_some()) {
+        (false, _) => KeyState::NoKey,
+        (true, false) => KeyState::Locked,
+        (true, true) => KeyState::Unlocked,
+    }
+}
+
 fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, VaultError> + Send + 'static,
     done: fn(Result<T, VaultError>) -> Message,

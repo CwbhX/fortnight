@@ -4,6 +4,11 @@
 //! then the saved settings. Key precedence: `FORTNIGHT_LLM_API_KEY`, then
 //! the key file (password from `--password-stdin` or a terminal prompt),
 //! otherwise no key. The key is never printed, logged or saved.
+//!
+//! The saved decision model (`Settings::decision_llm`, recommended tasks
+//! only) has its own optional key: `FORTNIGHT_DECISION_API_KEY`, then
+//! `llm-key-decision`, opened with the same password in the same prompt.
+//! Without one it borrows the main key on the main endpoint's host.
 
 use crate::args::LlmArgs;
 use crate::error::{CliError, CliResult};
@@ -14,7 +19,7 @@ use fortnight_core::secure;
 use fortnight_core::vault::{self, VaultError};
 use secrecy::SecretString;
 use std::io::BufRead;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// A client and where it points (for `Report::endpoint_host`).
@@ -58,34 +63,101 @@ pub fn resolve_key(
     stdin: &mut dyn BufRead,
     prompt: &mut dyn FnMut() -> std::io::Result<String>,
 ) -> CliResult<Option<SecretString>> {
-    if env_key.is_some() {
-        return Ok(env_key);
+    let needs = KeyNeeds {
+        main: true,
+        decision: false,
+    };
+    let (key, _) = resolve_keys(
+        data_dir,
+        needs,
+        (env_key, None),
+        password_stdin,
+        stdin,
+        prompt,
+    )?;
+    Ok(key)
+}
+
+/// Which saved keys a run needs: a local endpoint needs none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyNeeds {
+    pub main: bool,
+    pub decision: bool,
+}
+
+/// The main key and the decision model's key for this run, like
+/// `resolve_key`: an environment key (`env` = `FORTNIGHT_LLM_API_KEY`,
+/// `FORTNIGHT_DECISION_API_KEY`) wins; otherwise each needed key file that
+/// exists is opened with one password, asked for once. Both files share
+/// that password (the app keeps them so). It fails only if the password
+/// opens none of them.
+pub fn resolve_keys(
+    data_dir: &Path,
+    needs: KeyNeeds,
+    env: (Option<SecretString>, Option<SecretString>),
+    password_stdin: bool,
+    stdin: &mut dyn BufRead,
+    prompt: &mut dyn FnMut() -> std::io::Result<String>,
+) -> CliResult<(Option<SecretString>, Option<SecretString>)> {
+    let (env_main, env_decision) = env;
+    let file = |needed: bool, env: &Option<SecretString>, path: PathBuf| {
+        (needed && env.is_none() && path.exists()).then_some(path)
+    };
+    let main_path = file(needs.main, &env_main, vault::key_path(data_dir));
+    let decision_path = file(
+        needs.decision,
+        &env_decision,
+        vault::decision_key_path(data_dir),
+    );
+    if main_path.is_none() && decision_path.is_none() {
+        return Ok((env_main, env_decision));
     }
-    let path = vault::key_path(data_dir);
-    if !path.exists() {
-        return Ok(None);
+    let password = read_password(password_stdin, stdin, prompt)?;
+    let open = |p: Option<PathBuf>| p.map(|p| vault::unlock(&p, &password)).transpose();
+    match (open(main_path), open(decision_path)) {
+        (Err(e), Err(_) | Ok(None)) | (Ok(None), Err(e)) => Err(match e {
+            VaultError::WrongPassword => CliError::failure("wrong password"),
+            e => CliError::failure(e.to_string()),
+        }),
+        (main, decision) => Ok((
+            env_main.or(main.ok().flatten()),
+            env_decision.or(decision.ok().flatten()),
+        )),
     }
-    let password = if password_stdin {
+}
+
+/// One line of `stdin` with `password_stdin`, otherwise `prompt`'s answer.
+fn read_password(
+    password_stdin: bool,
+    stdin: &mut dyn BufRead,
+    prompt: &mut dyn FnMut() -> std::io::Result<String>,
+) -> CliResult<SecretString> {
+    if password_stdin {
         let mut line = String::new();
         stdin.read_line(&mut line)?;
         // Only the line ending goes; a password may end in a space.
         while line.ends_with(['\n', '\r']) {
             line.pop();
         }
-        SecretString::from(line)
+        Ok(SecretString::from(line))
     } else {
         let line = prompt().map_err(|e| {
             CliError::failure(format!(
                 "cannot read the key password: {e}. Use --password-stdin or set FORTNIGHT_LLM_API_KEY."
             ))
         })?;
-        SecretString::from(line)
-    };
-    match vault::unlock(&path, &password) {
-        Ok(key) => Ok(Some(key)),
-        Err(VaultError::WrongPassword) => Err(CliError::failure("wrong password")),
-        Err(e) => Err(CliError::failure(e.to_string())),
+        Ok(SecretString::from(line))
     }
+}
+
+/// `FORTNIGHT_DECISION_API_KEY`, if set and non-empty: the decision
+/// model's key for this process only, never persisted. Takes precedence
+/// over its key file.
+pub fn decision_env_key() -> Option<SecretString> {
+    std::env::var("FORTNIGHT_DECISION_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .map(|k| SecretString::from(k.trim().to_string()))
 }
 
 /// The client for these settings and this key, or a configuration error
@@ -106,16 +178,18 @@ pub fn build_client(llm: &LlmSettings, api_key: Option<SecretString>) -> CliResu
 }
 
 /// Adds the saved decision model to `handle`, unless it isn't configured
-/// or can't be built. `main` is the endpoint `handle` talks to; the
-/// decision model gets `key` only on that host.
+/// or can't be built. `main` is the endpoint `handle` talks to. The
+/// decision model uses `decision_key` if given, otherwise `main_key` only on
+/// that host.
 pub fn with_decision(
     mut handle: LlmHandle,
     decision: &LlmSettings,
     main: &LlmSettings,
-    key: Option<SecretString>,
+    main_key: Option<SecretString>,
+    decision_key: Option<SecretString>,
 ) -> LlmHandle {
     if decision.is_configured() {
-        let config = fallback::decision_config(decision, main, key);
+        let config = fallback::decision_config(decision, main, main_key, decision_key);
         let host = config.endpoint_host();
         handle.decision = llm::connect(decision.protocol, config)
             .ok()
@@ -147,27 +221,29 @@ pub fn connect_from_settings(
              FORTNIGHT_LLM_BASE_URL and FORTNIGHT_LLM_MODEL, or with --base-url and --model.",
         ));
     }
-    let env_key = llm::env_api_key();
-    // A local endpoint (Ollama, LM Studio) needs no key: don't ask for the
-    // password. `FORTNIGHT_LLM_API_KEY` still applies, for a local proxy.
-    if env_key.is_none() && secure::is_local_endpoint(&llm.base_url) {
-        return Ok(with_decision(
-            build_client(&llm, None)?,
-            &decision,
-            &llm,
-            None,
-        ));
-    }
+    // A local endpoint (Ollama, LM Studio) needs no key: its file isn't
+    // opened. The environment keys still apply, for a local proxy.
+    let needs = KeyNeeds {
+        main: !secure::is_local_endpoint(&llm.base_url),
+        decision: decision.is_configured() && !secure::is_local_endpoint(&decision.base_url),
+    };
     let stdin = std::io::stdin();
-    let key = resolve_key(
+    let (main_key, decision_key) = resolve_keys(
         data_dir,
-        env_key,
+        needs,
+        (llm::env_api_key(), decision_env_key()),
         flags.password_stdin,
         &mut stdin.lock(),
         &mut || rpassword::prompt_password("API key password: "),
     )?;
-    let handle = build_client(&llm, key.clone())?;
-    Ok(with_decision(handle, &decision, &llm, key))
+    let handle = build_client(&llm, main_key.clone())?;
+    Ok(with_decision(
+        handle,
+        &decision,
+        &llm,
+        main_key,
+        decision_key,
+    ))
 }
 
 #[cfg(test)]
@@ -320,6 +396,69 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.message.contains("--password-stdin"));
+    }
+
+    #[test]
+    fn one_password_opens_both_key_files() {
+        let dir = temp_dir("both-keys");
+        let pw = secret("correct horse");
+        vault::save(&vault::key_path(&dir), &secret("sk-main"), &pw).unwrap();
+        vault::save(&vault::decision_key_path(&dir), &secret("sk-dec"), &pw).unwrap();
+        let both = KeyNeeds {
+            main: true,
+            decision: true,
+        };
+        let mut prompts = 0;
+        let (main, decision) =
+            resolve_keys(&dir, both, (None, None), false, &mut &b""[..], &mut || {
+                prompts += 1;
+                Ok("correct horse".into())
+            })
+            .unwrap();
+        assert_eq!(prompts, 1);
+        assert_eq!(main.unwrap().expose_secret(), "sk-main");
+        assert_eq!(decision.unwrap().expose_secret(), "sk-dec");
+
+        // A local main endpoint: only the decision key is opened.
+        let decision_only = KeyNeeds {
+            main: false,
+            decision: true,
+        };
+        let (main, decision) = resolve_keys(
+            &dir,
+            decision_only,
+            (None, None),
+            true,
+            &mut &b"correct horse\n"[..],
+            &mut no_prompt(),
+        )
+        .unwrap();
+        assert!(main.is_none());
+        assert_eq!(decision.unwrap().expose_secret(), "sk-dec");
+
+        // Environment keys win and need no password.
+        let (main, decision) = resolve_keys(
+            &dir,
+            both,
+            (Some(secret("env-main")), Some(secret("env-dec"))),
+            false,
+            &mut &b""[..],
+            &mut no_prompt(),
+        )
+        .unwrap();
+        assert_eq!(main.unwrap().expose_secret(), "env-main");
+        assert_eq!(decision.unwrap().expose_secret(), "env-dec");
+
+        let err = resolve_keys(
+            &dir,
+            both,
+            (None, None),
+            true,
+            &mut &b"wrong password\n"[..],
+            &mut no_prompt(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("wrong password"), "{err}");
     }
 
     #[test]
