@@ -166,7 +166,8 @@ pub fn build_client(llm: &LlmSettings, api_key: Option<SecretString>) -> CliResu
     let config = LlmConfig {
         base_url: llm.base_url.trim().to_string(),
         model: llm.model.trim().to_string(),
-        api_key,
+        // A keyless endpoint never gets a key.
+        api_key: api_key.filter(|_| !llm.keyless),
     };
     let endpoint_host = config.endpoint_host();
     let client = llm::connect(llm.protocol, config).map_err(|e| CliError::usage(e.to_string()))?;
@@ -221,11 +222,13 @@ pub fn connect_from_settings(
              FORTNIGHT_LLM_BASE_URL and FORTNIGHT_LLM_MODEL, or with --base-url and --model.",
         ));
     }
-    // A local endpoint (Ollama, LM Studio) needs no key: its file isn't
-    // opened. The environment keys still apply, for a local proxy.
+    // A keyless or local endpoint (Ollama, LM Studio) needs no key: its
+    // file isn't opened, so there is no password prompt. The environment
+    // keys still apply to a local one, for a local proxy.
+    let needs_key = |e: &LlmSettings| !e.keyless && !secure::is_local_endpoint(&e.base_url);
     let needs = KeyNeeds {
-        main: !secure::is_local_endpoint(&llm.base_url),
-        decision: decision.is_configured() && !secure::is_local_endpoint(&decision.base_url),
+        main: needs_key(&llm),
+        decision: decision.is_configured() && needs_key(&decision),
     };
     let stdin = std::io::stdin();
     let (main_key, decision_key) = resolve_keys(
@@ -280,6 +283,7 @@ mod tests {
             protocol: Protocol::OpenAi,
             base_url: "http://saved/v1".into(),
             model: "saved".into(),
+            keyless: false,
         };
         let env = |name: &str| match name {
             "FORTNIGHT_LLM_BASE_URL" => Some("http://env/v1".to_string()),
@@ -462,6 +466,20 @@ mod tests {
     }
 
     #[test]
+    fn keyless_endpoint_never_gets_the_key() {
+        let lan = |keyless| LlmSettings {
+            protocol: Protocol::OpenAi,
+            base_url: "http://192.168.1.20:11434/v1".into(),
+            model: "llama3.2".into(),
+            keyless,
+        };
+        // With the key, plain http to another machine is refused...
+        assert!(build_client(&lan(false), Some(secret("sk-1"))).is_err());
+        // ...but a keyless endpoint drops the key and connects.
+        assert!(build_client(&lan(true), Some(secret("sk-1"))).is_ok());
+    }
+
+    #[test]
     fn unconfigured_endpoint_is_a_usage_error() {
         let err = build_client(&LlmSettings::default(), None).err().unwrap();
         assert_eq!(err.code, 2);
@@ -470,6 +488,7 @@ mod tests {
                 protocol: Protocol::OpenAi,
                 base_url: "http://user:pw@localhost:11434/v1".into(),
                 model: "m".into(),
+                keyless: false,
             },
             None,
         )

@@ -19,10 +19,11 @@ use secrecy::SecretString;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// The config for the decision endpoint. It uses its own key
-/// (`decision_key`, from `vault::decision_key_path`) when there is one.
-/// Otherwise it borrows `main_key` only when it is on the same host as
-/// `main`, so a key never goes to a provider it wasn't saved for.
+/// The config for the decision endpoint. A keyless one gets no key. It
+/// uses its own key (`decision_key`, from `vault::decision_key_path`) when
+/// there is one. Otherwise it borrows `main_key` only when it is on the
+/// same host as `main`, so a key never goes to a provider it wasn't saved
+/// for.
 pub fn decision_config(
     decision: &LlmSettings,
     main: &LlmSettings,
@@ -34,6 +35,9 @@ pub fn decision_config(
         model: llm.model.trim().to_string(),
         api_key,
     };
+    if decision.keyless {
+        return config(decision, None);
+    }
     if decision_key.is_some() {
         return config(decision, decision_key);
     }
@@ -198,6 +202,7 @@ mod tests {
             protocol: Protocol::OpenAi,
             base_url: url.into(),
             model: "m".into(),
+            keyless: false,
         };
         use secrecy::ExposeSecret;
         let key = |k: &str| Some(SecretString::from(k.to_string()));
@@ -229,6 +234,14 @@ mod tests {
             key("ds-2"),
         );
         assert_eq!(own.api_key.unwrap().expose_secret(), "ds-2");
+        // A keyless endpoint gets no key, even its own or on the main host.
+        let mut lan = llm("https://api.openai.com/v1");
+        lan.keyless = true;
+        assert!(
+            decision_config(&lan, &main, key("sk-1"), key("ds-2"))
+                .api_key
+                .is_none()
+        );
     }
 
     #[tokio::test]

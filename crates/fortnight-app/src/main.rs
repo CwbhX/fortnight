@@ -466,10 +466,14 @@ impl Ready {
         }
     }
 
-    /// The saved key is locked and `llm` needs it. A local endpoint (Ollama,
-    /// LM Studio) works without: it gets the key only if it is unlocked.
+    /// The saved key is locked and `llm` needs it. A keyless endpoint never
+    /// needs it; a local one (Ollama, LM Studio) works without it and gets
+    /// it only if it is unlocked.
     fn key_locked_for(&self, llm: &LlmSettings) -> bool {
-        self.key_exists && self.api_key.is_none() && !secure::is_local_endpoint(&llm.base_url)
+        self.key_exists
+            && self.api_key.is_none()
+            && !llm.keyless
+            && !secure::is_local_endpoint(&llm.base_url)
     }
 
     /// The client for the decision model (`Settings::decision_llm`) with
@@ -482,6 +486,7 @@ impl Ready {
     ) -> Result<(Arc<dyn LlmClient>, Option<String>), String> {
         if self.decision_key_exists
             && self.decision_key.is_none()
+            && !llm.keyless
             && !secure::is_local_endpoint(&llm.base_url)
         {
             return Err("The decision model's API key is locked. Unlock it first.".into());
@@ -519,7 +524,7 @@ impl Ready {
         let config = LlmConfig {
             base_url: llm.base_url.trim().to_string(),
             model: llm.model.trim().to_string(),
-            api_key: self.api_key.clone(),
+            api_key: self.api_key.clone().filter(|_| !llm.keyless),
         };
         let host = config.endpoint_host();
         let client = llm::connect(llm.protocol, config).map_err(|e| e.to_string())?;

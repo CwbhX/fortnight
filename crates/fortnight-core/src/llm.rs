@@ -289,6 +289,7 @@ mod tests {
             protocol: Protocol::OpenAi,
             base_url: "http://saved/v1".into(),
             model: "saved".into(),
+            keyless: false,
         };
         let out = with_overrides(&base, |name| match name {
             "FORTNIGHT_LLM_PROTOCOL" => Some("Anthropic".into()),

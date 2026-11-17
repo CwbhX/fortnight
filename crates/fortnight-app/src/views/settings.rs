@@ -95,6 +95,8 @@ pub enum Message {
     PickModel(Which, String),
     /// Fill in a local Ollama server's endpoint and load its models.
     UseOllama(Which),
+    /// The endpoint needs no API key.
+    Keyless(Which, bool),
     /// Empty the decision model fields (recommendations use the main LLM).
     ClearDecision,
     FocusHours(String),
@@ -312,6 +314,7 @@ struct Endpoint {
     protocol: Protocol,
     base_url: String,
     model: String,
+    keyless: bool,
 }
 
 impl Endpoint {
@@ -320,6 +323,7 @@ impl Endpoint {
             protocol: llm.protocol,
             base_url: llm.base_url.clone(),
             model: llm.model.clone(),
+            keyless: llm.keyless,
         }
     }
 
@@ -328,6 +332,7 @@ impl Endpoint {
             protocol: self.protocol,
             base_url: self.base_url.trim().to_string(),
             model: self.model.trim().to_string(),
+            keyless: self.keyless,
         }
     }
 }
@@ -656,12 +661,14 @@ impl SettingsView {
             Message::Protocol(w, p) => form.endpoint_mut(w).protocol = p,
             Message::BaseUrl(w, s) => form.endpoint_mut(w).base_url = s,
             Message::Model(w, s) | Message::PickModel(w, s) => form.endpoint_mut(w).model = s,
+            Message::Keyless(w, on) => form.endpoint_mut(w).keyless = on,
             Message::ClearDecision => form.decision = Endpoint::default(),
             Message::FocusHours(s) => form.focus_hours = s,
             Message::UseOllama(w) => {
                 let e = form.endpoint_mut(w);
                 e.protocol = Protocol::OpenAi;
                 e.base_url = OLLAMA_BASE_URL.into();
+                e.keyless = true;
                 return self.update(Message::LoadModels(w));
             }
             Message::LoadModels(w) => {
@@ -972,7 +979,9 @@ impl SettingsView {
         ]
         .spacing(theme::SPACING)
         .align_y(Center);
-        let key_hint = small_muted(if self.decision_key_state == KeyState::NoKey {
+        let key_hint = small_muted(if d.keyless {
+            "Not used: this endpoint needs no API key."
+        } else if self.decision_key_state == KeyState::NoKey {
             "Its API key, if it needs one. Without it, the key above is used only when the \
              decision model is on the same host."
         } else {
@@ -1076,8 +1085,9 @@ impl SettingsView {
         };
         let local = is_local_endpoint(&f.base_url);
         let hint_text = match f.protocol {
+            _ if f.keyless => "No API key is sent to this endpoint.",
             _ if local => {
-                "A local endpoint: no API key needed. Reasoning models work; their thinking is hidden."
+                "A local endpoint: it works without a key. Reasoning models work; their thinking is hidden."
             }
             Protocol::OpenAi => {
                 "Any OpenAI-compatible endpoint works, such as Ollama at http://localhost:11434/v1."
@@ -1090,12 +1100,22 @@ impl SettingsView {
             .padding([4, 10])
             .style(theme::secondary_button)
             .on_press_maybe(
-                (f.protocol != Protocol::OpenAi || f.base_url.trim() != OLLAMA_BASE_URL)
+                (f.protocol != Protocol::OpenAi
+                    || f.base_url.trim() != OLLAMA_BASE_URL
+                    || !f.keyless)
                     .then_some(Message::UseOllama(which)),
             );
-        let hint = row![container(small_muted(hint_text)).width(Fill), use_ollama]
-            .spacing(theme::SPACING)
-            .align_y(Center);
+        let keyless = checkbox(f.keyless)
+            .label("No API key needed")
+            .text_size(theme::TEXT_SMALL)
+            .on_toggle(move |on| Message::Keyless(which, on));
+        let hint = row![
+            container(small_muted(hint_text)).width(Fill),
+            keyless,
+            use_ollama
+        ]
+        .spacing(theme::SPACING)
+        .align_y(Center);
 
         let testing_here = self.testing && self.tested == which;
         let test_label = if testing_here {
@@ -1130,7 +1150,11 @@ impl SettingsView {
                         .width(Fill),
                 )
             }
-            None if !self.testing && self.key_state_of(which) == KeyState::Locked && !local => {
+            None if !self.testing
+                && self.key_state_of(which) == KeyState::Locked
+                && !local
+                && !f.keyless =>
+            {
                 test_row = test_row.push(small_muted("The key is locked. Unlock it first."))
             }
             None => {}
@@ -1152,7 +1176,18 @@ impl SettingsView {
     }
 
     fn key_section(&self) -> Element<'_, Message> {
-        section("API key", self.key_controls(Which::Main))
+        let controls = self.key_controls(Which::Main);
+        if !self.form.main.keyless {
+            return section("API key", controls);
+        }
+        section(
+            "API key",
+            column![
+                small_muted("Not used: the LLM above needs no API key."),
+                controls
+            ]
+            .spacing(theme::SPACING / 2.0),
+        )
     }
 
     /// The saved-key state and its buttons, or the key field, for one key,
@@ -1974,6 +2009,30 @@ mod tests {
             v.update(Message::ConfirmRemove),
             Action::RemoveKey(Which::Decision)
         ));
+    }
+
+    #[test]
+    fn keyless_is_per_endpoint_and_saved() {
+        let mut v = loaded(KeyState::Locked);
+        v.update(Message::BaseUrl(
+            Which::Main,
+            "http://192.168.1.20:11434/v1".into(),
+        ));
+        v.update(Message::Model(Which::Main, "llama3.2".into()));
+        v.update(Message::Keyless(Which::Main, true));
+        v.update(Message::UseOllama(Which::Decision));
+        let Action::Save(saved) = v.update(Message::Save) else {
+            panic!("expected Save");
+        };
+        assert!(saved.llm.keyless);
+        assert!(saved.decision_llm.keyless, "Use local Ollama ticks it");
+        v.load(data(saved, KeyState::Locked));
+        v.update(Message::Keyless(Which::Main, false));
+        let Action::Save(saved) = v.update(Message::Save) else {
+            panic!("expected Save");
+        };
+        assert!(!saved.llm.keyless);
+        assert!(saved.decision_llm.keyless);
     }
 
     #[test]

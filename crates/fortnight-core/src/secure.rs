@@ -30,7 +30,8 @@ pub(crate) fn check_key_transport(config: &LlmConfig) -> Result<(), LlmError> {
         return Ok(());
     }
     Err(LlmError::Connection(format!(
-        "refusing to send the API key over plain http to {}; use https",
+        "refusing to send the API key over plain http to {}; use https, or mark the \
+         endpoint as needing no API key",
         url_host(url)
     )))
 }

@@ -413,6 +413,10 @@ pub struct LlmSettings {
     /// `/v1`).
     pub base_url: String,
     pub model: String,
+    /// The endpoint needs no API key (Ollama, LM Studio, a self-hosted
+    /// server): no key is sent to it and none has to be unlocked for it.
+    /// Missing in older data, which therefore loads as `false`.
+    pub keyless: bool,
 }
 
 impl LlmSettings {
@@ -589,6 +593,7 @@ mod tests {
         assert_eq!(s.focus_minutes_per_day, DEFAULT_FOCUS_MINUTES);
         assert!(!s.notifications);
         assert!(!s.decision_llm.is_configured());
+        assert!(!s.llm.keyless);
     }
 
     #[test]
