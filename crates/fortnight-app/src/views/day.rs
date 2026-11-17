@@ -17,7 +17,8 @@
 //!   line dated today (replacing that day's others), so it reaches the
 //!   weekly summary as `log_lines`. Older side work lines show up as lines
 //!   of the notes. Other days show their notes read only, if any.
-//! - **Completed**, collapsed: tasks completed on the shown day.
+//! - **Completed**, collapsed: done tasks planned for the shown day (as the
+//!   Week tab shows them) or completed on it.
 //! - **No date**, collapsed: open tasks with no planned day (the inbox).
 //! - **Deleted**, collapsed: every deleted task, newest first, each a quiet
 //!   card with Restore and Delete forever, and Delete all in the header
@@ -307,7 +308,12 @@ fn completed_on(task: &Task, tz: &TimeZone) -> Option<Date> {
 pub fn section_of(task: &Task, day: Date, today: Date, tz: &TimeZone) -> Option<Section> {
     match task.status {
         TaskStatus::Dropped => return Some(Section::Deleted),
-        TaskStatus::Done => return (completed_on(task, tz) == Some(day)).then_some(Section::Done),
+        // On the day it was planned for (as on the Week tab) and on the day
+        // it was finished.
+        TaskStatus::Done => {
+            let shown = task.day() == Some(day) || completed_on(task, tz) == Some(day);
+            return shown.then_some(Section::Done);
+        }
         TaskStatus::Todo | TaskStatus::Doing => {}
     }
     let shows_today = day == today;
@@ -2085,6 +2091,18 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    #[test]
+    fn a_task_done_early_shows_on_its_day_and_the_day_it_was_done() {
+        let wed = date(2026, 11, 18);
+        let early = done_on(planned(task(1, "early", None), wed), today());
+        for day in [today(), wed] {
+            let data = data_for(day, vec![early.clone()]);
+            assert_eq!(ids(&section_tasks(&data, Section::Done)), vec![1], "{day}");
+        }
+        let thu = data_for(date(2026, 11, 19), vec![early]);
+        assert!(section_tasks(&thu, Section::Done).is_empty());
     }
 
     #[test]
