@@ -18,6 +18,10 @@
 //! The summary is also kept up to date in the background from its scheduled
 //! day and time. An edited summary is never regenerated.
 
+mod shell {
+    pub(crate) mod dev;
+}
+
 use fortnight_app::app_icon;
 use fortnight_app::theme;
 use fortnight_app::top_bar::{self, LockIcon, Tab};
@@ -56,6 +60,7 @@ use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp, ZonedDateTime};
 use secrecy::SecretString;
+use shell::dev::{self, data_dir_flag, forced_theme, save_screenshot, shoot_after_delay};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -446,12 +451,7 @@ impl Ready {
         let today = Timestamp::now().to_zoned_datetime(tz.clone()).date();
         let key_exists = vault::key_path(&dir).exists();
         let decision_key_exists = vault::decision_key_path(&dir).exists();
-        let (tab, settings_open) = match std::env::var("FORTNIGHT_PAGE").as_deref() {
-            Ok("week") => (Tab::Week, false),
-            Ok("month") => (Tab::Month, false),
-            Ok("settings") => (Tab::Today, true),
-            _ => (Tab::Today, false),
-        };
+        let (tab, settings_open) = dev::start_page();
         // One writer at a time (PLAN.md 3.5): warn, never refuse.
         let (lock, notice) = match datadir::acquire_lock(&dir) {
             Ok((lock, None)) => (Some(lock), None),
@@ -2483,16 +2483,6 @@ fn shortcut_for(key: Key<&str>, modifiers: keyboard::Modifiers) -> Option<Shortc
     }
 }
 
-/// Dev aid: `FORTNIGHT_THEME=light|dark` overrides the system theme (for
-/// screenshots of both).
-fn forced_theme() -> Option<bool> {
-    match std::env::var("FORTNIGHT_THEME").as_deref() {
-        Ok("dark") => Some(true),
-        Ok("light") => Some(false),
-        _ => None,
-    }
-}
-
 /// The saved key is locked (`exists` but not open) and `llm` needs it
 /// (`secure::needs_saved_key`).
 fn key_locked(exists: bool, key: &Option<SecretString>, llm: &LlmSettings) -> bool {
@@ -2652,49 +2642,6 @@ fn blocking<T: Send + 'static>(
         },
         done,
     )
-}
-
-/// `--data-dir <path>` or `--data-dir=<path>`.
-fn data_dir_flag() -> Option<PathBuf> {
-    let mut args = std::env::args_os().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--data-dir" {
-            return args.next().map(PathBuf::from);
-        }
-        if let Some(v) = arg.to_str().and_then(|s| s.strip_prefix("--data-dir=")) {
-            return Some(PathBuf::from(v));
-        }
-    }
-    None
-}
-
-/// Dev aid: with `FORTNIGHT_SCREENSHOT=<path>`, the app screenshots its own
-/// window after two seconds, writes `<width> <height>\n` + raw RGBA to
-/// `<path>`, and exits. Lets a headless agent check what renders.
-fn shoot_after_delay() -> Task<Message> {
-    if std::env::var_os("FORTNIGHT_SCREENSHOT").is_none() {
-        return Task::none();
-    }
-    // `FORTNIGHT_SCREENSHOT_DELAY` (seconds) waits longer, e.g. for the
-    // Ollama check.
-    let secs = std::env::var("FORTNIGHT_SCREENSHOT_DELAY")
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(2);
-    Task::perform(tokio::time::sleep(Duration::from_secs(secs)), |_| {
-        Message::Shoot
-    })
-}
-
-fn save_screenshot(shot: iced::window::Screenshot) -> Task<Message> {
-    if let Some(path) = std::env::var_os("FORTNIGHT_SCREENSHOT") {
-        let mut bytes = format!("{} {}\n", shot.size.width, shot.size.height).into_bytes();
-        bytes.extend_from_slice(&shot.rgba);
-        if let Err(e) = std::fs::write(&path, bytes) {
-            eprintln!("screenshot: {e}");
-        }
-    }
-    iced::exit()
 }
 
 #[cfg(test)]
