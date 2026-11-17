@@ -1,0 +1,106 @@
+---
+source: crates/fortnight-core/src/report.rs
+expression: facts
+---
+{
+  "week_start": "2026-11-09",
+  "week_end": "2026-11-15",
+  "completed": [
+    {
+      "id": 1,
+      "title": "Ship login page",
+      "project": "Website",
+      "completed_on": "2026-11-11",
+      "completed_weekday": "Wednesday",
+      "notes": "Released behind the `new-login` flag; 5% of users so far."
+    },
+    {
+      "id": 10,
+      "title": "Book venue",
+      "project": "Hiring",
+      "completed_on": "2026-11-12",
+      "completed_weekday": "Thursday"
+    },
+    {
+      "id": 2,
+      "title": "Fix flaky CI job",
+      "project": null,
+      "completed_on": "2026-11-13",
+      "completed_weekday": "Friday"
+    }
+  ],
+  "in_progress": [
+    {
+      "id": 9,
+      "title": "Hiring rubric",
+      "project": "Hiring",
+      "due_on": null,
+      "due_weekday": null
+    }
+  ],
+  "missed": [
+    {
+      "id": 6,
+      "title": "Vendor contract review",
+      "project": "Finance",
+      "due_on": "2026-11-12",
+      "due_weekday": "Thursday",
+      "days_overdue": 3,
+      "notes": "Waiting on legal <legal@example.com> to reply."
+    },
+    {
+      "id": 7,
+      "title": "Write onboarding doc",
+      "project": "Website",
+      "due_on": "2026-11-15",
+      "due_weekday": "Sunday",
+      "days_overdue": 0
+    }
+  ],
+  "next_week": [
+    {
+      "id": 5,
+      "title": "Migrate analytics",
+      "project": "Website",
+      "due_on": "2026-11-20",
+      "due_weekday": "Friday"
+    },
+    {
+      "id": 11,
+      "title": "Renew certificates",
+      "project": null,
+      "due_on": "2026-11-22",
+      "due_weekday": "Sunday"
+    }
+  ],
+  "added": [
+    {
+      "id": 8,
+      "title": "Plan team offsite",
+      "project": null,
+      "created_on": "2026-11-10",
+      "status": "todo"
+    },
+    {
+      "id": 10,
+      "title": "Book venue",
+      "project": "Hiring",
+      "created_on": "2026-11-10",
+      "status": "done"
+    }
+  ],
+  "completed_by_project": [
+    {
+      "project": "Hiring",
+      "completed": 1
+    },
+    {
+      "project": "Website",
+      "completed": 1
+    },
+    {
+      "project": null,
+      "completed": 1
+    }
+  ]
+}

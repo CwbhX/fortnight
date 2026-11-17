@@ -1,0 +1,36 @@
+---
+source: crates/fortnight-core/src/report.rs
+expression: summary_facts_markdown(&facts)
+---
+**Week:** Mon 9 Nov to Sun 15 Nov 2026
+
+### Completed (3)
+
+- Ship login page — *Website* · Wed 11 Nov
+- Book venue — *Hiring* · Thu 12 Nov
+- Fix flaky CI job · Fri 13 Nov
+
+### In progress (1)
+
+- Hiring rubric — *Hiring*
+
+### Still open, due by the week's end (2)
+
+- Vendor contract review — *Finance* · due Thu 12 Nov (3 days overdue)
+- Write onboarding doc — *Website* · due Sun 15 Nov (due on the last day)
+
+### Due next week (2)
+
+- Migrate analytics — *Website* · due Fri 20 Nov
+- Renew certificates · due Sun 22 Nov
+
+### Added (2)
+
+- Plan team offsite · Tue 10 Nov
+- Book venue — *Hiring* · Tue 10 Nov (done)
+
+### Completed by project
+
+- Hiring: 1
+- Website: 1
+- No project: 1
