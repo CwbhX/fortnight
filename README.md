@@ -6,6 +6,28 @@ Fortnight is a portable todo app. It keeps your tasks and their history in a SQL
 
 Created in [T3 Code](https://t3.codes).
 
+## Quick start
+
+1. Install Rust from [rustup.rs](https://rustup.rs). On macOS, also run `xcode-select --install`. On Windows, also install the [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the "Desktop development with C++" workload.
+2. Get the code and build it:
+
+   ```
+   git clone https://github.com/CwbhX/fortnight.git
+   cd fortnight
+   cargo build --release --locked
+   ```
+
+   The first build downloads the pinned Rust version and every dependency, and takes a few minutes.
+3. Start the app:
+
+   ```
+   ./target/release/fortnight
+   ```
+
+   On Windows, run `target\release\fortnight.exe`. On macOS you can run `cargo xtask bundle` instead, which makes `target/bundle/Fortnight.app`.
+
+Your data goes in a `fortnight-data` folder beside the program, here `target/release/fortnight-data`. To keep it somewhere else, start the app with `--data-dir <folder>`. To set up the LLM, see [First run](#first-run).
+
 ## What it does
 
 - Three tabs show the same tasks around one selected date. Today lists overdue tasks, the day's tasks and a collapsed No date inbox. Week has a column per working day with a load bar, and the report panel below. Month is a calendar; click a day or a week to open it. `‹` and `›` move by a day, a week or a month, and Today jumps back.
