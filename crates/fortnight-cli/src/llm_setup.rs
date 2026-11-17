@@ -295,10 +295,7 @@ pub fn connect_from_settings(
         uses_decision,
         Process {
             var: &|n| std::env::var(n).ok(),
-            keys: (
-                llm::env_api_key(),
-                llm::env_decision_api_key(),
-            ),
+            keys: (llm::env_api_key(), llm::env_decision_api_key()),
             stdin: &mut stdin.lock(),
             prompt: &mut || rpassword::prompt_password("API key password: "),
         },
