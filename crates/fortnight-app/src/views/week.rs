@@ -407,7 +407,10 @@ fn task_row(task: &Task) -> Element<'_, Message> {
 fn markdown_settings() -> markdown::Settings {
     markdown::Settings::with_text_size(
         theme::TEXT_BODY,
-        markdown::Style::from_palette(theme::theme_for(false).palette()),
+        markdown::Style {
+            font: theme::FONT,
+            ..markdown::Style::from_palette(theme::theme_for(false).palette())
+        },
     )
 }
 

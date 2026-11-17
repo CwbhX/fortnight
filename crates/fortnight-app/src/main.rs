@@ -124,7 +124,11 @@ impl App {
                 ready.refresh();
                 let tasks = Task::batch([
                     iced::system::theme().map(Message::ThemeMode),
-                    TasksView::focus_quick_add().map(Message::Tasks),
+                    if ready.unlocking {
+                        UnlockView::focus().map(Message::Unlock)
+                    } else {
+                        TasksView::focus_quick_add().map(Message::Tasks)
+                    },
                     start,
                     shoot_after_delay(),
                 ]);
