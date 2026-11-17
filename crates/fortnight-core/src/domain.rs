@@ -538,6 +538,58 @@ pub struct Settings {
     pub plan_prompt: String,
     /// Which app icon to show.
     pub app_icon: AppIcon,
+    /// The accent colour of selected tabs, primary buttons, checkboxes,
+    /// badges and focus rings. Missing in older data: orange.
+    pub accent: Accent,
+}
+
+/// The app's accent colour, picked in Settings. The app maps each to its
+/// RGB (`theme::accent_color`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Accent {
+    #[default]
+    Orange,
+    Olive,
+    Sage,
+    Green,
+    Emerald,
+    Teal,
+    Blue,
+    Purple,
+    Magenta,
+    Red,
+}
+
+impl Accent {
+    /// Every choice, in the order Settings shows them.
+    pub const ALL: [Accent; 10] = [
+        Accent::Orange,
+        Accent::Olive,
+        Accent::Sage,
+        Accent::Green,
+        Accent::Emerald,
+        Accent::Teal,
+        Accent::Blue,
+        Accent::Purple,
+        Accent::Magenta,
+        Accent::Red,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Accent::Orange => "Orange",
+            Accent::Olive => "Olive",
+            Accent::Sage => "Sage",
+            Accent::Green => "Green",
+            Accent::Emerald => "Emerald",
+            Accent::Teal => "Teal",
+            Accent::Blue => "Blue",
+            Accent::Purple => "Purple",
+            Accent::Magenta => "Magenta",
+            Accent::Red => "Red",
+        }
+    }
 }
 
 /// The app icon: the Dock icon on macOS, the window and taskbar icon
@@ -564,6 +616,7 @@ impl Default for Settings {
             summary_prompt: String::new(),
             plan_prompt: String::new(),
             app_icon: AppIcon::System,
+            accent: Accent::Orange,
         }
     }
 }
@@ -587,6 +640,19 @@ mod tests {
         assert!(json.contains(r#""app_icon":"dark""#));
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.app_icon, AppIcon::Dark);
+    }
+
+    #[test]
+    fn accent_defaults_to_orange_and_round_trips() {
+        let old: Settings = serde_json::from_str(r#"{"app_icon":"dark"}"#).unwrap();
+        assert_eq!(old.accent, Accent::Orange);
+        let teal = Settings {
+            accent: Accent::Teal,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&teal).unwrap();
+        assert!(json.contains(r#""accent":"teal""#));
+        assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), teal);
     }
 
     #[test]

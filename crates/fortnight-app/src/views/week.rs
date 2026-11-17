@@ -492,9 +492,9 @@ fn rank_badge<'a>(rank: usize, done: bool) -> Element<'a, Message> {
     .style(move |_: &Theme| container::Style {
         background: Some(
             if done {
-                theme::ACCENT.scale_alpha(0.4)
+                theme::accent_color().scale_alpha(0.4)
             } else {
-                theme::ACCENT
+                theme::accent_color()
             }
             .into(),
         ),
@@ -936,7 +936,7 @@ fn slot<'a>(line: bool) -> Element<'a, Message> {
             .width(Fill)
             .height(3)
             .style(|_: &Theme| container::Style {
-                background: Some(theme::ACCENT.into()),
+                background: Some(theme::accent_color().into()),
                 border: iced::border::rounded(2),
                 ..container::Style::default()
             })
@@ -1090,9 +1090,9 @@ fn drop_target(is_today: bool, over: bool) -> impl Fn(&Theme) -> container::Styl
             return base;
         }
         container::Style {
-            background: Some(theme::ACCENT.scale_alpha(0.08).into()),
+            background: Some(theme::accent_color().scale_alpha(0.08).into()),
             border: iced::Border {
-                color: theme::ACCENT,
+                color: theme::accent_color(),
                 width: 2.0,
                 ..base.border
             },

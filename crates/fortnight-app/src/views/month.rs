@@ -282,7 +282,7 @@ fn week_label<'a>(week: WeekRef, summary: bool) -> Element<'a, Message> {
     if summary {
         label = label.push(
             container(Space::new().width(6).height(6)).style(|_: &Theme| container::Style {
-                background: Some(theme::ACCENT.into()),
+                background: Some(theme::accent_color().into()),
                 border: border::rounded(3),
                 ..container::Style::default()
             }),

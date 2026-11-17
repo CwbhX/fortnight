@@ -1373,7 +1373,7 @@ fn task_card_style(done: bool, selected: bool) -> impl Fn(&Theme, button::Status
             background: Some(tinted(theme, amount).into()),
             text_color: theme.palette().text,
             border: border::rounded(theme::RADIUS).width(1).color(if selected {
-                theme::ACCENT.scale_alpha(0.7)
+                theme::accent_color().scale_alpha(0.7)
             } else {
                 Color::TRANSPARENT
             }),
@@ -1506,7 +1506,7 @@ fn drop_line<'a>(show: bool) -> Element<'a, Message> {
     container(Space::new().height(3))
         .width(Fill)
         .style(move |_: &Theme| container::Style {
-            background: show.then(|| theme::ACCENT.into()),
+            background: show.then(|| theme::accent_color().into()),
             border: border::rounded(2),
             ..container::Style::default()
         })
@@ -1548,7 +1548,7 @@ fn rank_badge<'a>(rank: usize) -> Element<'a, Message> {
     .center_x(20)
     .center_y(20)
     .style(|_: &Theme| container::Style {
-        background: Some(theme::ACCENT.into()),
+        background: Some(theme::accent_color().into()),
         border: border::rounded(999),
         ..container::Style::default()
     })
@@ -1647,7 +1647,7 @@ fn priority_picker<'a>(current: Priority, suggested: Option<Priority>) -> Elemen
 fn suggested_tab(t: &Theme, status: button::Status) -> button::Style {
     let mut style = theme::tab_button(false)(t, status);
     style.border = border::rounded(theme::RADIUS - 2.0)
-        .color(theme::ACCENT.scale_alpha(0.6))
+        .color(theme::accent_color().scale_alpha(0.6))
         .width(1.0);
     style
 }
@@ -1747,7 +1747,7 @@ fn project_menu(theme: &Theme) -> menu::Style {
             .color(theme::muted_color(theme).scale_alpha(0.25)),
         text_color: p.text,
         selected_text_color: Color::WHITE,
-        selected_background: theme::ACCENT.into(),
+        selected_background: theme::accent_color().into(),
         shadow: iced::Shadow {
             color: Color::BLACK.scale_alpha(0.3),
             offset: iced::Vector::new(0.0, 6.0),

@@ -44,13 +44,13 @@
 //! and a confirmation before closing with unsaved changes. Notifications are
 //! parked: the setting is kept but not shown.
 
-use fortnight_core::domain::{AppIcon, LlmSettings, Protocol, Schedule, Settings};
+use fortnight_core::domain::{Accent, AppIcon, LlmSettings, Protocol, Schedule, Settings};
 use fortnight_core::ollama::{self, DEFAULT_BASE_URL as OLLAMA_BASE_URL, ModelKind, OllamaModel};
 use fortnight_core::report::{DEFAULT_PLAN_PROMPT, DEFAULT_SUMMARY_PROMPT};
 use fortnight_core::vault::MIN_PASSWORD_LEN;
 use iced::widget::{
     Space, button, checkbox, column, container, opaque, operation, pick_list, row, rule,
-    scrollable, stack, text, text_editor, text_input,
+    scrollable, stack, text, text_editor, text_input, tooltip,
 };
 use iced::{Background, Border, Center, Color, Element, Fill, Theme};
 use jiff::civil::{Time, Weekday};
@@ -137,6 +137,8 @@ pub enum Message {
     /// Close whichever key form or confirmation is open.
     CancelKey,
     AppIcon(AppIcon),
+    /// A colour swatch: the accent colour, applied on Save.
+    Accent(Accent),
 }
 
 /// Which endpoint a field, button or request is for: the main LLM, or the
@@ -446,6 +448,7 @@ struct Form {
     /// Parked: carried through unchanged.
     notifications: bool,
     app_icon: AppIcon,
+    accent: Accent,
     /// The prompts as shown and edited.
     summary_prompt: String,
     plan_prompt: String,
@@ -485,6 +488,7 @@ impl Form {
             focus_hours: format_hours(s.focus_minutes_per_day),
             notifications: s.notifications,
             app_icon: s.app_icon,
+            accent: s.accent,
             summary_prompt: summary_shown.clone(),
             plan_prompt: match s.plan_prompt.trim() {
                 "" => DEFAULT_PLAN_PROMPT.to_string(),
@@ -526,6 +530,7 @@ impl Form {
             focus_minutes_per_day: parse_hours(&self.focus_hours)?,
             notifications: self.notifications,
             app_icon: self.app_icon,
+            accent: self.accent,
             summary_prompt,
             plan_prompt: stored_prompt(&self.plan_prompt, DEFAULT_PLAN_PROMPT),
         })
@@ -856,6 +861,7 @@ impl SettingsView {
             }
             Message::WeekStart(d) => form.week_start = d,
             Message::AppIcon(choice) => form.app_icon = choice,
+            Message::Accent(accent) => form.accent = accent,
             Message::SummaryDay(d) => form.summary_day = d,
             Message::SummaryTime(s) => form.summary_time = s,
             Message::PlanDay(d) => form.plan_day = d,
@@ -1429,7 +1435,16 @@ impl SettingsView {
         .text_size(theme::TEXT_BODY)
         .width(180)
         .style(picker);
-        section("Appearance", labelled("App icon", icon))
+        let swatches = row(Accent::ALL
+            .into_iter()
+            .map(|a| swatch(a, self.form.accent == a)))
+        .spacing(theme::SPACING / 2.0)
+        .align_y(Center);
+        section(
+            "Appearance",
+            column![labelled("Color", swatches), labelled("App icon", icon)]
+                .spacing(theme::SPACING),
+        )
     }
 
     fn data_section(&self) -> Element<'_, Message> {
@@ -1443,6 +1458,47 @@ impl SettingsView {
 }
 
 // ------------------------------------------------------------ view helpers
+
+/// A round colour swatch for an accent choice: a ring around it when it
+/// is the one picked (a faint one on hover), its name on hover.
+fn swatch<'a>(accent: Accent, picked: bool) -> Element<'a, Message> {
+    let color = theme::choice_color(accent);
+    let dot =
+        container(Space::new().width(22).height(22)).style(move |_: &Theme| container::Style {
+            background: Some(color.into()),
+            border: Border {
+                radius: 999.0.into(),
+                ..Border::default()
+            },
+            ..container::Style::default()
+        });
+    let ring = move |_: &Theme, status: button::Status| {
+        let ring = match (picked, status) {
+            (true, _) => color,
+            (false, button::Status::Hovered | button::Status::Pressed) => color.scale_alpha(0.45),
+            _ => Color::TRANSPARENT,
+        };
+        button::Style {
+            border: Border {
+                radius: 999.0.into(),
+                width: 2.0,
+                color: ring,
+            },
+            ..button::Style::default()
+        }
+    };
+    tooltip(
+        button(dot)
+            .padding(3)
+            .style(ring)
+            .on_press(Message::Accent(accent)),
+        container(text(accent.label()).size(theme::TEXT_SMALL))
+            .padding([4, 8])
+            .style(theme::card),
+        tooltip::Position::Bottom,
+    )
+    .into()
+}
 
 fn section<'a>(heading: &'a str, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     column![theme::section_heading(heading), body.into()]
@@ -1596,7 +1652,7 @@ fn picker(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
         )
     };
     let ring = match status {
-        pick_list::Status::Opened { .. } => theme::ACCENT,
+        pick_list::Status::Opened { .. } => theme::accent_color(),
         pick_list::Status::Hovered => mix(0.15),
         pick_list::Status::Active => Color::TRANSPARENT,
     };
@@ -1899,6 +1955,18 @@ mod tests {
         );
         assert_eq!(s.summary_instructions, "");
         assert_eq!(s.plan_prompt, "", "the built-in prompt is stored as empty");
+    }
+
+    #[test]
+    fn accent_choice_saves() {
+        let mut v = loaded(KeyState::NoKey);
+        assert_eq!(v.form.accent, Accent::Orange);
+        v.update(Message::Accent(Accent::Purple));
+        assert!(v.is_dirty());
+        let Action::Save(s) = v.update(Message::Save) else {
+            panic!("expected Save");
+        };
+        assert_eq!(s.accent, Accent::Purple);
     }
 
     #[test]

@@ -410,6 +410,7 @@ impl Ready {
         datadir::ensure(&dir).map_err(|e| e.to_string())?;
         let store = SqliteStore::open(&datadir::db_path(&dir)).map_err(|e| e.to_string())?;
         let settings = store.load_settings().map_err(|e| e.to_string())?;
+        theme::set_accent(settings.accent);
         let tasks = store.list_tasks().map_err(|e| e.to_string())?;
         let events = store
             .events_between(Timestamp::MIN, Timestamp::MAX)
@@ -1889,6 +1890,7 @@ impl Ready {
                 }
                 match self.store.save_settings(&s) {
                     Ok(()) => {
+                        theme::set_accent(s.accent);
                         self.settings = s;
                         self.settings_open = false;
                     }

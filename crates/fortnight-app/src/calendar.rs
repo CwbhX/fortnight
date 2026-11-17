@@ -188,10 +188,13 @@ fn calendar_day(
     let p = theme.palette();
     let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
     let (background, text_color) = if selected {
-        (Some(theme::ACCENT.into()), Color::WHITE)
+        (Some(theme::accent_color().into()), Color::WHITE)
     } else if today {
         let shade = if hovered || in_range { 0.32 } else { 0.18 };
-        (Some(theme::ACCENT.scale_alpha(shade).into()), theme::ACCENT)
+        (
+            Some(theme::accent_color().scale_alpha(shade).into()),
+            theme::accent_color(),
+        )
     } else {
         let color = if in_month || in_range {
             p.text
@@ -200,7 +203,7 @@ fn calendar_day(
         };
         let fill = if in_range {
             Some(
-                theme::ACCENT
+                theme::accent_color()
                     .scale_alpha(if hovered { 0.24 } else { 0.14 })
                     .into(),
             )

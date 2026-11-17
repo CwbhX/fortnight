@@ -1,8 +1,9 @@
 //! Theme and shared styles. Owner: orchestrator (round 2; was agent E).
 //! Views may add private style helpers in their own files.
 //!
-//! Follows the system light/dark theme. One accent colour, `#ea580c`, used
-//! sparingly (primary buttons, focus rings, checked boxes). Generous spacing,
+//! Follows the system light/dark theme. One accent colour, picked in
+//! Settings (orange `#ea580c` by default; [`accent_color`]), used sparingly
+//! (primary buttons, selected tabs, focus rings, checked boxes). Generous spacing,
 //! no borders where whitespace will do. Other views use the constants and
 //! style functions here so the app looks like one thing.
 //!
@@ -15,7 +16,7 @@
 //!
 //! # Constants
 //!
-//! - [`ACCENT`]: the accent colour.
+//! - [`accent_color`]: the accent colour in use (Settings picks it, [`set_accent`]).
 //! - [`SPACING`]: the base spacing unit; use multiples of it.
 //! - [`RADIUS`]: corner radius for cards, inputs and buttons.
 //! - [`TEXT_SMALL`], [`TEXT_BODY`], [`TEXT_HEADING`], [`TEXT_TITLE`]: sizes.
@@ -70,19 +71,54 @@
 //!   overlay (Settings).
 //! - [`priority_color`]: the colour of a priority marker.
 
+use fortnight_core::domain::Accent;
 use iced::border::{self, Border};
 use iced::theme::{Palette, palette};
 use iced::widget::{
     button, container, progress_bar, rich_text, span, stack, svg, text, text_editor, text_input,
 };
 use iced::{Background, Color, Element, Padding, Theme, color};
+use std::sync::atomic::{AtomicU32, Ordering};
 
-/// The accent colour, `#ea580c`.
-pub const ACCENT: Color = Color::from_rgb(
-    0xea as f32 / 255.0,
-    0x58 as f32 / 255.0,
-    0x0c as f32 / 255.0,
-);
+/// The accent colour in use (`0xRRGGBB`): Settings' choice, which
+/// `main.rs` applies with [`set_accent`]. Orange until then.
+static ACCENT_RGB: AtomicU32 = AtomicU32::new(0xea580c);
+
+/// Each accent choice's colour as `0xRRGGBB`.
+fn accent_rgb(accent: Accent) -> u32 {
+    match accent {
+        Accent::Orange => 0xea580c,
+        Accent::Olive => 0x797758,
+        Accent::Sage => 0x647c6b,
+        Accent::Green => 0x4c8602,
+        Accent::Emerald => 0x06885a,
+        Accent::Teal => 0x308480,
+        Accent::Blue => 0x0474e9,
+        Accent::Purple => 0x7864de,
+        Accent::Magenta => 0xb54eb2,
+        Accent::Red => 0xdc3552,
+    }
+}
+
+fn rgb_color(rgb: u32) -> Color {
+    Color::from_rgb8((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
+}
+
+/// The colour of an accent choice (for the Settings swatches).
+pub fn choice_color(accent: Accent) -> Color {
+    rgb_color(accent_rgb(accent))
+}
+
+/// Uses `accent` everywhere from the next frame on.
+pub fn set_accent(accent: Accent) {
+    ACCENT_RGB.store(accent_rgb(accent), Ordering::Relaxed);
+}
+
+/// The accent colour in use: selected tabs, primary buttons, checkboxes,
+/// badges, focus rings. Orange unless Settings picked another.
+pub fn accent_color() -> Color {
+    rgb_color(ACCENT_RGB.load(Ordering::Relaxed))
+}
 
 /// The app's one typeface, Inter, bundled and loaded by `main.rs`. Use it
 /// wherever a widget sets a font explicitly (e.g. `markdown::Style::font`):
@@ -111,7 +147,8 @@ pub const CONTENT_WIDTH: f32 = 760.0;
 const LIGHT: Palette = Palette {
     background: color!(0xfcfcfb),
     text: color!(0x1c1917),
-    primary: ACCENT,
+    // Replaced by the accent in use (`theme_for`).
+    primary: color!(0xea580c),
     success: color!(0x15803d),
     warning: color!(0xb45309),
     danger: color!(0xdc2626),
@@ -120,7 +157,8 @@ const LIGHT: Palette = Palette {
 const DARK: Palette = Palette {
     background: color!(0x1a1918),
     text: color!(0xe7e5e4),
-    primary: ACCENT,
+    // Replaced by the accent in use (`theme_for`).
+    primary: color!(0xea580c),
     success: color!(0x4ade80),
     warning: color!(0xfbbf24),
     danger: color!(0xf87171),
@@ -129,11 +167,16 @@ const DARK: Palette = Palette {
 /// The app theme for light (`dark = false`) or dark mode, with the accent.
 /// `main.rs` picks `dark` from the system setting (see the module doc).
 pub fn theme_for(dark: bool) -> Theme {
-    if dark {
-        Theme::custom_with_fn("Fortnight Dark", DARK, extended)
+    let (name, base) = if dark {
+        ("Fortnight Dark", DARK)
     } else {
-        Theme::custom_with_fn("Fortnight Light", LIGHT, extended)
-    }
+        ("Fortnight Light", LIGHT)
+    };
+    let palette = Palette {
+        primary: accent_color(),
+        ..base
+    };
+    Theme::custom_with_fn(name, palette, extended)
 }
 
 /// iced's generated palette, with white text on the accent and the
@@ -217,7 +260,7 @@ pub fn danger(theme: &Theme) -> text::Style {
 /// Accent-coloured text. Use rarely.
 pub fn accent(_theme: &Theme) -> text::Style {
     text::Style {
-        color: Some(ACCENT),
+        color: Some(accent_color()),
     }
 }
 
@@ -279,7 +322,7 @@ fn faded(style: button::Style) -> button::Style {
 /// The one main action on screen: accent fill, white text.
 pub fn primary_button(theme: &Theme, status: button::Status) -> button::Style {
     let palette = theme.extended_palette();
-    let base = button_base(Some(ACCENT), Color::WHITE);
+    let base = button_base(Some(accent_color()), Color::WHITE);
     match status {
         button::Status::Active => base,
         button::Status::Hovered | button::Status::Pressed => {
@@ -342,7 +385,7 @@ pub fn row_button(theme: &Theme, status: button::Status) -> button::Style {
 pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
     let palette = theme.extended_palette();
     let ring = match status {
-        text_input::Status::Focused { .. } => ACCENT,
+        text_input::Status::Focused { .. } => accent_color(),
         text_input::Status::Hovered => tint(theme, 0.15),
         _ => Color::TRANSPARENT,
     };
@@ -425,7 +468,7 @@ pub fn tab_button(active: bool) -> impl Fn(&Theme, button::Status) -> button::St
         let p = theme.palette();
         if active {
             button::Style {
-                background: Some(ACCENT.into()),
+                background: Some(accent_color().into()),
                 text_color: Color::WHITE,
                 border: border::rounded(RADIUS - 2.0),
                 shadow: iced::Shadow {
@@ -525,7 +568,7 @@ pub fn day_column(is_today: bool) -> impl Fn(&Theme) -> container::Style {
         border: Border {
             radius: RADIUS.into(),
             width: if is_today { 1.5 } else { 0.0 },
-            color: ACCENT,
+            color: accent_color(),
         },
         ..container::Style::default()
     }
@@ -558,7 +601,7 @@ pub fn calendar_cell(cell: Cell) -> impl Fn(&Theme) -> container::Style {
             border: Border {
                 radius: (RADIUS - 2.0).into(),
                 width: if cell.today { 1.5 } else { 0.0 },
-                color: ACCENT,
+                color: accent_color(),
             },
             ..container::Style::default()
         }
@@ -582,7 +625,7 @@ pub fn load_bar(theme: &Theme) -> progress_bar::Style {
 pub fn load_bar_done(_theme: &Theme) -> progress_bar::Style {
     progress_bar::Style {
         background: Background::Color(Color::TRANSPARENT),
-        bar: Background::Color(ACCENT),
+        bar: Background::Color(accent_color()),
         border: border::rounded(999),
     }
 }
@@ -614,7 +657,7 @@ pub fn overlay_panel(theme: &Theme) -> container::Style {
 pub fn priority_color(theme: &Theme, priority: u8) -> Option<Color> {
     match priority {
         0 => None,
-        1 => Some(ACCENT),
+        1 => Some(accent_color()),
         _ => Some(danger_color(theme)),
     }
 }
@@ -663,8 +706,8 @@ mod tests {
     fn themes_use_the_accent_and_report_their_mode() {
         let light = theme_for(false);
         let dark = theme_for(true);
-        assert_eq!(light.palette().primary, ACCENT);
-        assert_eq!(dark.palette().primary, ACCENT);
+        assert_eq!(light.palette().primary, accent_color());
+        assert_eq!(dark.palette().primary, accent_color());
         assert!(!light.extended_palette().is_dark);
         assert!(dark.extended_palette().is_dark);
     }

@@ -431,10 +431,10 @@ pub fn md(content: &markdown::Content, size: f32) -> Element<'_, Message> {
             border: border::rounded(4),
         },
         inline_code_padding: Padding::from([0, 2]),
-        inline_code_color: theme::ACCENT,
+        inline_code_color: theme::accent_color(),
         inline_code_font: Font::MONOSPACE,
         code_block_font: Font::MONOSPACE,
-        link_color: theme::ACCENT,
+        link_color: theme::accent_color(),
     };
     // iced's defaults (h1 twice the body) are too loud inside a panel.
     let settings = markdown::Settings {
