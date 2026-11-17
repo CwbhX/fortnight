@@ -35,7 +35,13 @@
 //! The statuses `Doing` (in progress) are shown as plain open tasks; the app
 //! no longer sets it.
 //!
-//! Skipped for the prototype: drag ordering, strikethrough on done tasks
+//! The Tasks section is in manual order (`Task::position`) and can be
+//! rearranged by dragging a card: a copy follows the pointer and an accent
+//! line shows where it will land; letting go renumbers the section (1, 2,
+//! 3, …). A press let go without moving is a click (it opens the card).
+//! The other sections keep their own order and don't drag.
+//!
+//! Skipped for the prototype: undo for a drag, strikethrough on done tasks
 //! (iced text has none), and adding side work to a day other than today
 //! (`Action::AddLog` has no date; main.rs stamps it now).
 
@@ -46,10 +52,10 @@ use fortnight_core::parse;
 use fortnight_core::week::add_months;
 use iced::widget::overlay::menu;
 use iced::widget::{
-    Column, Row, Space, button, checkbox, column, combo_box, container, row, scrollable, text,
-    text_editor, text_input,
+    Column, Row, Space, button, checkbox, column, combo_box, container, mouse_area, pin, row,
+    scrollable, stack, text, text_editor, text_input,
 };
-use iced::{Center, Color, Element, Fill, Theme, border};
+use iced::{Center, Color, Element, Fill, Point, Theme, border, mouse};
 use jiff::Timestamp;
 use jiff::civil::{Date, Weekday};
 use jiff::tz::TimeZone;
@@ -101,6 +107,59 @@ pub enum Message {
     ToggleShowDone,
     ToggleShowNoDate,
     ToggleShowDeleted,
+    /// The mouse went down on a Tasks card.
+    Press(TaskId),
+    /// The pointer moved while a card is held (position in the tab).
+    Moved(Point),
+    /// The pointer entered a card (or, while dragging, the space after the
+    /// last card).
+    Enter(Spot),
+    /// The pointer left a card.
+    Leave(TaskId),
+    /// A dragged card was let go there.
+    DropOn(Spot),
+    /// The mouse button went up anywhere: the drag (if any) is over.
+    EndDrag,
+}
+
+impl Message {
+    /// Pointer bookkeeping that changes no data: `main.rs` skips its
+    /// refresh for these, as they arrive with every mouse move.
+    pub fn is_pointer_move(&self) -> bool {
+        matches!(
+            self,
+            Message::Press(_)
+                | Message::Moved(_)
+                | Message::Enter(_)
+                | Message::Leave(_)
+                | Message::EndDrag
+        )
+    }
+}
+
+/// Where in the Tasks section a dragged card would land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spot {
+    /// Before this task's card.
+    Before(TaskId),
+    /// After the last card.
+    End,
+}
+
+/// How far the pointer must move before a press becomes a drag.
+const DRAG_THRESHOLD: f32 = 4.0;
+
+/// A held Tasks card.
+#[derive(Debug, Clone, PartialEq)]
+struct Drag {
+    id: TaskId,
+    /// Where the pointer was first seen after the press.
+    start: Option<Point>,
+    /// Where it is now.
+    at: Option<Point>,
+    /// Moved past `DRAG_THRESHOLD`: a drag, not a click.
+    active: bool,
+    over: Option<Spot>,
 }
 
 /// What `main.rs` must do.
@@ -123,6 +182,8 @@ pub enum Action {
     DeleteLog(EventId),
     /// Create a task (the add-a-task input). `main.rs` records it for undo.
     Add(NewTask),
+    /// The Tasks section was rearranged: set each task's position.
+    Reorder(Vec<(TaskId, f64)>),
 }
 
 /// A task the model recommends doing today.
@@ -181,6 +242,10 @@ pub struct DayView {
     day_log: String,
     /// The add-a-task input.
     quick_add: String,
+    /// A held Tasks card.
+    drag: Option<Drag>,
+    /// The Tasks card under the pointer.
+    hovered: Option<TaskId>,
 }
 
 /// Where a task is shown on the Today tab.
@@ -278,8 +343,8 @@ fn placed_section(data: &DayData, task: &Task) -> Option<Section> {
 }
 
 /// The tasks in `section`, sorted. Recommended: the model's order.
-/// Overdue: oldest deadline first, then [`open_order`]. The day and No
-/// date: [`open_order`]. Completed: most recently finished first. Deleted:
+/// Overdue: oldest deadline first, then [`open_order`]. The day: manual
+/// order (`position`). No date: [`open_order`]. Completed: most recently finished first. Deleted:
 /// most recently deleted first.
 pub fn section_tasks(data: &DayData, section: Section) -> Vec<&Task> {
     if section == Section::Recommended {
@@ -293,7 +358,9 @@ pub fn section_tasks(data: &DayData, section: Section) -> Vec<&Task> {
     match section {
         Section::Recommended => {}
         Section::Overdue => out.sort_by(|a, b| a.due_on.cmp(&b.due_on).then(open_order(a, b))),
-        Section::Day | Section::NoDate => out.sort_by(|a, b| open_order(a, b)),
+        // The day's tasks are in manual order (drag to rearrange).
+        Section::Day => out.sort_by(|a, b| a.position.total_cmp(&b.position).then(a.id.cmp(&b.id))),
+        Section::NoDate => out.sort_by(|a, b| open_order(a, b)),
         Section::Done | Section::Deleted => out.sort_by(|a, b| {
             let when = |t: &Task| t.completed_at.unwrap_or(t.updated_at);
             when(b).cmp(&when(a)).then(a.id.cmp(&b.id))
@@ -745,6 +812,55 @@ impl DayView {
                     TaskStatus::Todo
                 },
             ),
+            Message::Press(id) => {
+                self.drag = Some(Drag {
+                    id,
+                    start: None,
+                    at: None,
+                    active: false,
+                    over: None,
+                });
+                Action::None
+            }
+            Message::Moved(p) => {
+                if let Some(drag) = &mut self.drag {
+                    let start = *drag.start.get_or_insert(p);
+                    drag.at = Some(p);
+                    if !drag.active && start.distance(p) > DRAG_THRESHOLD {
+                        drag.active = true;
+                    }
+                }
+                Action::None
+            }
+            Message::Enter(spot) => {
+                if let Spot::Before(id) = spot {
+                    self.hovered = Some(id);
+                }
+                if let Some(drag) = self.drag.as_mut().filter(|d| d.active) {
+                    drag.over = Some(spot);
+                }
+                Action::None
+            }
+            Message::Leave(id) => {
+                if self.hovered == Some(id) {
+                    self.hovered = None;
+                }
+                Action::None
+            }
+            Message::DropOn(spot) => {
+                let Some(drag) = self.drag.take().filter(|d| d.active) else {
+                    return Action::None;
+                };
+                let order: Vec<&Task> = section_tasks(data, Section::Day);
+                reorder(&order, drag.id, spot)
+                    .map(Action::Reorder)
+                    .unwrap_or(Action::None)
+            }
+            // A press let go before it became a drag is a click.
+            Message::EndDrag => match self.drag.take() {
+                Some(drag) if !drag.active => self.update(Message::Expand(drag.id)),
+                _ => Action::None,
+            },
             Message::Expand(id) => {
                 if self.editing.as_ref().is_some_and(|f| f.id == id) {
                     self.editing = None;
@@ -897,7 +1013,7 @@ impl DayView {
         let day_group = if day_tasks.is_empty() {
             column![heading]
         } else {
-            column![heading, self.rows(day_tasks, data)]
+            column![heading, self.sortable_rows(day_tasks, data)]
         };
         content = content.push(day_group.push(quick_add).spacing(theme::SPACING / 2.0));
 
@@ -932,16 +1048,93 @@ impl DayView {
             }
         }
 
-        scrollable(
-            container(
-                content
-                    .padding(theme::SPACING * 2.0)
-                    .max_width(theme::CONTENT_WIDTH),
-            )
-            .center_x(Fill),
+        let page = container(
+            content
+                .padding(theme::SPACING * 2.0)
+                .max_width(theme::CONTENT_WIDTH),
         )
-        .height(Fill)
-        .into()
+        .center_x(Fill);
+        let mut layers = stack![page];
+        if let Some(drag) = self.dragging()
+            && let Some(at) = drag.at
+            && let Some(task) = data.tasks.iter().find(|t| t.id == drag.id)
+        {
+            let ghost = container(card_content(task, data.today, None))
+                .padding([11, 14])
+                .width(theme::CONTENT_WIDTH - theme::SPACING * 4.0)
+                .style(|t: &Theme| container::Style {
+                    shadow: iced::Shadow {
+                        color: Color::BLACK.scale_alpha(0.35),
+                        offset: iced::Vector::new(0.0, 6.0),
+                        blur_radius: 16.0,
+                    },
+                    ..card_box(true, false)(t)
+                });
+            layers = layers.push(pin(ghost).position(Point::new(at.x - 40.0, at.y - 22.0)));
+        }
+        let mut area = mouse_area(layers);
+        if self.drag.is_some() {
+            area = area.on_move(Message::Moved);
+        }
+        scrollable(area).height(Fill).into()
+    }
+
+    /// The task being dragged (past the threshold), if any.
+    fn dragging(&self) -> Option<&Drag> {
+        self.drag.as_ref().filter(|d| d.active)
+    }
+
+    /// The Tasks section's rows: open cards drag to rearrange; the open
+    /// form stays as it is. A thin strip after the last card takes drops
+    /// at the end.
+    fn sortable_rows<'a>(
+        &'a self,
+        tasks: Vec<&'a Task>,
+        data: &'a DayData,
+    ) -> Element<'a, Message> {
+        let dragging = self.dragging();
+        let over = dragging.and_then(|d| d.over);
+        let mut list = Column::new().spacing(3);
+        for task in tasks {
+            if let Some(form) = self.editing.as_ref().filter(|f| f.id == task.id) {
+                list = list.push(edit_card(task, form, data.today));
+                continue;
+            }
+            let id = task.id;
+            let held = dragging.is_some_and(|d| d.id == id);
+            let line = !held && over == Some(Spot::Before(id));
+            let card = container(card_content(task, data.today, None))
+                .padding([11, 14])
+                .width(Fill)
+                .style(card_box(
+                    held || (dragging.is_none() && self.hovered == Some(id)),
+                    self.selected == Some(id),
+                ));
+            let mut area = mouse_area(column![drop_line(line), card].spacing(3))
+                .on_press(Message::Press(id))
+                .on_enter(Message::Enter(Spot::Before(id)))
+                .on_exit(Message::Leave(id))
+                .interaction(if dragging.is_some() {
+                    mouse::Interaction::Grabbing
+                } else {
+                    mouse::Interaction::Pointer
+                });
+            if dragging.is_some() {
+                area = area.on_release(Message::DropOn(Spot::Before(id)));
+            }
+            list = list.push(area);
+        }
+        let mut end = mouse_area(
+            column![drop_line(over == Some(Spot::End))]
+                .height(12)
+                .width(Fill),
+        );
+        if dragging.is_some() {
+            end = end
+                .on_enter(Message::Enter(Spot::End))
+                .on_release(Message::DropOn(Spot::End));
+        }
+        list.push(end).into()
     }
 
     fn group<'a>(
@@ -1124,14 +1317,14 @@ fn priority_marker<'a>(priority: Priority) -> Option<Element<'a, Message>> {
     })
 }
 
-/// A task card. `rec` is its rank and reason when it is recommended: a
-/// numbered badge before the title and the reason after it.
-fn task_row<'a>(
+/// What a task card shows: checkbox, title and details. `rec` is its rank
+/// and reason when it is recommended: a numbered badge before the title and
+/// the reason after it.
+fn card_content<'a>(
     task: &'a Task,
     today: Date,
-    selected: bool,
     rec: Option<(usize, &'a str)>,
-) -> Element<'a, Message> {
+) -> Row<'a, Message> {
     let id = task.id;
     let open = task.status.is_open();
 
@@ -1179,19 +1372,83 @@ fn task_row<'a>(
 
     // The checkbox sits inside the card; it captures its own clicks, so
     // they don't open the form.
-    button(
-        row![
-            checkbox(task.is_done()).on_toggle(move |b| Message::Toggle(id, b)),
-            line,
-        ]
-        .spacing(theme::SPACING * 0.75)
-        .align_y(Center),
-    )
-    .width(Fill)
-    .padding([11, 14])
-    .style(task_card_style(!open, selected))
-    .on_press(Message::Expand(id))
-    .into()
+    row![
+        checkbox(task.is_done()).on_toggle(move |b| Message::Toggle(id, b)),
+        line,
+    ]
+    .spacing(theme::SPACING * 0.75)
+    .align_y(Center)
+}
+
+/// A task card that opens its form when clicked (the sections that don't
+/// drag).
+fn task_row<'a>(
+    task: &'a Task,
+    today: Date,
+    selected: bool,
+    rec: Option<(usize, &'a str)>,
+) -> Element<'a, Message> {
+    button(card_content(task, today, rec))
+        .width(Fill)
+        .padding([11, 14])
+        .style(task_card_style(!task.status.is_open(), selected))
+        .on_press(Message::Expand(task.id))
+        .into()
+}
+
+/// An open Tasks card's fill, as [`task_card_style`] gives a button:
+/// lighter when `lit` (hovered or held), with an accent ring when selected.
+fn card_box(lit: bool, selected: bool) -> impl Fn(&Theme) -> container::Style {
+    move |theme| {
+        let status = if lit {
+            button::Status::Hovered
+        } else {
+            button::Status::Active
+        };
+        let b = task_card_style(false, selected)(theme, status);
+        container::Style {
+            background: b.background,
+            text_color: Some(b.text_color),
+            border: b.border,
+            ..container::Style::default()
+        }
+    }
+}
+
+/// The accent line where a dragged card would land (empty space otherwise).
+fn drop_line<'a>(show: bool) -> Element<'a, Message> {
+    container(Space::new().height(3))
+        .width(Fill)
+        .style(move |_: &Theme| container::Style {
+            background: show.then(|| theme::ACCENT.into()),
+            border: border::rounded(2),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// The new positions after moving `dragged` to `spot` in `order` (the
+/// Tasks section as shown): 1, 2, 3, … top to bottom, only for the tasks
+/// whose position changes. `None` if `dragged` isn't in the list or
+/// nothing moves.
+pub fn reorder(order: &[&Task], dragged: TaskId, spot: Spot) -> Option<Vec<(TaskId, f64)>> {
+    let moving = order.iter().find(|t| t.id == dragged)?;
+    let mut ids: Vec<&Task> = order.iter().copied().filter(|t| t.id != dragged).collect();
+    let at = match spot {
+        Spot::Before(id) => ids.iter().position(|t| t.id == id).unwrap_or(ids.len()),
+        Spot::End => ids.len(),
+    };
+    ids.insert(at, moving);
+    let changes: Vec<(TaskId, f64)> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.id, (i + 1) as f64))
+        .filter(|(id, pos)| order.iter().any(|t| t.id == *id && t.position != *pos))
+        .collect();
+    let moved = ids.iter().map(|t| t.id).ne(order.iter().map(|t| t.id));
+    (moved || !changes.is_empty())
+        .then_some(changes)
+        .filter(|c| !c.is_empty())
 }
 
 /// A small round number in the accent colour: a recommended task's rank.
@@ -1651,11 +1908,63 @@ mod tests {
     }
 
     #[test]
+    fn reorder_renumbers_the_section_top_to_bottom() {
+        let a = planned(task(1, "a", None), today());
+        let b = planned(task(2, "b", None), today());
+        let c = planned(task(3, "c", None), today());
+        let order = [&a, &b, &c];
+        // c before a: c a b → positions 1 2 3, all three change.
+        assert_eq!(
+            reorder(&order, 3, Spot::Before(1)),
+            Some(vec![(3, 1.0), (1, 2.0), (2, 3.0)])
+        );
+        // a to the end: b c a; only what moves is written.
+        assert_eq!(
+            reorder(&order, 1, Spot::End),
+            Some(vec![(2, 1.0), (3, 2.0), (1, 3.0)])
+        );
+        // Dropped where it was: nothing to do.
+        assert_eq!(reorder(&order, 2, Spot::Before(3)), None);
+        assert_eq!(reorder(&order, 9, Spot::End), None);
+    }
+
+    #[test]
+    fn drag_reorders_the_tasks_section_and_a_click_still_opens() {
+        let mut a = planned(task(1, "a", None), today());
+        let mut b = planned(task(2, "b", None), today());
+        a.priority = 0;
+        b.priority = 2;
+        let mut view = loaded(vec![a, b]);
+        // Manual order, not priority: a (position 1) before b.
+        let data = view.data.clone().unwrap();
+        assert_eq!(ids(&section_tasks(&data, Section::Day)), vec![1, 2]);
+
+        // Press on b, move past the threshold, enter a, let go there.
+        view.update(Message::Press(2));
+        view.update(Message::Moved(Point::new(10.0, 10.0)));
+        view.update(Message::Moved(Point::new(10.0, 40.0)));
+        view.update(Message::Enter(Spot::Before(1)));
+        assert!(view.dragging().is_some());
+        let _ = view.view();
+        assert_eq!(
+            view.update(Message::DropOn(Spot::Before(1))),
+            Action::Reorder(vec![(2, 1.0), (1, 2.0)])
+        );
+        assert_eq!(view.update(Message::EndDrag), Action::None);
+
+        // A press let go without moving opens the card.
+        view.update(Message::Press(1));
+        view.update(Message::Moved(Point::new(5.0, 5.0)));
+        view.update(Message::EndDrag);
+        assert_eq!(view.editing.as_ref().map(|f| f.id), Some(1));
+    }
+
+    #[test]
     fn sections_for_today() {
         let data = data_for(today(), mixed());
         assert_eq!(ids(&section_tasks(&data, Section::Overdue)), vec![4, 1]);
-        // Doing is a plain open task now.
-        assert_eq!(ids(&section_tasks(&data, Section::Day)), vec![3, 2, 12]);
+        // Doing is a plain open task now. Manual order (position = id here).
+        assert_eq!(ids(&section_tasks(&data, Section::Day)), vec![2, 3, 12]);
         let mut done = ids(&section_tasks(&data, Section::Done));
         done.sort();
         assert_eq!(done, vec![5, 10]);
@@ -1683,6 +1992,8 @@ mod tests {
         assert_eq!(ids(&section_tasks(&data, Section::Deleted)), vec![6]);
     }
 
+    /// The day's tasks are in manual order: position, then id. Priority and
+    /// the planned day don't reorder them.
     #[test]
     fn sort_order() {
         let mut a = task(1, "a", Some(today()));
@@ -1697,14 +2008,14 @@ mod tests {
         let data = data_for(today(), vec![a, b, c, e, f]);
         assert_eq!(
             ids(&section_tasks(&data, Section::Day)),
-            vec![3, 6, 5, 2, 1]
+            vec![2, 3, 1, 5, 6]
         );
     }
 
     #[test]
     fn visible_rows_skip_collapsed_sections_and_deleted() {
         let data = data_for(today(), mixed());
-        assert_eq!(visible_rows(&data, false, false), vec![4, 1, 3, 2, 12]);
+        assert_eq!(visible_rows(&data, false, false), vec![4, 1, 2, 3, 12]);
         let all = visible_rows(&data, true, true);
         assert_eq!(all.len(), 8);
         assert_eq!(all.last(), Some(&7));

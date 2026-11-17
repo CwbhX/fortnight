@@ -106,6 +106,8 @@ enum Message {
     /// Typing in a new task's dialog paused: ask the decision model for a
     /// priority, if this is still the latest edit (`suggest_seq`).
     SuggestPriority(u64),
+    /// The left mouse button went up anywhere: ends a card drag.
+    PointerUp,
     PrioritySuggested(u64, Option<Priority>),
     /// A keyboard shortcut (applied only where it makes sense).
     Key(Shortcut),
@@ -293,12 +295,12 @@ impl App {
             iced::time::every(Duration::from_secs(60)).map(|_| Message::Tick),
             iced::system::theme_changes().map(Message::ThemeMode),
             iced::window::open_events().map(|_| Message::WindowOpened),
-            // Ends a Week-tab card drag even when the button is let go
-            // outside the window.
+            // Ends a card drag (Week or Today) even when the button is let
+            // go outside the window.
             iced::event::listen_with(|event, _, _| match event {
                 iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
                     iced::mouse::Button::Left,
-                )) => Some(Message::Week(week::Message::EndDrag)),
+                )) => Some(Message::PointerUp),
                 _ => None,
             }),
             keyboard::listen().filter_map(|event| {
@@ -1080,9 +1082,24 @@ impl Ready {
     fn update(&mut self, message: Message) -> Task<Message> {
         let task = match message {
             Message::Top(m) => self.top_bar(m),
+            Message::Day(m) if m.is_pointer_move() => {
+                // Drag bookkeeping (or a click let go): the view redraws
+                // itself; no data changed, so skip the refresh.
+                let action = self.day_view.update(m);
+                return self.day_action(action);
+            }
             Message::Day(m) => {
                 let action = self.day_view.update(m);
                 self.day_action(action)
+            }
+            Message::PointerUp => {
+                let week = match self.week_view.update(week::Message::EndDrag) {
+                    week::Action::Edit(id) => self.open_edit(id),
+                    _ => Task::none(),
+                };
+                let action = self.day_view.update(day::Message::EndDrag);
+                let day = self.day_action(action);
+                return Task::batch([week, day]);
             }
             Message::Week(m) if m.is_pointer_move() => {
                 // Drag bookkeeping only: no data changed, skip the refresh.
@@ -1506,6 +1523,9 @@ impl Ready {
                 self.add_task(new);
                 return Task::none();
             }
+            day::Action::Reorder(positions) => positions
+                .into_iter()
+                .try_for_each(|(id, position)| self.store.set_position(id, position)),
         };
         if let Err(e) = result {
             self.error = Some(e.to_string());
