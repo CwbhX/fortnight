@@ -89,16 +89,29 @@ pub struct LlmConfig {
 }
 
 impl LlmConfig {
-    /// The host part of `base_url`, for `Report::endpoint_host`.
-    /// Never includes credentials, path or query.
+    /// The config for saved settings `llm` and a key: base URL and model
+    /// trimmed, and no key at all for an endpoint marked keyless. Whether
+    /// the saved key file must be opened first is
+    /// `secure::needs_saved_key`.
+    pub fn from_settings(llm: &LlmSettings, api_key: Option<SecretString>) -> Self {
+        LlmConfig {
+            base_url: llm.base_url.trim().to_string(),
+            model: llm.model.trim().to_string(),
+            api_key: api_key.filter(|_| !llm.keyless),
+        }
+    }
+
+    /// The host (and a non-default port) of `base_url`, for
+    /// `Report::endpoint_host`, as reqwest reads it, so it names the host
+    /// requests really go to. Never includes credentials, path or query.
+    /// `None` if the URL can't be parsed or has no host.
     pub fn endpoint_host(&self) -> Option<String> {
-        let rest = self
-            .base_url
-            .split_once("://")
-            .map_or(self.base_url.as_str(), |(_, r)| r);
-        let authority = rest.split(['/', '?', '#']).next()?;
-        let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-        (!host.is_empty()).then(|| host.to_string())
+        let url = reqwest::Url::parse(self.base_url.trim()).ok()?;
+        let host = url.host_str().filter(|h| !h.is_empty())?;
+        Some(match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        })
     }
 }
 
@@ -185,10 +198,22 @@ pub fn with_overrides(llm: &LlmSettings, var: impl Fn(&str) -> Option<String>) -
 /// `FORTNIGHT_LLM_API_KEY`, if set and non-empty: a key for this process
 /// only, never persisted. Takes precedence over the key file.
 pub fn env_api_key() -> Option<SecretString> {
-    std::env::var("FORTNIGHT_LLM_API_KEY")
-        .ok()
-        .filter(|k| !k.trim().is_empty())
-        .map(|k| SecretString::from(k.trim().to_string()))
+    env_key(std::env::var("FORTNIGHT_LLM_API_KEY").ok())
+}
+
+/// `FORTNIGHT_DECISION_API_KEY`, if set and non-empty: the decision
+/// model's key for this process only, never persisted. Takes precedence
+/// over its key file (`vault::decision_key_path`).
+pub fn env_decision_api_key() -> Option<SecretString> {
+    env_key(std::env::var("FORTNIGHT_DECISION_API_KEY").ok())
+}
+
+/// A key from an environment variable's value: trimmed, `None` if blank.
+fn env_key(value: Option<String>) -> Option<SecretString> {
+    value
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+        .map(SecretString::from)
 }
 
 /// A client that returns canned replies and records requests. For tests.
@@ -315,5 +340,45 @@ mod tests {
             Some("localhost:11434")
         );
         assert_eq!(cfg("").endpoint_host(), None);
+        assert_eq!(
+            cfg("http://[::1]:8080/v1").endpoint_host().as_deref(),
+            Some("[::1]:8080")
+        );
+        // The host reqwest would connect to, not the text after the `@`.
+        assert_eq!(
+            cfg("https://evil.example\\@api.openai.com/v1")
+                .endpoint_host()
+                .as_deref(),
+            Some("evil.example")
+        );
+    }
+
+    #[test]
+    fn config_from_settings_trims_and_drops_the_key_when_keyless() {
+        use secrecy::ExposeSecret;
+        let mut llm = LlmSettings {
+            protocol: Protocol::OpenAi,
+            base_url: " https://api.openai.com/v1 ".into(),
+            model: " gpt ".into(),
+            keyless: false,
+        };
+        let key = || Some(SecretString::from("sk-1"));
+        let cfg = LlmConfig::from_settings(&llm, key());
+        assert_eq!(cfg.base_url, "https://api.openai.com/v1");
+        assert_eq!(cfg.model, "gpt");
+        assert_eq!(cfg.api_key.unwrap().expose_secret(), "sk-1");
+        llm.keyless = true;
+        assert!(LlmConfig::from_settings(&llm, key()).api_key.is_none());
+    }
+
+    #[test]
+    fn env_keys_are_trimmed_and_blank_is_none() {
+        use secrecy::ExposeSecret;
+        assert!(env_key(None).is_none());
+        assert!(env_key(Some("  ".into())).is_none());
+        assert_eq!(
+            env_key(Some(" sk-1\n".into())).unwrap().expose_secret(),
+            "sk-1"
+        );
     }
 }

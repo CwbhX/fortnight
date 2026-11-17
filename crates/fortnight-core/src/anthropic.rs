@@ -17,12 +17,21 @@
 //! Each attempt is bounded by the timeout; when streaming, the timeout
 //! bounds the wait for response headers and each gap between chunks.
 //!
+//! A 404 is `ModelNotFound` only when its body mentions the model.
+//! Timeouts, retries and error mapping are shared with the other clients
+//! (`llm_http`); a connection dropped mid-body is a (retryable)
+//! connection error, not a malformed reply.
+//!
 //! Skipped for the prototype: `Retry-After` is not honoured, and the model
 //! list reads one page of up to 1000 models.
 //! Requires a tokio runtime (reqwest does too).
 
 use crate::llm::{
     BoxFuture, BoxStream, ChatEvent, ChatRequest, ChatResponse, LlmClient, LlmConfig, LlmError,
+};
+use crate::llm_http::{
+    DEFAULT_BACKOFF, MAX_ATTEMPTS, backoff_delay, error_body, is_retryable, parse_model_ids,
+    sse_error, transport_error, with_retries,
 };
 use eventsource_stream::{EventStreamError, Eventsource};
 use futures_util::StreamExt;
@@ -33,11 +42,6 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::time::Duration;
 
-const MAX_ATTEMPTS: u32 = 3;
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const DEFAULT_BACKOFF: Duration = Duration::from_millis(500);
-const MAX_ERROR_BODY_CHARS: usize = 500;
 const MAX_TOKENS: u32 = 4096;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -52,10 +56,7 @@ impl fmt::Debug for AnthropicClient {
     /// Shows the host, never the full base URL (it may carry credentials)
     /// or the key.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AnthropicClient")
-            .field("host", &self.config.endpoint_host())
-            .field("model", &self.config.model)
-            .field("has_key", &self.config.api_key.is_some())
+        crate::llm_http::debug_endpoint(&mut f.debug_struct("AnthropicClient"), &self.config)
             .field("timeout", &self.timeout)
             .field("backoff", &self.backoff)
             .finish()
@@ -65,21 +66,9 @@ impl fmt::Debug for AnthropicClient {
 impl AnthropicClient {
     /// Errors with `NotConfigured` if base URL or model is empty.
     pub fn new(config: LlmConfig) -> Result<Self, LlmError> {
-        if config.base_url.trim().is_empty() || config.model.trim().is_empty() {
-            return Err(LlmError::NotConfigured);
-        }
-        crate::secure::check_key_transport(&config)?;
-        let http = crate::secure::client_builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .map_err(|e| LlmError::Connection(error_chain(&e.without_url())))?;
-        // A local server (Ollama also speaks this protocol) may need to
-        // load the model first; see `openai::LOCAL_TIMEOUT`.
-        let timeout = if crate::secure::is_local_endpoint(&config.base_url) {
-            crate::openai::LOCAL_TIMEOUT
-        } else {
-            DEFAULT_TIMEOUT
-        };
+        // A local server (Ollama also speaks this protocol) gets the long
+        // timeout: it may need to load the model first.
+        let (http, timeout) = crate::llm_http::prepare(&config)?;
         Ok(AnthropicClient {
             config,
             http,
@@ -147,7 +136,7 @@ impl LlmClient for AnthropicClient {
         Box::pin(async move {
             with_retries(backoff, || async {
                 let (status, text) = call.send_whole().await?;
-                match status_error(status, &text, &call.model) {
+                match call.status_error(status, &text) {
                     Some(e) => Err(e),
                     None => parse_message(&text, &call.model),
                 }
@@ -183,37 +172,15 @@ impl LlmClient for AnthropicClient {
                 if status == 404 {
                     return Ok(Vec::new());
                 }
-                if let Some(e) = status_error(status, &text, &call.model) {
+                if let Some(e) = call.status_error(status, &text) {
                     return Err(e);
                 }
-                parse_models(&text)
+                parse_model_ids(&text)
             })
             .await
             .map_err(|e| crate::secure::redact(e, key.as_ref()))
         })
     }
-}
-
-/// Runs `attempt` up to `MAX_ATTEMPTS` times while it fails retryably.
-async fn with_retries<T, F, Fut>(backoff: Duration, mut attempt: F) -> Result<T, LlmError>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, LlmError>>,
-{
-    let mut n = 1;
-    loop {
-        match attempt().await {
-            Err(e) if n < MAX_ATTEMPTS && is_retryable(&e) => {
-                tokio::time::sleep(retry_delay(backoff, n)).await;
-                n += 1;
-            }
-            result => return result,
-        }
-    }
-}
-
-fn retry_delay(backoff: Duration, attempt: u32) -> Duration {
-    backoff * 2u32.pow(attempt - 1)
 }
 
 /// Everything one request needs, owned, so futures and streams are
@@ -229,6 +196,13 @@ struct Call {
 }
 
 impl Call {
+    /// The error for a non-2xx status, or `None` for success.
+    fn status_error(&self, status: u16, body: &str) -> Option<LlmError> {
+        (!(200..=299).contains(&status)).then(|| {
+            crate::llm_http::status_error(status, body, &self.model, self.api_key.as_ref())
+        })
+    }
+
     fn builder(&self) -> Result<reqwest::RequestBuilder, LlmError> {
         let mut builder = match &self.body {
             // `json` also sets `content-type: application/json`.
@@ -278,7 +252,7 @@ impl Call {
                 .await
                 .map_err(|_| LlmError::Timeout)?
                 .map_err(transport_error)?;
-            if let Some(e) = status_error(status, &text, &self.model) {
+            if let Some(e) = self.status_error(status, &text) {
                 return Err(e);
             }
             return parse_message(&text, &self.model).map(Opened::Whole);
@@ -372,7 +346,7 @@ impl StreamState {
                         Err(_) => Step::Fail(LlmError::Timeout),
                         Ok(None) => Step::Fail(LlmError::Truncated),
                         Ok(Some(Err(e))) => Step::Fail(sse_error(e)),
-                        Ok(Some(Ok(event))) => interpret(&event, &self.call.model),
+                        Ok(Some(Ok(event))) => interpret(&event, &self.call),
                     };
                     match step {
                         Step::Done => return Some(Ok(ChatEvent::Done { model })),
@@ -411,7 +385,7 @@ impl StreamState {
         if attempt >= MAX_ATTEMPTS || !is_retryable(e) {
             return false;
         }
-        tokio::time::sleep(retry_delay(self.backoff, attempt)).await;
+        tokio::time::sleep(backoff_delay(self.backoff, attempt)).await;
         self.phase = Phase::Connect {
             attempt: attempt + 1,
         };
@@ -420,7 +394,7 @@ impl StreamState {
 }
 
 /// Reads one Messages API stream event.
-fn interpret(event: &eventsource_stream::Event, requested_model: &str) -> Step {
+fn interpret(event: &eventsource_stream::Event, call: &Call) -> Step {
     let data: serde_json::Value = match serde_json::from_str(&event.data) {
         Ok(v) => v,
         Err(e) => {
@@ -457,7 +431,7 @@ fn interpret(event: &eventsource_stream::Event, requested_model: &str) -> Step {
         "error" => Step::Fail(api_error(
             data["error"]["type"].as_str().unwrap_or_default(),
             data["error"]["message"].as_str().unwrap_or_default(),
-            requested_model,
+            call,
         )),
         _ => Step::Skip,
     }
@@ -473,89 +447,25 @@ fn stop_reason_error(reason: Option<&str>) -> Option<LlmError> {
 
 /// Maps an Anthropic `error.type` (from an SSE `error` event) onto the
 /// error the matching HTTP status would give.
-fn api_error(kind: &str, message: &str, model: &str) -> LlmError {
-    let http = |status: u16| LlmError::Http {
-        status,
-        body: truncate_chars(message.trim(), MAX_ERROR_BODY_CHARS),
-    };
-    match kind {
-        "overloaded_error" => http(529),
-        "api_error" => http(500),
-        "timeout_error" => http(504),
-        "rate_limit_error" => LlmError::RateLimited,
-        "authentication_error" | "permission_error" => LlmError::Unauthorized,
-        "not_found_error" => LlmError::ModelNotFound(model.to_string()),
-        "invalid_request_error" => http(400),
-        "billing_error" => http(402),
-        "request_too_large" => http(413),
-        _ => LlmError::Malformed(format!(
-            "unknown error event {kind}: {}",
-            truncate_chars(message.trim(), MAX_ERROR_BODY_CHARS)
-        )),
-    }
-}
-
-/// The error for a non-2xx status, or `None` for success.
-fn status_error(status: u16, body: &str, model: &str) -> Option<LlmError> {
-    match status {
-        200..=299 => None,
-        401 | 403 => Some(LlmError::Unauthorized),
-        404 => Some(LlmError::ModelNotFound(model.to_string())),
-        429 => Some(LlmError::RateLimited),
-        code => Some(LlmError::Http {
-            status: code,
-            body: truncate_chars(body.trim(), MAX_ERROR_BODY_CHARS),
-        }),
-    }
-}
-
-fn is_retryable(e: &LlmError) -> bool {
-    match e {
-        LlmError::Connection(_) | LlmError::Timeout | LlmError::RateLimited => true,
-        LlmError::Http { status, .. } => *status >= 500,
-        _ => false,
-    }
-}
-
-fn transport_error(e: reqwest::Error) -> LlmError {
-    if e.is_timeout() {
-        LlmError::Timeout
-    } else if e.is_decode() {
-        LlmError::Malformed(error_chain(&e.without_url()))
-    } else {
-        // The URL is dropped in case `base_url` carries credentials. A body
-        // error (connection lost mid-reply) counts as a connection error.
-        LlmError::Connection(error_chain(&e.without_url()))
-    }
-}
-
-fn sse_error(e: EventStreamError<reqwest::Error>) -> LlmError {
-    match e {
-        EventStreamError::Transport(e) => transport_error(e),
-        other => LlmError::Malformed(other.to_string()),
-    }
-}
-
-/// `e` and its sources, joined with ": ".
-fn error_chain(e: &dyn std::error::Error) -> String {
-    let mut out = e.to_string();
-    let mut source = e.source();
-    while let Some(s) = source {
-        let text = s.to_string();
-        if !out.contains(&text) {
-            out.push_str(": ");
-            out.push_str(&text);
+fn api_error(kind: &str, message: &str, call: &Call) -> LlmError {
+    let status = match kind {
+        "overloaded_error" => 529,
+        "api_error" => 500,
+        "timeout_error" => 504,
+        "rate_limit_error" => 429,
+        "authentication_error" | "permission_error" => 401,
+        "not_found_error" => 404,
+        "invalid_request_error" => 400,
+        "billing_error" => 402,
+        "request_too_large" => 413,
+        _ => {
+            return LlmError::Malformed(format!(
+                "unknown error event {kind}: {}",
+                error_body(message, call.api_key.as_ref())
+            ));
         }
-        source = s.source();
-    }
-    out
-}
-
-fn truncate_chars(s: &str, max: usize) -> String {
-    match s.char_indices().nth(max) {
-        Some((i, _)) => format!("{}…", &s[..i]),
-        None => s.to_string(),
-    }
+    };
+    crate::llm_http::status_error(status, message, &call.model, call.api_key.as_ref())
 }
 
 #[derive(Deserialize)]
@@ -592,22 +502,6 @@ fn parse_message(text: &str, requested_model: &str) -> Result<ChatResponse, LlmE
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| requested_model.to_string());
     Ok(ChatResponse { text, model })
-}
-
-#[derive(Deserialize)]
-struct ModelList {
-    data: Vec<ModelEntry>,
-}
-
-#[derive(Deserialize)]
-struct ModelEntry {
-    id: String,
-}
-
-fn parse_models(text: &str) -> Result<Vec<String>, LlmError> {
-    let list: ModelList =
-        serde_json::from_str(text).map_err(|e| LlmError::Malformed(e.to_string()))?;
-    Ok(list.data.into_iter().map(|m| m.id).collect())
 }
 
 #[cfg(test)]
@@ -978,7 +872,10 @@ mod tests {
             ("authentication_error", LlmError::Unauthorized, 1),
             (
                 "not_found_error",
-                LlmError::ModelNotFound("claude-test".into()),
+                LlmError::Http {
+                    status: 404,
+                    body: "bad thing".into(),
+                },
                 1,
             ),
             (
@@ -1017,6 +914,17 @@ mod tests {
             assert_eq!(stream_items(&c).await, vec![Err(expected)], "{kind}");
             assert_eq!(request_count(&server).await, attempts, "{kind}");
         }
+        // A not-found error about the model is `ModelNotFound`.
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            sse_response(start() + &error_event("not_found_error", "model: claude-test")),
+        )
+        .await;
+        assert_eq!(
+            stream_items(&client(&server.uri(), None)).await,
+            vec![Err(LlmError::ModelNotFound("claude-test".into()))]
+        );
     }
 
     #[tokio::test]
@@ -1099,7 +1007,13 @@ mod tests {
         assert_eq!(chat_error_for(403).await, (LlmError::Unauthorized, 1));
         assert_eq!(
             chat_error_for(404).await,
-            (LlmError::ModelNotFound("claude-test".into()), 1)
+            (
+                LlmError::Http {
+                    status: 404,
+                    body: "{\"error\":\"nope\"}".into()
+                },
+                1
+            )
         );
         assert_eq!(chat_error_for(429).await, (LlmError::RateLimited, 3));
         let body = "{\"error\":\"nope\"}".to_string();
@@ -1129,7 +1043,10 @@ mod tests {
         .await;
         match client(&server.uri(), None).chat(request()).await {
             Err(LlmError::Http { status: 413, body }) => {
-                assert_eq!(body.chars().count(), MAX_ERROR_BODY_CHARS + 1)
+                assert_eq!(
+                    body.chars().count(),
+                    crate::llm_http::MAX_ERROR_BODY_CHARS + 1
+                )
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -1208,6 +1125,107 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// A raw HTTP server that answers every connection with `response`
+    /// and closes it (so a promised body is cut short). Returns the base
+    /// URL and a connection counter.
+    fn cutting_server(
+        response: String,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = count.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut reader = BufReader::new(conn.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0; length];
+                let _ = reader.read_exact(&mut body);
+                let _ = conn.write_all(response.as_bytes());
+                let _ = conn.flush();
+            }
+        });
+        (format!("http://{addr}"), count)
+    }
+
+    #[tokio::test]
+    async fn stream_dropped_before_text_is_retried() {
+        // `message_start` arrives, then the connection drops mid-chunked-body.
+        let event = start();
+        let (base, count) = cutting_server(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+             transfer-encoding: chunked\r\n\r\n{:x}\r\n{event}\r\n",
+            event.len()
+        ));
+        let items = stream_items(&client(&base, None)).await;
+        assert!(
+            matches!(items.as_slice(), [Err(LlmError::Connection(_))]),
+            "{items:?}"
+        );
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn chat_body_cut_mid_reply_is_connection_and_retried() {
+        let (base, count) = cutting_server(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+             content-length: 1000\r\n\r\n{\"content\": ["
+                .into(),
+        );
+        let err = client(&base, None).chat(request()).await.unwrap_err();
+        assert!(matches!(err, LlmError::Connection(_)), "{err:?}");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_404_naming_the_model_is_model_not_found() {
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            ResponseTemplate::new(404).set_body_json(json!({
+                "type": "error",
+                "error": { "type": "not_found_error", "message": "model: claude-test" }
+            })),
+        )
+        .await;
+        let c = client(&server.uri(), Some(KEY));
+        assert_eq!(
+            c.chat(request()).await,
+            Err(LlmError::ModelNotFound("claude-test".into()))
+        );
+        assert_eq!(request_count(&server).await, 1);
+    }
+
+    #[tokio::test]
+    async fn key_straddling_the_error_cut_never_appears() {
+        let server = MockServer::start().await;
+        let body = format!(
+            "{}{KEY} trailing",
+            "x".repeat(crate::llm_http::MAX_ERROR_BODY_CHARS - 6)
+        );
+        mount(&server, ResponseTemplate::new(400).set_body_string(body)).await;
+        let err = client(&server.uri(), Some(KEY))
+            .chat(request())
+            .await
+            .unwrap_err();
+        let text = format!("{err} {err:?}");
+        assert!(!text.contains("sk-ant"), "{text}");
+        assert!(text.contains("[redac"), "{text}");
     }
 
     #[tokio::test]

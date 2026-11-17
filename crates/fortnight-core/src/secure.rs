@@ -8,6 +8,7 @@
 //! - Error text from the endpoint is scrubbed of the key before it reaches
 //!   the UI, the database or an export.
 
+use crate::domain::LlmSettings;
 use crate::llm::{LlmConfig, LlmError};
 use secrecy::{ExposeSecret, SecretString};
 
@@ -18,57 +19,87 @@ pub(crate) fn client_builder() -> reqwest::ClientBuilder {
 }
 
 /// Refuses a configuration that would send the key in clear text over the
-/// network: a key with an `http://` base URL whose host isn't loopback.
+/// network: a key with an `http://` base URL whose host isn't loopback. A
+/// key with a base URL reqwest can't parse, or whose scheme is neither
+/// `http` nor `https`, is refused too.
 pub(crate) fn check_key_transport(config: &LlmConfig) -> Result<(), LlmError> {
     if config.api_key.is_none() {
         return Ok(());
     }
-    let url = config.base_url.trim();
-    let is_http = url
-        .get(..7)
-        .is_some_and(|s| s.eq_ignore_ascii_case("http://"));
-    if !is_http || is_local_endpoint(url) {
-        return Ok(());
+    let Some(url) = parse(&config.base_url) else {
+        return Err(LlmError::Connection(
+            "refusing to send the API key: the base URL is not a valid http or https URL".into(),
+        ));
+    };
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback(&url) => Ok(()),
+        "http" => Err(LlmError::Connection(format!(
+            "refusing to send the API key over plain http to {}; use https, or mark the \
+             endpoint as needing no API key",
+            url.host_str().unwrap_or_default()
+        ))),
+        _ => Err(LlmError::Connection(
+            "refusing to send the API key: the base URL is not an http or https URL".into(),
+        )),
     }
-    Err(LlmError::Connection(format!(
-        "refusing to send the API key over plain http to {}; use https, or mark the \
-         endpoint as needing no API key",
-        url_host(url)
-    )))
 }
 
 /// Whether `base_url` points at this machine (`localhost`, `127.x.x.x` or
 /// `::1`), as a local Ollama or LM Studio server does. Local endpoints get
-/// a longer timeout and don't need the saved key unlocked.
+/// a longer timeout and don't need the saved key unlocked. The host is
+/// read with reqwest's own URL parser, so it is the host requests go to;
+/// a URL it can't parse is not local.
 pub fn is_local_endpoint(base_url: &str) -> bool {
-    let host = url_host(base_url.trim());
+    parse(base_url).is_some_and(|url| is_loopback(&url))
+}
+
+/// Whether `llm` needs the saved key file opened (and so a password): not
+/// for an endpoint marked keyless, and not for one on this machine (Ollama,
+/// LM Studio), which works without a key and gets it only if it is
+/// already unlocked or given in the environment.
+pub fn needs_saved_key(llm: &LlmSettings) -> bool {
+    !llm.keyless && !is_local_endpoint(&llm.base_url)
+}
+
+/// `url` as reqwest will read it.
+fn parse(url: &str) -> Option<reqwest::Url> {
+    reqwest::Url::parse(url.trim()).ok()
+}
+
+fn is_loopback(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    // An IPv6 host comes in brackets.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     host.eq_ignore_ascii_case("localhost")
         || host
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.is_loopback())
 }
 
-/// The bare host of `url`: no scheme, credentials, port, path or brackets.
-fn url_host(url: &str) -> &str {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    if let Some(v6) = host_port.strip_prefix('[') {
-        v6.split(']').next().unwrap_or("")
-    } else {
-        host_port.split(':').next().unwrap_or("")
+/// `text` with every occurrence of the key replaced. Keys shorter than 4
+/// characters are left alone (they would match ordinary text).
+pub(crate) fn scrub(text: &str, key: Option<&SecretString>) -> String {
+    match key
+        .map(ExposeSecret::expose_secret)
+        .filter(|k| k.len() >= 4)
+    {
+        Some(key) => text.replace(key, "[redacted]"),
+        None => text.to_string(),
     }
 }
 
 /// Replaces every occurrence of the key in an error's text.
 pub(crate) fn redact(e: LlmError, key: Option<&SecretString>) -> LlmError {
-    let Some(key) = key
-        .map(ExposeSecret::expose_secret)
-        .filter(|k| k.len() >= 4)
-    else {
+    if key.is_none() {
         return e;
-    };
-    let scrub = |s: String| s.replace(key, "[redacted]");
+    }
+    let scrub = |s: String| scrub(&s, key);
     match e {
         LlmError::Http { status, body } => LlmError::Http {
             status,
@@ -104,6 +135,18 @@ mod tests {
         assert!(check_key_transport(&cfg("http://[::1]:8080", true)).is_ok());
         // A loopback-looking user-info part doesn't count.
         assert!(check_key_transport(&cfg("http://localhost@evil.example/v1", true)).is_err());
+        // reqwest ends the authority at a backslash, so this goes to
+        // evil.example, not localhost.
+        assert!(check_key_transport(&cfg("http://evil.example\\@localhost/v1", true)).is_err());
+        // Ordinary local and remote forms.
+        assert!(check_key_transport(&cfg("HTTP://LOCALHOST:11434/v1", true)).is_ok());
+        assert!(check_key_transport(&cfg("http://user:pw@localhost:1234/v1", true)).is_ok());
+        assert!(check_key_transport(&cfg("http://[0:0:0:0:0:0:0:1]:8080/v1", true)).is_ok());
+        // Unparseable, scheme-less or non-http URLs never get the key.
+        assert!(check_key_transport(&cfg("http://", true)).is_err());
+        assert!(check_key_transport(&cfg("localhost:11434", true)).is_err());
+        assert!(check_key_transport(&cfg("ftp://localhost/v1", true)).is_err());
+        assert!(check_key_transport(&cfg("not a url", false)).is_ok());
     }
 
     #[test]
@@ -115,7 +158,32 @@ mod tests {
         assert!(!is_local_endpoint("https://api.openai.com/v1"));
         assert!(!is_local_endpoint("http://127.example.com/v1"));
         assert!(!is_local_endpoint("http://localhost@evil.example/v1"));
+        assert!(!is_local_endpoint("http://evil.example\\@localhost/v1"));
         assert!(!is_local_endpoint(""));
+        assert!(is_local_endpoint("HTTP://localhost:11434"));
+        assert!(is_local_endpoint("http://user:pw@127.0.0.1:1234/v1"));
+        assert!(is_local_endpoint("http://[0:0:0:0:0:0:0:1]/v1"));
+        assert!(!is_local_endpoint("http://[::2]/v1"));
+        // Without a scheme reqwest can't use it, so it isn't local.
+        assert!(!is_local_endpoint("localhost:11434"));
+    }
+
+    #[test]
+    fn saved_key_is_needed_only_for_keyed_remote_endpoints() {
+        use crate::domain::Protocol;
+        let llm = |url: &str, keyless: bool| LlmSettings {
+            protocol: Protocol::OpenAi,
+            base_url: url.into(),
+            model: "m".into(),
+            keyless,
+        };
+        assert!(needs_saved_key(&llm("https://api.openai.com/v1", false)));
+        assert!(!needs_saved_key(&llm("https://api.openai.com/v1", true)));
+        assert!(!needs_saved_key(&llm("http://localhost:11434/v1", false)));
+        assert!(needs_saved_key(&llm(
+            "http://evil.example\\@localhost/v1",
+            false
+        )));
     }
 
     #[test]
