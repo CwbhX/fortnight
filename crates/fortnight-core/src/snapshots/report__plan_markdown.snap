@@ -4,7 +4,7 @@ expression: plan_facts_markdown(&facts)
 ---
 **Today:** Wed 18 Nov · week Mon 16 Nov to Sun 22 Nov
 
-**Due by Sun 22 Nov:** 7h estimated (1 task has no estimate) · **available:** 18h over 3 working days
+**Due by Sun 22 Nov:** 7h estimated, 1 task has no estimate · **available:** 18h over 3 working days
 
 **Open:** 10 · overdue 1 · due this week 3 · no due date 2 · no estimate 6
 
@@ -16,21 +16,21 @@ expression: plan_facts_markdown(&facts)
 
 ### Overdue (1)
 
-- Vendor contract review — *Finance* · due Thu 12 Nov (6 days overdue) · ~1h · deadline moved once
+- Vendor contract review · *Finance* · due Thu 12 Nov (6 days overdue) · ~1h · deadline moved once
 
 ### Due this week (3)
 
-- Write onboarding doc — *Website* · due Wed 18 Nov (today) · ~2h
-- Board deck — *Finance* · due Fri 20 Nov (in 2 days) · ~4h · !! · planned Thu 19 Nov · deadline moved 2×
+- Write onboarding doc · *Website* · due Wed 18 Nov (today) · ~2h
+- Board deck · *Finance* · due Fri 20 Nov (in 2 days) · ~4h · !! · planned Thu 19 Nov · deadline moved 2×
 - Renew certificates · due Sun 22 Nov (in 4 days)
 
 ### Due in the next two weeks (3)
 
-- Migrate analytics — *Website* · due Wed 25 Nov (in 7 days)
+- Migrate analytics · *Website* · due Wed 25 Nov (in 7 days)
 - Annual review · due Wed 2 Dec (in 14 days)
 - Draft 2027 roadmap · due Tue 15 Dec (in 27 days) · ~1.5h · planned Fri 20 Nov
 
 ### No due date (2)
 
-- Hiring rubric — *Hiring*
+- Hiring rubric · *Hiring*
 - Plan team offsite

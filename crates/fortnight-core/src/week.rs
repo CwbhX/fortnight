@@ -11,17 +11,17 @@ pub fn week_containing(date: Date, week_start: Weekday) -> WeekRef {
     WeekRef::new(date.saturating_sub(i64::from(back).days()))
 }
 
-/// A short label such as "Week 46 · Nov 9–15". The number is the ISO week
+/// A short label such as "Week 46 · Nov 9 to 15". The number is the ISO week
 /// number of `start + 3 days` (the Thursday for Monday-start weeks).
 pub fn week_label(week: WeekRef) -> String {
     let start = week.start;
     let end = week.end();
     let number = start.saturating_add(3.days()).iso_week_date().week();
     let range = if start.month() == end.month() {
-        format!("{} {}–{}", month_abbr(start), start.day(), end.day())
+        format!("{} {} to {}", month_abbr(start), start.day(), end.day())
     } else {
         format!(
-            "{} {}–{} {}",
+            "{} {} to {} {}",
             month_abbr(start),
             start.day(),
             month_abbr(end),
@@ -222,12 +222,12 @@ mod tests {
     #[test]
     fn week_labels() {
         let cases = [
-            (week(2026, 11, 16), "Week 47 · Nov 16–22"),
-            (week(2026, 11, 9), "Week 46 · Nov 9–15"),
-            (week(2026, 11, 30), "Week 49 · Nov 30–Dec 6"),
-            (week(2026, 12, 28), "Week 53 · Dec 28–Jan 3"),
+            (week(2026, 11, 16), "Week 47 · Nov 16 to 22"),
+            (week(2026, 11, 9), "Week 46 · Nov 9 to 15"),
+            (week(2026, 11, 30), "Week 49 · Nov 30 to Dec 6"),
+            (week(2026, 12, 28), "Week 53 · Dec 28 to Jan 3"),
             // Sunday-start: number from start + 3 (Wednesday Nov 18).
-            (week(2026, 11, 15), "Week 47 · Nov 15–21"),
+            (week(2026, 11, 15), "Week 47 · Nov 15 to 21"),
         ];
         for (w, want) in cases {
             assert_eq!(week_label(w), want);

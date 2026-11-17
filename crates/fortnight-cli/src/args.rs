@@ -115,11 +115,11 @@ pub struct ExportArgs {
 }
 
 fn parse_protocol(s: &str) -> Result<Protocol, String> {
-    Protocol::parse(s).ok_or_else(|| format!("unknown protocol '{s}' (use openai or anthropic)"))
+    Protocol::parse(s).ok_or_else(|| format!("unknown protocol '{s}'. Use openai or anthropic."))
 }
 
 fn parse_format(s: &str) -> Result<ExportFormat, String> {
-    ExportFormat::parse(s).ok_or_else(|| format!("unknown format '{s}' (use md or json)"))
+    ExportFormat::parse(s).ok_or_else(|| format!("unknown format '{s}'. Use md or json."))
 }
 
 #[cfg(test)]

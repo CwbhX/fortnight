@@ -552,12 +552,11 @@ impl ReportPanel {
             Sent::Now
         };
         let (note, body) = match (sent, report) {
-            (Sent::ShownVersion, Some(r)) => (
-                "The facts this version was built from, exactly as sent.",
-                r.digest_json.as_str(),
-            ),
+            (Sent::ShownVersion, Some(r)) => {
+                ("The facts sent for this version.", r.digest_json.as_str())
+            }
             _ => (
-                "Exactly what generating now would send. Private tasks are left out.",
+                "What Generate would send now. Private tasks are left out.",
                 slot.preview.as_str(),
             ),
         };
@@ -628,7 +627,7 @@ fn empty_note(kind: ReportKind) -> &'static str {
             "No summary for this week yet. Generate turns the facts into an update for your manager."
         }
         ReportKind::Plan => {
-            "No advice for this week yet. Generate asks what is at risk, a suggested order and what to cut."
+            "No advice for this week yet. Generate asks the model what is at risk, what order to work in and what to cut."
         }
     }
 }
@@ -746,7 +745,7 @@ mod tests {
     fn data_slots(slots: Vec<ReportSlot>) -> ReportPanelData {
         ReportPanelData {
             week: week(),
-            week_label: "Week 47 · Nov 16–22".into(),
+            week_label: "Week 47 · Nov 16 to 22".into(),
             slots,
         }
     }

@@ -86,7 +86,7 @@ pub fn step(tab: Tab, selected: Date, dir: i32) -> Date {
     }
 }
 
-/// "Mon 16 Nov"; "Mon 16 – Fri 20 Nov" (the week's working days);
+/// "Mon 16 Nov"; "Mon 16 to Fri 20 Nov" (the week's working days);
 /// "November 2026". The year is added to day and week labels when it is not
 /// `today`'s year.
 pub fn period_label(tab: Tab, selected: Date, today: Date, schedule: &Schedule) -> String {
@@ -112,14 +112,14 @@ pub fn period_label(tab: Tab, selected: Date, today: Date, schedule: &Schedule) 
             };
             if first.month() == last.month() {
                 format!(
-                    "{} – {}{}",
+                    "{} to {}{}",
                     first.strftime("%a %-d"),
                     last.strftime("%a %-d %b"),
                     year(last)
                 )
             } else {
                 format!(
-                    "{} – {}{}",
+                    "{} to {}{}",
                     first.strftime("%a %-d %b"),
                     last.strftime("%a %-d %b"),
                     year(last)
@@ -221,7 +221,7 @@ pub fn view<'a>(bar: Bar<'a>) -> Element<'a, Message> {
     .align_y(Center);
 
     let quick_add = text_input(
-        "Add a task — e.g. Write Q4 report fri #work ~2h !",
+        "Add a task, for example: Write Q4 report fri #work ~2h !",
         bar.quick_add,
     )
     .id(QUICK_ADD_ID)
@@ -265,11 +265,11 @@ mod tests {
         assert_eq!(period_label(Tab::Today, today(), today(), &s), "Mon 16 Nov");
         assert_eq!(
             period_label(Tab::Week, date(2026, 11, 19), today(), &s),
-            "Mon 16 – Fri 20 Nov"
+            "Mon 16 to Fri 20 Nov"
         );
         assert_eq!(
             period_label(Tab::Week, date(2026, 12, 1), today(), &s),
-            "Mon 30 Nov – Fri 4 Dec"
+            "Mon 30 Nov to Fri 4 Dec"
         );
         assert_eq!(
             period_label(Tab::Today, date(2027, 1, 4), today(), &s),

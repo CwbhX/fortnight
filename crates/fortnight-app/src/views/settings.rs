@@ -723,8 +723,8 @@ impl SettingsView {
             input(f.protocol.example_base_url(), &f.base_url).on_input(Message::BaseUrl),
         );
         let model_placeholder = match f.protocol {
-            Protocol::OpenAi => "e.g. llama3.2 or gpt-4o",
-            Protocol::Anthropic => "e.g. claude-sonnet-5-5",
+            Protocol::OpenAi => "Model name, such as llama3.2",
+            Protocol::Anthropic => "Model name, such as claude-opus-5-5",
         };
         let load_label = if self.listing_models {
             "Loading…"
@@ -748,7 +748,7 @@ impl SettingsView {
             ModelsState::Hidden => Space::new().into(),
             ModelsState::Busy => small_muted("Asking the endpoint for its models…"),
             ModelsState::Empty => {
-                small_muted("The endpoint didn't list any models: type the model name above.")
+                small_muted("The endpoint didn't list any models. Type the model name above.")
             }
             ModelsState::Error(e) => text(format!("Couldn't load models: {}", shorten(e, 160)))
                 .size(theme::TEXT_SMALL)
@@ -778,9 +778,11 @@ impl SettingsView {
         };
         let hint = small_muted(match f.protocol {
             Protocol::OpenAi => {
-                "Any OpenAI-compatible endpoint works, e.g. Ollama at http://localhost:11434/v1."
+                "Any OpenAI-compatible endpoint works, such as Ollama at http://localhost:11434/v1."
             }
-            Protocol::Anthropic => "Anthropic's Messages API, e.g. https://api.anthropic.com.",
+            Protocol::Anthropic => {
+                "Anthropic's Messages API, usually at https://api.anthropic.com."
+            }
         });
 
         let test_label = if self.testing {
@@ -812,7 +814,7 @@ impl SettingsView {
                     )
                 }
                 None if self.key_state == KeyState::Locked => {
-                    test_row = test_row.push(small_muted("The key is locked: unlock it first."))
+                    test_row = test_row.push(small_muted("The key is locked. Unlock it first."))
                 }
                 None => {}
             }
@@ -855,7 +857,7 @@ impl SettingsView {
             (_, KeyMode::ConfirmRemove) => {
                 body = body.push(
                     row![
-                        text("Really remove the key?").size(theme::TEXT_BODY),
+                        text("Remove the key?").size(theme::TEXT_BODY),
                         button(text("Remove").size(theme::TEXT_BODY))
                             .padding([8, 14])
                             .style(theme::danger_button)
@@ -868,8 +870,8 @@ impl SettingsView {
             }
             (KeyState::NoKey, _) => {
                 body = body.push(small_muted(
-                    "Optional: a local endpoint such as Ollama needs no key. \
-                     The key is stored encrypted with a password you choose.",
+                    "A local endpoint such as Ollama needs no key. \
+                     A key you add is stored encrypted under a password you choose.",
                 ));
                 body = body.push(self.set_key_form(false));
             }
@@ -925,11 +927,11 @@ impl SettingsView {
         }
         if self.key_state != KeyState::NoKey {
             body = body.push(small_muted(
-                "A forgotten password can't be recovered: remove the key and enter it again.",
+                "A forgotten password can't be recovered. Remove the key and enter it again.",
             ));
         }
 
-        section("API KEY", body)
+        section("API key", body)
     }
 
     fn set_key_form(&self, cancellable: bool) -> Element<'_, Message> {
@@ -954,7 +956,7 @@ impl SettingsView {
                 ),
                 labelled(
                     "Confirm password",
-                    secret_input("Same again", &s.confirm, SecretField::Confirm)
+                    secret_input("Type it again", &s.confirm, SecretField::Confirm)
                         .on_submit(Message::SaveKey)
                 ),
             ]
@@ -983,7 +985,7 @@ impl SettingsView {
                 ),
                 labelled(
                     "Confirm new password",
-                    secret_input("Same again", &s.new_confirm, SecretField::NewConfirm)
+                    secret_input("Type it again", &s.new_confirm, SecretField::NewConfirm)
                         .on_submit(Message::SubmitChangePassword)
                 ),
             ]
@@ -1018,7 +1020,7 @@ impl SettingsView {
         );
 
         section(
-            "SCHEDULE",
+            "Schedule",
             column![week_start, row![summary, plan].spacing(theme::SPACING)]
                 .spacing(theme::SPACING * 1.25),
         )
@@ -1041,7 +1043,7 @@ impl SettingsView {
                 input("6", &f.focus_hours)
                     .on_input(Message::FocusHours)
                     .width(90),
-                small_muted("Hours of real work a day; the Week tab compares estimates with it."),
+                small_muted("The Week tab compares estimates against this."),
             ]
             .spacing(theme::SPACING)
             .align_y(Center),
@@ -1049,13 +1051,13 @@ impl SettingsView {
         .spacing(theme::SPACING / 3.0);
         if parse_hours(&f.focus_hours).is_none() {
             hours = hours.push(
-                text("Use hours between 0 and 24, e.g. 6 or 5.5")
+                text("Enter hours between 0 and 24, such as 6 or 5.5.")
                     .size(theme::TEXT_SMALL)
                     .style(theme::danger),
             );
         }
         section(
-            "CAPACITY",
+            "Capacity",
             column![
                 column![text("Working days").size(theme::TEXT_SMALL), days]
                     .spacing(theme::SPACING / 2.0),
@@ -1067,16 +1069,13 @@ impl SettingsView {
 
     fn notifications_section(&self) -> Element<'_, Message> {
         section(
-            "NOTIFICATIONS",
+            "Notifications",
             column![
                 checkbox(self.form.notifications)
                     .label("Notify me when a report is ready")
                     .text_size(theme::TEXT_BODY)
                     .on_toggle(Message::Notifications),
-                small_muted(
-                    "Uses the system's notifications, which are best-effort: \
-                     some systems hide or block them."
-                ),
+                small_muted("Some systems hide or block these notifications."),
             ]
             .spacing(theme::SPACING / 2.0),
         )
@@ -1084,10 +1083,10 @@ impl SettingsView {
 
     fn summary_section(&self) -> Element<'_, Message> {
         section(
-            "SUMMARY STYLE",
+            "Summary style",
             column![
                 input(
-                    "e.g. Under 150 words, bullet points, plain tone",
+                    "For example: under 150 words, plain tone",
                     &self.form.summary_instructions
                 )
                 .on_input(Message::SummaryInstructions),
@@ -1099,7 +1098,7 @@ impl SettingsView {
 
     fn data_section(&self) -> Element<'_, Message> {
         section(
-            "DATA FOLDER",
+            "Data folder",
             text(self.data_dir.display().to_string())
                 .size(theme::TEXT_SMALL)
                 .style(theme::muted),
@@ -1138,7 +1137,7 @@ fn labelled_when<'a>(
     .width(Fill);
     if parse_time(time).is_none() {
         col = col.push(
-            text("Use 24-hour HH:MM, e.g. 16:00")
+            text("Use 24-hour time, such as 16:00.")
                 .size(theme::TEXT_SMALL)
                 .style(theme::danger),
         );
@@ -1352,7 +1351,7 @@ impl UnlockView {
             .padding([10, 18])
             .style(theme::primary_button)
             .on_press_maybe((!self.password.is_empty()).then_some(UnlockMessage::Submit));
-        let skip = button(text("Skip — use without AI features").size(theme::TEXT_SMALL))
+        let skip = button(text("Skip for now").size(theme::TEXT_SMALL))
             .padding([4, 8])
             .style(theme::text_button)
             .on_press(UnlockMessage::Skip);

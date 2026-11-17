@@ -263,7 +263,7 @@ pub fn day_heading(day: Date, today: Date) -> String {
 /// The text shown when the shown day has no open tasks.
 pub fn empty_message(day: Date, today: Date) -> String {
     if day == today {
-        "Nothing planned for today. Add a task in the bar above.".to_string()
+        "Nothing planned for today.".to_string()
     } else {
         format!("Nothing planned for {}", day.strftime("%a %-d %b"))
     }
@@ -316,7 +316,10 @@ fn read_date(
         Ok(current)
     } else {
         parse_date(input, today).map(Some).ok_or_else(|| {
-            format!("{label}: can't read \"{input}\" as a date. Try fri, tomorrow, nov 20, +3d.")
+            format!(
+                "Can't read \"{input}\" as a {} date. Try fri, tomorrow, nov 20 or +3d.",
+                label.to_lowercase()
+            )
         })
     }
 }
@@ -384,7 +387,7 @@ impl EditForm {
             task.estimate_minutes
         } else {
             Some(parse::parse_estimate(estimate).ok_or_else(|| {
-                format!("Estimate: can't read \"{estimate}\". Try 30m, 2h, 1h30m.")
+                format!("Can't read \"{estimate}\" as an estimate. Try 30m, 2h or 1h30m.")
             })?)
         };
         let project = self.project.trim().trim_start_matches('#').trim();
@@ -771,15 +774,12 @@ fn day_log<'a>(data: &'a DayData, input: &'a str) -> Option<Element<'a, Message>
     group = group.push(log_lines(lines));
     if can_add {
         group = group.push(
-            text_input(
-                "Log work that isn't a task — e.g. helped Sam debug the deploy",
-                input,
-            )
-            .on_input(Message::EditDayLog)
-            .on_submit(Message::AddDayLog)
-            .padding([8, 10])
-            .size(theme::TEXT_SMALL)
-            .style(theme::input),
+            text_input("Log work that isn't a task", input)
+                .on_input(Message::EditDayLog)
+                .on_submit(Message::AddDayLog)
+                .padding([8, 10])
+                .size(theme::TEXT_SMALL)
+                .style(theme::input),
         );
     }
     Some(group.into())
@@ -999,7 +999,7 @@ fn edit_card<'a>(task: &'a Task, form: &'a EditForm, logs: &'a [LogLine]) -> Ele
             ),
             labelled(
                 "Due",
-                field("none — fri, nov 20", &form.due, Message::EditDue)
+                field("fri, nov 20 or +3d", &form.due, Message::EditDue)
             ),
             labelled(
                 "Planned",
@@ -1007,7 +1007,7 @@ fn edit_card<'a>(task: &'a Task, form: &'a EditForm, logs: &'a [LogLine]) -> Ele
             ),
             labelled(
                 "Estimate",
-                field("e.g. 2h, 30m", &form.estimate, Message::EditEstimate)
+                field("2h, 30m or 1h30m", &form.estimate, Message::EditEstimate)
             ),
         ]
         .spacing(theme::SPACING),
@@ -1036,7 +1036,7 @@ fn edit_card<'a>(task: &'a Task, form: &'a EditForm, logs: &'a [LogLine]) -> Ele
         "Log",
         column![
             log_lines(lines),
-            text_input("Add a log line — what you did on this", &form.log)
+            text_input("Add a log line", &form.log)
                 .on_input(Message::EditTaskLog)
                 .on_submit(Message::AddTaskLog)
                 .padding([8, 10])
@@ -1542,7 +1542,10 @@ mod tests {
         view.update(Message::EditPlanned("blah".into()));
         assert_eq!(view.update(Message::Save), Action::None);
         let err = view.editing.as_ref().unwrap().error.clone().unwrap();
-        assert!(err.starts_with("Planned") && err.contains("blah"), "{err}");
+        assert!(
+            err.contains("planned date") && err.contains("blah"),
+            "{err}"
+        );
 
         // Editing clears the error.
         view.update(Message::EditPlanned(String::new()));
@@ -1551,13 +1554,13 @@ mod tests {
         view.update(Message::EditDue("someday".into()));
         assert_eq!(view.update(Message::Save), Action::None);
         let err = view.editing.as_ref().unwrap().error.clone().unwrap();
-        assert!(err.starts_with("Due") && err.contains("someday"), "{err}");
+        assert!(err.contains("due date") && err.contains("someday"), "{err}");
         view.update(Message::EditDue(String::new()));
 
         view.update(Message::EditEstimate("lots".into()));
         assert_eq!(view.update(Message::Save), Action::None);
         let err = view.editing.as_ref().unwrap().error.clone().unwrap();
-        assert!(err.starts_with("Estimate") && err.contains("lots"), "{err}");
+        assert!(err.contains("estimate") && err.contains("lots"), "{err}");
         assert!(view.editing.is_some(), "the form stays open");
     }
 

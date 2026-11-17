@@ -263,7 +263,7 @@ pub fn parse_week_arg(arg: &str, today: Date, week_start: Weekday) -> CliResult<
             .map(|d| week::week_containing(d, week_start))
             .map_err(|_| {
                 CliError::usage(format!(
-                    "'{arg}' is not a week: use this, last or a date like 2026-11-16"
+                    "'{arg}' is not a week. Use this, last or a date such as 2026-11-16."
                 ))
             }),
     }
@@ -435,7 +435,7 @@ pub async fn run_due(
         Err(e) if e.code == crate::error::EXIT_USAGE => {
             writeln!(
                 out,
-                "{} due, but no LLM endpoint is configured; nothing generated. ({e})",
+                "{} due. No LLM endpoint is configured, so nothing was generated.",
                 jobs.len()
             )?;
             return Ok(());

@@ -281,11 +281,11 @@ fn heading_text(spec: &ColumnSpec) -> (String, String) {
             .collect();
         return (names.join(", "), String::new());
     }
-    let names = format!("{}–{}", first.strftime("%a"), last.strftime("%a"));
+    let names = format!("{} to {}", first.strftime("%a"), last.strftime("%a"));
     let dates = if first.month() == last.month() {
-        format!("{}–{}", first.day(), date_label(last))
+        format!("{} to {}", first.day(), date_label(last))
     } else {
-        format!("{} – {}", date_label(first), date_label(last))
+        format!("{} to {}", date_label(first), date_label(last))
     };
     (names, dates)
 }
@@ -356,7 +356,7 @@ fn day_column<'a>(data: &'a WeekData, spec: &ColumnSpec, overdue: usize) -> Elem
     if overdue > 0 {
         col = col.push(
             button(
-                text(format!("{overdue} overdue — see Today"))
+                text(format!("{overdue} overdue, see Today"))
                     .size(theme::TEXT_SMALL)
                     .style(theme::danger),
             )
@@ -592,7 +592,7 @@ mod tests {
         assert_eq!(weekend.days, vec![date(2026, 11, 21), date(2026, 11, 22)]);
         assert_eq!(
             heading_text(weekend),
-            ("Sat–Sun".to_string(), "21–22 Nov".to_string())
+            ("Sat to Sun".to_string(), "21 to 22 Nov".to_string())
         );
     }
 

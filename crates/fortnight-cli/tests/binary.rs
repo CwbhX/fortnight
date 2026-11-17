@@ -90,7 +90,7 @@ fn facts_work_without_an_llm_and_llm_commands_exit_2_when_unconfigured() {
     // run-due with something due but no LLM: nothing fails (PLAN.md 8).
     let due = run_on(&dir, "2026-11-20", &["run-due"]);
     assert_eq!(due.status.code(), Some(0), "{}", stderr(&due));
-    assert!(stdout(&due).contains("nothing generated"));
+    assert!(stdout(&due).contains("nothing was generated"));
 
     let bad = run(&dir, &["summary", "--week", "someday"]);
     assert_eq!(bad.status.code(), Some(2));

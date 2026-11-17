@@ -320,8 +320,8 @@ impl Ready {
                 (
                     Some(lock),
                     Some(format!(
-                        "This data folder was already open on {} (since {since}), or Fortnight \
-                         didn't close cleanly. Don't use one folder on two machines at once.",
+                        "This data folder is also open on {}, since {since}, or Fortnight didn't \
+                         close cleanly last time. Use the folder on one machine at a time.",
                         previous.host
                     )),
                 )
@@ -749,7 +749,7 @@ impl Ready {
             .iter()
             .any(|e| !matches!(e.kind, fortnight_core::domain::EventKind::Created { .. }))
         {
-            return Err("the new task has changed since; delete it instead".into());
+            return Err("the task has changed since you added it. Delete it instead".into());
         }
         self.store
             .delete_task(id)
@@ -1055,7 +1055,7 @@ impl Ready {
             day::Action::Delete(id) => match self.store.delete_task(id) {
                 Ok(deleted) => {
                     self.notice = Some(format!(
-                        "Deleted “{}”. Press {}Z to undo.",
+                        "Deleted \"{}\". Press {}Z to undo.",
                         deleted.task.title,
                         if cfg!(target_os = "macos") {
                             "⌘"

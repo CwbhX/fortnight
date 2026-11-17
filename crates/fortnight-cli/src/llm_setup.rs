@@ -71,7 +71,7 @@ pub fn resolve_key(
     } else {
         let line = prompt().map_err(|e| {
             CliError::failure(format!(
-                "cannot read the key-file password ({e}); use --password-stdin or set FORTNIGHT_LLM_API_KEY"
+                "cannot read the key password: {e}. Use --password-stdin or set FORTNIGHT_LLM_API_KEY."
             ))
         })?;
         SecretString::from(line)
@@ -109,8 +109,8 @@ pub fn connect_from_settings(
     let llm = effective_settings(saved, |n| std::env::var(n).ok(), flags);
     if !llm.is_configured() {
         return Err(CliError::usage(
-            "no LLM endpoint is configured: set it in the app's Settings, with \
-             FORTNIGHT_LLM_BASE_URL and FORTNIGHT_LLM_MODEL, or with --base-url and --model",
+            "no LLM endpoint is configured. Set it in the app's Settings, with \
+             FORTNIGHT_LLM_BASE_URL and FORTNIGHT_LLM_MODEL, or with --base-url and --model.",
         ));
     }
     let stdin = std::io::stdin();

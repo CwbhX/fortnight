@@ -117,7 +117,7 @@ fn all_json(tasks: &[Task], events: &[Event], reports: &[Report], today: Date) -
 // --------------------------------------------------------------- Markdown
 
 fn all_markdown(tasks: &[Task], events: &[Event], reports: &[Report], today: Date) -> String {
-    let mut out = format!("# Fortnight export — {today}\n");
+    let mut out = format!("# Fortnight export, {today}\n");
 
     // Log lines attached to a task that is in the export go under that task;
     // the rest (free-standing, or for a task that no longer exists) are
@@ -182,7 +182,7 @@ fn all_markdown(tasks: &[Task], events: &[Event], reports: &[Report], today: Dat
             }
             let text = e.log_text().unwrap_or_default();
             out.push_str(&format!(
-                "- {} — {}\n",
+                "- {} · {}\n",
                 utc_time(e.at),
                 indent_rest(text, 2)
             ));
@@ -273,7 +273,7 @@ fn push_task(out: &mut String, task: &Task, logs: Option<&Vec<&Event>>) {
         parts.push(format!("completed: {}", utc_date(at)));
     }
     if !parts.is_empty() {
-        line.push_str(" — ");
+        line.push_str(" · ");
         line.push_str(&parts.join(" · "));
     }
     out.push_str(&line);
@@ -292,7 +292,7 @@ fn push_task(out: &mut String, task: &Task, logs: Option<&Vec<&Event>>) {
     for e in logs.into_iter().flatten() {
         let text = e.log_text().unwrap_or_default();
         out.push_str(&format!(
-            "  - {} {} — {}\n",
+            "  - {} {} · {}\n",
             utc_date(e.at),
             utc_time(e.at),
             indent_rest(text, 4)
@@ -300,13 +300,13 @@ fn push_task(out: &mut String, task: &Task, logs: Option<&Vec<&Event>>) {
     }
 }
 
-/// "Summary — week of 2026-11-16".
+/// "Summary for the week of 2026-11-16".
 fn report_heading(report: &Report) -> String {
     let kind = match report.kind {
         ReportKind::Summary => "Summary",
-        ReportKind::Plan => "Plan",
+        ReportKind::Plan => "Advice",
     };
-    format!("{kind} — week of {}", report.week_start)
+    format!("{kind} for the week of {}", report.week_start)
 }
 
 /// The report's text (edit preferred), or its error if it failed.
@@ -498,7 +498,7 @@ mod tests {
     fn markdown_has_sections_in_order() {
         let (tasks, events, reports) = sample();
         let md = export_all(ExportFormat::Markdown, &tasks, &events, &reports, TODAY);
-        assert!(md.starts_with("# Fortnight export — 2026-11-16\n"));
+        assert!(md.starts_with("# Fortnight export, 2026-11-16\n"));
         let order = [
             "## Tasks",
             "### Open",
@@ -532,7 +532,7 @@ mod tests {
         let (tasks, events, reports) = sample();
         let md = export_all(ExportFormat::Markdown, &tasks, &events, &reports, TODAY);
         assert!(md.contains(
-            "- [ ] **Write spec** — project: Atlas · due: 2026-11-20 · estimate: ~1h30m · priority: !!\n"
+            "- [ ] **Write spec** · project: Atlas · due: 2026-11-20 · estimate: ~1h30m · priority: !!\n"
         ));
         assert!(md.contains("- [ ] **Call the bank** (private)\n"));
         assert_eq!(md.matches("(private)").count(), 1);
@@ -546,7 +546,7 @@ mod tests {
         let md = export_all(ExportFormat::Markdown, &tasks, &events, &reports, TODAY);
         let spec = pos(&md, "**Write spec**");
         let notes = pos(&md, "  first line\n  second line\n");
-        let logline = pos(&md, "  - 2026-11-12 14:30 — Drafted the outline");
+        let logline = pos(&md, "  - 2026-11-12 14:30 · Drafted the outline");
         let next = pos(&md, "**Call the bank**");
         assert!(spec < notes && notes < logline && logline < next);
         // Non-log events are not exported to Markdown.
@@ -558,7 +558,7 @@ mod tests {
         let (tasks, events, reports) = sample();
         let md = export_all(ExportFormat::Markdown, &tasks, &events, &reports, TODAY);
         let log = &md[pos(&md, "## Log")..pos(&md, "## Reports")];
-        assert!(log.contains("### 2026-11-13\n\n- 09:05 — Team offsite\n  second line\n"));
+        assert!(log.contains("### 2026-11-13\n\n- 09:05 · Team offsite\n  second line\n"));
         assert!(!log.contains("Drafted the outline"));
     }
 
@@ -567,8 +567,8 @@ mod tests {
         let (tasks, events, reports) = sample();
         let md = export_all(ExportFormat::Markdown, &tasks, &events, &reports, TODAY);
         let reports_md = &md[pos(&md, "## Reports")..];
-        let newer = pos(reports_md, "### Plan — week of 2026-11-16");
-        let older = pos(reports_md, "### Summary — week of 2026-11-09");
+        let newer = pos(reports_md, "### Advice for the week of 2026-11-16");
+        let older = pos(reports_md, "### Summary for the week of 2026-11-09");
         assert!(newer < older);
         assert!(reports_md.contains("my edited text"));
         assert!(!reports_md.contains("model text v2"));
@@ -580,7 +580,7 @@ mod tests {
     #[test]
     fn empty_inputs() {
         let md = export_all(ExportFormat::Markdown, &[], &[], &[], TODAY);
-        assert!(md.contains("# Fortnight export — 2026-11-16"));
+        assert!(md.contains("# Fortnight export, 2026-11-16"));
         assert!(md.contains("No tasks."));
         assert!(md.contains("No reports."));
         assert!(!md.contains("## Log"));
@@ -596,9 +596,12 @@ mod tests {
     fn export_report_markdown_and_json() {
         let (_, _, reports) = sample();
         let md = export_report(ExportFormat::Markdown, &reports[1]);
-        assert_eq!(md, "# Summary — week of 2026-11-09\n\nmy edited text\n");
+        assert_eq!(
+            md,
+            "# Summary for the week of 2026-11-09\n\nmy edited text\n"
+        );
         let failed = export_report(ExportFormat::Markdown, &reports[2]);
-        assert!(failed.starts_with("# Plan — week of 2026-11-16\n"));
+        assert!(failed.starts_with("# Advice for the week of 2026-11-16\n"));
         assert!(failed.contains("**Failed:** endpoint returned 500"));
         let json = export_report(ExportFormat::Json, &reports[1]);
         assert_eq!(serde_json::from_str::<Report>(&json).unwrap(), reports[1]);

@@ -23,7 +23,7 @@ pub fn lock_warning(dir: &Path, this_host: &str) -> Option<String> {
         // keep control characters out of the terminal.
         let host: String = lock.host.chars().filter(|c| !c.is_control()).collect();
         format!(
-            "warning: the data folder is in use on {host} (since {}); changes may conflict",
+            "warning: the data folder is also open on {host}, since {}. Changes may conflict.",
             lock.since
         )
     })

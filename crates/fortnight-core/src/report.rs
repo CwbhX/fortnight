@@ -959,7 +959,7 @@ pub fn summary_facts_markdown(facts: &SummaryFacts) -> String {
         };
         let _ = writeln!(
             md,
-            "- {}{} · {} → {}{times}",
+            "- {}{} · {} to {}{times}",
             t.title,
             project_suffix(&t.project),
             short_date(t.from),
@@ -1035,8 +1035,8 @@ pub fn plan_facts_markdown(facts: &PlanFacts) -> String {
     let days = facts.remaining_working_days.len();
     let unestimated = match t.due_without_estimate {
         0 => String::new(),
-        1 => " (1 task has no estimate)".to_string(),
-        n => format!(" ({n} tasks have no estimate)"),
+        1 => ", 1 task has no estimate".to_string(),
+        n => format!(", {n} tasks have no estimate"),
     };
     let overloaded = if t.overloaded {
         " · **overloaded**"
@@ -1506,7 +1506,7 @@ fn relative_days(n: i32) -> String {
 fn project_suffix(project: &Option<String>) -> String {
     project
         .as_deref()
-        .map(|p| format!(" — *{p}*"))
+        .map(|p| format!(" · *{p}*"))
         .unwrap_or_default()
 }
 
