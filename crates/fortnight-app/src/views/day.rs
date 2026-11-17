@@ -1130,18 +1130,9 @@ impl DayView {
     /// shown day's notes, read only, on another day that has some.
     fn day_notes_view<'a>(&'a self, data: &'a DayData) -> Option<Element<'a, Message>> {
         if data.day == data.today {
-            let heading = row![
-                text("Today's Notes").size(theme::TEXT_HEADING),
-                text("Goes into the weekly summary")
-                    .size(theme::TEXT_SMALL)
-                    .style(theme::muted),
-            ]
-            .spacing(theme::SPACING * 0.75)
-            .align_y(iced::alignment::Vertical::Bottom);
+            let heading = text("Today's Notes").size(theme::TEXT_HEADING);
             let editor = text_editor(&self.notes)
-                .placeholder(
-                    "Jot down anything from today: side work, meetings, decisions, blockers…",
-                )
+                .placeholder("What's on your mind?")
                 .on_action(Message::EditDayNotes)
                 // Grows with the text, then scrolls.
                 .min_height(120)
