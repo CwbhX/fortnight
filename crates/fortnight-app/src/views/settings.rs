@@ -45,14 +45,17 @@
 
 use fortnight_core::domain::{Accent, AppIcon, LlmSettings, Protocol, Schedule, Settings};
 use fortnight_core::ollama::{self, DEFAULT_BASE_URL as OLLAMA_BASE_URL, ModelKind, OllamaModel};
-use fortnight_core::report::{DEFAULT_PLAN_PROMPT, DEFAULT_SUMMARY_PROMPT};
+use fortnight_core::parse::{format_hours, format_time, parse_hours, parse_time};
+use fortnight_core::report::{
+    DEFAULT_PLAN_PROMPT, DEFAULT_SUMMARY_PROMPT, WEEKDAYS, short_weekday, weekday_name,
+};
 use fortnight_core::vault::MIN_PASSWORD_LEN;
 use iced::widget::{
     Space, button, checkbox, column, container, opaque, operation, pick_list, row, rule,
     scrollable, stack, text, text_editor, text_input, tooltip,
 };
 use iced::{Background, Border, Center, Color, Element, Fill, Theme};
-use jiff::civil::{Time, Weekday};
+use jiff::civil::Weekday;
 use secrecy::SecretString;
 use std::fmt;
 use std::path::PathBuf;
@@ -205,17 +208,6 @@ pub struct SettingsData {
     pub ollama: Option<Result<Vec<OllamaModel>, String>>,
 }
 
-/// Monday to Sunday.
-const WEEK: [Weekday; 7] = [
-    Weekday::Monday,
-    Weekday::Tuesday,
-    Weekday::Wednesday,
-    Weekday::Thursday,
-    Weekday::Friday,
-    Weekday::Saturday,
-    Weekday::Sunday,
-];
-
 /// An app icon choice with a `Display` impl, for `pick_list`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct IconChoice(AppIcon);
@@ -240,72 +232,10 @@ impl fmt::Display for IconChoice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Day(Weekday);
 
-const DAYS: [Day; 7] = [
-    Day(Weekday::Monday),
-    Day(Weekday::Tuesday),
-    Day(Weekday::Wednesday),
-    Day(Weekday::Thursday),
-    Day(Weekday::Friday),
-    Day(Weekday::Saturday),
-    Day(Weekday::Sunday),
-];
-
 impl fmt::Display for Day {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(day_name(self.0))
+        f.write_str(weekday_name(self.0))
     }
-}
-
-fn day_name(day: Weekday) -> &'static str {
-    match day {
-        Weekday::Monday => "Monday",
-        Weekday::Tuesday => "Tuesday",
-        Weekday::Wednesday => "Wednesday",
-        Weekday::Thursday => "Thursday",
-        Weekday::Friday => "Friday",
-        Weekday::Saturday => "Saturday",
-        Weekday::Sunday => "Sunday",
-    }
-}
-
-/// `HH:MM` (or `H:MM`), 24-hour.
-pub fn parse_time(s: &str) -> Option<Time> {
-    let (h, m) = s.trim().split_once(':')?;
-    if h.is_empty() || h.len() > 2 || m.len() != 2 {
-        return None;
-    }
-    if !h.chars().chain(m.chars()).all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    Time::new(h.parse().ok()?, m.parse().ok()?, 0, 0).ok()
-}
-
-pub fn format_time(t: Time) -> String {
-    format!("{:02}:{:02}", t.hour(), t.minute())
-}
-
-/// Decimal hours per day (`6`, `5.5`, `7,25`) as whole minutes. More than 0
-/// and at most 24 hours.
-pub fn parse_hours(s: &str) -> Option<u32> {
-    let s = s.trim().replace(',', ".");
-    if s.is_empty() || !s.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        return None;
-    }
-    let hours: f64 = s.parse().ok()?;
-    let minutes = (hours * 60.0).round();
-    (1.0..=24.0 * 60.0)
-        .contains(&minutes)
-        .then_some(minutes as u32)
-}
-
-/// Minutes as decimal hours with at most two decimals: 360 → `6`,
-/// 330 → `5.5`. [`parse_hours`] reads it back to the same minutes.
-pub fn format_hours(minutes: u32) -> String {
-    if minutes.is_multiple_of(60) {
-        return (minutes / 60).to_string();
-    }
-    let s = format!("{:.2}", f64::from(minutes) / 60.0);
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// What the model-list area shows.
@@ -355,11 +285,12 @@ pub enum Provider {
 impl Provider {
     const ALL: [Provider; 3] = [Provider::Ollama, Provider::OpenAi, Provider::Anthropic];
 
-    fn default_url(self) -> &'static str {
+    /// Ollama's is the one on this machine (`OLLAMA_HOST` if set).
+    fn default_url(self) -> String {
         match self {
-            Provider::Ollama => OLLAMA_BASE_URL,
-            Provider::OpenAi => "https://api.openai.com/v1",
-            Provider::Anthropic => "https://api.anthropic.com",
+            Provider::Ollama => ollama::local_base_url(),
+            Provider::OpenAi => "https://api.openai.com/v1".into(),
+            Provider::Anthropic => "https://api.anthropic.com".into(),
         }
     }
 }
@@ -417,11 +348,15 @@ impl Endpoint {
     }
 
     /// Switches provider; an empty URL or another provider's default URL
-    /// becomes the new provider's default.
+    /// (Ollama's built-in default counts too) becomes the new provider's
+    /// default.
     fn set_provider(&mut self, provider: Provider) {
         let url = self.base_url.trim();
-        if url.is_empty() || Provider::ALL.iter().any(|p| p.default_url() == url) {
-            self.base_url = provider.default_url().into();
+        if url.is_empty()
+            || url == OLLAMA_BASE_URL
+            || Provider::ALL.iter().any(|p| p.default_url() == url)
+        {
+            self.base_url = provider.default_url();
         }
         if provider != Provider::Ollama {
             self.decision = false;
@@ -481,7 +416,7 @@ impl Form {
             summary_time: format_time(sched.summary_time),
             plan_day: sched.plan_day,
             plan_time: format_time(sched.plan_time),
-            working_days: WEEK.map(|d| sched.working_days.contains(&d)),
+            working_days: WEEKDAYS.map(|d| sched.working_days.contains(&d)),
             focus_hours: format_hours(s.focus_minutes_per_day),
             app_icon: s.app_icon,
             accent: s.accent,
@@ -496,8 +431,11 @@ impl Form {
     }
 
     /// The settings this form describes, or `None` if a time or the focus
-    /// hours are invalid.
+    /// hours are invalid or no working day is ticked.
     fn to_settings(&self) -> Option<Settings> {
+        if !self.working_days.contains(&true) {
+            return None;
+        }
         let (summary_prompt, summary_instructions) = if self.summary_prompt == self.summary_shown {
             self.summary_stored.clone()
         } else {
@@ -515,7 +453,7 @@ impl Form {
                 summary_time: parse_time(&self.summary_time)?,
                 plan_day: self.plan_day,
                 plan_time: parse_time(&self.plan_time)?,
-                working_days: WEEK
+                working_days: WEEKDAYS
                     .iter()
                     .zip(self.working_days)
                     .filter(|(_, on)| *on)
@@ -554,6 +492,17 @@ fn stored_prompt(text: &str, default: &str) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// The form against the loaded settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormStatus {
+    /// Nothing to save.
+    Clean,
+    /// Edited, but a field is invalid.
+    Invalid,
+    /// Edited and valid: Save saves them.
+    Savable,
 }
 
 /// Which key form or confirmation is open.
@@ -619,8 +568,11 @@ pub const PASSWORD_INPUT_ID: &str = "settings-key-password";
 
 #[derive(Debug)]
 pub struct SettingsView {
-    /// The settings last given to `load`; the form resets when they change.
-    loaded: Option<Settings>,
+    /// The settings last given to `load` (the defaults before the first
+    /// one); the form resets when they change.
+    loaded: Settings,
+    /// The form as `loaded` fills it in, to tell which fields were edited.
+    baseline: Form,
     form: Form,
     data_dir: PathBuf,
     key_state: KeyState,
@@ -647,6 +599,9 @@ pub struct SettingsView {
     ollama_prefilled: bool,
     /// The section whose Test button was pressed last; its result shows there.
     tested: Which,
+    /// The endpoint that test was for: the result shows only while the
+    /// form still names it.
+    tested_llm: Option<LlmSettings>,
     /// The password pop-up is open (after Save key).
     password_prompt: bool,
     summary_editor: text_editor::Content,
@@ -655,9 +610,14 @@ pub struct SettingsView {
 
 impl Default for SettingsView {
     fn default() -> Self {
+        let loaded = Settings::default();
+        let form = Form::from_settings(&loaded);
         SettingsView {
-            loaded: None,
-            form: Form::default(),
+            summary_editor: text_editor::Content::with_text(&form.summary_prompt),
+            plan_editor: text_editor::Content::with_text(&form.plan_prompt),
+            loaded,
+            baseline: form.clone(),
+            form,
             data_dir: PathBuf::new(),
             key_state: KeyState::NoKey,
             test_result: None,
@@ -675,9 +635,8 @@ impl Default for SettingsView {
             ollama: None,
             ollama_prefilled: false,
             tested: Which::Main,
+            tested_llm: None,
             password_prompt: false,
-            summary_editor: text_editor::Content::new(),
-            plan_editor: text_editor::Content::new(),
         }
     }
 }
@@ -692,19 +651,19 @@ impl SettingsView {
     /// (typed URL, model, key, passwords) unless `settings` itself changed
     /// from what was last loaded.
     pub fn load(&mut self, data: SettingsData) {
-        if self.loaded.as_ref() != Some(&data.settings) {
-            self.form = Form::from_settings(&data.settings);
+        if self.loaded != data.settings {
+            self.baseline = Form::from_settings(&data.settings);
+            self.form = self.baseline.clone();
             self.decision_on = self.form.decision != Endpoint::default();
             self.summary_editor = text_editor::Content::with_text(&self.form.summary_prompt);
             self.plan_editor = text_editor::Content::with_text(&self.form.plan_prompt);
-            self.loaded = Some(data.settings);
+            self.loaded = data.settings;
         }
         if data.key_state != self.key_state || data.decision_key_state != self.decision_key_state {
             self.key_state = data.key_state;
             self.decision_key_state = data.decision_key_state;
-            self.key_mode = KeyMode::Idle;
-            self.key_error = None;
-            self.secrets.wipe_all();
+            // Closes the password pop-up too, so nothing typed survives.
+            self.close_key_form();
         }
         self.data_dir = data.data_dir;
         self.test_result = data.test_result;
@@ -726,7 +685,7 @@ impl SettingsView {
             return;
         }
         self.ollama_prefilled = true;
-        let unset = !self.loaded.as_ref().is_some_and(|s| s.llm.is_configured());
+        let unset = !self.loaded.llm.is_configured();
         if unset && self.form.main == Endpoint::default() {
             let first = models.iter().find(|m| m.kind != ModelKind::Decision);
             self.form.main.set_provider(Provider::Ollama);
@@ -746,20 +705,38 @@ impl SettingsView {
         }
     }
 
+    /// The edits: `None` when there is nothing to save, `Some(None)` when
+    /// a field is invalid, else the settings Save would save.
+    fn edits(&self) -> Option<Option<Settings>> {
+        // An untouched form saves nothing even when it doesn't round-trip
+        // exactly (older settings: keyless, untrimmed prompts).
+        if self.form == self.baseline {
+            return None;
+        }
+        match self.form.to_settings() {
+            // Edits that parse back to the same settings ("8" → "8.0").
+            Some(s) if s == self.loaded => None,
+            parsed => Some(parsed),
+        }
+    }
+
+    fn status(&self) -> FormStatus {
+        match self.edits() {
+            None => FormStatus::Clean,
+            Some(None) => FormStatus::Invalid,
+            Some(Some(_)) => FormStatus::Savable,
+        }
+    }
+
     /// The settings the form would save, if they differ from the loaded
     /// ones and every field is valid.
     fn savable(&self) -> Option<Settings> {
-        if !self.is_dirty() {
-            return None;
-        }
-        let settings = self.form.to_settings()?;
-        let loaded = self.loaded.clone().unwrap_or_default();
-        (settings != loaded).then_some(settings)
+        self.edits().flatten()
     }
 
+    #[cfg(test)]
     fn is_dirty(&self) -> bool {
-        let loaded = self.loaded.clone().unwrap_or_default();
-        self.form != Form::from_settings(&loaded)
+        !matches!(self.status(), FormStatus::Clean)
     }
 
     fn can_test(&self, which: Which) -> bool {
@@ -850,8 +827,7 @@ impl SettingsView {
                 }
             }
             Message::Close => {
-                // Typed but unsubmitted secrets don't outlive the overlay.
-                self.close_key_form();
+                self.on_hidden();
                 return Action::Close;
             }
             Message::WeekStart(d) => form.week_start = d,
@@ -871,11 +847,14 @@ impl SettingsView {
                     PromptKind::Summary => &mut self.summary_editor,
                     PromptKind::Plan => &mut self.plan_editor,
                 };
+                let edit = action.is_edit();
                 editor.perform(action);
-                let text = editor.text();
-                match kind {
-                    PromptKind::Summary => form.summary_prompt = text,
-                    PromptKind::Plan => form.plan_prompt = text,
+                if edit {
+                    let text = editor.text();
+                    match kind {
+                        PromptKind::Summary => form.summary_prompt = text,
+                        PromptKind::Plan => form.plan_prompt = text,
+                    }
                 }
             }
             Message::ResetPrompt(kind) => {
@@ -897,8 +876,10 @@ impl SettingsView {
             }
             Message::Test(w) => {
                 if self.can_test(w) {
+                    let llm = self.form.endpoint(w).llm();
                     self.tested = w;
-                    return Action::Test(self.form.endpoint(w).llm(), w);
+                    self.tested_llm = Some(llm.clone());
+                    return Action::Test(llm, w);
                 }
             }
             Message::Secret(field, Typed(value)) => {
@@ -941,6 +922,13 @@ impl SettingsView {
         Action::None
     }
 
+    /// The overlay was hidden, by any route: typed but unsubmitted secrets
+    /// don't outlive it, and the key form and password pop-up close. Form
+    /// edits are kept.
+    pub fn on_hidden(&mut self) {
+        self.close_key_form();
+    }
+
     fn open_key_form(&mut self, which: Which, mode: KeyMode) {
         self.close_key_form();
         self.key_target = which;
@@ -974,6 +962,7 @@ impl SettingsView {
         let which = self.key_target;
         if self.typed_key(which).trim().is_empty() {
             self.password_prompt = false;
+            wipe(&mut self.secrets.password);
             return Action::None;
         }
         if let Err(e) = check_password(&self.secrets.password) {
@@ -993,26 +982,25 @@ impl SettingsView {
     // ------------------------------------------------------------- view
 
     pub fn view(&self) -> Element<'_, Message> {
+        let status = self.status();
         let save = button(text("Save").size(theme::TEXT_BODY))
             .padding([8, 18])
             .style(theme::primary_button)
-            .on_press_maybe(self.savable().map(|_| Message::Save));
+            .on_press_maybe((status == FormStatus::Savable).then_some(Message::Save));
         let close = button(theme::icon(Icon::Close))
             .padding(theme::ICON_PADDING)
             .style(theme::icon_button)
             .on_press(Message::Close);
-        let status: Element<'_, Message> = if !self.is_dirty() {
-            Space::new().into()
-        } else if self.form.to_settings().is_none() {
-            text("Fix the errors below to save")
+        let status: Element<'_, Message> = match status {
+            FormStatus::Clean => Space::new().into(),
+            FormStatus::Invalid => text("Fix the errors below to save")
                 .size(theme::TEXT_SMALL)
                 .style(theme::danger)
-                .into()
-        } else {
-            text("Unsaved changes")
+                .into(),
+            FormStatus::Savable => text("Unsaved changes")
                 .size(theme::TEXT_SMALL)
                 .style(theme::muted)
-                .into()
+                .into(),
         };
         let header = container(
             row![
@@ -1153,7 +1141,7 @@ impl SettingsView {
                     .style(theme::muted),
             });
         }
-        let url = input(f.provider.default_url(), &f.base_url)
+        let url = input(&f.provider.default_url(), &f.base_url)
             .on_input(move |s| Message::BaseUrl(which, s));
 
         let model_input = input("Model name", &f.model).on_input(move |s| Message::Model(which, s));
@@ -1206,7 +1194,7 @@ impl SettingsView {
                 .style(theme::secondary_button)
                 .on_press_maybe(self.can_test(which).then_some(Message::Test(which)));
         let mut test_row = row![test].spacing(theme::SPACING).align_y(Center);
-        if self.tested == which && !self.testing {
+        if self.tested == which && !self.testing && self.tested_llm.as_ref() == Some(&f.llm()) {
             match &self.test_result {
                 Some(Ok(reply)) => {
                     test_row = test_row.push(
@@ -1337,12 +1325,15 @@ impl SettingsView {
     fn capacity_section(&self) -> Element<'_, Message> {
         let f = &self.form;
         let mut days = row![].spacing(theme::SPACING * 1.25);
-        for (i, day) in WEEK.iter().enumerate() {
+        let ticked = f.working_days.iter().filter(|on| **on).count();
+        for (i, day) in WEEKDAYS.iter().enumerate() {
+            // The last ticked day can't be unticked.
+            let last = f.working_days[i] && ticked == 1;
             days = days.push(
                 checkbox(f.working_days[i])
-                    .label(&day_name(*day)[..3])
+                    .label(short_weekday(*day))
                     .text_size(theme::TEXT_BODY)
-                    .on_toggle(move |on| Message::WorkingDay(i, on)),
+                    .on_toggle_maybe((!last).then_some(move |on| Message::WorkingDay(i, on))),
             );
         }
         let mut hours = column![
@@ -1562,12 +1553,14 @@ fn secret_input<'a>(
 }
 
 fn day_picker<'a>(day: Weekday, on_select: fn(Weekday) -> Message) -> Element<'a, Message> {
-    pick_list(DAYS, Some(Day(day)), move |d: Day| on_select(d.0))
-        .padding([8, 12])
-        .text_size(theme::TEXT_BODY)
-        .width(150)
-        .style(picker)
-        .into()
+    pick_list(WEEKDAYS.map(Day), Some(Day(day)), move |d: Day| {
+        on_select(d.0)
+    })
+    .padding([8, 12])
+    .text_size(theme::TEXT_BODY)
+    .width(150)
+    .style(picker)
+    .into()
 }
 
 fn primary<'a>(label: &'a str, message: Message) -> Element<'a, Message> {
@@ -1704,6 +1697,13 @@ impl UnlockView {
         wipe(&mut self.password);
     }
 
+    /// Wipes the typed password and clears the error, for the next time
+    /// the prompt opens. `main.rs` calls it whenever the prompt closes.
+    pub fn reset(&mut self) {
+        wipe(&mut self.password);
+        self.error = None;
+    }
+
     pub fn update(&mut self, message: UnlockMessage) -> UnlockAction {
         match message {
             UnlockMessage::Password(Typed(s)) => {
@@ -1719,7 +1719,7 @@ impl UnlockView {
                 UnlockAction::Unlock(take_secret(&mut self.password))
             }
             UnlockMessage::Skip => {
-                wipe(&mut self.password);
+                self.reset();
                 UnlockAction::Skip
             }
         }
@@ -1772,6 +1772,7 @@ impl UnlockView {
 mod tests {
     use super::*;
     use fortnight_core::domain::DEFAULT_FOCUS_MINUTES;
+    use jiff::civil::Time;
     use secrecy::ExposeSecret;
 
     fn data(settings: Settings, key_state: KeyState) -> SettingsData {
@@ -1982,17 +1983,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_time_accepts_only_hh_mm() {
-        assert_eq!(parse_time("16:00"), Some(Time::constant(16, 0, 0, 0)));
-        assert_eq!(parse_time("8:05"), Some(Time::constant(8, 5, 0, 0)));
-        for bad in [
-            "", "16", "16:0", "24:00", "12:60", "1:2:3", "+1:00", "ab:cd",
-        ] {
-            assert_eq!(parse_time(bad), None, "{bad}");
-        }
-    }
-
-    #[test]
     fn save_key_asks_for_a_password_then_emits() {
         let mut v = loaded(KeyState::NoKey);
         assert!(matches!(
@@ -2105,7 +2095,7 @@ mod tests {
         };
         assert_eq!(llm.protocol, Protocol::OpenAi);
         assert!(llm.keyless);
-        assert_eq!(llm.base_url, OLLAMA_BASE_URL);
+        assert_eq!(llm.base_url, ollama::local_base_url());
         // A typed URL is kept.
         v.update(Message::BaseUrl(
             Which::Main,
@@ -2125,7 +2115,7 @@ mod tests {
             panic!("expected ListModels for the recommendations model");
         };
         assert!(v.decision_on);
-        assert_eq!(llm.base_url, OLLAMA_BASE_URL);
+        assert_eq!(llm.base_url, ollama::local_base_url());
         // The list belongs to the recommendations block only.
         assert_eq!(v.models_state(Which::Main), ModelsState::Hidden);
         v.update(Message::PickModel(Which::Decision, "deepseek-r1:8b".into()));
@@ -2138,7 +2128,7 @@ mod tests {
             panic!("expected Save");
         };
         assert_eq!(saved.llm.model, "gpt-4o");
-        assert_eq!(saved.decision_llm.base_url, OLLAMA_BASE_URL);
+        assert_eq!(saved.decision_llm.base_url, ollama::local_base_url());
         assert_eq!(saved.decision_llm.model, "deepseek-r1:8b");
         assert!(saved.decision_llm.keyless);
 
@@ -2335,22 +2325,6 @@ mod tests {
     }
 
     #[test]
-    fn hours_format_and_parse_round_trip() {
-        assert_eq!(format_hours(360), "6");
-        assert_eq!(format_hours(330), "5.5");
-        assert_eq!(format_hours(345), "5.75");
-        for minutes in 1..=24 * 60 {
-            assert_eq!(
-                parse_hours(&format_hours(minutes)),
-                Some(minutes),
-                "{minutes}"
-            );
-        }
-        assert_eq!(parse_hours("24"), Some(1440));
-        assert_eq!(parse_hours("24.5"), None);
-    }
-
-    #[test]
     fn list_models_carries_current_fields() {
         let mut v = loaded(KeyState::NoKey);
         // Needs a base URL.
@@ -2449,6 +2423,167 @@ mod tests {
             u.update(UnlockMessage::Submit),
             UnlockAction::Unlock(_)
         ));
+        assert!(u.error.is_none());
+    }
+
+    #[test]
+    fn on_hidden_wipes_secrets_and_closes_key_forms_but_keeps_edits() {
+        let mut v = loaded(KeyState::NoKey);
+        v.update(Message::Model(Which::Main, "unsaved".into()));
+        typed(&mut v, SecretField::ApiKey, "sk-abc");
+        v.update(Message::SaveKey(Which::Main));
+        typed(&mut v, SecretField::Password, "correct horse");
+        assert!(v.password_prompt);
+        v.on_hidden();
+        assert!(!v.password_prompt);
+        assert_eq!(v.key_mode, KeyMode::Idle);
+        assert!(v.key_error.is_none());
+        assert!(v.secrets.api_key.is_empty());
+        assert!(v.secrets.password.is_empty());
+        assert_eq!(v.form.main.model, "unsaved");
+
+        // The close button goes the same way.
+        let mut v = loaded(KeyState::Unlocked);
+        v.update(Message::ShowReplace(Which::Main));
+        typed(&mut v, SecretField::ApiKey, "sk-abc");
+        assert!(matches!(v.update(Message::Close), Action::Close));
+        assert_eq!(v.key_mode, KeyMode::Idle);
+        assert!(v.secrets.api_key.is_empty());
+    }
+
+    #[test]
+    fn test_result_shows_only_for_the_tested_endpoint() {
+        let mut v = loaded(KeyState::NoKey);
+        v.update(Message::BaseUrl(
+            Which::Main,
+            "http://localhost:8080/v1".into(),
+        ));
+        v.update(Message::Model(Which::Main, "llama3.2".into()));
+        let Action::Test(..) = v.update(Message::Test(Which::Main)) else {
+            panic!("expected Test");
+        };
+        let mut d = data(Settings::default(), KeyState::NoKey);
+        d.test_result = Some(Err("404 Not Found".into()));
+        v.load(d);
+        let shown =
+            |v: &SettingsView| v.tested_llm.as_ref() == Some(&v.form.endpoint(Which::Main).llm());
+        assert!(shown(&v));
+        // Fixing the URL hides the old result; a trimmed-equal URL doesn't.
+        v.update(Message::BaseUrl(
+            Which::Main,
+            "http://localhost:8081/v1".into(),
+        ));
+        assert!(!shown(&v));
+        v.update(Message::BaseUrl(
+            Which::Main,
+            " http://localhost:8080/v1 ".into(),
+        ));
+        assert!(shown(&v));
+        v.update(Message::Model(Which::Main, "qwen3".into()));
+        assert!(!shown(&v));
+        // Rendering works either way.
+        let _ = v.view();
+    }
+
+    #[test]
+    fn edits_that_parse_to_the_loaded_settings_are_not_unsaved() {
+        let mut v = loaded(KeyState::NoKey);
+        v.update(Message::FocusHours("8.0".into()));
+        v.update(Message::PlanTime("8:00".into()));
+        assert!(!v.is_dirty());
+        assert!(v.savable().is_none());
+        assert!(matches!(v.update(Message::Save), Action::None));
+        v.update(Message::FocusHours("8.5".into()));
+        assert!(v.is_dirty());
+        assert!(v.savable().is_some());
+        // Invalid counts as unsaved (the header asks to fix it).
+        v.update(Message::FocusHours("x".into()));
+        assert!(v.is_dirty());
+        assert!(v.savable().is_none());
+    }
+
+    #[test]
+    fn key_state_change_under_the_password_prompt_closes_it() {
+        let mut v = loaded(KeyState::NoKey);
+        typed(&mut v, SecretField::ApiKey, "sk-abc");
+        v.update(Message::SaveKey(Which::Main));
+        typed(&mut v, SecretField::Password, "correct horse");
+        v.load(data(Settings::default(), KeyState::Unlocked));
+        assert!(!v.password_prompt);
+        assert!(v.secrets.api_key.is_empty());
+        assert!(v.secrets.password.is_empty());
+
+        // Submitting with the key gone wipes the password too.
+        typed(&mut v, SecretField::ApiKey, "sk-abc");
+        v.update(Message::SaveKey(Which::Main));
+        typed(&mut v, SecretField::ApiKey, "");
+        typed(&mut v, SecretField::Password, "correct horse");
+        assert!(matches!(v.update(Message::SubmitPassword), Action::None));
+        assert!(!v.password_prompt);
+        assert!(v.secrets.password.is_empty());
+    }
+
+    #[test]
+    fn ollama_defaults_follow_the_local_address() {
+        let mut v = loaded(KeyState::NoKey);
+        v.update(Message::Provider(Which::Main, Provider::Ollama));
+        assert_eq!(v.form.main.base_url, ollama::local_base_url());
+        v.update(Message::Separate(true));
+        assert_eq!(v.form.decision.base_url, ollama::local_base_url());
+        // The built-in address still counts as a default when switching.
+        v.update(Message::BaseUrl(Which::Main, OLLAMA_BASE_URL.into()));
+        v.update(Message::Provider(Which::Main, Provider::Anthropic));
+        assert_eq!(v.form.main.base_url, "https://api.anthropic.com");
+    }
+
+    #[test]
+    fn no_working_days_cannot_be_saved() {
+        let mut v = loaded(KeyState::NoKey);
+        v.update(Message::Model(Which::Main, "m".into()));
+        for i in 0..7 {
+            v.update(Message::WorkingDay(i, false));
+        }
+        assert!(v.form.to_settings().is_none());
+        assert!(matches!(v.update(Message::Save), Action::None));
+        v.update(Message::WorkingDay(2, true));
+        let Action::Save(s) = v.update(Message::Save) else {
+            panic!("expected Save");
+        };
+        assert_eq!(s.schedule.working_days, vec![Weekday::Wednesday]);
+    }
+
+    #[test]
+    fn prompt_text_is_copied_only_on_edits() {
+        let mut v = loaded(KeyState::NoKey);
+        // A stale form copy shows that a move didn't copy the editor text.
+        v.form.summary_prompt = "stale".into();
+        v.update(Message::Prompt(
+            PromptKind::Summary,
+            text_editor::Action::Move(text_editor::Motion::DocumentEnd),
+        ));
+        assert_eq!(v.form.summary_prompt, "stale");
+        v.update(Message::Prompt(
+            PromptKind::Summary,
+            text_editor::Action::Edit(text_editor::Edit::Insert('!')),
+        ));
+        assert_eq!(v.form.summary_prompt, format!("{DEFAULT_SUMMARY_PROMPT}!"));
+    }
+
+    #[test]
+    fn unlock_reset_wipes_password_and_error() {
+        let mut u = UnlockView::new();
+        u.update(UnlockMessage::Password(Typed("wrong".into())));
+        u.set_error("wrong password".into());
+        u.update(UnlockMessage::Password(Typed("typed".into())));
+        u.reset();
+        assert!(u.password.is_empty());
+        assert!(u.error.is_none());
+        // Cancel does the same.
+        u.update(UnlockMessage::Password(Typed("typed".into())));
+        u.set_error("wrong password".into());
+        u.update(UnlockMessage::Password(Typed("again".into())));
+        assert!(matches!(u.update(UnlockMessage::Skip), UnlockAction::Skip));
+        assert!(u.password.is_empty());
         assert!(u.error.is_none());
     }
 }
