@@ -17,14 +17,16 @@
 //! Recommended tasks card (the order to work in, with a few words on why)
 //! and the Work summary card.
 //!
-//! Tasks are small cards. An open task's card can be dragged to another day:
-//! a copy follows the pointer, the day under it is highlighted, and
-//! dropping makes that day the task's due date (and clears an old planned
-//! day). Dropping on the weekend column uses its first day; letting go
-//! anywhere else cancels.
+//! Tasks are small cards. An open task's card can be dragged: a copy follows
+//! the pointer, the day under it is highlighted, and an accent line shows
+//! where it will land. Dropping on a card puts the task before it; dropping
+//! on a column's free space puts it after that day's open tasks. Another day
+//! becomes the task's due date (clearing an old planned day); within a day
+//! only the order (`Task::position`) changes. Dropping on the weekend
+//! column's free space uses its first day; letting go anywhere else cancels.
 //!
-//! Skipped on purpose: reordering within a day, deleted tasks (the Today tab
-//! has them) and editing in place (click a heading to edit the day).
+//! Skipped on purpose: deleted tasks (the Today tab has them) and editing in
+//! place (click a heading to edit the day).
 
 use crate::theme;
 use crate::views::report_panel::{self, ReportPanel, ReportPanelData};
@@ -52,10 +54,11 @@ pub enum Message {
     Press(TaskId),
     /// The pointer moved while a card is held (position in the tab).
     Moved(Point),
-    /// The pointer entered a day column while dragging.
-    Hover(Date),
-    /// A dragged card was let go over this day.
-    DropOn(Date),
+    /// While dragging, the pointer entered a day column's free space
+    /// (`None`) or the card of this task.
+    Hover(Date, Option<TaskId>),
+    /// A dragged card was let go there.
+    DropOn(Date, Option<TaskId>),
     /// The mouse button went up: the drag (if any) is over.
     EndDrag,
 }
@@ -66,7 +69,7 @@ impl Message {
     pub fn is_pointer_move(&self) -> bool {
         matches!(
             self,
-            Message::Press(_) | Message::Moved(_) | Message::Hover(_) | Message::EndDrag
+            Message::Press(_) | Message::Moved(_) | Message::Hover(..) | Message::EndDrag
         )
     }
 }
@@ -84,8 +87,9 @@ struct Drag {
     at: Option<Point>,
     /// Moved past `DRAG_THRESHOLD`: a drag, not a click.
     active: bool,
-    /// The day column under the pointer.
-    over: Option<Date>,
+    /// The day under the pointer, and the card it is over (`None`: the
+    /// column's free space).
+    over: Option<(Date, Option<TaskId>)>,
 }
 
 /// What `main.rs` must do.
@@ -97,8 +101,9 @@ pub enum Action {
     OpenDay(Date),
     /// Something the embedded report panel asked for.
     Panel(report_panel::Action),
-    /// A card was dragged to this day: make it the task's due date.
-    Move(TaskId, Date),
+    /// A card was dragged: make `Date` its due date (if it isn't already
+    /// its day) and set its position to the `f64`.
+    Move(TaskId, Date, f64),
 }
 
 /// Everything the tab shows, supplied by `main.rs`. FROZEN contract
@@ -176,25 +181,22 @@ impl WeekView {
                 }
                 Action::None
             }
-            Message::Hover(day) => {
+            Message::Hover(day, card) => {
                 if let Some(drag) = &mut self.drag {
-                    drag.over = Some(day);
+                    drag.over = Some((day, card));
                 }
                 Action::None
             }
-            Message::DropOn(day) => {
+            Message::DropOn(day, before) => {
                 let Some(drag) = self.drag.take().filter(|d| d.active) else {
                     return Action::None;
                 };
-                let moved = self
-                    .data
-                    .as_ref()
-                    .and_then(|d| d.tasks.iter().find(|t| t.id == drag.id))
-                    .is_some_and(|t| t.day() != Some(day));
-                if moved {
-                    Action::Move(drag.id, day)
-                } else {
-                    Action::None
+                let Some(data) = &self.data else {
+                    return Action::None;
+                };
+                match drop_position(&data.tasks, drag.id, day, before) {
+                    Some(position) => Action::Move(drag.id, day, position),
+                    None => Action::None,
                 }
             }
             Message::EndDrag => {
@@ -217,7 +219,6 @@ impl WeekView {
         let overdue = overdue_before_week(data);
         let ranks = self.ranks();
         let dragging = self.dragging();
-        let dragged_id = dragging.map(|d| d.id);
 
         // Equal heights: the backgrounds are pushed under the contents in a
         // stack, so they take the height of the tallest column (iced's row
@@ -225,33 +226,31 @@ impl WeekView {
         let mut backgrounds = Row::new().spacing(theme::SPACING);
         let mut contents = Row::new().spacing(theme::SPACING);
         for spec in &specs {
-            backgrounds = backgrounds.push(container(space()).width(Fill).height(Fill).style(
-                drop_target(
-                    spec.is_today,
-                    dragging.is_some_and(|d| d.over == Some(spec.days[0])),
-                ),
-            ));
+            let day = spec.days[0];
+            let mut free =
+                mouse_area(container(space()).width(Fill).height(Fill).style(
+                    drop_target(
+                        spec.is_today,
+                        dragging.is_some_and(|d| {
+                            d.over.is_some_and(|(day, _)| spec.days.contains(&day))
+                        }),
+                    ),
+                ));
+            if dragging.is_some() {
+                // The column's free space: drop after its open tasks.
+                free = free
+                    .on_enter(Message::Hover(day, None))
+                    .on_release(Message::DropOn(day, None));
+            }
+            backgrounds = backgrounds.push(free);
             let note = if spec.is_today { overdue } else { 0 };
-            contents = contents.push(day_column(data, spec, note, &ranks, dragged_id));
+            contents = contents.push(day_column(data, spec, note, &ranks, dragging));
         }
         let base = row![
             space().width(0).height(MIN_COLUMN_HEIGHT),
             contents.width(Fill)
         ];
-        let mut grid = stack![base].push_under(backgrounds).width(Fill);
-        if dragging.is_some() {
-            // While dragging, a layer of full-height drop targets on top.
-            let targets = Row::with_children(specs.iter().map(|spec| {
-                let day = spec.days[0];
-                mouse_area(container(space()).width(Fill).height(Fill))
-                    .on_enter(Message::Hover(day))
-                    .on_release(Message::DropOn(day))
-                    .interaction(mouse::Interaction::Grabbing)
-                    .into()
-            }))
-            .spacing(theme::SPACING);
-            grid = grid.push(targets);
-        }
+        let grid = stack![base].push_under(backgrounds).width(Fill);
 
         let mut body = Column::new().spacing(theme::SPACING * 2.0);
         if let Some(focus) = self
@@ -597,8 +596,10 @@ fn day_column<'a>(
     spec: &ColumnSpec,
     overdue: usize,
     ranks: &[(TaskId, usize)],
-    dragged: Option<TaskId>,
+    drag: Option<&Drag>,
 ) -> Element<'a, Message> {
+    let dragged = drag.map(|d| d.id);
+    let over = drag.and_then(|d| d.over);
     let (name, dates) = heading_text(spec);
     let name_style: fn(&Theme) -> text::Style = if spec.is_today {
         theme::accent
@@ -652,22 +653,36 @@ fn day_column<'a>(
     let mut any = false;
     for day in &spec.days {
         let tasks = tasks_on(&data.tasks, *day);
+        let append_here = over == Some((*day, None));
         if tasks.is_empty() {
+            if append_here {
+                list = list.push(insert_line());
+            }
             continue;
         }
         if spec.weekend && spec.days.len() > 1 {
             list = list.push(theme::section_heading(day.strftime("%a %-d").to_string()));
         }
-        for task in tasks {
+        let open = tasks.iter().filter(|t| t.status.is_open()).count();
+        for (i, task) in tasks.into_iter().enumerate() {
             any = true;
+            if over == Some((*day, Some(task.id))) && dragged != Some(task.id) {
+                list = list.push(insert_line());
+            }
             let rank = ranks.iter().find(|(id, _)| *id == task.id).map(|r| r.1);
             list = list.push(task_row(
                 task,
                 *day,
                 data.today,
                 rank,
-                dragged == Some(task.id),
+                dragged.is_some().then_some(dragged == Some(task.id)),
             ));
+            if append_here && i + 1 == open {
+                list = list.push(insert_line());
+            }
+        }
+        if append_here && open == 0 {
+            list = list.push(insert_line());
         }
     }
     if !any {
@@ -715,24 +730,80 @@ fn load_view<'a>(line: LoadLine) -> Element<'a, Message> {
     col.push(labels.wrap().vertical_spacing(2)).into()
 }
 
-/// A task card in a day column: draggable when open, faded while it is
-/// being dragged.
+/// A task card in a day column: draggable when open. `dragging` is `None`
+/// when nothing is being dragged, else whether this is the dragged card
+/// (shown faded). While dragging, an open card is a drop target: the
+/// dragged task goes before it.
 fn task_row<'a>(
     task: &'a Task,
     day: Date,
     today: Date,
     rank: Option<usize>,
-    dragged: bool,
+    dragging: Option<bool>,
 ) -> Element<'a, Message> {
-    let card = task_card(task, day, today, rank, dragged);
-    if task.status.is_open() {
-        mouse_area(card)
-            .on_press(Message::Press(task.id))
-            .interaction(mouse::Interaction::Grab)
-            .into()
-    } else {
-        card
+    let card = task_card(task, day, today, rank, dragging == Some(true));
+    if !task.status.is_open() {
+        return card;
     }
+    let mut area = mouse_area(card)
+        .on_press(Message::Press(task.id))
+        .interaction(if dragging.is_some() {
+            mouse::Interaction::Grabbing
+        } else {
+            mouse::Interaction::Grab
+        });
+    if dragging.is_some() {
+        area = area
+            .on_enter(Message::Hover(day, Some(task.id)))
+            .on_release(Message::DropOn(day, Some(task.id)));
+    }
+    area.into()
+}
+
+/// The accent line that shows where a dragged card will land.
+fn insert_line<'a>() -> Element<'a, Message> {
+    container(space())
+        .width(Fill)
+        .height(3)
+        .style(|_: &Theme| container::Style {
+            background: Some(theme::ACCENT.into()),
+            border: iced::border::rounded(2),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// Where task `id` goes when dropped on `day`, before the open task
+/// `before` (or after the day's open tasks): its new `position`, between its
+/// new neighbours. `None` when nothing would change (same day, same place).
+pub fn drop_position(tasks: &[Task], id: TaskId, day: Date, before: Option<TaskId>) -> Option<f64> {
+    let task = tasks.iter().find(|t| t.id == id)?;
+    let open: Vec<&Task> = tasks_on(tasks, day)
+        .into_iter()
+        .filter(|t| t.status.is_open())
+        .collect();
+    let others: Vec<&Task> = open.iter().copied().filter(|t| t.id != id).collect();
+    let index = match before {
+        Some(b) if b != id => others
+            .iter()
+            .position(|t| t.id == b)
+            .unwrap_or(others.len()),
+        Some(_) => return None,
+        None => others.len(),
+    };
+    if task.day() == Some(day) {
+        let now = open.iter().position(|t| t.id == id);
+        if now == Some(index) {
+            return None;
+        }
+    }
+    let position = match (index.checked_sub(1).map(|i| others[i]), others.get(index)) {
+        (Some(prev), Some(next)) => (prev.position + next.position) / 2.0,
+        (None, Some(next)) => next.position - 1.0,
+        (Some(prev), None) => prev.position + 1.0,
+        (None, None) => task.position,
+    };
+    Some(position)
 }
 
 /// The card itself: checkbox, rank badge, priority, title and the meta line.
@@ -1038,6 +1109,7 @@ mod tests {
 
     #[test]
     fn dragging_a_card_to_another_day_moves_it() {
+        let wed = date(2026, 11, 19);
         let mut v = WeekView::new();
         v.load(data(vec![task(
             1,
@@ -1047,25 +1119,19 @@ mod tests {
         // A press and release without moving is a click: nothing.
         v.update(Message::Press(1));
         v.update(Message::Moved(Point::new(10.0, 10.0)));
-        assert_eq!(v.update(Message::DropOn(date(2026, 11, 19))), Action::None);
+        assert_eq!(v.update(Message::DropOn(wed, None)), Action::None);
 
         v.update(Message::Press(1));
         v.update(Message::Moved(Point::new(10.0, 10.0)));
         v.update(Message::Moved(Point::new(80.0, 12.0)));
         assert!(v.dragging().is_some());
-        v.update(Message::Hover(date(2026, 11, 19)));
+        v.update(Message::Hover(wed, None));
         let _ = v.view();
         assert_eq!(
-            v.update(Message::DropOn(date(2026, 11, 19))),
-            Action::Move(1, date(2026, 11, 19))
+            v.update(Message::DropOn(wed, None)),
+            Action::Move(1, wed, 1.0)
         );
         assert!(v.drag.is_none());
-
-        // Dropped back on its own day: nothing to do.
-        v.update(Message::Press(1));
-        v.update(Message::Moved(Point::new(0.0, 0.0)));
-        v.update(Message::Moved(Point::new(50.0, 0.0)));
-        assert_eq!(v.update(Message::DropOn(date(2026, 11, 17))), Action::None);
 
         // Let go outside a column: cancelled.
         v.update(Message::Press(1));
@@ -1074,7 +1140,55 @@ mod tests {
         v.update(Message::EndDrag);
         assert!(v.drag.is_none());
         assert!(Message::Moved(Point::ORIGIN).is_pointer_move());
-        assert!(!Message::DropOn(date(2026, 11, 19)).is_pointer_move());
+        assert!(!Message::DropOn(wed, None).is_pointer_move());
+    }
+
+    #[test]
+    fn drop_positions_within_and_across_days() {
+        let tue = date(2026, 11, 17);
+        let wed = date(2026, 11, 18);
+        let mut tasks = vec![
+            task(1, Some(tue), TaskStatus::Todo),
+            task(2, Some(tue), TaskStatus::Todo),
+            task(3, Some(tue), TaskStatus::Todo),
+            task(4, Some(tue), TaskStatus::Done),
+            task(5, Some(wed), TaskStatus::Todo),
+        ];
+        // Positions are the ids: 1, 2, 3 (open), 4 (done), 5.
+        // Before the first: below it.
+        assert_eq!(drop_position(&tasks, 3, tue, Some(1)), Some(0.0));
+        // Between two.
+        assert_eq!(drop_position(&tasks, 3, tue, Some(2)), Some(1.5));
+        // To the end of the open ones.
+        assert_eq!(drop_position(&tasks, 1, tue, None), Some(4.0));
+        // Already there: nothing.
+        assert_eq!(drop_position(&tasks, 3, tue, None), None);
+        assert_eq!(drop_position(&tasks, 2, tue, Some(3)), None);
+        assert_eq!(drop_position(&tasks, 2, tue, Some(2)), None);
+        // Another day: before its card, or alone in an empty day.
+        assert_eq!(drop_position(&tasks, 1, wed, Some(5)), Some(4.0));
+        assert_eq!(drop_position(&tasks, 1, wed, None), Some(6.0));
+        assert_eq!(
+            drop_position(&tasks, 1, date(2026, 11, 19), None),
+            Some(1.0)
+        );
+        tasks.clear();
+        assert_eq!(drop_position(&tasks, 1, tue, None), None);
+
+        let mut v = WeekView::new();
+        v.load(data(vec![
+            task(1, Some(tue), TaskStatus::Todo),
+            task(2, Some(tue), TaskStatus::Todo),
+        ]));
+        v.update(Message::Press(2));
+        v.update(Message::Moved(Point::new(0.0, 0.0)));
+        v.update(Message::Moved(Point::new(0.0, 40.0)));
+        v.update(Message::Hover(tue, Some(1)));
+        let _ = v.view();
+        assert_eq!(
+            v.update(Message::DropOn(tue, Some(1))),
+            Action::Move(2, tue, 0.0)
+        );
     }
 
     #[test]

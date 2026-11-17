@@ -591,6 +591,25 @@ impl Store for SqliteStore {
         tx.commit().map_err(db)
     }
 
+    fn set_position(&self, id: TaskId, position: f64) -> StoreResult<()> {
+        if !position.is_finite() {
+            return Err(StoreError::Invalid(format!(
+                "task {id}: bad position {position}"
+            )));
+        }
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE tasks SET position = ?2 WHERE id = ?1",
+                params![id, position],
+            )
+            .map_err(db)?;
+        if changed == 0 {
+            return Err(StoreError::TaskNotFound(id));
+        }
+        Ok(())
+    }
+
     fn set_status(&self, id: TaskId, status: TaskStatus) -> StoreResult<()> {
         let tx = self.write_tx()?;
         let old: String = tx
@@ -1745,6 +1764,20 @@ mod tests {
         s.update_task(&got).unwrap();
         assert_eq!(s.get_task(t.id).unwrap(), Some(got));
         assert_eq!(count(&s), 7);
+    }
+
+    #[test]
+    fn set_position_changes_only_the_order() {
+        let s = store();
+        let a = s.add_task(new_task("a")).unwrap();
+        let b = s.add_task(new_task("b")).unwrap();
+        s.set_position(b.id, 0.5).unwrap();
+        let got = s.list_tasks().unwrap();
+        assert_eq!(got[0].id, b.id);
+        assert_eq!(got[0].updated_at, b.updated_at);
+        assert_eq!(s.task_events(b.id).unwrap().len(), 1);
+        assert!(s.set_position(999, 1.0).is_err());
+        assert!(s.set_position(a.id, f64::NAN).is_err());
     }
 
     #[test]

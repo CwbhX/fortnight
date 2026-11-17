@@ -858,15 +858,19 @@ impl Ready {
             }
             Message::Week(m) => match self.week_view.update(m) {
                 week::Action::None => Task::none(),
-                week::Action::Move(id, day) => {
+                week::Action::Move(id, day, position) => {
                     if let Some(task) = self.task(id).cloned() {
                         let undo = self.snapshot(id, "Move undone.");
-                        let moved = CoreTask {
-                            due_on: Some(day),
-                            planned_for: None,
-                            ..task
-                        };
-                        match self.store.update_task(&moved) {
+                        let mut result = Ok(());
+                        if task.day() != Some(day) {
+                            result = self.store.update_task(&CoreTask {
+                                due_on: Some(day),
+                                planned_for: None,
+                                ..task
+                            });
+                        }
+                        let result = result.and_then(|()| self.store.set_position(id, position));
+                        match result {
                             Ok(()) => {
                                 if let Some(undo) = undo {
                                     self.remember(undo);

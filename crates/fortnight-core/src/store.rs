@@ -60,6 +60,11 @@ pub trait Store {
     /// unless the status is already `status` (then it does nothing).
     fn set_status(&self, id: TaskId, status: TaskStatus) -> StoreResult<()>;
 
+    /// Sets the manual ordering (`Task::position`; lower sorts first). No
+    /// event and no `updated_at` change: order isn't history. (Round 3, for
+    /// dragging cards within a day.)
+    fn set_position(&self, id: TaskId, position: f64) -> StoreResult<()>;
+
     /// Round 1 shorthand: `set_status(id, Done)` or `set_status(id, Todo)`.
     fn set_done(&self, id: TaskId, done: bool) -> StoreResult<()> {
         self.set_status(
