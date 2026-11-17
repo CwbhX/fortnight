@@ -65,7 +65,8 @@ impl OpenAiClient {
         if config.base_url.trim().is_empty() || config.model.trim().is_empty() {
             return Err(LlmError::NotConfigured);
         }
-        let http = reqwest::Client::builder()
+        crate::secure::check_key_transport(&config)?;
+        let http = crate::secure::client_builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|e| LlmError::Connection(error_chain(&e.without_url())))?;
@@ -127,7 +128,12 @@ impl LlmClient for OpenAiClient {
     fn chat(&self, req: ChatRequest) -> BoxFuture<Result<ChatResponse, LlmError>> {
         let call = self.call(req, false);
         let backoff = self.backoff;
-        Box::pin(async move { with_retries(backoff, || call.send()).await })
+        let key = self.config.api_key.clone();
+        Box::pin(async move {
+            with_retries(backoff, || call.send())
+                .await
+                .map_err(|e| crate::secure::redact(e, key.as_ref()))
+        })
     }
 
     fn chat_stream(&self, req: ChatRequest) -> BoxStream<Result<ChatEvent, LlmError>> {
@@ -139,13 +145,14 @@ impl LlmClient for OpenAiClient {
             pending: VecDeque::new(),
             phase: Phase::Start,
         };
-        Box::pin(futures_util::stream::unfold(
-            state,
-            |mut state| async move {
+        let key = self.config.api_key.clone();
+        Box::pin(
+            futures_util::stream::unfold(state, |mut state| async move {
                 let item = state.next_item().await?;
                 Some((item, state))
-            },
-        ))
+            })
+            .map(move |item| item.map_err(|e| crate::secure::redact(e, key.as_ref()))),
+        )
     }
 
     fn list_models(&self) -> BoxFuture<Result<Vec<String>, LlmError>> {
@@ -159,6 +166,7 @@ impl LlmClient for OpenAiClient {
                 fetch_models(&http, &url, api_key.as_ref(), timeout)
             })
             .await
+            .map_err(|e| crate::secure::redact(e, api_key.as_ref()))
         })
     }
 }

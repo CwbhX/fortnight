@@ -19,9 +19,12 @@ use std::path::{Path, PathBuf};
 pub fn lock_warning(dir: &Path, this_host: &str) -> Option<String> {
     let lock = datadir::read_lock(dir)?;
     (lock.host != this_host).then(|| {
+        // The lock file is untrusted (it may arrive through a sync service):
+        // keep control characters out of the terminal.
+        let host: String = lock.host.chars().filter(|c| !c.is_control()).collect();
         format!(
-            "warning: the data folder is in use on {} (since {}); changes may conflict",
-            lock.host, lock.since
+            "warning: the data folder is in use on {host} (since {}); changes may conflict",
+            lock.since
         )
     })
 }

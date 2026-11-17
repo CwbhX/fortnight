@@ -68,7 +68,8 @@ impl AnthropicClient {
         if config.base_url.trim().is_empty() || config.model.trim().is_empty() {
             return Err(LlmError::NotConfigured);
         }
-        let http = reqwest::Client::builder()
+        crate::secure::check_key_transport(&config)?;
+        let http = crate::secure::client_builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|e| LlmError::Connection(error_chain(&e.without_url())))?;
@@ -132,6 +133,7 @@ impl LlmClient for AnthropicClient {
     fn chat(&self, req: ChatRequest) -> BoxFuture<Result<ChatResponse, LlmError>> {
         let call = self.message_call(req, false);
         let backoff = self.backoff;
+        let key = self.config.api_key.clone();
         Box::pin(async move {
             with_retries(backoff, || async {
                 let (status, text) = call.send_whole().await?;
@@ -141,6 +143,7 @@ impl LlmClient for AnthropicClient {
                 }
             })
             .await
+            .map_err(|e| crate::secure::redact(e, key.as_ref()))
         })
     }
 
@@ -150,18 +153,20 @@ impl LlmClient for AnthropicClient {
             backoff: self.backoff,
             phase: Phase::Connect { attempt: 1 },
         };
-        Box::pin(futures_util::stream::unfold(
-            state,
-            |mut state| async move {
+        let key = self.config.api_key.clone();
+        Box::pin(
+            futures_util::stream::unfold(state, |mut state| async move {
                 let item = state.next_item().await?;
                 Some((item, state))
-            },
-        ))
+            })
+            .map(move |item| item.map_err(|e| crate::secure::redact(e, key.as_ref()))),
+        )
     }
 
     fn list_models(&self) -> BoxFuture<Result<Vec<String>, LlmError>> {
         let call = self.call(self.url("models?limit=1000"), None);
         let backoff = self.backoff;
+        let key = self.config.api_key.clone();
         Box::pin(async move {
             with_retries(backoff, || async {
                 let (status, text) = call.send_whole().await?;
@@ -174,6 +179,7 @@ impl LlmClient for AnthropicClient {
                 parse_models(&text)
             })
             .await
+            .map_err(|e| crate::secure::redact(e, key.as_ref()))
         })
     }
 }

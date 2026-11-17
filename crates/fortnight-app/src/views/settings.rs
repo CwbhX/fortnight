@@ -529,7 +529,11 @@ impl SettingsView {
                     return Action::ListModels(llm);
                 }
             }
-            Message::Close => return Action::Close,
+            Message::Close => {
+                // Typed but unsubmitted secrets don't outlive the overlay.
+                self.close_key_form();
+                return Action::Close;
+            }
             Message::WeekStart(d) => form.week_start = d,
             Message::SummaryDay(d) => form.summary_day = d,
             Message::SummaryTime(s) => form.summary_time = s,

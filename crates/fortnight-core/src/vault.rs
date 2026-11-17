@@ -67,9 +67,9 @@ const DEFAULT_T_COST: u32 = 2;
 const DEFAULT_P_COST: u32 = 1;
 
 /// Upper bounds accepted by `unlock`: 1 GiB, 64 passes, 16 lanes.
-const MAX_M_COST_KIB: u32 = 1024 * 1024;
-const MAX_T_COST: u32 = 64;
-const MAX_P_COST: u32 = 16;
+const MAX_M_COST_KIB: u32 = 256 * 1024;
+const MAX_T_COST: u32 = 10;
+const MAX_P_COST: u32 = 4;
 
 /// `<data_dir>/llm-key`.
 pub fn key_path(data_dir: &Path) -> PathBuf {

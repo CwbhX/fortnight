@@ -123,6 +123,8 @@ struct Generation {
     host: Option<String>,
     /// Started by the schedule (not a button): notify when it is ready.
     scheduled: bool,
+    /// Aborts the request (Lock stops requests that hold the key).
+    abort: iced::task::Handle,
 }
 
 /// One change that Ctrl/Cmd+Z can take back.
@@ -182,6 +184,8 @@ struct Ready {
     undo: Vec<Undo>,
     /// A report became ready while the Week tab wasn't showing.
     week_badge: bool,
+    /// Test connection / Load models requests in flight, aborted on Lock.
+    key_requests: Vec<iced::task::Handle>,
     /// Held for the app's lifetime; removes the lock file when dropped.
     _lock: Option<DataLock>,
 }
@@ -345,6 +349,7 @@ impl Ready {
             notice,
             undo: Vec::new(),
             week_badge: false,
+            key_requests: Vec::new(),
             _lock: lock,
         })
     }
@@ -595,6 +600,9 @@ impl Ready {
         };
         let prepared = self.prepare(kind, week);
         let stream = client.chat_stream(prepared.request.clone());
+        let (task, abort) = Task::run(stream, move |item| Message::Stream(key, item))
+            .chain(Task::done(Message::StreamEnded(key)))
+            .abortable();
         self.generating.insert(
             key,
             Generation {
@@ -603,11 +611,11 @@ impl Ready {
                 requested_model: client.model().to_string(),
                 host,
                 scheduled,
+                abort,
             },
         );
         self.last_attempt.insert(key, Timestamp::now());
-        Task::run(stream, move |item| Message::Stream(key, item))
-            .chain(Task::done(Message::StreamEnded(key)))
+        task
     }
 
     /// Stores the finished (or failed) report and forgets the generation.
@@ -795,11 +803,17 @@ impl Ready {
             }
             Message::Tested(result) => {
                 self.testing = false;
+                if !self.listing_models {
+                    self.key_requests.clear();
+                }
                 self.test_result = Some(result);
                 Task::none()
             }
             Message::Models(result) => {
                 self.listing_models = false;
+                if !self.testing {
+                    self.key_requests.clear();
+                }
                 self.models = Some(result);
                 Task::none()
             }
@@ -1073,8 +1087,19 @@ impl Ready {
         }
     }
 
+    /// Forgets the key and stops every request that holds a copy of it.
+    /// Reports being generated are dropped (not stored); the schedule
+    /// generates them again after the next unlock.
     fn lock(&mut self) {
         self.api_key = None; // dropping the SecretString zeroizes it
+        for (_, g) in self.generating.drain() {
+            g.abort.abort();
+        }
+        for handle in self.key_requests.drain(..) {
+            handle.abort();
+        }
+        self.testing = false;
+        self.listing_models = false;
         self.key_message = Some(Ok("Locked.".into()));
     }
 
@@ -1097,7 +1122,7 @@ impl Ready {
                 Ok((client, _)) => {
                     self.testing = true;
                     self.test_result = None;
-                    Task::perform(
+                    let (task, handle) = Task::perform(
                         async move {
                             client
                                 .chat(ChatRequest::test())
@@ -1107,6 +1132,9 @@ impl Ready {
                         },
                         Message::Tested,
                     )
+                    .abortable();
+                    self.key_requests.push(handle);
+                    task
                 }
                 Err(e) => {
                     self.test_result = Some(Err(e));
@@ -1117,10 +1145,13 @@ impl Ready {
                 Ok((client, _)) => {
                     self.listing_models = true;
                     self.models = None;
-                    Task::perform(
+                    let (task, handle) = Task::perform(
                         async move { client.list_models().await.map_err(|e| e.to_string()) },
                         Message::Models,
                     )
+                    .abortable();
+                    self.key_requests.push(handle);
+                    task
                 }
                 Err(e) => {
                     self.models = Some(Err(e));
