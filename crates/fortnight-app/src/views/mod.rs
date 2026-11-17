@@ -7,6 +7,7 @@ pub mod month;
 pub mod report_panel;
 pub mod settings;
 pub mod task_form;
+pub mod unlock;
 pub mod week;
 
 /// A key pressed while no text field has focus, forwarded by `main.rs` to
