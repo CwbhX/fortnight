@@ -7,17 +7,31 @@ expression: summary_facts_markdown(&facts)
 ### Completed (3)
 
 - Ship login page — *Website* · Wed 11 Nov
+  - Wed 11 Nov: Rolled out to 5% of users
 - Book venue — *Hiring* · Thu 12 Nov
 - Fix flaky CI job · Fri 13 Nov
 
-### In progress (1)
+### In progress (3)
 
+- Migrate analytics — *Website* · due Fri 20 Nov · started
+  - Thu 12 Nov: Found the double-counting bug
 - Hiring rubric — *Hiring*
+  - Wed 11 Nov: Drafted the scoring scale
+- Q3 retro write-up — *Team*
+  - Fri 13 Nov: Wrote the first half
 
 ### Overdue or due now (2)
 
 - Vendor contract review — *Finance* · due Thu 12 Nov (3 days overdue)
 - Write onboarding doc — *Website* · due Sun 15 Nov
+
+### Deadlines moved (1)
+
+- Vendor contract review — *Finance* · Tue 10 Nov → Thu 12 Nov (2 times)
+
+### Dropped (1)
+
+- Old migration plan — *Website* · Thu 12 Nov
 
 ### Coming up (2)
 
@@ -28,6 +42,11 @@ expression: summary_facts_markdown(&facts)
 
 - Plan team offsite · Tue 10 Nov
 - Book venue — *Hiring* · Tue 10 Nov (done)
+
+### Log (2)
+
+- Tue 10 Nov: Helped Sam debug the deploy
+- Sat 14 Nov: Ran the team retro
 
 ### Completed by project
 

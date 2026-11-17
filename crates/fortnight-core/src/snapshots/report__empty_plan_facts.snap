@@ -10,15 +10,33 @@ expression: plan
   "remaining_working_days": [
     {
       "date": "2026-11-18",
-      "weekday": "Wednesday"
+      "weekday": "Wednesday",
+      "capacity_minutes": 360,
+      "capacity_hours": 6.0,
+      "load_minutes": 0,
+      "load_hours": 0.0,
+      "unestimated": 0,
+      "over_capacity": false
     },
     {
       "date": "2026-11-19",
-      "weekday": "Thursday"
+      "weekday": "Thursday",
+      "capacity_minutes": 360,
+      "capacity_hours": 6.0,
+      "load_minutes": 0,
+      "load_hours": 0.0,
+      "unestimated": 0,
+      "over_capacity": false
     },
     {
       "date": "2026-11-20",
-      "weekday": "Friday"
+      "weekday": "Friday",
+      "capacity_minutes": 360,
+      "capacity_hours": 6.0,
+      "load_minutes": 0,
+      "load_hours": 0.0,
+      "unestimated": 0,
+      "over_capacity": false
     }
   ],
   "overdue": [],
@@ -30,6 +48,13 @@ expression: plan
     "overdue": 0,
     "due_this_week": 0,
     "due_soon": 0,
-    "undated": 0
+    "undated": 0,
+    "due_estimate_minutes": 0,
+    "due_estimate_hours": 0.0,
+    "available_minutes": 1080,
+    "available_hours": 18.0,
+    "due_without_estimate": 0,
+    "without_estimate": 0,
+    "overloaded": false
   }
 }
