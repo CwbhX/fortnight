@@ -1,22 +1,29 @@
-//! Fortnight: the application shell. Owns all state, carries out the actions
-//! the views return, talks to the store, the key vault and the LLM, and runs
-//! the minute tick that generates due reports.
+//! Fortnight: the application shell. Owns all state (`Ready`), carries out
+//! the actions the views return, talks to the store, the key vault and the
+//! LLM, and runs the minute tick that generates due reports.
 //!
 //! Layout (PLAN.md 4.2): the top bar (tabs, period navigation over one
 //! shared selected date, lock, gear), then the active tab. Settings opens
 //! over the current view.
 //!
-//! Also here: undo (Ctrl/Cmd+Z, silent: the last add, status change, edit
-//! or delete), the keyboard shortcuts of PLAN.md 4.4, Lock and the unlock
-//! prompt (from the lock icon; the app never asks at launch), the data-folder
-//! lock file and the model list.
-//!
-//! The Week tab's Work summary and the Today tab's Recommended tasks update
-//! on their own: when their tab is shown, when the shown week or day
-//! changes and on the minute tick while it is showing, each report whose
-//! facts (or prompt) changed since its newest version is generated once.
-//! The summary is also kept up to date in the background from its scheduled
-//! day and time. An edited summary is never regenerated.
+//! This file holds the app plumbing (boot, theme, icon, subscriptions),
+//! the `Message` enum, the `Ready` state, the message dispatch, navigation
+//! and the view. The rest of the shell is in `shell/`, mostly as further
+//! `impl Ready` blocks:
+//! - `reports`: report generation and scheduling, and the Week tab's
+//!   report panel. The Work summary and the Today tab's Recommended tasks
+//!   update on their own; an edited summary is never regenerated.
+//! - `recommend`: today's and later days' recommended tasks, and the plan
+//!   route.
+//! - `keys`: the API keys, the LLM clients, Lock and unlock.
+//! - `edits`: task writes and undo (Ctrl/Cmd+Z).
+//! - `suggest`: priority suggestions for an open task form.
+//! - `settings_panel`: the Settings panel's actions and request replies.
+//! - `dialog`: the task dialog.
+//! - `shortcuts`: the keyboard shortcuts of PLAN.md 4.4.
+//! - `refresh`: reloading data, the derived-value cache, and pushing data
+//!   into the views.
+//! - `dev`: developer hooks (`--data-dir`, `FORTNIGHT_*`).
 
 mod shell {
     pub(crate) mod dev;
@@ -24,6 +31,7 @@ mod shell {
     pub(crate) mod edits;
     pub(crate) mod keys;
     pub(crate) mod recommend;
+    pub(crate) mod refresh;
     pub(crate) mod reports;
     pub(crate) mod settings_panel;
     pub(crate) mod shortcuts;
@@ -33,20 +41,19 @@ mod shell {
 use fortnight_app::app_icon;
 use fortnight_app::theme;
 use fortnight_app::top_bar::{self, LockIcon, Tab};
-use fortnight_app::views::day::{self, DayData, DayView, LogLine};
-use fortnight_app::views::month::{self, MonthData, MonthView};
+use fortnight_app::views::day::{self, DayView};
+use fortnight_app::views::month::{self, MonthView};
 use fortnight_app::views::settings::{
-    self, KeyState, SettingsData, SettingsView, UnlockAction, UnlockMessage, UnlockView,
+    self, KeyState, SettingsView, UnlockAction, UnlockMessage, UnlockView,
 };
 use fortnight_app::views::task_form;
 use fortnight_app::views::week::{self, WeekData, WeekView};
 use fortnight_core::datadir::{self, DataLock};
 use fortnight_core::domain::{
-    Event, Priority, Report, ReportKey, ReportKind, Settings, Task as CoreTask, TaskId, WeekRef,
+    Event, Priority, ReportKey, Settings, Task as CoreTask, TaskId, WeekRef,
 };
 use fortnight_core::llm::{ChatEvent, ChatResponse, LlmError};
 use fortnight_core::ollama::OllamaModel;
-use fortnight_core::report;
 use fortnight_core::sqlite::SqliteStore;
 use fortnight_core::store::Store;
 use fortnight_core::vault::VaultError;
@@ -64,11 +71,11 @@ use shell::dev::{self, data_dir_flag, forced_theme, save_screenshot, shoot_after
 use shell::edits::UndoStack;
 use shell::keys::{Keys, SavedKey};
 use shell::recommend::LaterDays;
+use shell::refresh::Derived;
 use shell::reports::Reports;
 use shell::settings_panel::detect_ollama;
 use shell::shortcuts::{Shortcut, shortcut_for};
 use shell::suggest::Suggestions;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -117,7 +124,7 @@ enum Message {
     /// The local Ollama check: its models, or why it didn't answer.
     OllamaDetected(Result<Vec<OllamaModel>, String>),
     /// Typing in a new task's dialog paused: ask the decision model for a
-    /// priority, if this is still the latest edit (`suggest_seq`).
+    /// priority, if this is still the latest edit (`Suggestions`).
     SuggestPriority(u64),
     /// The left mouse button went up anywhere: ends a card drag.
     PointerUp,
@@ -163,6 +170,7 @@ struct Ready {
     /// The unlock prompt is showing (opened from the lock icon).
     unlocking: bool,
 
+    /// The API keys.
     keys: Keys,
 
     /// Report generation and scheduling.
@@ -444,120 +452,6 @@ impl Ready {
 
     fn current_week(&self) -> WeekRef {
         self.week_of(self.today())
-    }
-
-    // ---- data flow ----
-
-    fn reload_tasks(&mut self) {
-        self.tasks_changed = true;
-        self.invalidate();
-        match self.store.list_tasks() {
-            Ok(tasks) => self.tasks = tasks,
-            Err(e) => self.error = Some(e.to_string()),
-        }
-        match self.store.events_between(Timestamp::MIN, Timestamp::MAX) {
-            Ok(events) => self.events = events,
-            Err(e) => self.error = Some(e.to_string()),
-        }
-    }
-
-    /// Forgets every derived value (tasks, events, reports or settings
-    /// changed, or the minute ticked) and has the views refreshed.
-    fn invalidate(&mut self) {
-        self.derived = Derived::default();
-        self.must_refresh = true;
-    }
-
-    /// Pushes fresh data into the visible tab (and Settings when open).
-    fn refresh(&mut self) {
-        self.must_refresh = false;
-        let today = self.today();
-        match self.tab {
-            Tab::Today => {
-                let (recommended, recommending) = self.day_recommendations(today);
-                let logs = self.logs();
-                self.day_view.load(DayData {
-                    day: self.selected,
-                    today,
-                    tz: self.tz.clone(),
-                    tasks: self.tasks.clone(),
-                    week_start: self.settings.schedule.week_start,
-                    recommended,
-                    recommending,
-                    logs,
-                });
-            }
-            Tab::Week => {
-                let week = self.week_of(self.selected);
-                let panel = self.panel_data(week);
-                let data = WeekData {
-                    week,
-                    today,
-                    tasks: self.tasks.clone(),
-                    working_days: self.settings.schedule.working_days.clone(),
-                    loads: report::day_loads(&self.tasks, week, &self.settings),
-                    panel,
-                };
-                self.week_data = Some(data.clone());
-                self.week_view.load(data);
-            }
-            Tab::Month => {
-                let summary_weeks = match self.store.ready_report_keys() {
-                    Ok(keys) => keys
-                        .into_iter()
-                        .filter(|k| k.kind == ReportKind::Summary)
-                        .map(|k| k.week_start)
-                        .collect(),
-                    Err(e) => {
-                        self.error = Some(e.to_string());
-                        Vec::new()
-                    }
-                };
-                self.month_view.load(MonthData {
-                    month: self.selected.first_of_month(),
-                    today,
-                    week_start: self.settings.schedule.week_start,
-                    working_days: self.settings.schedule.working_days.clone(),
-                    tasks: self.tasks.clone(),
-                    summary_weeks,
-                });
-            }
-        }
-
-        if self.settings_open {
-            self.settings_view.load(SettingsData {
-                settings: self.settings.clone(),
-                data_dir: self.data_dir.clone(),
-                key_state: self.keys.key_state(),
-                decision_key_state: self.keys.decision_key_state(),
-                test_result: self.test_result.clone(),
-                testing: self.testing,
-                key_message: self.key_message.clone(),
-                models: self.models.clone(),
-                ollama: self.ollama.clone(),
-                listing_models: self.listing_models,
-            });
-        }
-    }
-
-    /// The free-standing log lines (day notes), each on its local date.
-    fn logs(&mut self) -> Vec<LogLine> {
-        if let Some(logs) = &self.derived.logs {
-            return logs.clone();
-        }
-        let logs: Vec<LogLine> = self
-            .events
-            .iter()
-            .filter(|e| e.task_id.is_none())
-            .filter_map(|e| {
-                Some(LogLine {
-                    date: self.tz.to_datetime(e.at).date(),
-                    text: e.log_text()?.to_string(),
-                })
-            })
-            .collect();
-        self.derived.logs = Some(logs.clone());
-        logs
     }
 
     /// The date changed (past midnight): the selection follows it if it
@@ -969,18 +863,6 @@ struct TaskDialog {
     form: task_form::EditForm,
     /// The task being edited; `None` for a new task.
     task: Option<TaskId>,
-}
-
-/// Values worked out from the tasks, events, reports and settings, kept
-/// until `Ready::invalidate`.
-#[derive(Default)]
-struct Derived {
-    /// Every version of a report, newest first.
-    versions: HashMap<ReportKey, Vec<Report>>,
-    /// Whether a report has nothing to work from, and its facts' digest.
-    facts: HashMap<ReportKey, (bool, String)>,
-    recommended_today: Option<Vec<day::Recommended>>,
-    logs: Option<Vec<LogLine>>,
 }
 
 /// The selected date after the day changed from `last_today` to `today`:
