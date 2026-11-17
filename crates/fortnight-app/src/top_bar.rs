@@ -10,7 +10,7 @@
 //! [ Write Q4 report fri #work ~2h !                                              ]
 //! ```
 
-use crate::calendar::{Popup, month_picker};
+use crate::calendar::{Popup, month_picker, year_picker};
 use crate::theme::{self, Icon};
 use fortnight_core::domain::{NewTask, Schedule};
 use fortnight_core::parse;
@@ -96,6 +96,22 @@ pub fn step(tab: Tab, selected: Date, dir: i32) -> Date {
     }
 }
 
+/// The first and last working day of the week containing `selected` (the
+/// whole week if no day is a working day): what the Week tab's label names
+/// and its calendar bands.
+pub fn week_span(selected: Date, schedule: &Schedule) -> (Date, Date) {
+    let week = week_containing(selected, schedule.week_start);
+    let days: Vec<Date> = week
+        .days()
+        .into_iter()
+        .filter(|d| schedule.working_days.contains(&d.weekday()))
+        .collect();
+    match (days.first(), days.last()) {
+        (Some(f), Some(l)) => (*f, *l),
+        _ => (week.start, week.end()),
+    }
+}
+
 /// "Mon 16 Nov"; "Nov 16 to Nov 20" (the week's working days);
 /// "November 2026". The year is added to day and week labels when it is not
 /// `today`'s year.
@@ -110,16 +126,7 @@ pub fn period_label(tab: Tab, selected: Date, today: Date, schedule: &Schedule) 
     match tab {
         Tab::Today => format!("{}{}", selected.strftime("%a %-d %b"), year(selected)),
         Tab::Week => {
-            let week = week_containing(selected, schedule.week_start);
-            let days: Vec<Date> = week
-                .days()
-                .into_iter()
-                .filter(|d| schedule.working_days.contains(&d.weekday()))
-                .collect();
-            let (first, last) = match (days.first(), days.last()) {
-                (Some(f), Some(l)) => (*f, *l),
-                _ => (week.start, week.end()),
-            };
+            let (first, last) = week_span(selected, schedule);
             format!(
                 "{} to {}{}",
                 first.strftime("%b %-d"),
@@ -198,25 +205,33 @@ pub fn view<'a>(bar: Bar<'a>) -> Element<'a, Message> {
         .on_press(Message::ToggleCalendar)
         .on_double_click(Message::Today)
         .interaction(iced::mouse::Interaction::Pointer);
-    // In the Week tab the calendar bands the week shown instead of marking
-    // one day.
-    let (selected, range) = match bar.tab {
-        Tab::Week => {
-            let week = week_containing(bar.selected, bar.schedule.week_start);
-            (None, Some((week.start, week.end())))
-        }
-        _ => (Some(bar.selected), None),
-    };
-    let picker = bar.calendar.map(|month| {
-        month_picker(
-            month,
-            selected,
-            range,
+    // Today: a month calendar marking the day. Week: the same, banding the
+    // days the label names. Month: the months of the year (the arrows step
+    // a year, 12 months).
+    let picker = bar.calendar.map(|month| match bar.tab {
+        Tab::Month => year_picker(
+            month.year(),
+            bar.selected,
             bar.today,
-            Message::CalendarMonth,
+            |step| Message::CalendarMonth(step * 12),
             Message::PickDate,
-            None,
-        )
+        ),
+        Tab::Today | Tab::Week => {
+            let (selected, range) = match bar.tab {
+                Tab::Week => (None, Some(week_span(bar.selected, bar.schedule))),
+                _ => (Some(bar.selected), None),
+            };
+            month_picker(
+                month,
+                selected,
+                range,
+                bar.today,
+                bar.schedule.week_start,
+                Message::CalendarMonth,
+                Message::PickDate,
+                None,
+            )
+        }
     });
     let period = row![
         icon_button(Icon::ChevronLeft, Message::Prev, "Previous (←)"),
@@ -278,6 +293,33 @@ mod tests {
         assert_eq!(step(Tab::Today, d, 1), date(2026, 2, 1));
         assert_eq!(step(Tab::Week, d, -1), date(2026, 1, 24));
         assert_eq!(step(Tab::Month, d, 1), date(2026, 2, 28));
+    }
+
+    #[test]
+    fn week_span_is_the_working_days_from_the_week_start() {
+        let mut s = Schedule::default();
+        assert_eq!(
+            week_span(date(2026, 11, 19), &s),
+            (date(2026, 11, 16), date(2026, 11, 20))
+        );
+        // Sunday start, Sunday to Thursday working: Sun 22 is in the next
+        // week.
+        s.week_start = jiff::civil::Weekday::Sunday;
+        s.working_days = vec![
+            jiff::civil::Weekday::Sunday,
+            jiff::civil::Weekday::Monday,
+            jiff::civil::Weekday::Tuesday,
+            jiff::civil::Weekday::Wednesday,
+            jiff::civil::Weekday::Thursday,
+        ];
+        assert_eq!(
+            week_span(date(2026, 11, 19), &s),
+            (date(2026, 11, 15), date(2026, 11, 19))
+        );
+        assert_eq!(
+            week_span(date(2026, 11, 22), &s),
+            (date(2026, 11, 22), date(2026, 11, 26))
+        );
     }
 
     #[test]

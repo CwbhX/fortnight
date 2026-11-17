@@ -471,6 +471,7 @@ impl Ready {
                     today,
                     tz: self.tz.clone(),
                     tasks: self.tasks.clone(),
+                    week_start: self.settings.schedule.week_start,
                     logs,
                 });
             }
@@ -1085,7 +1086,7 @@ impl Ready {
     fn open_new_task(&mut self, day: Date) -> Task<Message> {
         self.dialog = Some(TaskDialog {
             day: Some(day),
-            form: day::EditForm::blank(&self.tasks),
+            form: day::EditForm::blank(&self.tasks, self.settings.schedule.week_start),
             task: None,
         });
         operation::focus(day::DIALOG_TITLE_ID)
@@ -1096,7 +1097,7 @@ impl Ready {
         if let Some(task) = self.task(id) {
             self.dialog = Some(TaskDialog {
                 day: task.day(),
-                form: day::open_form(task, &self.tasks),
+                form: day::open_form(task, &self.tasks, self.settings.schedule.week_start),
                 task: Some(id),
             });
         }

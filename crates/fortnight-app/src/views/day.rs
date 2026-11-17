@@ -48,7 +48,7 @@ use iced::widget::{
 };
 use iced::{Center, Color, Element, Fill, Theme, border};
 use jiff::Timestamp;
-use jiff::civil::Date;
+use jiff::civil::{Date, Weekday};
 use jiff::tz::TimeZone;
 
 use super::NavKey;
@@ -145,6 +145,8 @@ pub struct DayData {
     pub tz: TimeZone,
     /// Every task, in any status.
     pub tasks: Vec<Task>,
+    /// The first day of the week (Settings), for the due-date calendar.
+    pub week_start: Weekday,
     /// Every log line, oldest first. Only free-standing ones are shown.
     pub logs: Vec<LogLine>,
 }
@@ -402,6 +404,8 @@ pub struct EditForm {
     pub due: Option<Date>,
     /// The month the calendar shows, while it is open.
     pub calendar: Option<Date>,
+    /// The first day of the calendar's weeks (the Settings week start).
+    pub week_start: Weekday,
     pub estimate: String,
     /// The estimate as first shown, so an untouched field is not re-parsed.
     pub original_estimate: String,
@@ -428,6 +432,7 @@ impl EditForm {
             projects: combo_box::State::default(),
             due: task.due_on,
             calendar: None,
+            week_start: Weekday::Monday,
             estimate: estimate.clone(),
             original_estimate: estimate,
             priority: priority_level(task.priority),
@@ -511,8 +516,8 @@ pub fn open_projects(tasks: &[Task]) -> Vec<String> {
 impl EditForm {
     /// An empty form for a new task (the Week tab's dialog), with the
     /// project list from `tasks`.
-    pub fn blank(tasks: &[Task]) -> Self {
-        open_form(&Task::default(), tasks)
+    pub fn blank(tasks: &[Task], week_start: Weekday) -> Self {
+        open_form(&Task::default(), tasks, week_start)
     }
 
     /// The new task this form describes, planned for `day`, or an error
@@ -589,9 +594,10 @@ impl EditForm {
 }
 
 /// The edit form for `task`, with the project list from `tasks`.
-pub fn open_form(task: &Task, tasks: &[Task]) -> EditForm {
+pub fn open_form(task: &Task, tasks: &[Task], week_start: Weekday) -> EditForm {
     EditForm {
         projects: combo_box::State::new(open_projects(tasks)),
+        week_start,
         ..EditForm::from_task(task)
     }
 }
@@ -670,7 +676,7 @@ impl DayView {
                     && self.editing.as_ref().is_none_or(|f| f.id != task.id)
                     && let Some(data) = &self.data
                 {
-                    self.editing = Some(open_form(task, &data.tasks));
+                    self.editing = Some(open_form(task, &data.tasks, data.week_start));
                 }
                 Action::None
             }
@@ -707,7 +713,7 @@ impl DayView {
                 if self.editing.as_ref().is_some_and(|f| f.id == id) {
                     self.editing = None;
                 } else if let Some(task) = data.tasks.iter().find(|t| t.id == id) {
-                    self.editing = Some(open_form(task, &data.tasks));
+                    self.editing = Some(open_form(task, &data.tasks, data.week_start));
                     self.selected = Some(id);
                 }
                 Action::None
@@ -1314,6 +1320,7 @@ fn form_fields<'a>(
                         form.due,
                         None,
                         today,
+                        form.week_start,
                         Message::CalendarMonth,
                         Message::PickDue,
                         Some(Message::ClearDue),
@@ -1483,6 +1490,7 @@ mod tests {
             today: today(),
             tz: TimeZone::UTC,
             tasks,
+            week_start: Weekday::Monday,
             logs: Vec::new(),
         }
     }
@@ -1761,7 +1769,7 @@ mod tests {
 
     #[test]
     fn blank_form_makes_a_new_task_for_the_day() {
-        let mut form = EditForm::blank(&[]);
+        let mut form = EditForm::blank(&[], Weekday::Monday);
         assert!(form.new_task(today()).is_err());
         form.handle(&Message::EditTitle("Draft plan".into()), today());
         form.handle(&Message::PickDue(date(2026, 11, 20)), today());

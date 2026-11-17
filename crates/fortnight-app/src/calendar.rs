@@ -4,13 +4,13 @@
 use iced::widget::{Column, Row, Space, button, column, container, row, text};
 use iced::{Center, Color, Element, Fill, Theme, border};
 use jiff::ToSpan;
-use jiff::civil::Date;
+use jiff::civil::{Date, Weekday};
 
 use crate::theme;
 
 pub use popup::Popup;
 
-/// A month calendar, Monday first, as a raised panel. `selected` is filled
+/// A month calendar, weeks starting on `week_start`, as a raised panel. `selected` is filled
 /// with the accent; the days of `range` (first, last) get a soft accent
 /// band; `today` is shaded and in the accent colour so it is easy to find.
 /// The arrows send `on_month(-1 | 1)`, a day sends `on_pick`, and
@@ -21,13 +21,17 @@ pub fn month_picker<'a, Message: Clone + 'a>(
     selected: Option<Date>,
     range: Option<(Date, Date)>,
     today: Date,
+    week_start: Weekday,
     on_month: impl Fn(i32) -> Message,
     on_pick: impl Fn(Date) -> Message,
     on_clear: Option<Message>,
 ) -> Element<'a, Message> {
     const CELL: f32 = 36.0;
     let first = month.first_of_month();
-    let offset = i64::from(first.weekday().to_monday_zero_offset());
+    let offset = i64::from(
+        (first.weekday().to_monday_zero_offset() - week_start.to_monday_zero_offset())
+            .rem_euclid(7),
+    );
     let start = first.saturating_sub(offset.days());
 
     let arrow = |icon, step| {
@@ -47,8 +51,10 @@ pub fn month_picker<'a, Message: Clone + 'a>(
     .align_y(Center)
     .width(CELL * 7.0);
 
-    let names = Row::with_children(["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"].map(|n| {
-        text(n)
+    const NAMES: [&str; 7] = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
+    let shift = week_start.to_monday_zero_offset() as usize;
+    let names = Row::with_children((0..7).map(|i| {
+        text(NAMES[(i + shift) % 7])
             .size(theme::TEXT_SMALL)
             .style(theme::muted)
             .width(CELL)
@@ -94,7 +100,67 @@ pub fn month_picker<'a, Message: Clone + 'a>(
             .width(CELL * 7.0),
         );
     }
-    container(col)
+    panel(col.into())
+}
+
+/// The twelve months of `year` in a 4 × 3 grid, as a raised panel like
+/// [`month_picker`]. `selected`'s month is filled with the accent; today's
+/// month is shaded and in the accent colour. The arrows send
+/// `on_year(-1 | 1)`; a month sends `on_pick` with its first day.
+pub fn year_picker<'a, Message: Clone + 'a>(
+    year: i16,
+    selected: Date,
+    today: Date,
+    on_year: impl Fn(i32) -> Message,
+    on_pick: impl Fn(Date) -> Message,
+) -> Element<'a, Message> {
+    const CELL: f32 = 72.0;
+    let arrow = |icon, step| {
+        button(theme::icon(icon))
+            .padding(theme::ICON_PADDING)
+            .style(theme::icon_button)
+            .on_press(on_year(step))
+    };
+    let header = row![
+        arrow(theme::Icon::ChevronLeft, -1),
+        text(year.to_string())
+            .size(theme::TEXT_BODY)
+            .width(Fill)
+            .align_x(Center),
+        arrow(theme::Icon::ChevronRight, 1),
+    ]
+    .align_y(Center)
+    .width(CELL * 3.0);
+
+    let mut grid = Column::new().spacing(4);
+    for r in 0..4i8 {
+        let months = (1..=3i8).map(|c| {
+            let month = r * 3 + c;
+            let first = Date::new(year, month, 1).unwrap_or(selected);
+            let is_selected = selected.year() == year && selected.month() == month;
+            let is_today = today.year() == year && today.month() == month;
+            button(
+                text(first.strftime("%b").to_string())
+                    .size(theme::TEXT_SMALL)
+                    .width(Fill)
+                    .align_x(Center),
+            )
+            .width(CELL)
+            .padding([10, 0])
+            .style(move |theme: &Theme, status| {
+                calendar_day(theme, status, true, is_selected, false, is_today)
+            })
+            .on_press(on_pick(first))
+            .into()
+        });
+        grid = grid.push(Row::with_children(months).spacing(0));
+    }
+    panel(column![header, grid].spacing(8).into())
+}
+
+/// The raised panel the pickers sit in.
+fn panel<'a, Message: 'a>(content: Element<'a, Message>) -> Element<'a, Message> {
+    container(content)
         .padding(theme::SPACING)
         .style(|theme: &Theme| container::Style {
             background: Some(theme.palette().background.into()),
