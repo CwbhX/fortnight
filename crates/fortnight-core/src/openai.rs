@@ -8,17 +8,12 @@
 //!
 //! Skipped for the prototype: `Retry-After` is not honoured (fixed
 //! exponential backoff instead), and streaming is not supported.
-//! `fortnight-core` has no runtime dependency on tokio, so the backoff
-//! sleep is a small thread-backed future (`Sleep`) that works on any
-//! executor; it only runs between failed attempts.
+//! Requires a tokio runtime (reqwest does too); the app runs iced with
+//! its `tokio` feature.
 
 use crate::llm::{BoxFuture, ChatRequest, ChatResponse, LlmClient, LlmConfig, LlmError};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 const MAX_ATTEMPTS: u32 = 3;
@@ -100,7 +95,7 @@ impl LlmClient for OpenAiClient {
             loop {
                 match call.send().await {
                     Err(e) if attempt < MAX_ATTEMPTS && is_retryable(&e) => {
-                        Sleep::new(backoff * 2u32.pow(attempt - 1)).await;
+                        tokio::time::sleep(backoff * 2u32.pow(attempt - 1)).await;
                         attempt += 1;
                     }
                     result => return result,
@@ -231,54 +226,6 @@ fn parse_body(text: &str, requested_model: &str) -> Result<ChatResponse, LlmErro
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| requested_model.to_string());
     Ok(ChatResponse { text, model })
-}
-
-/// A runtime-agnostic sleep: a helper thread wakes the task when done.
-struct Sleep {
-    state: Arc<Mutex<SleepState>>,
-    duration: Duration,
-}
-
-#[derive(Default)]
-struct SleepState {
-    started: bool,
-    done: bool,
-    waker: Option<Waker>,
-}
-
-impl Sleep {
-    fn new(duration: Duration) -> Self {
-        Sleep {
-            state: Arc::default(),
-            duration,
-        }
-    }
-}
-
-impl Future for Sleep {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let mut state = self.state.lock().expect("sleep lock");
-        if state.done || self.duration.is_zero() {
-            return Poll::Ready(());
-        }
-        state.waker = Some(cx.waker().clone());
-        if !state.started {
-            state.started = true;
-            let shared = Arc::clone(&self.state);
-            let duration = self.duration;
-            std::thread::spawn(move || {
-                std::thread::sleep(duration);
-                let mut state = shared.lock().expect("sleep lock");
-                state.done = true;
-                if let Some(w) = state.waker.take() {
-                    w.wake();
-                }
-            });
-        }
-        Poll::Pending
-    }
 }
 
 #[cfg(test)]
