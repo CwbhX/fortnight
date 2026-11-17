@@ -296,30 +296,25 @@ fn overdue_weight(days_until_due: Option<i64>) -> f64 {
 fn plan_question(user: &str, model: &str) -> Option<Ask> {
     let start = user.find("<facts>")? + "<facts>".len();
     let end = user.rfind("</facts>")?;
-    let facts: Value = serde_json::from_str(user.get(start..end)?.trim()).ok()?;
-    facts.get("due_this_week")?;
+    // Anything that isn't plan facts (a weekly summary) fails here.
+    let facts: crate::report::PlanFacts =
+        serde_json::from_str(user.get(start..end)?.trim()).ok()?;
 
-    let today = facts.get("today").and_then(Value::as_str).unwrap_or("");
     let mut candidates: Vec<Candidate> = Vec::new();
-    for list in ["overdue", "due_this_week", "due_soon", "undated"] {
-        for task in facts
-            .get(list)
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let Some(id) = task.get("id").and_then(Value::as_i64) else {
-                continue;
-            };
-            // Only the tasks on today's list (carried-over ones too), and
-            // overdue ones until done.
-            let overdue = task.get("overdue").and_then(Value::as_bool) == Some(true);
-            if !on_today_list(task, today) && !overdue {
-                continue;
-            }
-            if candidates.len() < MAX_OPTIONS && candidates.iter().all(|c| c.id != id) {
-                candidates.push(candidate(id, task, &facts));
-            }
+    for task in facts
+        .overdue
+        .iter()
+        .chain(&facts.due_this_week)
+        .chain(&facts.due_soon)
+        .chain(&facts.undated)
+    {
+        // Only the tasks on today's list (carried-over ones too), and
+        // overdue ones until done.
+        if !task.on_today_list && !task.overdue {
+            continue;
+        }
+        if candidates.len() < MAX_OPTIONS && candidates.iter().all(|c| c.id != task.id) {
+            candidates.push(candidate(task));
         }
     }
     if candidates.len() < 2 {
@@ -328,22 +323,16 @@ fn plan_question(user: &str, model: &str) -> Option<Ask> {
         )));
     }
 
-    let weekday = facts
-        .get("today_weekday")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let mut state = format!("Today is {weekday} {today}.");
+    let mut state = format!("Today is {} {}.", facts.today_weekday, facts.today);
     if let Some(day) = facts
-        .get("remaining_working_days")
-        .and_then(Value::as_array)
-        .and_then(|d| d.first())
-        .filter(|d| d.get("date").and_then(Value::as_str) == Some(today))
+        .remaining_working_days
+        .first()
+        .filter(|d| d.date == facts.today)
     {
-        let hours = day
-            .get("capacity_hours")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        state.push_str(&format!(" {hours} focus hours are free today."));
+        state.push_str(&format!(
+            " {} focus hours are free today.",
+            day.capacity_hours
+        ));
     }
     state.push_str(&format!(" There are {} open tasks.", candidates.len()));
 
@@ -365,34 +354,17 @@ fn plan_question(user: &str, model: &str) -> Option<Ask> {
     Some(Ask::Question { body, candidates })
 }
 
-/// Whether `task` is on the Today list: planned for today, or for an
-/// earlier day and carried over (`on_today_list` in the facts; older facts
-/// without it fall back to `planned_for == today`).
-fn on_today_list(task: &Value, today: &str) -> bool {
-    match task.get("on_today_list").and_then(Value::as_bool) {
-        Some(on) => on,
-        None => !today.is_empty() && task.get("planned_for").and_then(Value::as_str) == Some(today),
-    }
-}
-
-fn candidate(id: i64, task: &Value, facts: &Value) -> Candidate {
-    let text = |k: &str| {
-        task.get(k)
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    };
-    let today = facts.get("today").and_then(Value::as_str).unwrap_or("");
-    let days = task.get("days_until_due").and_then(Value::as_i64);
-    let priority = task.get("priority").and_then(Value::as_u64).unwrap_or(0);
-    let planned_today = on_today_list(task, today);
+fn candidate(task: &crate::report::PlanTask) -> Candidate {
+    let days = task.days_until_due.map(i64::from);
+    let priority = u64::from(task.priority);
+    let weekday = task.due_weekday.unwrap_or("");
 
     let due = days.map(|d| match d {
         d if d < -1 => format!("overdue {} days", -d),
         -1 => "overdue 1 day".to_string(),
         0 => "due today".to_string(),
         1 => "due tomorrow".to_string(),
-        _ => format!("due {}", text("due_weekday")),
+        _ => format!("due {weekday}"),
     });
     // Priority first, in the app's words (0 low, 1 medium, 2 or more high).
     let level = match priority {
@@ -400,8 +372,8 @@ fn candidate(id: i64, task: &Value, facts: &Value) -> Candidate {
         1 => "Medium",
         _ => "High",
     };
-    let mut parts = vec![format!("{level} priority"), text("title")];
-    if let Some(project) = task.get("project").and_then(Value::as_str) {
+    let mut parts = vec![format!("{level} priority"), task.title.clone()];
+    if let Some(project) = &task.project {
         parts.push(format!("project {project}"));
     }
     if let (Some(due), Some(d)) = (&due, days) {
@@ -413,29 +385,32 @@ fn candidate(id: i64, task: &Value, facts: &Value) -> Candidate {
     } else {
         parts.push("no deadline".into());
     }
-    if planned_today {
+    if task.on_today_list {
         parts.push("planned for today".into());
-    } else if let Some(day) = task.get("planned_weekday").and_then(Value::as_str) {
+    } else if let Some(day) = task.planned_weekday {
         parts.push(format!("planned for {day}"));
     }
-    if let Some(minutes) = task.get("estimate_minutes").and_then(Value::as_u64) {
+    if let Some(minutes) = task.estimate_minutes {
         parts.push(format!("about {minutes} minutes"));
     }
 
+    // The weekday alone names a day within the coming six; a week away it
+    // would read as today.
     let deadline = match (&due, days) {
-        (Some(due), Some(d)) if d <= 7 => Some(due.clone()),
+        (Some(due), Some(d)) if d <= 6 => Some(due.clone()),
+        (Some(_), Some(7)) => Some(format!("due next {weekday}")),
         _ => None,
     };
     let why = match (priority, deadline) {
         (p, Some(deadline)) if p >= 2 => format!("high priority, {deadline}"),
         (p, None) if p >= 2 => "high priority".into(),
         (_, Some(deadline)) => deadline,
-        _ if planned_today => "planned for today".into(),
+        _ if task.on_today_list => "planned for today".into(),
         _ => "no deadline".into(),
     };
     Candidate {
-        id,
-        key: format!("t{id}"),
+        id: task.id,
+        key: format!("t{}", task.id),
         description: parts.join("; "),
         why,
         weight: priority_weight(priority) * overdue_weight(days),
@@ -706,6 +681,35 @@ mod tests {
         assert_eq!(overdue_weight(Some(-1)), 1.25);
         assert_eq!(overdue_weight(Some(-4)), 2.0);
         assert_eq!(overdue_weight(Some(-30)), 2.0);
+    }
+
+    /// On Monday 16 Nov: a weekday alone names this week's day; a week
+    /// away it says "next".
+    #[test]
+    fn reasons_name_the_weekday_only_within_six_days() {
+        let mut high = task(3, "High", Some(date(2026, 11, 23)));
+        high.priority = 2;
+        let tasks = vec![
+            task(1, "Saturday", Some(date(2026, 11, 21))),
+            task(2, "Next Monday", Some(date(2026, 11, 23))),
+            high,
+            task(4, "Later", Some(date(2026, 11, 25))),
+        ];
+        let Some(Ask::Question { candidates, .. }) = plan_question(&plan_request(&tasks).user, "m")
+        else {
+            panic!("expected a question");
+        };
+        let why: Vec<(i64, &str)> = candidates.iter().map(|c| (c.id, c.why.as_str())).collect();
+        assert_eq!(
+            why,
+            vec![
+                (1, "due Saturday"),
+                (2, "due next Monday"),
+                (3, "high priority, due next Monday"),
+                (4, "planned for today"),
+            ]
+        );
+        assert!(candidates[1].description.contains("due Monday (in 7 days)"));
     }
 
     #[tokio::test]

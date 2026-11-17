@@ -1,7 +1,10 @@
 ---
-source: crates/fortnight-core/src/report.rs
-expression: facts
+source: crates/fortnight-core/src/report/summary.rs
+expression: p.request.user
 ---
+Write my weekly update for the week Monday 2026-11-09 to Sunday 2026-11-15.
+
+<facts>
 {
   "week_start": "2026-11-09",
   "week_end": "2026-11-15",
@@ -97,7 +100,7 @@ expression: facts
       "due_on": "2026-11-12",
       "due_weekday": "Thursday",
       "days_overdue": 3,
-      "notes": "Waiting on legal <legal@example.com> to reply."
+      "notes": "Waiting on legal \u003clegal@example.com\u003e to reply."
     },
     {
       "id": 7,
@@ -180,3 +183,4 @@ expression: facts
     }
   ]
 }
+</facts>

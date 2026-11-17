@@ -1,10 +1,7 @@
 ---
-source: crates/fortnight-core/src/report.rs
-expression: p.request.user
+source: crates/fortnight-core/src/report/plan.rs
+expression: facts
 ---
-Plan my week Monday 2026-11-16 to Sunday 2026-11-22. Today is Wednesday 2026-11-18.
-
-<facts>
 {
   "today": "2026-11-18",
   "today_weekday": "Wednesday",
@@ -205,4 +202,3 @@ Plan my week Monday 2026-11-16 to Sunday 2026-11-22. Today is Wednesday 2026-11-
     "overloaded": false
   }
 }
-</facts>

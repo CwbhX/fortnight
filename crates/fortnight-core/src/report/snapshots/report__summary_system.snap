@@ -1,5 +1,5 @@
 ---
-source: crates/fortnight-core/src/report.rs
+source: crates/fortnight-core/src/report/summary.rs
 expression: p.request.system
 ---
 You write the weekly status update that the user sends to their manager.
