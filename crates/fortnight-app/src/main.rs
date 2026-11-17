@@ -154,7 +154,7 @@ impl App {
                     start,
                     shoot_after_delay(),
                 ]);
-                (App::Ready(ready, None), tasks)
+                (App::Ready(ready, forced_theme()), tasks)
             }
             Err(e) => (App::Fatal(e), shoot_after_delay()),
         }
@@ -195,6 +195,7 @@ impl App {
                 .and_then(iced::window::screenshot)
                 .map(Message::Shot),
             (_, Message::Shot(shot)) => save_screenshot(shot),
+            (App::Ready(_, _), Message::ThemeMode(_)) if forced_theme().is_some() => Task::none(),
             (App::Ready(_, mode), Message::ThemeMode(m)) => {
                 *mode = match m {
                     iced::theme::Mode::Dark => Some(true),
@@ -942,6 +943,16 @@ impl Ready {
             )
         ]
         .into()
+    }
+}
+
+/// Dev aid: `FORTNIGHT_THEME=light|dark` overrides the system theme (for
+/// screenshots of both).
+fn forced_theme() -> Option<bool> {
+    match std::env::var("FORTNIGHT_THEME").as_deref() {
+        Ok("dark") => Some(true),
+        Ok("light") => Some(false),
+        _ => None,
     }
 }
 

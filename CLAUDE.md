@@ -31,4 +31,6 @@ Commit your work on your branch when done. Do not push.
 
 Run the app with `FORTNIGHT_SCREENSHOT=/path/out.raw`; it screenshots its own window after two seconds, writes `<w> <h>\n` + RGBA, and exits. Convert with `python3 -I /private/tmp/claude-501/-Users-clementhathaway--t3-projects-fortnight/313991d6-cb8c-4c8c-82ee-a8a7380d8a4a/scratchpad/tools/raw2png.py out.raw out.png`, then view the PNG.
 
-Useful environment: `--data-dir <folder>` (use a scratch folder, never the repo), `FORTNIGHT_PAGE=today|week|month|settings`, `FORTNIGHT_SKIP_UNLOCK=1`.
+Useful environment: `--data-dir <folder>` (use a scratch folder outside the repo, never the repo), `FORTNIGHT_PAGE=today|week|month|settings`, `FORTNIGHT_SKIP_UNLOCK=1`, `FORTNIGHT_THEME=light|dark`.
+
+Sample data: copy `crates/fortnight-core/tests/fixtures/round1.db` to `<scratch folder>/fortnight.db` (it migrates on open; tasks are around 16 Nov 2026). To see richer data, insert rows into that scratch copy with `sqlite3` (schema in `crates/fortnight-core/src/sqlite.rs`).
