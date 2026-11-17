@@ -17,8 +17,9 @@
 //!   line dated today (replacing that day's others), so it reaches the
 //!   weekly summary as `log_lines`. Older side work lines show up as lines
 //!   of the notes. Other days show their notes read only, if any.
-//! - **Completed**, collapsed: done tasks planned for the shown day (as the
-//!   Week tab shows them) or completed on it.
+//! - **Completed**, collapsed: done tasks whose day is the shown day (as on
+//!   the Week tab), whenever they were ticked; a done task with no day shows
+//!   on the day it was ticked.
 //! - **No date**, collapsed: open tasks with no planned day (the inbox).
 //! - **Deleted**, collapsed: every deleted task, newest first, each a quiet
 //!   card with Restore and Delete forever, and Delete all in the header
@@ -308,11 +309,11 @@ fn completed_on(task: &Task, tz: &TimeZone) -> Option<Date> {
 pub fn section_of(task: &Task, day: Date, today: Date, tz: &TimeZone) -> Option<Section> {
     match task.status {
         TaskStatus::Dropped => return Some(Section::Deleted),
-        // On the day it was planned for (as on the Week tab) and on the day
-        // it was finished.
+        // Counted as done on the day it sits on (as on the Week tab), not
+        // the day the box was ticked; that only for a task with no day.
         TaskStatus::Done => {
-            let shown = task.day() == Some(day) || completed_on(task, tz) == Some(day);
-            return shown.then_some(Section::Done);
+            let done_on = task.day().or_else(|| completed_on(task, tz));
+            return (done_on == Some(day)).then_some(Section::Done);
         }
         TaskStatus::Todo | TaskStatus::Doing => {}
     }
@@ -1995,7 +1996,7 @@ mod tests {
                 task(9, "done wed", Some(date(2026, 11, 18))),
                 date(2026, 11, 18),
             ),
-            // Due last week, done today: completed today.
+            // Due last week, ticked today: done on its own day, not today.
             done_on(task(10, "late but done", Some(date(2026, 11, 9))), today()),
             planned(task(11, "planned wed", None), date(2026, 11, 18)),
             with_status(task(12, "doing today", Some(today())), TaskStatus::Doing),
@@ -2078,12 +2079,10 @@ mod tests {
         assert_eq!(ids(&section_tasks(&data, Section::Overdue)), vec![4, 1]);
         // Doing is a plain open task now. Manual order (position = id here).
         assert_eq!(ids(&section_tasks(&data, Section::Day)), vec![2, 3, 12]);
-        let mut done = ids(&section_tasks(&data, Section::Done));
-        done.sort();
-        assert_eq!(done, vec![5, 10]);
+        assert_eq!(ids(&section_tasks(&data, Section::Done)), vec![5]);
         assert_eq!(ids(&section_tasks(&data, Section::NoDate)), vec![7]);
         assert_eq!(ids(&section_tasks(&data, Section::Deleted)), vec![6]);
-        for id in [8, 9, 11] {
+        for id in [8, 9, 10, 11] {
             let t = data.tasks.iter().find(|t| t.id == id).unwrap();
             assert_eq!(
                 section_of(t, today(), today(), &TimeZone::UTC),
@@ -2094,15 +2093,25 @@ mod tests {
     }
 
     #[test]
-    fn a_task_done_early_shows_on_its_day_and_the_day_it_was_done() {
+    fn a_done_task_shows_on_its_day_not_the_day_it_was_ticked() {
         let wed = date(2026, 11, 18);
         let early = done_on(planned(task(1, "early", None), wed), today());
-        for day in [today(), wed] {
-            let data = data_for(day, vec![early.clone()]);
-            assert_eq!(ids(&section_tasks(&data, Section::Done)), vec![1], "{day}");
-        }
-        let thu = data_for(date(2026, 11, 19), vec![early]);
-        assert!(section_tasks(&thu, Section::Done).is_empty());
+        let on = |day| {
+            ids(&section_tasks(
+                &data_for(day, vec![early.clone()]),
+                Section::Done,
+            ))
+        };
+        assert_eq!(on(wed), vec![1]);
+        assert!(on(today()).is_empty());
+        // No day: the day it was ticked.
+        let loose = done_on(task(2, "loose", None), today());
+        let loose = Task {
+            planned_for: None,
+            ..loose
+        };
+        let data = data_for(today(), vec![loose]);
+        assert_eq!(ids(&section_tasks(&data, Section::Done)), vec![2]);
     }
 
     #[test]
@@ -2143,7 +2152,7 @@ mod tests {
         // The day's tasks, then Overdue under them.
         assert_eq!(visible_rows(&data, false, false), vec![2, 3, 12, 4, 1]);
         let all = visible_rows(&data, true, true);
-        assert_eq!(all.len(), 8);
+        assert_eq!(all.len(), 7);
         assert_eq!(all.last(), Some(&7));
         assert!(!all.contains(&6));
     }
