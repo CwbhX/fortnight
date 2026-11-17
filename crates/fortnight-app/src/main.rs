@@ -1743,7 +1743,10 @@ impl Ready {
                     self.prompt_changed.insert(ReportKind::Plan, now);
                 }
                 match self.store.save_settings(&s) {
-                    Ok(()) => self.settings = s,
+                    Ok(()) => {
+                        self.settings = s;
+                        self.settings_open = false;
+                    }
                     Err(e) => self.error = Some(e.to_string()),
                 }
                 Task::batch([self.run_due(), self.update_week_reports()])

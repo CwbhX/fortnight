@@ -1349,15 +1349,10 @@ impl SettingsView {
             );
         }
         let mut hours = column![
-            text("Focus hours per day").size(theme::TEXT_SMALL),
-            row![
-                input("6", &f.focus_hours)
-                    .on_input(Message::FocusHours)
-                    .width(90),
-                small_muted("The Week tab compares estimates against this."),
-            ]
-            .spacing(theme::SPACING)
-            .align_y(Center),
+            text("Work hours per day").size(theme::TEXT_SMALL),
+            input("8", &f.focus_hours)
+                .on_input(Message::FocusHours)
+                .width(90),
         ]
         .spacing(theme::SPACING / 3.0);
         if parse_hours(&f.focus_hours).is_none() {
@@ -1560,10 +1555,6 @@ fn remove_button<'a>(which: Which) -> Element<'a, Message> {
         .style(theme::danger_button)
         .on_press(Message::AskRemove(which))
         .into()
-}
-
-fn small_muted<'a>(s: &'a str) -> Element<'a, Message> {
-    text(s).size(theme::TEXT_SMALL).style(theme::muted).into()
 }
 
 /// First `max` characters of the first line, with an ellipsis if cut.
