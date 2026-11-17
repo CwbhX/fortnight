@@ -1,0 +1,14 @@
+---
+source: crates/fortnight-core/src/report.rs
+expression: summary
+---
+{
+  "week_start": "2026-11-09",
+  "week_end": "2026-11-15",
+  "completed": [],
+  "in_progress": [],
+  "missed": [],
+  "next_week": [],
+  "added": [],
+  "completed_by_project": []
+}

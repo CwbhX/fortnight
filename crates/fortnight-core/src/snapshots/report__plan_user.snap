@@ -1,0 +1,116 @@
+---
+source: crates/fortnight-core/src/report.rs
+expression: p.request.user
+---
+Plan my week Monday 2026-11-16 to Sunday 2026-11-22. Today is Wednesday 2026-11-18.
+
+<facts>
+{
+  "today": "2026-11-18",
+  "today_weekday": "Wednesday",
+  "week_start": "2026-11-16",
+  "week_end": "2026-11-22",
+  "remaining_working_days": [
+    {
+      "date": "2026-11-18",
+      "weekday": "Wednesday"
+    },
+    {
+      "date": "2026-11-19",
+      "weekday": "Thursday"
+    },
+    {
+      "date": "2026-11-20",
+      "weekday": "Friday"
+    }
+  ],
+  "overdue": [
+    {
+      "id": 1,
+      "title": "Vendor contract review",
+      "project": "Finance",
+      "due_on": "2026-11-12",
+      "due_weekday": "Thursday",
+      "days_until_due": -6,
+      "overdue": true
+    }
+  ],
+  "due_this_week": [
+    {
+      "id": 2,
+      "title": "Write onboarding doc",
+      "project": "Website",
+      "due_on": "2026-11-18",
+      "due_weekday": "Wednesday",
+      "days_until_due": 0,
+      "overdue": false
+    },
+    {
+      "id": 3,
+      "title": "Board deck",
+      "project": "Finance",
+      "due_on": "2026-11-20",
+      "due_weekday": "Friday",
+      "days_until_due": 2,
+      "overdue": false,
+      "notes": "Needs Q3 actuals from Sam."
+    },
+    {
+      "id": 4,
+      "title": "Renew certificates",
+      "project": null,
+      "due_on": "2026-11-22",
+      "due_weekday": "Sunday",
+      "days_until_due": 4,
+      "overdue": false
+    }
+  ],
+  "due_soon": [
+    {
+      "id": 5,
+      "title": "Migrate analytics",
+      "project": "Website",
+      "due_on": "2026-11-25",
+      "due_weekday": "Wednesday",
+      "days_until_due": 7,
+      "overdue": false
+    },
+    {
+      "id": 6,
+      "title": "Annual review",
+      "project": null,
+      "due_on": "2026-12-02",
+      "due_weekday": "Wednesday",
+      "days_until_due": 14,
+      "overdue": false
+    }
+  ],
+  "undated": [
+    {
+      "id": 8,
+      "title": "Hiring rubric",
+      "project": "Hiring",
+      "due_on": null,
+      "due_weekday": null,
+      "days_until_due": null,
+      "overdue": false
+    },
+    {
+      "id": 9,
+      "title": "Plan team offsite",
+      "project": null,
+      "due_on": null,
+      "due_weekday": null,
+      "days_until_due": null,
+      "overdue": false
+    }
+  ],
+  "totals": {
+    "open": 9,
+    "overdue": 1,
+    "due_this_week": 3,
+    "due_soon": 2,
+    "undated": 2
+  }
+}
+</facts>

@@ -1,0 +1,25 @@
+---
+source: crates/fortnight-core/src/report.rs
+expression: summary_facts_markdown(&summary)
+---
+**Week:** Mon 9 Nov to Sun 15 Nov 2026
+
+### Completed
+
+Nothing completed this week.
+
+### In progress
+
+Nothing in progress.
+
+### Still open, due by the week's end
+
+Nothing due this week was left open.
+
+### Due next week
+
+Nothing due next week.
+
+### Added
+
+No tasks added this week.

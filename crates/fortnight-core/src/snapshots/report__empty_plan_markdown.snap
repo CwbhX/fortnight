@@ -1,0 +1,25 @@
+---
+source: crates/fortnight-core/src/report.rs
+expression: plan_facts_markdown(&plan)
+---
+**Today:** Wed 18 Nov · week Mon 16 Nov to Sun 22 Nov
+
+**Working days left:** Wed, Thu, Fri
+
+**Open:** 0 · overdue 0 · due this week 0 · no due date 0
+
+### Overdue
+
+Nothing overdue.
+
+### Due this week
+
+Nothing due this week.
+
+### Due in the next two weeks
+
+Nothing else due in the next two weeks.
+
+### No due date
+
+Every open task has a due date.

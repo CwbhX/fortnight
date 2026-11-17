@@ -1,0 +1,35 @@
+---
+source: crates/fortnight-core/src/report.rs
+expression: plan
+---
+{
+  "today": "2026-11-18",
+  "today_weekday": "Wednesday",
+  "week_start": "2026-11-16",
+  "week_end": "2026-11-22",
+  "remaining_working_days": [
+    {
+      "date": "2026-11-18",
+      "weekday": "Wednesday"
+    },
+    {
+      "date": "2026-11-19",
+      "weekday": "Thursday"
+    },
+    {
+      "date": "2026-11-20",
+      "weekday": "Friday"
+    }
+  ],
+  "overdue": [],
+  "due_this_week": [],
+  "due_soon": [],
+  "undated": [],
+  "totals": {
+    "open": 0,
+    "overdue": 0,
+    "due_this_week": 0,
+    "due_soon": 0,
+    "undated": 0
+  }
+}

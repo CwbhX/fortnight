@@ -1,0 +1,29 @@
+---
+source: crates/fortnight-core/src/report.rs
+expression: plan_facts_markdown(&facts)
+---
+**Today:** Wed 18 Nov · week Mon 16 Nov to Sun 22 Nov
+
+**Working days left:** Wed, Thu, Fri
+
+**Open:** 9 · overdue 1 · due this week 3 · no due date 2
+
+### Overdue (1)
+
+- Vendor contract review — *Finance* · due Thu 12 Nov (6 days overdue)
+
+### Due this week (3)
+
+- Write onboarding doc — *Website* · due Wed 18 Nov (today)
+- Board deck — *Finance* · due Fri 20 Nov (in 2 days)
+- Renew certificates · due Sun 22 Nov (in 4 days)
+
+### Due in the next two weeks (2)
+
+- Migrate analytics — *Website* · due Wed 25 Nov (in 7 days)
+- Annual review · due Wed 2 Dec (in 14 days)
+
+### No due date (2)
+
+- Hiring rubric — *Hiring*
+- Plan team offsite
