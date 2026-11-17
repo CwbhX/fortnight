@@ -18,6 +18,11 @@
 //! built-in changes. Round 2's "summary instructions" are shown folded into
 //! the summary prompt and are folded in for good once that prompt is saved.
 //!
+//! "Use local Ollama" fills in Ollama's OpenAI-compatible endpoint and
+//! loads its model list; a local endpoint needs no API key. Reasoning
+//! models (DeepSeek-R1, Qwen3, gpt-oss) work like any other: the client
+//! drops their thinking.
+//!
 //! Secrets (API key, password) live in the form as `String` only while
 //! typed. They are moved into a `SecretString` when an action is emitted,
 //! and wiped otherwise. `Message` prints them as `***` in `Debug` output.
@@ -29,6 +34,7 @@
 
 use fortnight_core::domain::{LlmSettings, Protocol, Schedule, Settings};
 use fortnight_core::report::{DEFAULT_PLAN_PROMPT, DEFAULT_SUMMARY_PROMPT};
+use fortnight_core::secure::is_local_endpoint;
 use fortnight_core::vault::MIN_PASSWORD_LEN;
 use iced::widget::{
     Space, button, checkbox, column, container, opaque, operation, pick_list, row, rule,
@@ -85,6 +91,8 @@ pub enum Message {
     LoadModels,
     /// A model picked from the listed ones.
     PickModel(String),
+    /// Fill in a local Ollama server's endpoint and load its models.
+    UseOllama,
     FocusHours(String),
     Close,
     Save,
@@ -557,6 +565,11 @@ impl SettingsView {
             Message::BaseUrl(s) => form.base_url = s,
             Message::Model(s) | Message::PickModel(s) => form.model = s,
             Message::FocusHours(s) => form.focus_hours = s,
+            Message::UseOllama => {
+                form.protocol = Protocol::OpenAi;
+                form.base_url = OLLAMA_BASE_URL.into();
+                return self.update(Message::LoadModels);
+            }
             Message::LoadModels => {
                 if self.can_list_models() {
                     let llm = self.form.llm();
@@ -864,14 +877,27 @@ impl SettingsView {
                 .into()
             }
         };
-        let hint = small_muted(match f.protocol {
+        let hint_text = match f.protocol {
+            _ if is_local_endpoint(&f.base_url) => {
+                "A local endpoint: no API key needed. Reasoning models work; their thinking is hidden."
+            }
             Protocol::OpenAi => {
                 "Any OpenAI-compatible endpoint works, such as Ollama at http://localhost:11434/v1."
             }
             Protocol::Anthropic => {
                 "Anthropic's Messages API, usually at https://api.anthropic.com."
             }
-        });
+        };
+        let use_ollama = button(text("Use local Ollama").size(theme::TEXT_SMALL))
+            .padding([4, 10])
+            .style(theme::secondary_button)
+            .on_press_maybe(
+                (f.protocol != Protocol::OpenAi || f.base_url.trim() != OLLAMA_BASE_URL)
+                    .then_some(Message::UseOllama),
+            );
+        let hint = row![container(small_muted(hint_text)).width(Fill), use_ollama]
+            .spacing(theme::SPACING)
+            .align_y(Center);
 
         let test_label = if self.testing {
             "Testing…"
@@ -901,7 +927,7 @@ impl SettingsView {
                             .width(Fill),
                     )
                 }
-                None if self.key_state == KeyState::Locked => {
+                None if self.key_state == KeyState::Locked && !is_local_endpoint(&f.base_url) => {
                     test_row = test_row.push(small_muted("The key is locked. Unlock it first."))
                 }
                 None => {}
@@ -1205,6 +1231,9 @@ fn primary<'a>(label: &'a str, message: Message) -> Element<'a, Message> {
         .on_press(message)
         .into()
 }
+
+/// Ollama's OpenAI-compatible endpoint on its default port.
+const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
 
 fn secondary<'a>(label: &'a str, message: Message) -> Element<'a, Message> {
     button(text(label).size(theme::TEXT_BODY))
@@ -1610,6 +1639,19 @@ mod tests {
         };
         assert_eq!(saved.summary_instructions, "");
         assert!(saved.summary_prompt.contains("Short."));
+    }
+
+    #[test]
+    fn use_ollama_fills_the_endpoint_and_lists_models() {
+        let mut v = loaded(KeyState::Locked);
+        v.update(Message::Protocol(Protocol::Anthropic));
+        let Action::ListModels(llm) = v.update(Message::UseOllama) else {
+            panic!("expected ListModels");
+        };
+        assert_eq!(llm.protocol, Protocol::OpenAi);
+        assert_eq!(llm.base_url, OLLAMA_BASE_URL);
+        assert_eq!(v.form.base_url, OLLAMA_BASE_URL);
+        assert_eq!(v.form.protocol, Protocol::OpenAi);
     }
 
     #[test]

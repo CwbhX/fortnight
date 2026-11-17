@@ -9,6 +9,7 @@ use crate::args::LlmArgs;
 use crate::error::{CliError, CliResult};
 use fortnight_core::domain::LlmSettings;
 use fortnight_core::llm::{self, LlmClient, LlmConfig};
+use fortnight_core::secure;
 use fortnight_core::vault::{self, VaultError};
 use secrecy::SecretString;
 use std::io::BufRead;
@@ -113,10 +114,16 @@ pub fn connect_from_settings(
              FORTNIGHT_LLM_BASE_URL and FORTNIGHT_LLM_MODEL, or with --base-url and --model.",
         ));
     }
+    let env_key = llm::env_api_key();
+    // A local endpoint (Ollama, LM Studio) needs no key: don't ask for the
+    // password. `FORTNIGHT_LLM_API_KEY` still applies, for a local proxy.
+    if env_key.is_none() && secure::is_local_endpoint(&llm.base_url) {
+        return build_client(&llm, None);
+    }
     let stdin = std::io::stdin();
     let key = resolve_key(
         data_dir,
-        llm::env_api_key(),
+        env_key,
         flags.password_stdin,
         &mut stdin.lock(),
         &mut || rpassword::prompt_password("API key password: "),

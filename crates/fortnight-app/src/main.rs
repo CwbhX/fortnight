@@ -38,6 +38,7 @@ use fortnight_core::llm::{
     self, ChatEvent, ChatRequest, ChatResponse, LlmClient, LlmConfig, LlmError,
 };
 use fortnight_core::report::{self, Prepared};
+use fortnight_core::secure;
 use fortnight_core::sqlite::SqliteStore;
 use fortnight_core::store::Store;
 use fortnight_core::vault::{self, VaultError};
@@ -410,18 +411,24 @@ impl Ready {
     fn blocked(&self) -> Option<String> {
         if !self.settings.llm.is_configured() {
             Some("no endpoint is set up in Settings.".into())
-        } else if self.key_exists && self.api_key.is_none() {
+        } else if self.key_locked_for(&self.settings.llm) {
             Some("the API key is locked.".into())
         } else {
             None
         }
     }
 
+    /// The saved key is locked and `llm` needs it. A local endpoint (Ollama,
+    /// LM Studio) works without: it gets the key only if it is unlocked.
+    fn key_locked_for(&self, llm: &LlmSettings) -> bool {
+        self.key_exists && self.api_key.is_none() && !secure::is_local_endpoint(&llm.base_url)
+    }
+
     fn client_for(
         &self,
         llm: &LlmSettings,
     ) -> Result<(Arc<dyn LlmClient>, Option<String>), String> {
-        if self.key_exists && self.api_key.is_none() {
+        if self.key_locked_for(llm) {
             return Err("The API key is locked. Unlock it first.".into());
         }
         let config = LlmConfig {

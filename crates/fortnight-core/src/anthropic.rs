@@ -73,15 +73,23 @@ impl AnthropicClient {
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|e| LlmError::Connection(error_chain(&e.without_url())))?;
+        // A local server (Ollama also speaks this protocol) may need to
+        // load the model first; see `openai::LOCAL_TIMEOUT`.
+        let timeout = if crate::secure::is_local_endpoint(&config.base_url) {
+            crate::openai::LOCAL_TIMEOUT
+        } else {
+            DEFAULT_TIMEOUT
+        };
         Ok(AnthropicClient {
             config,
             http,
-            timeout: DEFAULT_TIMEOUT,
+            timeout,
             backoff: DEFAULT_BACKOFF,
         })
     }
 
-    /// Total time allowed for each attempt (default 120 s).
+    /// Total time allowed for each attempt (default 120 s, or 600 s for a
+    /// local endpoint).
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self

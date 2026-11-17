@@ -23,28 +23,38 @@ pub(crate) fn check_key_transport(config: &LlmConfig) -> Result<(), LlmError> {
         return Ok(());
     }
     let url = config.base_url.trim();
-    let Some(rest) = url
+    let is_http = url
         .get(..7)
-        .filter(|s| s.eq_ignore_ascii_case("http://"))
-        .map(|_| &url[7..])
-    else {
+        .is_some_and(|s| s.eq_ignore_ascii_case("http://"));
+    if !is_http || is_local_endpoint(url) {
         return Ok(());
-    };
+    }
+    Err(LlmError::Connection(format!(
+        "refusing to send the API key over plain http to {}; use https",
+        url_host(url)
+    )))
+}
+
+/// Whether `base_url` points at this machine (`localhost`, `127.x.x.x` or
+/// `::1`), as a local Ollama or LM Studio server does. Local endpoints get
+/// a longer timeout and don't need the saved key unlocked.
+pub fn is_local_endpoint(base_url: &str) -> bool {
+    let host = url_host(base_url.trim());
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The bare host of `url`: no scheme, credentials, port, path or brackets.
+fn url_host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    let host = if let Some(v6) = host_port.strip_prefix('[') {
+    if let Some(v6) = host_port.strip_prefix('[') {
         v6.split(']').next().unwrap_or("")
     } else {
         host_port.split(':').next().unwrap_or("")
-    };
-    let loopback =
-        host.eq_ignore_ascii_case("localhost") || host.starts_with("127.") || host == "::1";
-    if loopback {
-        Ok(())
-    } else {
-        Err(LlmError::Connection(format!(
-            "refusing to send the API key over plain http to {host}; use https"
-        )))
     }
 }
 
@@ -92,6 +102,18 @@ mod tests {
         assert!(check_key_transport(&cfg("http://[::1]:8080", true)).is_ok());
         // A loopback-looking user-info part doesn't count.
         assert!(check_key_transport(&cfg("http://localhost@evil.example/v1", true)).is_err());
+    }
+
+    #[test]
+    fn local_endpoints_are_loopback_hosts_only() {
+        assert!(is_local_endpoint("http://localhost:11434/v1"));
+        assert!(is_local_endpoint(" http://127.0.0.1:1234/v1 "));
+        assert!(is_local_endpoint("http://[::1]:11434"));
+        assert!(is_local_endpoint("https://LOCALHOST/v1"));
+        assert!(!is_local_endpoint("https://api.openai.com/v1"));
+        assert!(!is_local_endpoint("http://127.example.com/v1"));
+        assert!(!is_local_endpoint("http://localhost@evil.example/v1"));
+        assert!(!is_local_endpoint(""));
     }
 
     #[test]

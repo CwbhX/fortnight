@@ -16,6 +16,20 @@
 //! `list_models` reads `GET {base_url}/models`; endpoints without it
 //! (404, 405, 501) give an empty list.
 //!
+//! Reasoning ("thinking") models: their reasoning is dropped, never shown.
+//! A separate `reasoning` / `reasoning_content` field (Ollama, DeepSeek,
+//! OpenRouter, vLLM) is ignored, and a `<think>…</think>` or
+//! `<thinking>…</thinking>` block at the start of the content (DeepSeek-R1,
+//! Qwen3 and others served by llama.cpp or older Ollama) is stripped, in
+//! whole replies and in streams. A whole reply whose opening tag was part
+//! of the prompt template (only `</think>` appears) loses everything up to
+//! the closing tag; a stream in that case is not fixed (it would have to
+//! buffer the whole reply).
+//!
+//! Local endpoints (`localhost`, loopback IPs) get a 10-minute timeout
+//! instead of 2 minutes: a local model may need to load, and a reasoning
+//! model may think for minutes before its first token.
+//!
 //! Skipped for the prototype: `Retry-After` is not honoured (fixed
 //! exponential backoff instead), and a streamed body served with the wrong
 //! content type is not sniffed (it fails as malformed JSON).
@@ -37,6 +51,8 @@ use tokio::time::Instant;
 
 const MAX_ATTEMPTS: u32 = 3;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+/// For endpoints on this machine (see `secure::is_local_endpoint`).
+pub(crate) const LOCAL_TIMEOUT: Duration = Duration::from_secs(600);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_ERROR_BODY_CHARS: usize = 500;
@@ -70,17 +86,22 @@ impl OpenAiClient {
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|e| LlmError::Connection(error_chain(&e.without_url())))?;
+        let timeout = if crate::secure::is_local_endpoint(&config.base_url) {
+            LOCAL_TIMEOUT
+        } else {
+            DEFAULT_TIMEOUT
+        };
         Ok(OpenAiClient {
             config,
             http,
-            timeout: DEFAULT_TIMEOUT,
+            timeout,
             backoff: DEFAULT_BACKOFF,
         })
     }
 
     /// Time allowed for each attempt of `chat` and `list_models`; for
     /// `chat_stream`, for the response to start and for each gap between
-    /// events (default 120 s).
+    /// events (default 120 s, or 600 s for a local endpoint).
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -334,6 +355,20 @@ impl StreamState {
                 },
                 Phase::Events(reader) => {
                     match reader.next_item(self.call.timeout, &self.call.model).await {
+                        Some(Ok(ChatEvent::Delta(piece))) => match reader.think.push(&piece) {
+                            Some(text) => Ok(ChatEvent::Delta(text)),
+                            None => continue,
+                        },
+                        // Text the filter held back (a reply too short to
+                        // tell from an opening tag) goes out before `Done`.
+                        Some(Ok(done @ ChatEvent::Done { .. })) => match reader.think.finish() {
+                            Some(rest) => {
+                                self.pending.push_back(Ok(done));
+                                self.phase = Phase::Ended;
+                                Ok(ChatEvent::Delta(rest))
+                            }
+                            None => Ok(done),
+                        },
                         Some(result) => result,
                         None => continue,
                     }
@@ -370,6 +405,8 @@ struct SseReader {
     /// A chunk carried a normal `finish_reason` (e.g. "stop"), so the
     /// stream may end without `[DONE]`.
     finished: bool,
+    /// Drops a leading reasoning block from the content deltas.
+    think: ThinkFilter,
 }
 
 impl SseReader {
@@ -378,6 +415,7 @@ impl SseReader {
             events,
             model: None,
             finished: false,
+            think: ThinkFilter::default(),
         }
     }
 
@@ -437,6 +475,111 @@ impl SseReader {
             .filter(|c| !c.is_empty())
             .map(|c| Ok(ChatEvent::Delta(c)))
     }
+}
+
+/// Reasoning tags some models wrap their thinking in, opening and closing.
+const THINK_TAGS: [(&str, &str); 2] = [("<think>", "</think>"), ("<thinking>", "</thinking>")];
+
+/// Drops a reasoning block at the very start of a reply, fed piece by
+/// piece as a stream delivers it. Text before the block may only be
+/// whitespace; whitespace after it is dropped too.
+#[derive(Debug, Default)]
+struct ThinkFilter {
+    state: ThinkState,
+    /// Text received but not yet passed on or dropped.
+    buf: String,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ThinkState {
+    /// Nothing but whitespace seen yet, or a possible opening tag.
+    #[default]
+    Start,
+    /// Inside a reasoning block, waiting for this closing tag.
+    Inside(&'static str),
+    /// The block closed; skipping whitespace before the answer.
+    After,
+    /// Everything from here on is the answer.
+    Pass,
+}
+
+impl ThinkFilter {
+    /// The answer text `piece` completes, if any.
+    fn push(&mut self, piece: &str) -> Option<String> {
+        self.buf.push_str(piece);
+        loop {
+            match self.state {
+                ThinkState::Start => {
+                    let t = self.buf.trim_start();
+                    if t.is_empty() {
+                        return None;
+                    }
+                    if let Some((open, close)) = THINK_TAGS.iter().find(|(o, _)| t.starts_with(o)) {
+                        self.buf = t[open.len()..].to_string();
+                        self.state = ThinkState::Inside(close);
+                    } else if THINK_TAGS.iter().any(|(o, _)| o.starts_with(t)) {
+                        return None;
+                    } else {
+                        self.state = ThinkState::Pass;
+                    }
+                }
+                ThinkState::Inside(close) => {
+                    if let Some(i) = self.buf.find(close) {
+                        self.buf.drain(..i + close.len());
+                        self.state = ThinkState::After;
+                        continue;
+                    }
+                    // Keep only a tail that could hold the start of the tag.
+                    let mut cut = self.buf.len().saturating_sub(close.len());
+                    while !self.buf.is_char_boundary(cut) {
+                        cut += 1;
+                    }
+                    self.buf.drain(..cut);
+                    return None;
+                }
+                ThinkState::After => {
+                    let t = self.buf.trim_start();
+                    if t.is_empty() {
+                        self.buf.clear();
+                        return None;
+                    }
+                    self.buf = t.to_string();
+                    self.state = ThinkState::Pass;
+                }
+                ThinkState::Pass => {
+                    return Some(std::mem::take(&mut self.buf)).filter(|s| !s.is_empty());
+                }
+            }
+        }
+    }
+
+    /// At the end of the reply: text held back as a possible opening tag.
+    /// An unclosed reasoning block yields nothing.
+    fn finish(&mut self) -> Option<String> {
+        match self.state {
+            ThinkState::Start | ThinkState::Pass => {
+                Some(std::mem::take(&mut self.buf)).filter(|s| !s.is_empty())
+            }
+            ThinkState::Inside(_) | ThinkState::After => None,
+        }
+    }
+}
+
+/// `text` without its reasoning block: a leading `<think>…</think>` (or
+/// `<thinking>`), or everything up to a closing tag whose opening tag was
+/// in the prompt template.
+fn strip_reasoning(text: &str) -> String {
+    let mut filter = ThinkFilter::default();
+    let mut out = filter.push(text).unwrap_or_default();
+    out.push_str(&filter.finish().unwrap_or_default());
+    for (open, close) in THINK_TAGS {
+        if let Some(i) = out.find(close)
+            && !out[..i].contains(open)
+        {
+            return out[i + close.len()..].trim_start().to_string();
+        }
+    }
+    out
 }
 
 #[derive(Deserialize)]
@@ -638,6 +781,7 @@ fn parse_body(text: &str, requested_model: &str) -> Result<ChatResponse, LlmErro
     }
     let text = message
         .and_then(|m| m.content)
+        .map(|c| strip_reasoning(&c))
         .ok_or_else(|| LlmError::Malformed("response has no message content".into()))?;
     let model = body
         .model
@@ -1531,5 +1675,121 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, LlmError::Malformed(_)), "{err:?}");
+    }
+
+    // ---- reasoning models and local endpoints ----
+
+    fn filtered(pieces: &[&str]) -> String {
+        let mut f = ThinkFilter::default();
+        let mut out: String = pieces.iter().filter_map(|p| f.push(p)).collect();
+        out.push_str(&f.finish().unwrap_or_default());
+        out
+    }
+
+    #[test]
+    fn think_filter_drops_a_leading_block_split_anywhere() {
+        let reply = "\n<think>Mon is busy… so Tue</think>\n\nPlan: do X";
+        // Every split point, including inside the tags and the "…".
+        for i in (0..reply.len()).filter(|&i| reply.is_char_boundary(i)) {
+            assert_eq!(
+                filtered(&[&reply[..i], &reply[i..]]),
+                "Plan: do X",
+                "split {i}"
+            );
+        }
+        let one_char_pieces: Vec<String> = reply.chars().map(String::from).collect();
+        let pieces: Vec<&str> = one_char_pieces.iter().map(String::as_str).collect();
+        assert_eq!(filtered(&pieces), "Plan: do X");
+        assert_eq!(filtered(&["<thinking>hm</thinking>OK"]), "OK");
+    }
+
+    #[test]
+    fn think_filter_passes_ordinary_text_and_holds_back_short_prefixes() {
+        assert_eq!(filtered(&["Hello"]), "Hello");
+        assert_eq!(filtered(&["<b>bold</b>"]), "<b>bold</b>");
+        assert_eq!(filtered(&["<", "thin"]), "<thin");
+        assert_eq!(
+            filtered(&["OK <think>not leading</think>"]),
+            "OK <think>not leading</think>"
+        );
+        // An unclosed block was all reasoning: no answer.
+        assert_eq!(filtered(&["<think>still going"]), "");
+    }
+
+    #[test]
+    fn strip_reasoning_handles_an_orphan_closing_tag() {
+        assert_eq!(
+            strip_reasoning("reasoning here</think>\n\nAnswer"),
+            "Answer"
+        );
+        assert_eq!(strip_reasoning("<think>a</think> Answer"), "Answer");
+        assert_eq!(strip_reasoning("Answer"), "Answer");
+    }
+
+    #[tokio::test]
+    async fn whole_reply_drops_think_block_and_reasoning_field() {
+        let body = json!({
+            "model": "deepseek-r1:8b",
+            "choices": [{
+                "message": {
+                    "content": "<think>\nThe user wants OK.\n</think>\n\nOK",
+                    "reasoning_content": "The user wants OK."
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        assert_eq!(result_for_body(body).await.unwrap().text, "OK");
+    }
+
+    #[tokio::test]
+    async fn stream_drops_think_block_and_reasoning_deltas() {
+        let server = MockServer::start().await;
+        let reasoning = json!({
+            "model": "qwen3:8b",
+            "choices": [{ "delta": { "content": "", "reasoning": "Let me think." }, "finish_reason": null }]
+        })
+        .to_string();
+        mount(
+            &server,
+            sse(&[
+                &reasoning,
+                &chunk("<thi"),
+                &chunk("nk>weigh the options</th"),
+                &chunk("ink>\n\n"),
+                &chunk("Do A"),
+                &chunk(" first."),
+                &finish_chunk("stop"),
+                "[DONE]",
+            ]),
+        )
+        .await;
+        let c = client(&format!("{}/v1", server.uri()), None);
+        assert_eq!(
+            stream_items(&c).await,
+            vec![
+                delta("Do A"),
+                delta(" first."),
+                done("test-model-2026-01-01")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_releases_held_back_text_before_done() {
+        let server = MockServer::start().await;
+        mount(&server, sse(&[&chunk("<"), "[DONE]"])).await;
+        let c = client(&format!("{}/v1", server.uri()), None);
+        assert_eq!(
+            stream_items(&c).await,
+            vec![delta("<"), done("test-model-2026-01-01")]
+        );
+    }
+
+    #[test]
+    fn local_endpoints_get_the_long_timeout() {
+        let local = OpenAiClient::new(config("http://localhost:11434/v1", None)).unwrap();
+        assert_eq!(local.timeout, LOCAL_TIMEOUT);
+        let remote = OpenAiClient::new(config("https://api.openai.com/v1", None)).unwrap();
+        assert_eq!(remote.timeout, DEFAULT_TIMEOUT);
     }
 }
