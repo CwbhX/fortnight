@@ -256,11 +256,9 @@ impl ReportPanel {
         Some(tools.into())
     }
 
-    /// The Work summary's body. Empty when there is no summary to show.
+    /// The Work summary's body. Empty when there is no summary to show
+    /// (`refresh` leaves `body_src` empty without a summary slot).
     pub fn summary_view(&self) -> Element<'_, Message> {
-        if self.slot(ReportKind::Summary).is_none() {
-            return Column::new().into();
-        }
         if self.body_src.is_empty() {
             return Column::new().into();
         }

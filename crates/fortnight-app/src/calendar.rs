@@ -1,6 +1,8 @@
 //! A month calendar date picker and the pop-up that shows it over the
 //! page. Used by the task form's due date and the top bar's date.
 
+use fortnight_core::report::short_weekday;
+use fortnight_core::week::{month_label, week_containing};
 use iced::widget::{Column, Row, Space, button, column, container, row, text};
 use iced::{Center, Color, Element, Fill, Theme, border};
 use jiff::ToSpan;
@@ -28,11 +30,7 @@ pub fn month_picker<'a, Message: Clone + 'a>(
 ) -> Element<'a, Message> {
     const CELL: f32 = 36.0;
     let first = month.first_of_month();
-    let offset = i64::from(
-        (first.weekday().to_monday_zero_offset() - week_start.to_monday_zero_offset())
-            .rem_euclid(7),
-    );
-    let start = first.saturating_sub(offset.days());
+    let start = week_containing(first, week_start).start;
 
     let arrow = |icon, step| {
         button(theme::icon(icon))
@@ -42,7 +40,7 @@ pub fn month_picker<'a, Message: Clone + 'a>(
     };
     let header = row![
         arrow(theme::Icon::ChevronLeft, -1),
-        text(first.strftime("%B %Y").to_string())
+        text(month_label(first))
             .size(theme::TEXT_BODY)
             .width(Fill)
             .align_x(Center),
@@ -51,10 +49,9 @@ pub fn month_picker<'a, Message: Clone + 'a>(
     .align_y(Center)
     .width(CELL * 7.0);
 
-    const NAMES: [&str; 7] = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
-    let shift = week_start.to_monday_zero_offset() as usize;
+    // "Mo", "Tu", …: the first two letters of the short name.
     let names = Row::with_children((0..7).map(|i| {
-        text(NAMES[(i + shift) % 7])
+        text(&short_weekday(week_start.wrapping_add(i))[..2])
             .size(theme::TEXT_SMALL)
             .style(theme::muted)
             .width(CELL)
