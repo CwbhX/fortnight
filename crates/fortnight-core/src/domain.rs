@@ -104,6 +104,18 @@ impl Task {
     pub fn is_overdue(&self, today: Date) -> bool {
         self.status.is_open() && self.due_on.is_some_and(|d| d < today)
     }
+
+    /// On today's list: open and planned for `today` or an earlier day
+    /// (carried over). The one rule for "today's list"; the report facts'
+    /// `on_today_list` and the Today tab's recommendations use it.
+    ///
+    /// Overdue is a separate test (`is_overdue`): an overdue task is not on
+    /// the list by its deadline alone (it may be undated or planned later),
+    /// so "today's list or overdue" is `on_today_list(t) || is_overdue(t)`.
+    /// Done and deleted tasks are never on it.
+    pub fn on_today_list(&self, today: Date) -> bool {
+        self.status.is_open() && self.day().is_some_and(|d| d <= today)
+    }
 }
 
 /// What the store needs to create a task. Status starts as `Todo`.
@@ -571,6 +583,35 @@ pub const DEFAULT_FOCUS_MINUTES: u32 = 8 * 60;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn on_today_list_is_open_and_planned_by_today() {
+        let today = Date::constant(2026, 11, 18);
+        let task = |status, planned: Option<Date>, due: Option<Date>| Task {
+            status,
+            planned_for: planned,
+            due_on: due,
+            ..Task::default()
+        };
+        let mon = Some(Date::constant(2026, 11, 16));
+        let wed = Some(today);
+        let fri = Some(Date::constant(2026, 11, 20));
+        use TaskStatus::*;
+        // Planned for today, or carried over from an earlier day.
+        assert!(task(Todo, wed, None).on_today_list(today));
+        assert!(task(Doing, mon, None).on_today_list(today));
+        assert!(task(Todo, mon, fri).on_today_list(today));
+        // Later, undated, or not open: not on it.
+        assert!(!task(Todo, fri, None).on_today_list(today));
+        assert!(!task(Todo, None, None).on_today_list(today));
+        assert!(!task(Done, wed, None).on_today_list(today));
+        assert!(!task(Dropped, mon, None).on_today_list(today));
+        // A passed deadline alone does not put it there; that is overdue.
+        let undated_overdue = task(Todo, None, mon);
+        assert!(!undated_overdue.on_today_list(today));
+        assert!(undated_overdue.is_overdue(today));
+        assert!(!task(Todo, fri, mon).on_today_list(today));
+    }
 
     #[test]
     fn app_icon_defaults_to_system_and_round_trips() {

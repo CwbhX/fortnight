@@ -621,10 +621,17 @@ fn export_to_stdout_and_file_in_both_formats() {
         let tasks = s.list_tasks().unwrap();
         let events = s.events_between(Timestamp::MIN, Timestamp::MAX).unwrap();
         let reports = s.all_reports().unwrap();
-        let expected = export::export_all(format, &tasks, &events, &reports, wednesday());
+        let expected = export::export_all(
+            format,
+            &tasks,
+            &events,
+            &reports,
+            wednesday(),
+            &TimeZone::UTC,
+        );
 
         let mut out = Vec::new();
-        commands::export(&s, format, wednesday(), None, &mut out).unwrap();
+        commands::export(&s, format, &now(wednesday()), None, &mut out).unwrap();
         let out = text(out);
         assert_eq!(out.trim_end(), expected.trim_end());
         if format == ExportFormat::Json {
@@ -638,7 +645,7 @@ fn export_to_stdout_and_file_in_both_formats() {
             format.extension()
         ));
         let mut out = Vec::new();
-        commands::export(&s, format, wednesday(), Some(&path), &mut out).unwrap();
+        commands::export(&s, format, &now(wednesday()), Some(&path), &mut out).unwrap();
         assert!(out.is_empty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
         std::fs::remove_file(&path).unwrap();
@@ -646,7 +653,7 @@ fn export_to_stdout_and_file_in_both_formats() {
     let err = commands::export(
         &s,
         ExportFormat::Json,
-        wednesday(),
+        &now(wednesday()),
         Some(std::path::Path::new("/nonexistent-dir/x/out.json")),
         &mut Vec::new(),
     )

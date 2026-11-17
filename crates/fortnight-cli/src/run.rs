@@ -63,7 +63,7 @@ fn execute(cli: Cli, out: &mut dyn Write) -> CliResult<()> {
         Command::List(opts) => commands::list(store, &opts, today, out),
         Command::Done { ids, undo } => commands::done(store, &ids, undo, out),
         Command::Log { task, words } => commands::log(store, task, &words, out),
-        Command::Export(a) => commands::export(store, a.format, today, a.out.as_deref(), out),
+        Command::Export(a) => commands::export(store, a.format, &now, a.out.as_deref(), out),
         Command::Summary(a) => block_on(async {
             let saved = store.load_settings()?;
             let make =

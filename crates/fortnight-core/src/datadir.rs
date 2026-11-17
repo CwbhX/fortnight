@@ -151,10 +151,18 @@ fn read_file(path: &Path) -> Option<LockInfo> {
 }
 
 /// The same machine, allowing for macOS adding or dropping `.local` from its
-/// host name depending on the network.
-fn same_host(a: &str, b: &str) -> bool {
+/// host name depending on the network, and for case. An "unknown" host (an
+/// unreadable lock file) is never the same machine.
+pub fn same_host(a: &str, b: &str) -> bool {
     let base = |s: &str| s.trim().trim_end_matches(".local").to_ascii_lowercase();
     a != "unknown" && base(a) == base(b)
+}
+
+/// Whether `lock` was written on a machine other than `host` (this one, from
+/// [`host_name`]): what the CLI warns about. A lock from an unknown host
+/// counts as elsewhere.
+pub fn held_elsewhere(lock: &LockInfo, host: &str) -> bool {
+    !same_host(&lock.host, host)
 }
 
 /// Whether a process with this id is running on this machine. When it
@@ -196,11 +204,53 @@ fn process_running(pid: u32) -> bool {
 /// A lock left by this machine whose process has gone is not reported: the
 /// app was closed without running its clean-up (macOS's Cmd+Q ends the
 /// process without dropping the app state) or crashed.
+///
+/// With no lock file, the lock is created with `create_new`, so of two
+/// instances starting together only one gets it that way and the other sees
+/// its lock and warns. Otherwise the existing file is read and replaced.
 pub fn acquire_lock(dir: &Path) -> Result<(DataLock, Option<LockInfo>), DataDirError> {
     let path = lock_path(dir);
     let now = jiff::Timestamp::now();
     let host = host_name();
     let pid = std::process::id();
+    let not_writable = |e: std::io::Error| DataDirError::NotWritable {
+        path: dir.to_path_buf(),
+        reason: e.to_string(),
+    };
+    let to_json = |info: &LockInfo| {
+        serde_json::to_string_pretty(info).map_err(|e| DataDirError::NotWritable {
+            path: dir.to_path_buf(),
+            reason: e.to_string(),
+        })
+    };
+
+    let fresh = LockInfo {
+        host: host.clone(),
+        pid,
+        since: now,
+    };
+    // On `AlreadyExists`, read, report and replace it below. Any other error
+    // (a file system without exclusive create, say) takes the same path,
+    // which reports what it can and fails if the folder is not writable.
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        use std::io::Write as _;
+        let written = to_json(&fresh).and_then(|json| {
+            file.write_all(json.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(not_writable)
+        });
+        if let Err(e) = written {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
+        }
+        return Ok((DataLock { path, info: fresh }, None));
+    }
+
     let previous = match path.try_exists() {
         Ok(false) => None,
         // Exists (or cannot tell): report what it says, or "unknown".
@@ -221,17 +271,12 @@ pub fn acquire_lock(dir: &Path) -> Result<(DataLock, Option<LockInfo>), DataDirE
         since = prev.since + jiff::SignedDuration::from_nanos(1);
     }
     let info = LockInfo { host, pid, since };
-
-    let not_writable = |e: std::io::Error| DataDirError::NotWritable {
-        path: dir.to_path_buf(),
-        reason: e.to_string(),
-    };
-    let json = serde_json::to_string_pretty(&info).map_err(|e| DataDirError::NotWritable {
-        path: dir.to_path_buf(),
-        reason: e.to_string(),
-    })?;
+    let json = to_json(&info)?;
     // Write beside the target, then rename, so readers never see half a file.
-    let tmp = dir.join(format!(".fortnight.lock.{pid}.tmp"));
+    // Unique per call, so two acquires in one process cannot collide.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".fortnight.lock.{pid}.{n}.tmp"));
     std::fs::write(&tmp, json).map_err(not_writable)?;
     if let Err(e) = std::fs::rename(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
@@ -357,6 +402,28 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Instances starting together: only one finds no lock.
+    #[test]
+    fn simultaneous_acquires_see_each_other() {
+        let dir = temp_dir("lock-race");
+        std::fs::create_dir_all(&dir).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (dir, barrier) = (dir.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    acquire_lock(&dir).unwrap()
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        let unwarned = results.iter().filter(|(_, prev)| prev.is_none()).count();
+        drop(results);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(unwarned, 1);
+    }
+
     #[test]
     fn drop_removes_our_lock_file() {
         let dir = temp_dir("lock-drop");
@@ -450,7 +517,22 @@ mod tests {
     }
 
     #[test]
-    fn host_name_is_never_empty() {
-        assert!(!host_name().trim().is_empty());
+    fn held_elsewhere_ignores_local_suffix_and_case() {
+        let lock = |host: &str| LockInfo {
+            host: host.into(),
+            pid: 1,
+            since: jiff::Timestamp::UNIX_EPOCH,
+        };
+        assert!(!held_elsewhere(&lock("Foo.local"), "Foo"));
+        assert!(!held_elsewhere(&lock("foo"), "FOO.local"));
+        assert!(held_elsewhere(&lock("Bar"), "Foo"));
+        assert!(held_elsewhere(&lock("unknown"), "Foo"));
+    }
+
+    #[test]
+    fn host_name_is_trimmed_and_not_empty() {
+        let name = host_name();
+        assert!(!name.is_empty());
+        assert_eq!(name.trim(), name);
     }
 }

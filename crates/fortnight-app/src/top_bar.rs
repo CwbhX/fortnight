@@ -148,8 +148,8 @@ pub fn quick_add_task(input: &str, tab: Tab, selected: Date, today: Date) -> Opt
         return None;
     }
     let planned_for = match tab {
-        Tab::Today => parsed.due_on.or(Some(selected)),
-        _ => parsed.due_on,
+        Tab::Today => parsed.day.or(Some(selected)),
+        _ => parsed.day,
     };
     Some(NewTask {
         title: parsed.title,

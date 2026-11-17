@@ -151,29 +151,44 @@ impl SqliteStore {
         Self::init(Connection::open_in_memory().map_err(db)?)
     }
 
-    fn init(mut conn: Connection) -> StoreResult<Self> {
+    fn init(conn: Connection) -> StoreResult<Self> {
+        Self::init_with(conn, MIGRATIONS)
+    }
+
+    /// `init` with a given migration list (tests use a longer one).
+    ///
+    /// Foreign keys are switched on only after migrating: inside the
+    /// migration transaction `PRAGMA foreign_keys` cannot change, and with
+    /// them on, a migration that rebuilds `tasks` (create, copy, drop,
+    /// rename) would fail on the drop because `events` references it.
+    /// `migrate` checks the references itself before committing.
+    fn init_with(mut conn: Connection, migrations: &[&str]) -> StoreResult<Self> {
         conn.busy_timeout(Duration::from_secs(5)).map_err(db)?;
         conn.execute_batch(
             "PRAGMA journal_mode = DELETE;
              PRAGMA synchronous = FULL;
-             PRAGMA foreign_keys = ON;",
+             PRAGMA foreign_keys = OFF;",
         )
         .map_err(db)?;
-        migrate(&mut conn)?;
+        migrate(&mut conn, migrations)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(db)?;
         Ok(SqliteStore { conn })
     }
 }
 
 /// Applies every migration past the current `user_version`, all in one
-/// transaction.
-fn migrate(conn: &mut Connection) -> StoreResult<()> {
+/// transaction. Before committing, checks that every foreign key still
+/// points at a row (`PRAGMA foreign_key_check`); if not, the migration is
+/// rejected with `Invalid` and nothing changes.
+fn migrate(conn: &mut Connection, migrations: &[&str]) -> StoreResult<()> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db)?;
     let current: i64 = tx
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .map_err(db)?;
-    let target = MIGRATIONS.len() as i64;
+    let target = migrations.len() as i64;
     if current < 0 || current > target {
         return Err(StoreError::Invalid(format!(
             "database schema version {current} is not one this app supports ({target})"
@@ -182,8 +197,24 @@ fn migrate(conn: &mut Connection) -> StoreResult<()> {
     if current == target {
         return Ok(());
     }
-    for sql in &MIGRATIONS[current as usize..] {
+    for sql in &migrations[current as usize..] {
         tx.execute_batch(sql).map_err(db)?;
+    }
+    let dangling: Vec<(String, Option<i64>, String)> = tx
+        .prepare("PRAGMA foreign_key_check")
+        .map_err(db)?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(db)?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(db)?;
+    if let Some((table, rowid, parent)) = dangling.first() {
+        // Dropping `tx` rolls the migration back.
+        return Err(StoreError::Invalid(format!(
+            "migrating the database to version {target} would leave {} broken \
+             reference(s), e.g. {table} row {} to a missing {parent} row",
+            dangling.len(),
+            rowid.map_or("?".to_string(), |r| r.to_string())
+        )));
     }
     tx.pragma_update(None, "user_version", target).map_err(db)?;
     tx.commit().map_err(db)
@@ -433,6 +464,62 @@ fn payload(kind: &EventKind) -> StoreResult<String> {
         .map_err(|e| StoreError::Invalid(format!("cannot encode event: {e}")))
 }
 
+/// Appends a log line and returns it.
+fn insert_log(
+    conn: &Connection,
+    task_id: Option<TaskId>,
+    text: &str,
+    at: Timestamp,
+) -> StoreResult<Event> {
+    if let Some(id) = task_id
+        && !task_exists(conn, id)?
+    {
+        return Err(StoreError::TaskNotFound(id));
+    }
+    let kind = EventKind::Log {
+        text: text.to_string(),
+    };
+    let id = insert_event(conn, task_id, &ts_to_sql(at), &kind)?;
+    // Nine fraction digits are lossless, so this equals a later read.
+    Ok(Event {
+        id,
+        task_id,
+        at,
+        kind,
+    })
+}
+
+/// Deletes one log line; `EventNotFound` if it is absent or not a log.
+fn delete_log_row(conn: &Connection, id: EventId) -> StoreResult<()> {
+    let n = conn
+        .execute("DELETE FROM events WHERE id = ?1 AND kind = 'log'", [id])
+        .map_err(db)?;
+    if n == 0 {
+        return Err(StoreError::EventNotFound(id));
+    }
+    Ok(())
+}
+
+/// Sets one task's position; `Invalid` if not finite, `TaskNotFound` if
+/// absent.
+fn update_position(conn: &Connection, id: TaskId, position: f64) -> StoreResult<()> {
+    if !position.is_finite() {
+        return Err(StoreError::Invalid(format!(
+            "task {id}: bad position {position}"
+        )));
+    }
+    let changed = conn
+        .execute(
+            "UPDATE tasks SET position = ?2 WHERE id = ?1",
+            params![id, position],
+        )
+        .map_err(db)?;
+    if changed == 0 {
+        return Err(StoreError::TaskNotFound(id));
+    }
+    Ok(())
+}
+
 /// Appends an event and returns its id.
 fn insert_event(
     conn: &Connection,
@@ -454,34 +541,6 @@ impl SqliteStore {
     /// failing on a read-to-write upgrade when the GUI and CLI write at once.
     fn write_tx(&self) -> StoreResult<Transaction<'_>> {
         Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate).map_err(db)
-    }
-
-    /// `Store::add_log` at a given time instead of now: the Today tab's
-    /// notes for a day other than today are stamped on that day.
-    pub fn add_log_at(
-        &self,
-        task_id: Option<TaskId>,
-        text: &str,
-        at: Timestamp,
-    ) -> StoreResult<Event> {
-        let tx = self.write_tx()?;
-        if let Some(id) = task_id
-            && !task_exists(&tx, id)?
-        {
-            return Err(StoreError::TaskNotFound(id));
-        }
-        let kind = EventKind::Log {
-            text: text.to_string(),
-        };
-        let id = insert_event(&tx, task_id, &ts_to_sql(at), &kind)?;
-        tx.commit().map_err(db)?;
-        // Nine fraction digits are lossless, so this equals a later read.
-        Ok(Event {
-            id,
-            task_id,
-            at,
-            kind,
-        })
     }
 
     fn report_by_id(&self, id: ReportId) -> StoreResult<Option<Report>> {
@@ -624,22 +683,15 @@ impl Store for SqliteStore {
     }
 
     fn set_position(&self, id: TaskId, position: f64) -> StoreResult<()> {
-        if !position.is_finite() {
-            return Err(StoreError::Invalid(format!(
-                "task {id}: bad position {position}"
-            )));
+        update_position(&self.conn, id, position)
+    }
+
+    fn set_positions(&self, positions: &[(TaskId, f64)]) -> StoreResult<()> {
+        let tx = self.write_tx()?;
+        for &(id, position) in positions {
+            update_position(&tx, id, position)?;
         }
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE tasks SET position = ?2 WHERE id = ?1",
-                params![id, position],
-            )
-            .map_err(db)?;
-        if changed == 0 {
-            return Err(StoreError::TaskNotFound(id));
-        }
-        Ok(())
+        tx.commit().map_err(db)
     }
 
     fn set_status(&self, id: TaskId, status: TaskStatus) -> StoreResult<()> {
@@ -725,19 +777,87 @@ impl Store for SqliteStore {
         tx.commit().map_err(db)
     }
 
-    fn add_log(&self, task_id: Option<TaskId>, text: &str) -> StoreResult<Event> {
-        self.add_log_at(task_id, text, Timestamp::now())
+    fn revert_task(&self, before: &Task, keep_up_to: EventId) -> StoreResult<()> {
+        let t = before;
+        let tx = self.write_tx()?;
+        let changed = tx
+            .execute(
+                "UPDATE tasks SET title = ?2, notes = ?3, status = ?4, project = ?5,
+                                  due_on = ?6, planned_for = ?7, estimate_minutes = ?8,
+                                  priority = ?9, private = ?10, position = ?11,
+                                  created_at = ?12, updated_at = ?13, completed_at = ?14
+                 WHERE id = ?1",
+                params![
+                    t.id,
+                    t.title,
+                    t.notes,
+                    t.status.as_str(),
+                    t.project,
+                    t.due_on.map(date_to_sql),
+                    t.planned_for.map(date_to_sql),
+                    t.estimate_minutes,
+                    t.priority,
+                    t.private,
+                    t.position,
+                    ts_to_sql(t.created_at),
+                    ts_to_sql(t.updated_at),
+                    t.completed_at.map(ts_to_sql)
+                ],
+            )
+            .map_err(db)?;
+        if changed == 0 {
+            return Err(StoreError::TaskNotFound(t.id));
+        }
+        tx.execute(
+            "DELETE FROM events WHERE task_id = ?1 AND id > ?2 AND kind <> 'log'",
+            params![t.id, keep_up_to],
+        )
+        .map_err(db)?;
+        tx.commit().map_err(db)
+    }
+
+    fn delete_new_task(&self, id: TaskId) -> StoreResult<Option<DeletedTask>> {
+        let tx = self.write_tx()?;
+        let task = query_task(&tx, id)?.ok_or(StoreError::TaskNotFound(id))?;
+        let events = query_events(&tx, "WHERE task_id = ?1", [id])?;
+        if events
+            .iter()
+            .any(|e| !matches!(e.kind, EventKind::Created { .. }))
+        {
+            return Ok(None);
+        }
+        tx.execute("DELETE FROM events WHERE task_id = ?1", [id])
+            .map_err(db)?;
+        tx.execute("DELETE FROM tasks WHERE id = ?1", [id])
+            .map_err(db)?;
+        tx.commit().map_err(db)?;
+        Ok(Some(DeletedTask { task, events }))
+    }
+
+    fn add_log_at(&self, task_id: Option<TaskId>, text: &str, at: Timestamp) -> StoreResult<Event> {
+        let tx = self.write_tx()?;
+        let event = insert_log(&tx, task_id, text, at)?;
+        tx.commit().map_err(db)?;
+        Ok(event)
+    }
+
+    fn replace_logs(
+        &self,
+        delete: &[EventId],
+        text: Option<&str>,
+        at: Timestamp,
+    ) -> StoreResult<Option<Event>> {
+        let tx = self.write_tx()?;
+        for &id in delete {
+            delete_log_row(&tx, id)?;
+        }
+        let event = text.map(|t| insert_log(&tx, None, t, at)).transpose()?;
+        tx.commit().map_err(db)?;
+        Ok(event)
     }
 
     fn delete_log(&self, id: EventId) -> StoreResult<()> {
-        let n = self
-            .conn
-            .execute("DELETE FROM events WHERE id = ?1 AND kind = 'log'", [id])
-            .map_err(db)?;
-        if n == 0 {
-            return Err(StoreError::EventNotFound(id));
-        }
-        Ok(())
+        delete_log_row(&self.conn, id)
     }
 
     fn task_events(&self, id: TaskId) -> StoreResult<Vec<Event>> {
@@ -848,6 +968,38 @@ impl Store for SqliteStore {
             return Err(StoreError::ReportNotFound(id));
         }
         Ok(())
+    }
+
+    fn prune_reports(&self, kind: ReportKind, week_start: Date, keep: usize) -> StoreResult<usize> {
+        let tx = self.write_tx()?;
+        let versions: Vec<(ReportId, String, bool)> = tx
+            .prepare_cached(
+                "SELECT id, status, edited_md IS NOT NULL FROM reports
+                 WHERE kind = ?1 AND week_start = ?2
+                 ORDER BY created_at DESC, id DESC",
+            )
+            .map_err(db)?
+            .query_map(params![kind.as_str(), date_to_sql(week_start)], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(db)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(db)?;
+        let newest_ready = versions
+            .iter()
+            .find(|(_, status, _)| status == ReportStatus::Ready.as_str())
+            .map(|(id, _, _)| *id);
+        let mut removed = 0;
+        for (id, _, edited) in versions.iter().skip(keep) {
+            if *edited || Some(*id) == newest_ready {
+                continue;
+            }
+            removed += tx
+                .execute("DELETE FROM reports WHERE id = ?1", [id])
+                .map_err(db)?;
+        }
+        tx.commit().map_err(db)?;
+        Ok(removed)
     }
 
     fn load_settings(&self) -> StoreResult<Settings> {
@@ -1215,12 +1367,8 @@ mod tests {
     /// writers wait, not how long the wait takes.
     #[test]
     fn concurrent_writers_wait_instead_of_failing() {
-        let path = std::env::temp_dir().join(format!(
-            "fortnight-sqlite-concurrent-{}-{}.db",
-            std::process::id(),
-            Timestamp::now().as_nanosecond()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let tmp = TempDb::new("concurrent");
+        let path = tmp.0.clone();
         let id = SqliteStore::open(&path)
             .unwrap()
             .add_task(new_task("shared"))
@@ -1251,22 +1399,16 @@ mod tests {
             })
             .collect();
         let failures: i32 = threads.into_iter().map(|t| t.join().unwrap()).sum();
-        let _ = std::fs::remove_file(&path);
         assert_eq!(failures, 0);
     }
 
     #[test]
     fn open_file_persists_across_reopen() {
-        let path = std::env::temp_dir().join(format!(
-            "fortnight-sqlite-test-{}-{}.db",
-            std::process::id(),
-            Timestamp::now().as_nanosecond()
-        ));
-        let _ = std::fs::remove_file(&path);
-
-        let result = std::panic::catch_unwind(|| {
+        let tmp = TempDb::new("reopen");
+        let path = &tmp.0;
+        {
             let task_id = {
-                let s = SqliteStore::open(&path).unwrap();
+                let s = SqliteStore::open(path).unwrap();
                 s.save_settings(&Settings {
                     summary_instructions: "persisted".into(),
                     ..Settings::default()
@@ -1275,7 +1417,7 @@ mod tests {
                 s.add_task(new_task("keep me")).unwrap().id
             };
 
-            let s = SqliteStore::open(&path).unwrap();
+            let s = SqliteStore::open(path).unwrap();
             let t = s.get_task(task_id).unwrap().unwrap();
             assert_eq!(t.title, "keep me");
             assert_eq!(s.load_settings().unwrap().summary_instructions, "persisted");
@@ -1310,11 +1452,6 @@ mod tests {
                 .optional()
                 .unwrap();
             assert_eq!(index.as_deref(), Some("reports_week"));
-        });
-
-        let _ = std::fs::remove_file(&path);
-        if let Err(panic) = result {
-            std::panic::resume_unwind(panic);
         }
     }
 
@@ -2146,5 +2283,339 @@ mod tests {
             s.list_reports(Summary, w2).unwrap()[0],
             s.latest_report(Summary, w2).unwrap().unwrap()
         );
+    }
+
+    // ------------------------------------------------- compound writes
+
+    /// A copy of an in-memory store, through a temp file.
+    fn copy_of(s: &SqliteStore, tmp: &TempDb) -> SqliteStore {
+        s.conn
+            .execute("VACUUM INTO ?1", [tmp.0.to_str().unwrap()])
+            .unwrap();
+        SqliteStore::open(&tmp.0).unwrap()
+    }
+
+    /// The undo the app did before `revert_task`: delete, then restore
+    /// `before` with the events up to `keep_up_to` and every log line.
+    fn delete_and_restore(s: &SqliteStore, before: &Task, keep_up_to: EventId) {
+        let current = s.delete_task(before.id).unwrap();
+        s.restore_task(&DeletedTask {
+            task: before.clone(),
+            events: current
+                .events
+                .into_iter()
+                .filter(|e| e.id <= keep_up_to || e.kind.is_log())
+                .collect(),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn revert_task_leaves_what_delete_and_restore_left() {
+        let s = store();
+        let other = s.add_task(new_task("other")).unwrap();
+        let t = s
+            .add_task(NewTask {
+                title: "t".into(),
+                due_on: Some(date(2026, 11, 20)),
+                ..NewTask::default()
+            })
+            .unwrap();
+        s.set_status(t.id, Done).unwrap();
+        s.add_log(Some(t.id), "before").unwrap();
+        let before = s.get_task(t.id).unwrap().unwrap();
+        let keep_up_to = all_events(&s).iter().map(|e| e.id).max().unwrap();
+
+        // The change: reopen, edit, move, reorder; a log line in between
+        // and changes to another task.
+        s.set_status(t.id, Todo).unwrap();
+        s.add_log(Some(t.id), "kept").unwrap();
+        let mut edited = s.get_task(t.id).unwrap().unwrap();
+        edited.title = "t2".into();
+        edited.planned_for = Some(date(2026, 11, 18));
+        s.update_task(&edited).unwrap();
+        s.set_position(t.id, 0.25).unwrap();
+        s.set_status(other.id, Doing).unwrap();
+        s.add_log(None, "free").unwrap();
+
+        let tmp = TempDb::new("revert");
+        let old_way = copy_of(&s, &tmp);
+        delete_and_restore(&old_way, &before, keep_up_to);
+        s.revert_task(&before, keep_up_to).unwrap();
+
+        assert_eq!(s.get_task(t.id).unwrap().unwrap(), before);
+        assert_eq!(s.list_tasks().unwrap(), old_way.list_tasks().unwrap());
+        assert_eq!(all_events(&s), all_events(&old_way));
+        let texts: Vec<_> = s
+            .task_events(t.id)
+            .unwrap()
+            .iter()
+            .filter_map(|e| e.log_text().map(str::to_string))
+            .collect();
+        assert_eq!(texts, ["before", "kept"]);
+        assert_eq!(
+            kinds(&s.task_events(other.id).unwrap()),
+            [created("other"), status(Todo, Doing)]
+        );
+
+        assert_eq!(
+            s.revert_task(&Task { id: 999, ..before }, keep_up_to),
+            Err(StoreError::TaskNotFound(999))
+        );
+    }
+
+    #[test]
+    fn failed_revert_changes_nothing() {
+        let s = store();
+        let t = s.add_task(new_task("t")).unwrap();
+        let keep_up_to = all_events(&s).last().unwrap().id;
+        s.set_status(t.id, Done).unwrap();
+        let changed = s.get_task(t.id).unwrap().unwrap();
+        let events = all_events(&s);
+        // The task row updates, then deleting the change's events fails.
+        s.conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER keep BEFORE DELETE ON events
+                 BEGIN SELECT RAISE(ABORT, 'kept'); END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            s.revert_task(&t, keep_up_to),
+            Err(StoreError::Db(_))
+        ));
+        assert_eq!(s.get_task(t.id).unwrap().unwrap(), changed);
+        assert_eq!(all_events(&s), events);
+    }
+
+    #[test]
+    fn delete_new_task_only_while_it_has_no_history() {
+        let s = store();
+        let fresh = s.add_task(new_task("fresh")).unwrap();
+        let deleted = s.delete_new_task(fresh.id).unwrap().unwrap();
+        assert_eq!(deleted.task, fresh);
+        assert_eq!(kinds(&deleted.events), [created("fresh")]);
+        assert_eq!(s.get_task(fresh.id).unwrap(), None);
+        assert!(all_events(&s).is_empty());
+
+        let logged = s.add_task(new_task("logged")).unwrap();
+        s.add_log(Some(logged.id), "note").unwrap();
+        let edited = s.add_task(new_task("edited")).unwrap();
+        s.set_status(edited.id, Done).unwrap();
+        let events = all_events(&s);
+        assert_eq!(s.delete_new_task(logged.id).unwrap(), None);
+        assert_eq!(s.delete_new_task(edited.id).unwrap(), None);
+        assert_eq!(s.list_tasks().unwrap().len(), 2);
+        assert_eq!(all_events(&s), events);
+
+        assert_eq!(
+            s.delete_new_task(fresh.id),
+            Err(StoreError::TaskNotFound(fresh.id))
+        );
+    }
+
+    #[test]
+    fn replace_logs_is_all_or_nothing() {
+        let s = store();
+        let t = s.add_task(new_task("t")).unwrap();
+        let a = s.add_log_at(None, "a", ts("2026-11-16T09:00:00Z")).unwrap();
+        let b = s.add_log_at(None, "b", ts("2026-11-16T10:00:00Z")).unwrap();
+        let other = s
+            .add_log_at(None, "other day", ts("2026-11-17T09:00:00Z"))
+            .unwrap();
+
+        // Replace a and b with one line stamped when a was.
+        let new = s
+            .replace_logs(&[a.id, b.id], Some("a\nb"), a.at)
+            .unwrap()
+            .unwrap();
+        assert_eq!(new.task_id, None);
+        assert_eq!(new.at, a.at);
+        assert_eq!(new.log_text(), Some("a\nb"));
+        let logs: Vec<_> = all_events(&s)
+            .into_iter()
+            .filter(|e| e.kind.is_log())
+            .collect();
+        assert_eq!(logs, [new.clone(), other.clone()]);
+
+        // Clearing: delete only.
+        assert_eq!(s.replace_logs(&[new.id], None, a.at).unwrap(), None);
+        let before = all_events(&s);
+        assert_eq!(
+            before.iter().filter(|e| e.kind.is_log()).count(),
+            1,
+            "only the other day's line is left"
+        );
+
+        // A non-log or missing id: nothing deleted, nothing added.
+        let created_id = s.task_events(t.id).unwrap()[0].id;
+        for bad in [created_id, 999] {
+            assert_eq!(
+                s.replace_logs(&[other.id, bad], Some("x"), a.at),
+                Err(StoreError::EventNotFound(bad))
+            );
+            assert_eq!(all_events(&s), before);
+        }
+
+        // The insert fails after the deletes: they are rolled back.
+        s.conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER block BEFORE INSERT ON events
+                 BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            s.replace_logs(&[other.id], Some("x"), a.at),
+            Err(StoreError::Db(_))
+        ));
+        assert_eq!(all_events(&s), before);
+    }
+
+    #[test]
+    fn set_positions_is_all_or_nothing() {
+        let s = store();
+        let a = s.add_task(new_task("a")).unwrap();
+        let b = s.add_task(new_task("b")).unwrap();
+        let c = s.add_task(new_task("c")).unwrap();
+        s.set_positions(&[(c.id, 1.0), (a.id, 2.0), (b.id, 3.0)])
+            .unwrap();
+        let order = |s: &SqliteStore| {
+            s.list_tasks()
+                .unwrap()
+                .into_iter()
+                .map(|t| (t.id, t.position))
+                .collect::<Vec<_>>()
+        };
+        let reordered = order(&s);
+        assert_eq!(reordered, [(c.id, 1.0), (a.id, 2.0), (b.id, 3.0)]);
+        // No events, no updated_at change.
+        assert_eq!(all_events(&s).len(), 3);
+        assert_eq!(s.get_task(a.id).unwrap().unwrap().updated_at, a.updated_at);
+
+        assert_eq!(
+            s.set_positions(&[(a.id, 0.0), (999, 1.0)]),
+            Err(StoreError::TaskNotFound(999))
+        );
+        assert!(matches!(
+            s.set_positions(&[(a.id, 0.0), (b.id, f64::INFINITY)]),
+            Err(StoreError::Invalid(_))
+        ));
+        assert_eq!(order(&s), reordered);
+        s.set_positions(&[]).unwrap();
+    }
+
+    #[test]
+    fn prune_reports_keeps_newest_edited_and_newest_ready() {
+        use ReportKind::{Plan, Summary};
+        use ReportStatus::{Failed, Ready};
+        let s = store();
+        let w = date(2026, 11, 16);
+        let other_week = s
+            .insert_report(new_report(Summary, date(2026, 11, 9), Ready, "x"))
+            .unwrap();
+        let plan = s.insert_report(new_report(Plan, w, Ready, "p")).unwrap();
+        // Oldest first.
+        let edited = s.insert_report(new_report(Summary, w, Ready, "1")).unwrap();
+        s.set_report_edit(edited.id, Some("mine")).unwrap();
+        let old_ready = s.insert_report(new_report(Summary, w, Ready, "2")).unwrap();
+        let ready = s.insert_report(new_report(Summary, w, Ready, "3")).unwrap();
+        let failed1 = s
+            .insert_report(new_report(Summary, w, Failed, "4"))
+            .unwrap();
+        let failed2 = s
+            .insert_report(new_report(Summary, w, Failed, "5"))
+            .unwrap();
+        let ids = |rs: Vec<Report>| rs.into_iter().map(|r| r.id).collect::<Vec<_>>();
+
+        // keep 1: failed2 stays as the newest; ready as the newest Ready;
+        // edited as edited. old_ready and failed1 go.
+        assert_eq!(s.prune_reports(Summary, w, 1).unwrap(), 2);
+        assert_eq!(
+            ids(s.list_reports(Summary, w).unwrap()),
+            [failed2.id, ready.id, edited.id]
+        );
+        // keep 0: still never the edit or the newest Ready.
+        assert_eq!(s.prune_reports(Summary, w, 0).unwrap(), 1);
+        assert_eq!(
+            ids(s.list_reports(Summary, w).unwrap()),
+            [ready.id, edited.id]
+        );
+        assert_eq!(s.prune_reports(Summary, w, 0).unwrap(), 0);
+        // A large keep removes nothing; other kinds and weeks are untouched.
+        assert_eq!(s.prune_reports(Summary, w, 10).unwrap(), 0);
+        assert_eq!(s.prune_reports(Plan, date(2026, 11, 23), 0).unwrap(), 0);
+        assert_eq!(ids(s.list_reports(Plan, w).unwrap()), [plan.id]);
+        assert_eq!(
+            ids(s.list_reports(Summary, date(2026, 11, 9)).unwrap()),
+            [other_week.id]
+        );
+        let _ = (old_ready, failed1);
+    }
+
+    // ------------------------------------------------------ migrations
+
+    /// A current database with a task, its events and a log line.
+    fn current_db(tmp: &TempDb) -> TaskId {
+        let s = SqliteStore::open(&tmp.0).unwrap();
+        let t = s.add_task(new_task("t")).unwrap();
+        s.add_log(Some(t.id), "note").unwrap();
+        t.id
+    }
+
+    #[test]
+    fn migration_leaving_a_broken_reference_is_rejected() {
+        let tmp = TempDb::new("dangling");
+        let id = current_db(&tmp);
+        let mut migrations = MIGRATIONS.to_vec();
+        migrations.push("DELETE FROM tasks;");
+        let err = SqliteStore::init_with(Connection::open(&tmp.0).unwrap(), &migrations);
+        assert!(
+            matches!(err, Err(StoreError::Invalid(_))),
+            "{:?}",
+            err.err()
+        );
+
+        let s = SqliteStore::open(&tmp.0).unwrap();
+        assert_eq!(user_version(&s.conn), MIGRATIONS.len() as i64);
+        assert_eq!(s.get_task(id).unwrap().unwrap().title, "t");
+        assert_eq!(s.task_events(id).unwrap().len(), 2);
+    }
+
+    /// A future migration can rebuild `tasks` (the 12-step table change)
+    /// although `events` references it, and foreign keys are on afterwards.
+    #[test]
+    fn migration_can_rebuild_a_referenced_table() {
+        let tmp = TempDb::new("rebuild");
+        let id = current_db(&tmp);
+        let mut migrations = MIGRATIONS.to_vec();
+        migrations.push(
+            "CREATE TABLE tasks_new (
+                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                 title            TEXT    NOT NULL,
+                 notes            TEXT    NOT NULL DEFAULT '',
+                 status           TEXT    NOT NULL,
+                 project          TEXT,
+                 due_on           TEXT,
+                 planned_for      TEXT,
+                 estimate_minutes INTEGER,
+                 priority         INTEGER NOT NULL DEFAULT 0,
+                 private          INTEGER NOT NULL DEFAULT 0,
+                 position         REAL    NOT NULL,
+                 created_at       TEXT    NOT NULL,
+                 updated_at       TEXT    NOT NULL,
+                 completed_at     TEXT
+             );
+             INSERT INTO tasks_new SELECT * FROM tasks;
+             DROP TABLE tasks;
+             ALTER TABLE tasks_new RENAME TO tasks;",
+        );
+        let s = SqliteStore::init_with(Connection::open(&tmp.0).unwrap(), &migrations).unwrap();
+        assert_eq!(user_version(&s.conn), migrations.len() as i64);
+        assert_eq!(s.get_task(id).unwrap().unwrap().title, "t");
+        assert_eq!(s.task_events(id).unwrap().len(), 2);
+        let fk: i64 = s
+            .conn
+            .pragma_query_value(None, "foreign_keys", |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk, 1);
     }
 }
