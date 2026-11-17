@@ -33,7 +33,7 @@
 
 use crate::domain::Priority;
 use crate::llm::{BoxFuture, ChatRequest, ChatResponse, LlmClient, LlmConfig, LlmError};
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -42,7 +42,6 @@ use std::time::Duration;
 /// the model, not the ten minutes a local chat model may get, so a hung
 /// server soon gives way to the fallback.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The most options a `choice` question takes.
 const MAX_OPTIONS: usize = 26;
 /// How many tasks to recommend.
@@ -56,24 +55,18 @@ pub struct DecisionClient {
 
 impl std::fmt::Debug for DecisionClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DecisionClient")
-            .field("config", &self.config)
+        // The host only: the full base URL may carry credentials.
+        crate::llm_http::debug_endpoint(&mut f.debug_struct("DecisionClient"), &self.config)
             .field("timeout", &self.timeout)
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 
 impl DecisionClient {
     /// Errors with `NotConfigured` if base URL or model is empty.
     pub fn new(config: LlmConfig) -> Result<Self, LlmError> {
-        if config.base_url.trim().is_empty() || config.model.trim().is_empty() {
-            return Err(LlmError::NotConfigured);
-        }
-        crate::secure::check_key_transport(&config)?;
-        let http = crate::secure::client_builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .map_err(|e| LlmError::Connection(crate::openai::error_chain(&e)))?;
+        // Its own, shorter timeout, local or not.
+        let (http, _) = crate::llm_http::prepare(&config)?;
         Ok(DecisionClient {
             config,
             http,
@@ -129,7 +122,7 @@ impl DecisionClient {
         let builder = self.request();
         let key = self.config.api_key.clone();
         Box::pin(async move {
-            let reply = ask(builder, body, &model)
+            let reply = ask(builder, body, &model, key.as_ref())
                 .await
                 .map_err(|e| crate::secure::redact(e, key.as_ref()))?;
             let answer = reply.answers.get("priority");
@@ -176,10 +169,12 @@ impl LlmClient for DecisionClient {
                         "ok": { "type": "noul", "instructions": "Is this a connection test?" }
                     }
                 });
-                ask(builder, body, &model).await.map(|reply| ChatResponse {
-                    text: "OK".into(),
-                    model: reply.model,
-                })
+                ask(builder, body, &model, key.as_ref())
+                    .await
+                    .map(|reply| ChatResponse {
+                        text: "OK".into(),
+                        model: reply.model,
+                    })
             } else {
                 match plan_question(&req.user, &model) {
                     None => Err(LlmError::Malformed(
@@ -187,12 +182,14 @@ impl LlmClient for DecisionClient {
                     )),
                     Some(Ask::Answer(text)) => Ok(ChatResponse { text, model }),
                     Some(Ask::Question { body, candidates }) => {
-                        ask(builder, body, &model).await.and_then(|reply| {
-                            Ok(ChatResponse {
-                                text: plan_reply(&reply.answers, &candidates)?,
-                                model: reply.model,
+                        ask(builder, body, &model, key.as_ref())
+                            .await
+                            .and_then(|reply| {
+                                Ok(ChatResponse {
+                                    text: plan_reply(&reply.answers, &candidates)?,
+                                    model: reply.model,
+                                })
                             })
-                        })
                     }
                 }
             };
@@ -210,19 +207,20 @@ async fn ask(
     builder: reqwest::RequestBuilder,
     body: Value,
     model: &str,
+    key: Option<&SecretString>,
 ) -> Result<Reply, LlmError> {
     let response = builder
         .json(&body)
         .send()
         .await
-        .map_err(crate::openai::transport_error)?;
+        .map_err(crate::llm_http::transport_error)?;
     let status = response.status().as_u16();
     let text = response
         .text()
         .await
-        .map_err(crate::openai::transport_error)?;
+        .map_err(crate::llm_http::transport_error)?;
     if !(200..300).contains(&status) {
-        return Err(status_error(status, &text, model));
+        return Err(status_error(status, &text, model, key));
     }
     #[derive(Deserialize)]
     struct Body {
@@ -240,20 +238,14 @@ async fn ask(
     })
 }
 
-fn status_error(status: u16, body: &str, model: &str) -> LlmError {
+/// Ollama's `{"error": "…"}` message, or the whole body, mapped like any
+/// other client's error (`llm_http::status_error`).
+fn status_error(status: u16, body: &str, model: &str, key: Option<&SecretString>) -> LlmError {
     let message = serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string))
         .unwrap_or_else(|| body.trim().to_string());
-    match status {
-        401 | 403 => LlmError::Unauthorized,
-        404 if message.contains("model") => LlmError::ModelNotFound(model.to_string()),
-        429 => LlmError::RateLimited,
-        _ => LlmError::Http {
-            status,
-            body: crate::openai::truncate_chars(&message, 500),
-        },
-    }
+    crate::llm_http::status_error(status, &message, model, key)
 }
 
 /// What to do for a recommended-tasks request.

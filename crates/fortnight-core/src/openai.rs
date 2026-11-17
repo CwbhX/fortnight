@@ -30,6 +30,11 @@
 //! instead of 2 minutes: a local model may need to load, and a reasoning
 //! model may think for minutes before its first token.
 //!
+//! A 404 is `ModelNotFound` only when its body mentions the model; a 404
+//! for a wrong path (a base URL missing `/v1`) stays an HTTP error.
+//! Timeouts, retries and error mapping are shared with the other clients
+//! (`llm_http`).
+//!
 //! Skipped for the prototype: `Retry-After` is not honoured (fixed
 //! exponential backoff instead), and a streamed body served with the wrong
 //! content type is not sniffed (it fails as malformed JSON).
@@ -38,6 +43,10 @@
 
 use crate::llm::{
     BoxFuture, BoxStream, ChatEvent, ChatRequest, ChatResponse, LlmClient, LlmConfig, LlmError,
+};
+use crate::llm_http::{
+    DEFAULT_BACKOFF, MAX_ATTEMPTS, backoff_delay, is_retryable, parse_model_ids, sse_error,
+    status_error, transport_error, with_retries,
 };
 use eventsource_stream::{EventStreamError, Eventsource};
 use futures_util::{Stream, StreamExt};
@@ -49,14 +58,6 @@ use std::pin::Pin;
 use std::time::Duration;
 use tokio::time::Instant;
 
-const MAX_ATTEMPTS: u32 = 3;
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
-/// For endpoints on this machine (see `secure::is_local_endpoint`).
-pub(crate) const LOCAL_TIMEOUT: Duration = Duration::from_secs(600);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const DEFAULT_BACKOFF: Duration = Duration::from_millis(500);
-const MAX_ERROR_BODY_CHARS: usize = 500;
-
 pub struct OpenAiClient {
     config: LlmConfig,
     http: reqwest::Client,
@@ -66,31 +67,18 @@ pub struct OpenAiClient {
 
 impl std::fmt::Debug for OpenAiClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `LlmConfig`'s Debug redacts the key (`SecretString`).
-        f.debug_struct("OpenAiClient")
-            .field("config", &self.config)
+        // The host only: the full base URL may carry credentials.
+        crate::llm_http::debug_endpoint(&mut f.debug_struct("OpenAiClient"), &self.config)
             .field("timeout", &self.timeout)
             .field("backoff", &self.backoff)
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 
 impl OpenAiClient {
     /// Errors with `NotConfigured` if base URL or model is empty.
     pub fn new(config: LlmConfig) -> Result<Self, LlmError> {
-        if config.base_url.trim().is_empty() || config.model.trim().is_empty() {
-            return Err(LlmError::NotConfigured);
-        }
-        crate::secure::check_key_transport(&config)?;
-        let http = crate::secure::client_builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .map_err(|e| LlmError::Connection(error_chain(&e.without_url())))?;
-        let timeout = if crate::secure::is_local_endpoint(&config.base_url) {
-            LOCAL_TIMEOUT
-        } else {
-            DEFAULT_TIMEOUT
-        };
+        let (http, timeout) = crate::llm_http::prepare(&config)?;
         Ok(OpenAiClient {
             config,
             http,
@@ -194,29 +182,6 @@ impl LlmClient for OpenAiClient {
     }
 }
 
-/// Runs `attempt` up to `MAX_ATTEMPTS` times while it fails retryably.
-async fn with_retries<T, F, Fut>(backoff: Duration, mut attempt: F) -> Result<T, LlmError>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, LlmError>>,
-{
-    let mut n = 1;
-    loop {
-        match attempt().await {
-            Err(e) if n < MAX_ATTEMPTS && is_retryable(&e) => {
-                tokio::time::sleep(backoff_delay(backoff, n)).await;
-                n += 1;
-            }
-            result => return result,
-        }
-    }
-}
-
-/// The delay after failed attempt `n` (1-based).
-fn backoff_delay(backoff: Duration, n: u32) -> Duration {
-    backoff * 2u32.pow(n - 1)
-}
-
 /// Everything one request needs, owned, so futures and streams are `'static`.
 struct Call {
     http: reqwest::Client,
@@ -264,7 +229,12 @@ impl Call {
         if status.is_success() {
             parse_body(&text, &self.model)
         } else {
-            Err(status_error(status.as_u16(), &text, &self.model))
+            Err(status_error(
+                status.as_u16(),
+                &text,
+                &self.model,
+                self.api_key.as_ref(),
+            ))
         }
     }
 
@@ -287,7 +257,12 @@ impl Call {
         if status.is_success() {
             parse_body(&text, &self.model).map(Opened::Whole)
         } else {
-            Err(status_error(status.as_u16(), &text, &self.model))
+            Err(status_error(
+                status.as_u16(),
+                &text,
+                &self.model,
+                self.api_key.as_ref(),
+            ))
         }
     }
 }
@@ -356,7 +331,14 @@ impl StreamState {
                     Err(e) => Err(e),
                 },
                 Phase::Events(reader) => {
-                    match reader.next_item(self.call.timeout, &self.call.model).await {
+                    match reader
+                        .next_item(
+                            self.call.timeout,
+                            &self.call.model,
+                            self.call.api_key.as_ref(),
+                        )
+                        .await
+                    {
                         Some(Ok(ChatEvent::Delta(piece))) => match reader.think.push(&piece) {
                             Some(text) => Ok(ChatEvent::Delta(text)),
                             None => continue,
@@ -435,6 +417,7 @@ impl SseReader {
         &mut self,
         gap: Duration,
         requested_model: &str,
+        key: Option<&SecretString>,
     ) -> Option<Result<ChatEvent, LlmError>> {
         let event = match tokio::time::timeout(gap, self.events.next()).await {
             Err(_) => return Some(Err(LlmError::Timeout)),
@@ -455,7 +438,7 @@ impl SseReader {
             Err(e) => return Some(Err(LlmError::Malformed(e.to_string()))),
         };
         if let Some(error) = chunk.error {
-            return Some(Err(error_object(&error, requested_model)));
+            return Some(Err(error_object(&error, requested_model, key)));
         }
         if let Some(model) = chunk.model.filter(|m| !m.is_empty()) {
             self.model = Some(model);
@@ -607,7 +590,11 @@ struct Delta {
 /// Maps an in-stream `{"error": ...}` like the HTTP error it stands for:
 /// a numeric `code` (or `status`) is used as the status; otherwise the
 /// `type`/`code` text is matched, and anything else counts as a 500.
-fn error_object(error: &serde_json::Value, requested_model: &str) -> LlmError {
+fn error_object(
+    error: &serde_json::Value,
+    requested_model: &str,
+    key: Option<&SecretString>,
+) -> LlmError {
     let message = error
         .get("message")
         .and_then(|m| m.as_str())
@@ -639,30 +626,7 @@ fn error_object(error: &serde_json::Value, requested_model: &str) -> LlmError {
             500
         }
     });
-    status_error(status, &message, requested_model)
-}
-
-/// An error status (not 2xx) and its body as an `LlmError`.
-fn status_error(status: u16, body: &str, requested_model: &str) -> LlmError {
-    match status {
-        401 | 403 => LlmError::Unauthorized,
-        404 => LlmError::ModelNotFound(requested_model.to_string()),
-        429 => LlmError::RateLimited,
-        code => LlmError::Http {
-            status: code,
-            body: truncate_chars(body.trim(), MAX_ERROR_BODY_CHARS),
-        },
-    }
-}
-
-fn sse_error(e: EventStreamError<reqwest::Error>) -> LlmError {
-    match e {
-        EventStreamError::Transport(e) if e.is_timeout() => LlmError::Timeout,
-        // reqwest marks every body-stream error as "decode", so anything
-        // from the transport here is the connection dropping.
-        EventStreamError::Transport(e) => LlmError::Connection(error_chain(&e.without_url())),
-        other => LlmError::Malformed(other.to_string()),
-    }
+    status_error(status, &message, requested_model, key)
 }
 
 async fn fetch_models(
@@ -677,74 +641,21 @@ async fn fetch_models(
     }
     let response = builder.send().await.map_err(transport_error)?;
     let status = response.status().as_u16();
+    // An endpoint without a model list (or a base URL whose path is wrong,
+    // which chat requests then report) gives an empty list: the UI falls
+    // back to free text.
     if matches!(status, 404 | 405 | 501) {
         return Ok(Vec::new());
     }
     let text = response.text().await.map_err(transport_error)?;
     if !(200..300).contains(&status) {
         // No model is involved; 404 was handled above.
-        return Err(status_error(status, &text, ""));
+        return Err(status_error(status, &text, "", api_key));
     }
-    #[derive(Deserialize)]
-    struct ModelList {
-        data: Vec<ModelEntry>,
-    }
-    #[derive(Deserialize)]
-    struct ModelEntry {
-        id: String,
-    }
-    let list: ModelList =
-        serde_json::from_str(&text).map_err(|e| LlmError::Malformed(e.to_string()))?;
-    let mut ids: Vec<String> = list
-        .data
-        .into_iter()
-        .map(|m| m.id)
-        .filter(|id| !id.trim().is_empty())
-        .collect();
+    let mut ids = parse_model_ids(&text)?;
     ids.sort();
     ids.dedup();
     Ok(ids)
-}
-
-fn is_retryable(e: &LlmError) -> bool {
-    match e {
-        LlmError::Connection(_) | LlmError::Timeout | LlmError::RateLimited => true,
-        LlmError::Http { status, .. } => *status >= 500,
-        _ => false,
-    }
-}
-
-pub(crate) fn transport_error(e: reqwest::Error) -> LlmError {
-    if e.is_timeout() {
-        LlmError::Timeout
-    } else if e.is_body() || e.is_decode() {
-        LlmError::Malformed(error_chain(&e.without_url()))
-    } else {
-        // The URL is dropped in case `base_url` carries credentials.
-        LlmError::Connection(error_chain(&e.without_url()))
-    }
-}
-
-/// `e` and its sources, joined with ": ".
-pub(crate) fn error_chain(e: &dyn std::error::Error) -> String {
-    let mut out = e.to_string();
-    let mut source = e.source();
-    while let Some(s) = source {
-        let text = s.to_string();
-        if !out.contains(&text) {
-            out.push_str(": ");
-            out.push_str(&text);
-        }
-        source = s.source();
-    }
-    out
-}
-
-pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
-    match s.char_indices().nth(max) {
-        Some((i, _)) => format!("{}…", &s[..i]),
-        None => s.to_string(),
-    }
 }
 
 #[derive(Deserialize)]
@@ -863,12 +774,6 @@ mod tests {
         assert_eq!(c.url(), "http://localhost/v1/chat/completions");
     }
 
-    #[test]
-    fn truncate_chars_counts_characters() {
-        assert_eq!(truncate_chars("abc", 5), "abc");
-        assert_eq!(truncate_chars("ééééé", 2), "éé…");
-    }
-
     #[tokio::test]
     async fn success_sends_bearer_and_exact_body() {
         let server = MockServer::start().await;
@@ -942,11 +847,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_404_is_model_not_found() {
+    async fn status_404_is_model_not_found_only_when_it_names_the_model() {
+        // A wrong path (base URL without `/v1`): an HTTP error, not retried.
         assert_eq!(
             error_for(404).await,
-            (LlmError::ModelNotFound("test-model".into()), 1)
+            (
+                LlmError::Http {
+                    status: 404,
+                    body: "{\"error\":\"nope\"}".into()
+                },
+                1
+            )
         );
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            ResponseTemplate::new(404).set_body_json(json!({
+                "error": { "message": "The model `test-model` does not exist", "code": "model_not_found" }
+            })),
+        )
+        .await;
+        let c = client(&format!("{}/v1", server.uri()), Some("sk-test"));
+        assert_eq!(
+            c.chat(request()).await,
+            Err(LlmError::ModelNotFound("test-model".into()))
+        );
+        assert_eq!(
+            stream_items(&c).await,
+            vec![Err(LlmError::ModelNotFound("test-model".into()))]
+        );
+        assert_eq!(request_count(&server).await, 2);
+    }
+
+    /// A key echoed across the truncation point is redacted before the
+    /// body is cut, so no prefix of it survives.
+    #[tokio::test]
+    async fn key_straddling_the_error_cut_never_appears() {
+        let key = "sk-straddling-secret-key";
+        let server = MockServer::start().await;
+        let body = format!(
+            "{}{key} trailing",
+            "x".repeat(crate::llm_http::MAX_ERROR_BODY_CHARS - 6)
+        );
+        mount(&server, ResponseTemplate::new(400).set_body_string(body)).await;
+        let c = client(&format!("{}/v1", server.uri()), Some(key));
+        let err = c.chat(request()).await.unwrap_err();
+        let text = format!("{err} {err:?}");
+        assert!(!text.contains("sk-str"), "{text}");
+        assert!(text.contains("[redac"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn body_cut_mid_reply_is_connection_and_retried() {
+        let (url, count) = raw_truncated_server();
+        let err = client(&url, None).chat(request()).await.unwrap_err();
+        assert!(matches!(err, LlmError::Connection(_)), "{err:?}");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
@@ -1012,7 +968,10 @@ mod tests {
         match err {
             LlmError::Http { status, body } => {
                 assert_eq!(status, 418);
-                assert_eq!(body.chars().count(), MAX_ERROR_BODY_CHARS + 1);
+                assert_eq!(
+                    body.chars().count(),
+                    crate::llm_http::MAX_ERROR_BODY_CHARS + 1
+                );
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -1387,7 +1346,13 @@ mod tests {
         );
         assert_eq!(
             stream_error_for(404).await,
-            (vec![Err(LlmError::ModelNotFound("test-model".into()))], 1)
+            (
+                vec![Err(LlmError::Http {
+                    status: 404,
+                    body: "{\"error\":\"nope\"}".into()
+                })],
+                1
+            )
         );
         assert_eq!(
             stream_error_for(429).await,
@@ -1511,6 +1476,38 @@ mod tests {
         (format!("http://{addr}/v1"), count)
     }
 
+    /// A server that promises a longer JSON body than it sends, then closes
+    /// the connection: the body is cut mid-reply. Returns the base URL and
+    /// a connection counter.
+    fn raw_truncated_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = count.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut reader = BufReader::new(conn.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let _ = conn.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                      content-length: 1000\r\n\r\n{\"choices\": [",
+                );
+                let _ = conn.flush();
+                // Dropping `conn` closes it 990 bytes short.
+            }
+        });
+        (format!("http://{addr}/v1"), count)
+    }
+
     #[tokio::test]
     async fn stream_dropped_after_text_is_connection_and_not_retried() {
         let (url, count) = raw_sse_server(
@@ -1579,10 +1576,14 @@ mod tests {
     #[test]
     fn stream_is_send_and_static_and_debug_hides_key() {
         fn assert_send_static<T: Send + 'static>(_: &T) {}
-        let c = OpenAiClient::new(config("http://localhost/v1", Some("sk-secret"))).unwrap();
+        let c =
+            OpenAiClient::new(config("http://user:pw@localhost/v1", Some("sk-secret"))).unwrap();
         let stream = c.chat_stream(request());
         let models = c.list_models();
-        assert!(!format!("{c:?}").contains("sk-secret"));
+        let debug = format!("{c:?}");
+        assert!(!debug.contains("sk-secret"), "{debug}");
+        assert!(!debug.contains("pw"), "{debug}");
+        assert!(debug.contains("localhost"), "{debug}");
         drop(c);
         assert_send_static(&stream);
         assert_send_static(&models);
@@ -1789,6 +1790,7 @@ mod tests {
 
     #[test]
     fn local_endpoints_get_the_long_timeout() {
+        use crate::llm_http::{DEFAULT_TIMEOUT, LOCAL_TIMEOUT};
         let local = OpenAiClient::new(config("http://localhost:11434/v1", None)).unwrap();
         assert_eq!(local.timeout, LOCAL_TIMEOUT);
         let remote = OpenAiClient::new(config("https://api.openai.com/v1", None)).unwrap();

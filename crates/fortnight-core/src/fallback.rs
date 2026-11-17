@@ -7,8 +7,14 @@
 //! rate limited, or cut off before its first word. An error after text has
 //! started is final, as with any stream: that text can't be taken back.
 //!
+//! The primary also gives way when it sends nothing for
+//! `PRIMARY_FIRST_ITEM_DEADLINE`: a server that accepts the connection but
+//! hangs would otherwise hold the request for its whole retry budget (up to
+//! half an hour for a local one).
+//!
 //! Make one `FallbackClient` per request when the caller needs to know
-//! which endpoint answered (`used_fallback`), e.g. to record the host.
+//! which endpoint answered (`used_fallback`), e.g. to record the host;
+//! `PlanRoute` does that bookkeeping for recommended tasks.
 
 use crate::domain::LlmSettings;
 use crate::llm::{
@@ -18,6 +24,12 @@ use futures_util::StreamExt;
 use secrecy::SecretString;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+/// How long the primary may take to send its first item (text, the end of
+/// the reply, or an error), or to answer a `chat`, before the fallback is
+/// asked instead. Generous, so a slow but working model isn't abandoned.
+pub const PRIMARY_FIRST_ITEM_DEADLINE: Duration = Duration::from_secs(120);
 
 /// The config for the decision endpoint. A keyless one gets no key. It
 /// uses its own key (`decision_key`, from `vault::decision_key_path`) when
@@ -30,11 +42,7 @@ pub fn decision_config(
     main_key: Option<SecretString>,
     decision_key: Option<SecretString>,
 ) -> LlmConfig {
-    let config = |llm: &LlmSettings, api_key| LlmConfig {
-        base_url: llm.base_url.trim().to_string(),
-        model: llm.model.trim().to_string(),
-        api_key,
-    };
+    let config = |llm: &LlmSettings, api_key| LlmConfig::from_settings(llm, api_key);
     if decision.keyless {
         return config(decision, None);
     }
@@ -53,6 +61,8 @@ pub struct FallbackClient {
     primary: Arc<dyn LlmClient>,
     fallback: Arc<dyn LlmClient>,
     used: Arc<AtomicBool>,
+    /// `PRIMARY_FIRST_ITEM_DEADLINE`, shorter in tests.
+    first_item_deadline: Duration,
 }
 
 impl std::fmt::Debug for FallbackClient {
@@ -71,7 +81,14 @@ impl FallbackClient {
             primary,
             fallback,
             used: Arc::new(AtomicBool::new(false)),
+            first_item_deadline: PRIMARY_FIRST_ITEM_DEADLINE,
         }
+    }
+
+    #[cfg(test)]
+    fn with_first_item_deadline(mut self, deadline: Duration) -> Self {
+        self.first_item_deadline = deadline;
+        self
     }
 
     /// Whether a request so far was answered (or failed) by the fallback.
@@ -106,10 +123,12 @@ impl LlmClient for FallbackClient {
         let primary = self.primary.chat(req.clone());
         let fallback = self.fallback.clone();
         let used = self.used.clone();
+        let deadline = self.first_item_deadline;
         Box::pin(async move {
-            match primary.await {
-                Ok(resp) => Ok(resp),
-                Err(_) => {
+            match tokio::time::timeout(deadline, primary).await {
+                Ok(Ok(resp)) => Ok(resp),
+                // Failed, or no answer in time.
+                Ok(Err(_)) | Err(_) => {
                     used.store(true, Ordering::SeqCst);
                     fallback.chat(req).await
                 }
@@ -125,6 +144,7 @@ impl LlmClient for FallbackClient {
         };
         let fallback = self.fallback.clone();
         let used = self.used.clone();
+        let deadline = self.first_item_deadline;
         Box::pin(futures_util::stream::unfold(start, move |phase| {
             let fallback = fallback.clone();
             let used = used.clone();
@@ -134,25 +154,36 @@ impl LlmClient for FallbackClient {
                         mut stream,
                         started,
                         req,
-                    } => match stream.next().await? {
-                        Err(_) if !started => {
-                            used.store(true, Ordering::SeqCst);
-                            let mut stream = fallback.chat_stream(req);
-                            let item = stream.next().await?;
-                            Some((item, Phase::Fallback(stream)))
+                    } => {
+                        // Until text starts, the primary gets a deadline; a
+                        // miss counts as an error before text.
+                        let item = if started {
+                            stream.next().await?
+                        } else {
+                            tokio::time::timeout(deadline, stream.next())
+                                .await
+                                .unwrap_or(Some(Err(LlmError::Timeout)))?
+                        };
+                        match item {
+                            Err(_) if !started => {
+                                used.store(true, Ordering::SeqCst);
+                                let mut stream = fallback.chat_stream(req);
+                                let item = stream.next().await?;
+                                Some((item, Phase::Fallback(stream)))
+                            }
+                            item => {
+                                let started = started || matches!(item, Ok(ChatEvent::Delta(_)));
+                                Some((
+                                    item,
+                                    Phase::Primary {
+                                        stream,
+                                        started,
+                                        req,
+                                    },
+                                ))
+                            }
                         }
-                        item => {
-                            let started = started || matches!(item, Ok(ChatEvent::Delta(_)));
-                            Some((
-                                item,
-                                Phase::Primary {
-                                    stream,
-                                    started,
-                                    req,
-                                },
-                            ))
-                        }
-                    },
+                    }
                     Phase::Fallback(mut stream) => {
                         let item = stream.next().await?;
                         Some((item, Phase::Fallback(stream)))
@@ -164,6 +195,65 @@ impl LlmClient for FallbackClient {
 
     fn list_models(&self) -> BoxFuture<Result<Vec<String>, LlmError>> {
         self.primary.list_models()
+    }
+}
+
+/// A client and the host it talks to (`LlmConfig::endpoint_host`), for
+/// recording on a report.
+#[derive(Clone)]
+pub struct Endpoint {
+    pub client: Arc<dyn LlmClient>,
+    pub host: Option<String>,
+}
+
+impl std::fmt::Debug for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Endpoint")
+            .field("model", &self.client.model())
+            .field("host", &self.host)
+            .finish()
+    }
+}
+
+/// Where a recommended-tasks request goes, and afterwards who answered it.
+/// With a decision model, requests go to it first and fall back to the
+/// main endpoint (a `FallbackClient`); without one, to the main endpoint.
+/// Make one per request: `answered_by` reads that request's outcome.
+#[derive(Debug, Clone)]
+pub struct PlanRoute {
+    main: Endpoint,
+    decision: Option<(Arc<FallbackClient>, Option<String>)>,
+}
+
+impl PlanRoute {
+    /// `decision` is the decision model's endpoint, if one is configured
+    /// and could be built; otherwise everything goes to `main`.
+    pub fn new(main: Endpoint, decision: Option<Endpoint>) -> Self {
+        let decision = decision.map(|d| {
+            (
+                Arc::new(FallbackClient::new(d.client, main.client.clone())),
+                d.host,
+            )
+        });
+        PlanRoute { main, decision }
+    }
+
+    /// The client to send the request to.
+    pub fn client(&self) -> Arc<dyn LlmClient> {
+        match &self.decision {
+            Some((fc, _)) => fc.clone(),
+            None => self.main.client.clone(),
+        }
+    }
+
+    /// The requested model and host to record on the report: the decision
+    /// model's unless the request fell back (or there is no decision
+    /// model), then the main endpoint's. Call it once the request is over.
+    pub fn answered_by(&self) -> (String, Option<String>) {
+        match &self.decision {
+            Some((fc, host)) if !fc.used_fallback() => (fc.model().to_string(), host.clone()),
+            _ => (self.main.client.model().to_string(), self.main.host.clone()),
+        }
     }
 }
 
@@ -290,6 +380,128 @@ mod tests {
         );
         assert!(!c.used_fallback());
         assert!(fallback.requests.lock().unwrap().is_empty());
+    }
+
+    /// A client that never answers.
+    struct Hung;
+
+    impl LlmClient for Hung {
+        fn model(&self) -> &str {
+            "hung"
+        }
+        fn chat(&self, _req: ChatRequest) -> BoxFuture<Result<ChatResponse, LlmError>> {
+            Box::pin(futures_util::future::pending())
+        }
+        fn chat_stream(&self, _req: ChatRequest) -> BoxStream<Result<ChatEvent, LlmError>> {
+            Box::pin(futures_util::stream::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_silent_primary_gives_way_at_the_deadline() {
+        let fallback = Arc::new(MockClient::new("from main"));
+        let short = Duration::from_millis(20);
+        let c =
+            FallbackClient::new(Arc::new(Hung), fallback.clone()).with_first_item_deadline(short);
+        let reply = collect_stream(c.chat_stream(ChatRequest::test()))
+            .await
+            .unwrap();
+        assert_eq!(reply.text, "from main");
+        assert!(c.used_fallback());
+
+        let c = FallbackClient::new(Arc::new(Hung), fallback).with_first_item_deadline(short);
+        assert_eq!(c.chat(ChatRequest::test()).await.unwrap().text, "from main");
+        assert!(c.used_fallback());
+        assert_eq!(PRIMARY_FIRST_ITEM_DEADLINE, Duration::from_secs(120));
+    }
+
+    #[tokio::test]
+    async fn the_deadline_does_not_cut_a_reply_that_has_started() {
+        // Text, then a gap longer than the deadline, then the end.
+        let primary = Arc::new(Scripted {
+            items: vec![
+                Ok(ChatEvent::Delta("a".into())),
+                Ok(ChatEvent::Done { model: "p".into() }),
+            ],
+        });
+        struct Slow(Arc<Scripted>);
+        impl LlmClient for Slow {
+            fn model(&self) -> &str {
+                "slow"
+            }
+            fn chat(&self, req: ChatRequest) -> BoxFuture<Result<ChatResponse, LlmError>> {
+                self.0.chat(req)
+            }
+            fn chat_stream(&self, req: ChatRequest) -> BoxStream<Result<ChatEvent, LlmError>> {
+                Box::pin(self.0.chat_stream(req).then(|item| async move {
+                    if matches!(item, Ok(ChatEvent::Done { .. })) {
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                    }
+                    item
+                }))
+            }
+        }
+        let fallback = Arc::new(MockClient::new("from main"));
+        let c = FallbackClient::new(Arc::new(Slow(primary)), fallback)
+            .with_first_item_deadline(Duration::from_millis(20));
+        let reply = collect_stream(c.chat_stream(ChatRequest::test()))
+            .await
+            .unwrap();
+        assert_eq!(reply.text, "a");
+        assert!(!c.used_fallback());
+    }
+
+    #[tokio::test]
+    async fn plan_route_reports_who_answered() {
+        let main = || Endpoint {
+            client: Arc::new(MockClient::new("from main")),
+            host: Some("main.example".into()),
+        };
+        // No decision model: the main endpoint, directly.
+        let route = PlanRoute::new(main(), None);
+        let reply = route.client().chat(ChatRequest::test()).await.unwrap();
+        assert_eq!(reply.text, "from main");
+        assert_eq!(
+            route.answered_by(),
+            ("mock".to_string(), Some("main.example".to_string()))
+        );
+        // The decision model answers.
+        let decision = || Endpoint {
+            client: Arc::new(Scripted {
+                items: vec![
+                    Ok(ChatEvent::Delta("picked".into())),
+                    Ok(ChatEvent::Done {
+                        model: "scripted".into(),
+                    }),
+                ],
+            }),
+            host: Some("localhost:11434".into()),
+        };
+        let route = PlanRoute::new(main(), Some(decision()));
+        let reply = collect_stream(route.client().chat_stream(ChatRequest::test()))
+            .await
+            .unwrap();
+        assert_eq!(reply.text, "picked");
+        assert_eq!(
+            route.answered_by(),
+            ("scripted".to_string(), Some("localhost:11434".to_string()))
+        );
+        // It fails: the main endpoint answers and is recorded.
+        let route = PlanRoute::new(
+            main(),
+            Some(Endpoint {
+                client: down(),
+                host: Some("localhost:11434".into()),
+            }),
+        );
+        let reply = collect_stream(route.client().chat_stream(ChatRequest::test()))
+            .await
+            .unwrap();
+        assert_eq!(reply.text, "from main");
+        assert_eq!(
+            route.answered_by(),
+            ("mock".to_string(), Some("main.example".to_string()))
+        );
     }
 
     #[tokio::test]

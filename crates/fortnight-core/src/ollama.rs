@@ -72,7 +72,7 @@ pub async fn detect(base_url: &str, timeout: Duration) -> Result<Vec<OllamaModel
         .connect_timeout(timeout)
         .timeout(timeout)
         .build()
-        .map_err(|e| LlmError::Connection(crate::openai::error_chain(&e)))?;
+        .map_err(|e| LlmError::Connection(crate::llm_http::error_chain(&e.without_url())))?;
 
     #[derive(Deserialize)]
     struct Tags {
@@ -87,16 +87,16 @@ pub async fn detect(base_url: &str, timeout: Duration) -> Result<Vec<OllamaModel
         .get(format!("{root}/api/tags"))
         .send()
         .await
-        .map_err(crate::openai::transport_error)?;
+        .map_err(crate::llm_http::transport_error)?;
     let status = response.status();
     let body = response
         .text()
         .await
-        .map_err(crate::openai::transport_error)?;
+        .map_err(crate::llm_http::transport_error)?;
     if !status.is_success() {
         return Err(LlmError::Http {
             status: status.as_u16(),
-            body: crate::openai::truncate_chars(&body, 200),
+            body: crate::llm_http::truncate_chars(&body, 200),
         });
     }
     let tags: Tags = serde_json::from_str(&body).map_err(|e| LlmError::Malformed(e.to_string()))?;
