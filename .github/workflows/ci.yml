@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Do NOT set RUSTFLAGS here: it would replace the +crt-static flags in
+  # .cargo/config.toml and the Windows dependency check would then fail.
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macOS, os: macos-latest, platform: macos }
+          - { name: Windows, os: windows-latest, platform: windows }
+          - { name: Linux, os: ubuntu-latest, platform: linux }
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the compiler (1.99.1) and components. Since
+      # rustup 1.28 it is no longer installed implicitly, so ask for it.
+      - name: Install toolchain from rust-toolchain.toml
+        shell: bash
+        run: |
+          rustup toolchain install --profile minimal
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      # No apt packages are needed on Linux. Everything the GUI talks to
+      # (X11, Wayland, Vulkan/EGL, xkbcommon) is dlopen'd at run time, the
+      # file dialog (rfd, xdg-portal) and notifications (notify-rust, zbus) are
+      # pure Rust over D-Bus, and SQLite and aws-lc are built from bundled C
+      # source with the runner's gcc.
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Release build
+        run: cargo build --release --locked
+
+      - name: Dependency check (macOS)
+        if: matrix.platform == 'macos'
+        run: |
+          ci/check-deps.sh target/release/fortnight macos
+          ci/check-deps.sh target/release/fortnight-cli macos
+
+      - name: Dependency check (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          ci/check-deps.sh target/release/fortnight linux
+          ci/check-deps.sh target/release/fortnight-cli linux
+
+      # dumpbin comes with the MSVC developer environment.
+      - name: MSVC developer environment
+        if: matrix.platform == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Dependency check (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          ./ci/check-deps.ps1 target/release/fortnight.exe
+          ./ci/check-deps.ps1 target/release/fortnight-cli.exe
