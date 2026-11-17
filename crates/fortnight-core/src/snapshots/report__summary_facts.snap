@@ -121,16 +121,6 @@ expression: facts
       "times": 2
     }
   ],
-  "dropped": [
-    {
-      "id": 13,
-      "title": "Old migration plan",
-      "project": "Website",
-      "dropped_on": "2026-11-12",
-      "dropped_weekday": "Thursday",
-      "notes": "Superseded by the analytics migration."
-    }
-  ],
   "next_week": [
     {
       "id": 5,

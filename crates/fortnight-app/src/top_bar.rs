@@ -4,8 +4,8 @@
 //! Owner: orchestrator.
 //!
 //! ```text
-//! [ Today | Week | Month ]      ‹  Mon 16 – Fri 20 Nov  ›   Today      lock  gear
-//! [ Add a task — e.g. Write Q4 report fri #work ~2h !                            ]
+//! [ Today | Week | Month ]      Today  ‹ Mon 16 to Fri 20 Nov ›      lock  gear
+//! [ Write Q4 report fri #work ~2h !                                              ]
 //! ```
 
 use crate::theme::{self, Icon};
@@ -131,18 +131,20 @@ pub fn period_label(tab: Tab, selected: Date, today: Date, schedule: &Schedule) 
 }
 
 /// The task a quick-add line creates, or `None` if it has no title.
-/// In the Today tab a line without a date is planned for the day shown.
+/// In the Today tab a line without a date is due on the day shown.
 pub fn quick_add_task(input: &str, tab: Tab, selected: Date, today: Date) -> Option<NewTask> {
     let parsed = parse::parse_quick_add(input, today);
     if parsed.title.trim().is_empty() {
         return None;
     }
-    let planned_for = (tab == Tab::Today && parsed.due_on.is_none()).then_some(selected);
+    let due_on = match tab {
+        Tab::Today => parsed.due_on.or(Some(selected)),
+        _ => parsed.due_on,
+    };
     Some(NewTask {
         title: parsed.title,
         project: parsed.project,
-        due_on: parsed.due_on,
-        planned_for,
+        due_on,
         estimate_minutes: parsed.estimate_minutes,
         priority: parsed.priority,
         ..NewTask::default()
@@ -179,29 +181,31 @@ pub fn view<'a>(bar: Bar<'a>) -> Element<'a, Message> {
         )
     };
 
+    // Today, then the arrows hugging the label. The label has a fixed width
+    // so the arrows don't jump as it changes.
     let period = row![
+        button(text("Today").size(theme::TEXT_BODY))
+            .padding([5, 14])
+            .style(theme::secondary_button)
+            .on_press_maybe(
+                (bar.selected != bar.today || bar.tab == Tab::Month).then_some(Message::Today)
+            ),
+        space().width(theme::SPACING / 2.0),
         icon_button(Icon::ChevronLeft, Message::Prev, "Previous (←)"),
         container(
             text(period_label(bar.tab, bar.selected, bar.today, bar.schedule))
                 .size(theme::TEXT_BODY)
         )
-        .width(190)
-        .center_x(190),
+        .center_x(150),
         icon_button(Icon::ChevronRight, Message::Next, "Next (→)"),
-        button(text("Today").size(theme::TEXT_BODY))
-            .padding([5, 12])
-            .style(theme::secondary_button)
-            .on_press_maybe(
-                (bar.selected != bar.today || bar.tab == Tab::Month).then_some(Message::Today)
-            ),
     ]
-    .spacing(4)
+    .spacing(2)
     .align_y(Center);
 
     let mut right = row![].spacing(2).align_y(Center);
     match bar.lock {
         Some(LockIcon::Unlocked) => {
-            right = right.push(icon_button(Icon::Unlock, Message::Lock, "Lock the API key"));
+            right = right.push(icon_button(Icon::Unlock, Message::Lock, "API key unlocked"));
         }
         Some(LockIcon::Locked) => {
             right = right.push(icon_button(Icon::Lock, Message::Lock, "Unlock the API key"));
@@ -220,16 +224,13 @@ pub fn view<'a>(bar: Bar<'a>) -> Element<'a, Message> {
     .spacing(theme::SPACING)
     .align_y(Center);
 
-    let quick_add = text_input(
-        "Add a task, for example: Write Q4 report fri #work ~2h !",
-        bar.quick_add,
-    )
-    .id(QUICK_ADD_ID)
-    .on_input(Message::QuickAdd)
-    .on_submit(Message::QuickAddSubmit)
-    .padding([9, 14])
-    .size(theme::TEXT_BODY)
-    .style(theme::input);
+    let quick_add = text_input("Write Q4 report fri #work ~2h !", bar.quick_add)
+        .id(QUICK_ADD_ID)
+        .on_input(Message::QuickAdd)
+        .on_submit(Message::QuickAddSubmit)
+        .padding([9, 14])
+        .size(theme::TEXT_BODY)
+        .style(theme::input);
 
     container(
         column![first, quick_add]
@@ -282,11 +283,11 @@ mod tests {
     }
 
     #[test]
-    fn quick_add_plans_undated_tasks_on_the_day_shown() {
+    fn quick_add_dates_undated_tasks_on_the_day_shown() {
         let shown = date(2026, 11, 18);
         let t = quick_add_task("Buy milk #home", Tab::Today, shown, today()).unwrap();
-        assert_eq!(t.planned_for, Some(shown));
-        assert_eq!(t.due_on, None);
+        assert_eq!(t.due_on, Some(shown));
+        assert_eq!(t.planned_for, None);
         assert_eq!(t.project.as_deref(), Some("home"));
 
         let t = quick_add_task("Report fri", Tab::Today, shown, today()).unwrap();
@@ -294,7 +295,7 @@ mod tests {
         assert_eq!(t.due_on, Some(date(2026, 11, 20)));
 
         let t = quick_add_task("Inbox item", Tab::Week, shown, today()).unwrap();
-        assert_eq!(t.planned_for, None);
+        assert_eq!(t.due_on, None);
 
         assert_eq!(quick_add_task("   ", Tab::Today, shown, today()), None);
         assert_eq!(quick_add_task("#work", Tab::Today, shown, today()), None);

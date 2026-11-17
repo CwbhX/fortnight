@@ -124,16 +124,6 @@ Write my weekly update for the week Monday 2026-11-09 to Sunday 2026-11-15.
       "times": 2
     }
   ],
-  "dropped": [
-    {
-      "id": 13,
-      "title": "Old migration plan",
-      "project": "Website",
-      "dropped_on": "2026-11-12",
-      "dropped_weekday": "Thursday",
-      "notes": "Superseded by the analytics migration."
-    }
-  ],
   "next_week": [
     {
       "id": 5,

@@ -405,7 +405,21 @@ pub async fn report_command(
     }
     let prepared = prepare(store, kind, week, now, &settings)?;
     let llm = make_client()?;
-    let stored = generate_report(store, prepared, &llm, out).await?;
+    // The plan arrives as JSON: print it as a list once it is complete.
+    let stored = match kind {
+        ReportKind::Summary => generate_report(store, prepared, &llm, out).await?,
+        ReportKind::Plan => {
+            let stored = generate_report(store, prepared, &llm, &mut std::io::sink()).await?;
+            if let Some(text) = stored.text() {
+                let md = report::recommendations_markdown(text, &store.list_tasks()?);
+                out.write_all(md.as_bytes())?;
+                if !md.ends_with('\n') {
+                    writeln!(out)?;
+                }
+            }
+            stored
+        }
+    };
     match stored.status {
         ReportStatus::Ready => Ok(()),
         ReportStatus::Failed => Err(CliError::failure(

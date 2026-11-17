@@ -65,7 +65,7 @@ fn bundle(args: &[String]) -> Result<()> {
     for dir in [&macos, &resources] {
         std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     }
-    std::fs::copy(&binary, macos.join("fortnight"))
+    std::fs::copy(&binary, macos.join("Fortnight"))
         .map_err(|e| format!("copying the binary: {e}"))?;
 
     let icon = match make_icon(
@@ -106,7 +106,7 @@ fn build_binary(root: &Path, universal: bool) -> Result<PathBuf> {
             "-p",
             "fortnight-app",
         ]))?;
-        return Ok(root.join("target/release/fortnight"));
+        return Ok(root.join("target/release/Fortnight"));
     }
 
     let installed = installed_targets()?;
@@ -127,7 +127,7 @@ fn build_binary(root: &Path, universal: bool) -> Result<PathBuf> {
             "--target",
             target,
         ]))?;
-        outputs.push(root.join("target").join(target).join("release/fortnight"));
+        outputs.push(root.join("target").join(target).join("release/Fortnight"));
     }
     let joined = root.join("target/release/fortnight-universal");
     std::fs::create_dir_all(joined.parent().expect("has parent"))
@@ -248,7 +248,7 @@ fn info_plist(version: &str, with_icon: bool) -> String {
 \t<key>CFBundleName</key>\n\t<string>Fortnight</string>\n\
 \t<key>CFBundleDisplayName</key>\n\t<string>Fortnight</string>\n\
 \t<key>CFBundleIdentifier</key>\n\t<string>{BUNDLE_ID}</string>\n\
-\t<key>CFBundleExecutable</key>\n\t<string>fortnight</string>\n\
+\t<key>CFBundleExecutable</key>\n\t<string>Fortnight</string>\n\
 \t<key>CFBundlePackageType</key>\n\t<string>APPL</string>\n\
 \t<key>CFBundleVersion</key>\n\t<string>{version}</string>\n\
 \t<key>CFBundleShortVersionString</key>\n\t<string>{version}</string>\n\
@@ -286,7 +286,7 @@ mod tests {
         for needle in [
             "<key>CFBundleName</key>",
             "<string>app.fortnight.Fortnight</string>",
-            "<key>CFBundleExecutable</key>\n\t<string>fortnight</string>",
+            "<key>CFBundleExecutable</key>\n\t<string>Fortnight</string>",
             "<string>APPL</string>",
             "<key>CFBundleShortVersionString</key>\n\t<string>0.1.0</string>",
             "<key>LSMinimumSystemVersion</key>\n\t<string>11.0</string>",

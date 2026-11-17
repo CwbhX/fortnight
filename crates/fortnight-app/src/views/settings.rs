@@ -1,36 +1,38 @@
-//! Settings overlay and the unlock prompt. Owner: agent M (round 2; was
-//! agent I).
+//! Settings overlay and the unlock prompt.
 //!
 //! Settings opens as an overlay panel over the current tab. It is one
 //! scrollable column under a fixed header that holds the title, the single
 //! Save button (it saves the whole form: endpoint and protocol, schedule,
-//! capacity, notifications, summary style) and a close button. Closing with
-//! unsaved changes is allowed: the header says "Unsaved changes", and the
-//! edits stay in the form until the saved settings change.
+//! capacity and the two prompts) and a close button. Closing with unsaved
+//! changes is allowed: the header says "Unsaved changes", and the edits stay
+//! in the form until the saved settings change.
 //!
-//! The API key controls act immediately and are not part of Save. "Load
-//! models" asks `main.rs` for the endpoint's model list; the result is
-//! offered in a pick list beside the free-text model field, and is hidden
-//! once the protocol or base URL is edited away from the listed endpoint.
+//! The API key controls act immediately and are not part of Save. There is
+//! one API key field; Save key (or Enter) asks for a password in a small
+//! pop-up, which encrypts the key. Unlocking is done from the lock icon in
+//! the top bar (the Unlock button here opens the same prompt).
 //!
-//! Focus hours per day are typed as decimal hours (`5.5`) and stored as
-//! whole minutes; an invalid value blocks Save like an invalid time does.
+//! The prompts: the system prompts for the Work summary and Recommended
+//! tasks, shown in full (the built-in one until changed) with Reset. A
+//! prompt equal to the built-in one is saved as empty, so it follows future
+//! built-in changes. Round 2's "summary instructions" are shown folded into
+//! the summary prompt and are folded in for good once that prompt is saved.
 //!
-//! Secrets (API key, passwords) live in the form as `String` only while
+//! Secrets (API key, password) live in the form as `String` only while
 //! typed. They are moved into a `SecretString` when an action is emitted,
-//! and every other secret field is wiped at the same time. `Message` prints
-//! them as `***` in `Debug` output.
+//! and wiped otherwise. `Message` prints them as `***` in `Debug` output.
 //!
-//! Skipped for the prototype: summary length/tone presets (free-form
-//! instructions only), a "working…" indicator while Argon2 runs, selectable
-//! data-folder text (iced 0.14 has no selectable text widget), and a
-//! confirmation before closing with unsaved changes.
+//! Skipped for the prototype: a "working…" indicator while Argon2 runs,
+//! selectable data-folder text (iced 0.14 has no selectable text widget),
+//! and a confirmation before closing with unsaved changes. Notifications are
+//! parked: the setting is kept but not shown.
 
 use fortnight_core::domain::{LlmSettings, Protocol, Schedule, Settings};
+use fortnight_core::report::{DEFAULT_PLAN_PROMPT, DEFAULT_SUMMARY_PROMPT};
 use fortnight_core::vault::MIN_PASSWORD_LEN;
 use iced::widget::{
-    Space, button, checkbox, column, container, operation, pick_list, row, rule, scrollable, text,
-    text_input,
+    Space, button, checkbox, column, container, opaque, operation, pick_list, row, rule,
+    scrollable, stack, text, text_editor, text_input,
 };
 use iced::{Background, Border, Center, Color, Element, Fill, Length, Theme};
 use jiff::civil::{Time, Weekday};
@@ -63,12 +65,15 @@ impl fmt::Debug for Typed {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretField {
     ApiKey,
+    /// The password pop-up.
     Password,
-    Confirm,
-    OldPassword,
-    NewPassword,
-    NewConfirm,
-    UnlockPassword,
+}
+
+/// The two editable prompts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    Summary,
+    Plan,
 }
 
 #[derive(Debug, Clone)]
@@ -81,7 +86,6 @@ pub enum Message {
     /// A model picked from the listed ones.
     PickModel(String),
     FocusHours(String),
-    Notifications(bool),
     Close,
     Save,
     Test,
@@ -92,17 +96,20 @@ pub enum Message {
     PlanTime(String),
     /// Monday-based index (0 = Monday) and the new value.
     WorkingDay(usize, bool),
-    SummaryInstructions(String),
+    Prompt(PromptKind, text_editor::Action),
+    /// Put the built-in prompt back in the editor.
+    ResetPrompt(PromptKind),
     Secret(SecretField, Typed),
-    /// Submit the set/replace key form.
+    /// Submit the API key field: opens the password pop-up.
     SaveKey,
-    SubmitChangePassword,
+    /// Submit the password pop-up.
+    SubmitPassword,
+    CancelPassword,
+    /// Open the unlock prompt.
     Unlock,
     Lock,
-    /// Open the replace-key form (Unlocked).
+    /// Open the replace-key form.
     ShowReplace,
-    /// Open the change-password form (Unlocked).
-    ShowChangePassword,
     /// First click on Remove key: ask for confirmation.
     AskRemove,
     ConfirmRemove,
@@ -110,7 +117,7 @@ pub enum Message {
     CancelKey,
 }
 
-/// What `main.rs` must do. FROZEN contract (round 2).
+/// What `main.rs` must do.
 #[derive(Debug, Clone)]
 pub enum Action {
     None,
@@ -119,7 +126,7 @@ pub enum Action {
     /// Fetch the endpoint's model list using these endpoint fields and the
     /// current key. The result arrives as `SettingsData::models`.
     ListModels(LlmSettings),
-    /// Save these settings (endpoint, schedule, summary instructions).
+    /// Save these settings (endpoint, schedule, capacity, prompts).
     Save(Settings),
     /// Send a test request using these endpoint fields and the current key.
     Test(LlmSettings),
@@ -128,13 +135,12 @@ pub enum Action {
         api_key: SecretString,
         password: SecretString,
     },
-    ChangePassword {
-        old: SecretString,
-        new: SecretString,
-    },
     RemoveKey,
     Lock,
-    Unlock(SecretString),
+    /// Show the unlock prompt.
+    ShowUnlock,
+    /// The password pop-up opened: focus its field (`PASSWORD_INPUT_ID`).
+    FocusPassword,
 }
 
 /// Everything the view shows, supplied by `main.rs`.
@@ -146,7 +152,7 @@ pub struct SettingsData {
     /// Result of the last Test: `Ok(model reply)` or `Err(message)`.
     pub test_result: Option<Result<String, String>>,
     pub testing: bool,
-    /// Result of the last key operation (set, change, remove, unlock),
+    /// Result of the last key operation (set, remove, unlock),
     /// shown near the key controls. `Err` for failures such as a wrong
     /// password.
     pub key_message: Option<Result<String, String>>,
@@ -263,11 +269,18 @@ struct Form {
     plan_time: String,
     /// Indexed Monday = 0.
     working_days: [bool; 7],
-    summary_instructions: String,
     protocol: Protocol,
     /// Decimal hours as typed, e.g. `5.5`.
     focus_hours: String,
+    /// Parked: carried through unchanged.
     notifications: bool,
+    /// The prompts as shown and edited.
+    summary_prompt: String,
+    plan_prompt: String,
+    /// The summary prompt as first shown, and the stored fields it came
+    /// from, so an untouched prompt saves back exactly as it was.
+    summary_shown: String,
+    summary_stored: (String, String),
 }
 
 impl Default for Form {
@@ -279,6 +292,15 @@ impl Default for Form {
 impl Form {
     fn from_settings(s: &Settings) -> Self {
         let sched = &s.schedule;
+        let mut summary_shown = match s.summary_prompt.trim() {
+            "" => DEFAULT_SUMMARY_PROMPT.to_string(),
+            custom => custom.to_string(),
+        };
+        let extra = s.summary_instructions.trim();
+        if !extra.is_empty() {
+            summary_shown.push_str("\n\n");
+            summary_shown.push_str(extra);
+        }
         Form {
             base_url: s.llm.base_url.clone(),
             model: s.llm.model.clone(),
@@ -288,16 +310,30 @@ impl Form {
             plan_day: sched.plan_day,
             plan_time: format_time(sched.plan_time),
             working_days: WEEK.map(|d| sched.working_days.contains(&d)),
-            summary_instructions: s.summary_instructions.clone(),
             protocol: s.llm.protocol,
             focus_hours: format_hours(s.focus_minutes_per_day),
             notifications: s.notifications,
+            summary_prompt: summary_shown.clone(),
+            plan_prompt: match s.plan_prompt.trim() {
+                "" => DEFAULT_PLAN_PROMPT.to_string(),
+                custom => custom.to_string(),
+            },
+            summary_shown,
+            summary_stored: (s.summary_prompt.clone(), s.summary_instructions.clone()),
         }
     }
 
     /// The settings this form describes, or `None` if a time or the focus
     /// hours are invalid.
     fn to_settings(&self) -> Option<Settings> {
+        let (summary_prompt, summary_instructions) = if self.summary_prompt == self.summary_shown {
+            self.summary_stored.clone()
+        } else {
+            (
+                stored_prompt(&self.summary_prompt, DEFAULT_SUMMARY_PROMPT),
+                String::new(),
+            )
+        };
         Some(Settings {
             llm: self.llm(),
             schedule: Schedule {
@@ -313,9 +349,11 @@ impl Form {
                     .map(|(d, _)| *d)
                     .collect(),
             },
-            summary_instructions: self.summary_instructions.trim().to_string(),
+            summary_instructions,
             focus_minutes_per_day: parse_hours(&self.focus_hours)?,
             notifications: self.notifications,
+            summary_prompt,
+            plan_prompt: stored_prompt(&self.plan_prompt, DEFAULT_PLAN_PROMPT),
         })
     }
 
@@ -328,13 +366,22 @@ impl Form {
     }
 }
 
+/// A prompt as stored: empty when it is the built-in one.
+fn stored_prompt(text: &str, default: &str) -> String {
+    let text = text.trim();
+    if text == default.trim() {
+        String::new()
+    } else {
+        text.to_string()
+    }
+}
+
 /// Which key form or confirmation is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum KeyMode {
     #[default]
     Idle,
     Replace,
-    ChangePassword,
     ConfirmRemove,
 }
 
@@ -343,11 +390,6 @@ enum KeyMode {
 struct Secrets {
     api_key: String,
     password: String,
-    confirm: String,
-    old_password: String,
-    new_password: String,
-    new_confirm: String,
-    unlock_password: String,
 }
 
 impl fmt::Debug for Secrets {
@@ -361,26 +403,12 @@ impl Secrets {
         match field {
             SecretField::ApiKey => &mut self.api_key,
             SecretField::Password => &mut self.password,
-            SecretField::Confirm => &mut self.confirm,
-            SecretField::OldPassword => &mut self.old_password,
-            SecretField::NewPassword => &mut self.new_password,
-            SecretField::NewConfirm => &mut self.new_confirm,
-            SecretField::UnlockPassword => &mut self.unlock_password,
         }
     }
 
     fn wipe_all(&mut self) {
-        for s in [
-            &mut self.api_key,
-            &mut self.password,
-            &mut self.confirm,
-            &mut self.old_password,
-            &mut self.new_password,
-            &mut self.new_confirm,
-            &mut self.unlock_password,
-        ] {
-            wipe(s);
-        }
+        wipe(&mut self.api_key);
+        wipe(&mut self.password);
     }
 }
 
@@ -394,18 +422,17 @@ fn take_secret(s: &mut String) -> SecretString {
     SecretString::from(std::mem::take(s))
 }
 
-/// Checks a new password and its confirmation.
-fn check_new_password(password: &str, confirm: &str) -> Result<(), String> {
+/// Checks a new password.
+fn check_password(password: &str) -> Result<(), String> {
     if password.chars().count() < MIN_PASSWORD_LEN {
         return Err(format!(
             "The password needs at least {MIN_PASSWORD_LEN} characters."
         ));
     }
-    if password != confirm {
-        return Err("The passwords don't match.".into());
-    }
     Ok(())
 }
+
+pub const PASSWORD_INPUT_ID: &str = "settings-key-password";
 
 #[derive(Debug)]
 pub struct SettingsView {
@@ -426,6 +453,10 @@ pub struct SettingsView {
     /// The endpoint of the last "Load models" request, to hide a list that
     /// belongs to an endpoint the form no longer names.
     listed_for: Option<(Protocol, String)>,
+    /// The password pop-up is open (after Save key).
+    password_prompt: bool,
+    summary_editor: text_editor::Content,
+    plan_editor: text_editor::Content,
 }
 
 impl Default for SettingsView {
@@ -444,6 +475,9 @@ impl Default for SettingsView {
             models: None,
             listing_models: false,
             listed_for: None,
+            password_prompt: false,
+            summary_editor: text_editor::Content::new(),
+            plan_editor: text_editor::Content::new(),
         }
     }
 }
@@ -460,6 +494,8 @@ impl SettingsView {
     pub fn load(&mut self, data: SettingsData) {
         if self.loaded.as_ref() != Some(&data.settings) {
             self.form = Form::from_settings(&data.settings);
+            self.summary_editor = text_editor::Content::with_text(&self.form.summary_prompt);
+            self.plan_editor = text_editor::Content::with_text(&self.form.plan_prompt);
             self.loaded = Some(data.settings);
         }
         if data.key_state != self.key_state {
@@ -521,7 +557,6 @@ impl SettingsView {
             Message::BaseUrl(s) => form.base_url = s,
             Message::Model(s) | Message::PickModel(s) => form.model = s,
             Message::FocusHours(s) => form.focus_hours = s,
-            Message::Notifications(on) => form.notifications = on,
             Message::LoadModels => {
                 if self.can_list_models() {
                     let llm = self.form.llm();
@@ -544,7 +579,30 @@ impl SettingsView {
                     *day = on;
                 }
             }
-            Message::SummaryInstructions(s) => form.summary_instructions = s,
+            Message::Prompt(kind, action) => {
+                let editor = match kind {
+                    PromptKind::Summary => &mut self.summary_editor,
+                    PromptKind::Plan => &mut self.plan_editor,
+                };
+                editor.perform(action);
+                let text = editor.text();
+                match kind {
+                    PromptKind::Summary => form.summary_prompt = text,
+                    PromptKind::Plan => form.plan_prompt = text,
+                }
+            }
+            Message::ResetPrompt(kind) => {
+                let (text, editor) = match kind {
+                    PromptKind::Summary => (&mut form.summary_prompt, &mut self.summary_editor),
+                    PromptKind::Plan => (&mut form.plan_prompt, &mut self.plan_editor),
+                };
+                let default = match kind {
+                    PromptKind::Summary => DEFAULT_SUMMARY_PROMPT,
+                    PromptKind::Plan => DEFAULT_PLAN_PROMPT,
+                };
+                *text = default.to_string();
+                *editor = text_editor::Content::with_text(default);
+            }
             Message::Save => {
                 if let Some(settings) = self.savable() {
                     return Action::Save(settings);
@@ -560,21 +618,27 @@ impl SettingsView {
                 wipe(slot);
                 *slot = value;
             }
-            Message::SaveKey => return self.save_key(),
-            Message::SubmitChangePassword => return self.change_password(),
-            Message::Unlock => {
-                if self.secrets.unlock_password.is_empty() {
+            Message::SaveKey => {
+                if self.secrets.api_key.trim().is_empty() {
+                    self.key_error = Some("Enter the API key.".into());
                     return Action::None;
                 }
                 self.key_error = None;
-                return Action::Unlock(take_secret(&mut self.secrets.unlock_password));
+                self.password_prompt = true;
+                return Action::FocusPassword;
             }
+            Message::SubmitPassword => return self.save_key(),
+            Message::CancelPassword => {
+                self.password_prompt = false;
+                self.key_error = None;
+                wipe(&mut self.secrets.password);
+            }
+            Message::Unlock => return Action::ShowUnlock,
             Message::Lock => {
                 self.close_key_form();
                 return Action::Lock;
             }
             Message::ShowReplace => self.open_key_form(KeyMode::Replace),
-            Message::ShowChangePassword => self.open_key_form(KeyMode::ChangePassword),
             Message::AskRemove => self.open_key_form(KeyMode::ConfirmRemove),
             Message::ConfirmRemove => {
                 if self.key_mode == KeyMode::ConfirmRemove {
@@ -595,17 +659,16 @@ impl SettingsView {
     fn close_key_form(&mut self) {
         self.key_mode = KeyMode::Idle;
         self.key_error = None;
+        self.password_prompt = false;
         self.secrets.wipe_all();
     }
 
     fn save_key(&mut self) -> Action {
-        let s = &self.secrets;
-        let check = if s.api_key.trim().is_empty() {
-            Err("Enter the API key.".to_string())
-        } else {
-            check_new_password(&s.password, &s.confirm)
-        };
-        if let Err(e) = check {
+        if self.secrets.api_key.trim().is_empty() {
+            self.password_prompt = false;
+            return Action::None;
+        }
+        if let Err(e) = check_password(&self.secrets.password) {
             self.key_error = Some(e);
             return Action::None;
         }
@@ -613,23 +676,6 @@ impl SettingsView {
         let password = take_secret(&mut self.secrets.password);
         self.close_key_form();
         Action::SetKey { api_key, password }
-    }
-
-    fn change_password(&mut self) -> Action {
-        let s = &self.secrets;
-        let check = if s.old_password.is_empty() {
-            Err("Enter your current password.".to_string())
-        } else {
-            check_new_password(&s.new_password, &s.new_confirm)
-        };
-        if let Err(e) = check {
-            self.key_error = Some(e);
-            return Action::None;
-        }
-        let old = take_secret(&mut self.secrets.old_password);
-        let new = take_secret(&mut self.secrets.new_password);
-        self.close_key_form();
-        Action::ChangePassword { old, new }
     }
 
     // ------------------------------------------------------------- view
@@ -680,8 +726,7 @@ impl SettingsView {
             self.key_section(),
             self.schedule_section(),
             self.capacity_section(),
-            self.notifications_section(),
-            self.summary_section(),
+            self.prompts_section(),
             self.data_section(),
         ]
         .spacing(theme::SPACING * 2.5)
@@ -693,7 +738,7 @@ impl SettingsView {
         })
         .width(Fill);
 
-        column![
+        let page = column![
             header,
             rule::horizontal(1).style(divider),
             scrollable(content)
@@ -704,7 +749,50 @@ impl SettingsView {
                         .margin(4)
                 ))
                 .height(Fill)
+        ];
+        if !self.password_prompt {
+            return page.into();
+        }
+        stack![page, opaque(self.password_view())].into()
+    }
+
+    /// The pop-up that asks for the password that encrypts the key.
+    fn password_view(&self) -> Element<'_, Message> {
+        let field = input(
+            &format!("At least {MIN_PASSWORD_LEN} characters"),
+            &self.secrets.password,
+        )
+        .id(PASSWORD_INPUT_ID)
+        .secure(true)
+        .on_input(|s| Message::Secret(SecretField::Password, Typed(s)))
+        .on_submit(Message::SubmitPassword);
+        let mut card = column![
+            text("Choose a password").size(theme::TEXT_HEADING),
+            small_muted("It encrypts the key. It can't be recovered if you forget it."),
+            field,
         ]
+        .spacing(theme::SPACING);
+        if let Some(e) = &self.key_error {
+            card = card.push(text(e).size(theme::TEXT_SMALL).style(theme::danger));
+        }
+        card = card.push(
+            row![
+                primary("Save", Message::SubmitPassword),
+                button(text("Cancel").size(theme::TEXT_BODY))
+                    .padding([8, 14])
+                    .style(theme::text_button)
+                    .on_press(Message::CancelPassword),
+            ]
+            .spacing(theme::SPACING / 2.0),
+        );
+        container(
+            container(card)
+                .padding(theme::SPACING * 2.0)
+                .max_width(380)
+                .style(theme::overlay_panel),
+        )
+        .center(Fill)
+        .style(theme::backdrop)
         .into()
     }
 
@@ -838,20 +926,12 @@ impl SettingsView {
     }
 
     fn key_section(&self) -> Element<'_, Message> {
-        let state = match self.key_state {
-            KeyState::NoKey => "No key",
-            KeyState::Locked => "Locked",
-            KeyState::Unlocked => "Unlocked",
+        let mut body = column![].spacing(theme::SPACING);
+        let state = |label: &'static str| {
+            container(text(label).size(theme::TEXT_SMALL))
+                .padding(theme::chip_padding())
+                .style(theme::chip)
         };
-        let chip = container(text(state).size(theme::TEXT_SMALL))
-            .padding(theme::chip_padding())
-            .style(theme::chip);
-        let mut body = column![
-            row![text("Status").size(theme::TEXT_BODY), chip]
-                .spacing(theme::SPACING)
-                .align_y(Center)
-        ]
-        .spacing(theme::SPACING);
 
         match (self.key_state, self.key_mode) {
             (_, KeyMode::ConfirmRemove) => {
@@ -868,24 +948,14 @@ impl SettingsView {
                     .align_y(Center),
                 );
             }
-            (KeyState::NoKey, _) => {
-                body = body.push(small_muted(
-                    "A local endpoint such as Ollama needs no key. \
-                     A key you add is stored encrypted under a password you choose.",
-                ));
-                body = body.push(self.set_key_form(false));
-            }
-            (KeyState::Locked, _) => {
+            (KeyState::NoKey, _) => body = body.push(self.key_input(false)),
+            (_, KeyMode::Replace) => body = body.push(self.key_input(true)),
+            (KeyState::Locked, KeyMode::Idle) => {
                 body = body.push(
                     row![
-                        secret_input(
-                            "Password",
-                            &self.secrets.unlock_password,
-                            SecretField::UnlockPassword
-                        )
-                        .on_submit(Message::Unlock)
-                        .width(280),
-                        primary("Unlock", Message::Unlock),
+                        state("Saved, locked"),
+                        secondary("Unlock", Message::Unlock),
+                        secondary("Replace", Message::ShowReplace),
                         Space::new().width(Fill),
                         remove_button(),
                     ]
@@ -893,18 +963,12 @@ impl SettingsView {
                     .align_y(Center),
                 );
             }
-            (KeyState::Unlocked, KeyMode::Replace) => {
-                body = body.push(self.set_key_form(true));
-            }
-            (KeyState::Unlocked, KeyMode::ChangePassword) => {
-                body = body.push(self.change_password_form());
-            }
             (KeyState::Unlocked, KeyMode::Idle) => {
                 body = body.push(
                     row![
+                        state("Saved, unlocked"),
                         secondary("Lock", Message::Lock),
-                        secondary("Replace key", Message::ShowReplace),
-                        secondary("Change password", Message::ShowChangePassword),
+                        secondary("Replace", Message::ShowReplace),
                         Space::new().width(Fill),
                         remove_button(),
                     ]
@@ -914,7 +978,9 @@ impl SettingsView {
             }
         }
 
-        if let Some(e) = &self.key_error {
+        if self.password_prompt {
+            // The pop-up shows the error.
+        } else if let Some(e) = &self.key_error {
             body = body.push(text(e).size(theme::TEXT_SMALL).style(theme::danger));
         } else {
             match &self.key_message {
@@ -925,79 +991,23 @@ impl SettingsView {
                 None => {}
             }
         }
-        if self.key_state != KeyState::NoKey {
-            body = body.push(small_muted(
-                "A forgotten password can't be recovered. Remove the key and enter it again.",
-            ));
-        }
 
         section("API key", body)
     }
 
-    fn set_key_form(&self, cancellable: bool) -> Element<'_, Message> {
-        let s = &self.secrets;
-        let mut buttons = row![primary("Save key", Message::SaveKey)].spacing(theme::SPACING);
+    /// The API key field and Save key (Enter works too).
+    fn key_input(&self, cancellable: bool) -> Element<'_, Message> {
+        let mut line = row![
+            secret_input("sk-…", &self.secrets.api_key, SecretField::ApiKey)
+                .on_submit(Message::SaveKey),
+            primary("Save key", Message::SaveKey),
+        ]
+        .spacing(theme::SPACING / 2.0)
+        .align_y(Center);
         if cancellable {
-            buttons = buttons.push(cancel_button());
+            line = line.push(cancel_button());
         }
-        column![
-            labelled(
-                "API key",
-                secret_input("sk-…", &s.api_key, SecretField::ApiKey)
-            ),
-            row![
-                labelled(
-                    "Password",
-                    secret_input(
-                        &format!("At least {MIN_PASSWORD_LEN} characters"),
-                        &s.password,
-                        SecretField::Password
-                    )
-                ),
-                labelled(
-                    "Confirm password",
-                    secret_input("Type it again", &s.confirm, SecretField::Confirm)
-                        .on_submit(Message::SaveKey)
-                ),
-            ]
-            .spacing(theme::SPACING),
-            buttons,
-        ]
-        .spacing(theme::SPACING)
-        .into()
-    }
-
-    fn change_password_form(&self) -> Element<'_, Message> {
-        let s = &self.secrets;
-        column![
-            labelled(
-                "Current password",
-                secret_input("", &s.old_password, SecretField::OldPassword)
-            ),
-            row![
-                labelled(
-                    "New password",
-                    secret_input(
-                        &format!("At least {MIN_PASSWORD_LEN} characters"),
-                        &s.new_password,
-                        SecretField::NewPassword
-                    )
-                ),
-                labelled(
-                    "Confirm new password",
-                    secret_input("Type it again", &s.new_confirm, SecretField::NewConfirm)
-                        .on_submit(Message::SubmitChangePassword)
-                ),
-            ]
-            .spacing(theme::SPACING),
-            row![
-                primary("Change password", Message::SubmitChangePassword),
-                cancel_button()
-            ]
-            .spacing(theme::SPACING),
-        ]
-        .spacing(theme::SPACING)
-        .into()
+        line.into()
     }
 
     fn schedule_section(&self) -> Element<'_, Message> {
@@ -1013,7 +1023,7 @@ impl SettingsView {
             Message::SummaryTime,
         );
         let plan = labelled_when(
-            "Week-ahead advice",
+            "Recommended tasks",
             day_picker(f.plan_day, Message::PlanDay),
             &f.plan_time,
             Message::PlanTime,
@@ -1067,32 +1077,49 @@ impl SettingsView {
         )
     }
 
-    fn notifications_section(&self) -> Element<'_, Message> {
-        section(
-            "Notifications",
+    fn prompts_section(&self) -> Element<'_, Message> {
+        let editor = |label: &'static str, kind: PromptKind| {
+            let (content, current, default) = match kind {
+                PromptKind::Summary => (
+                    &self.summary_editor,
+                    &self.form.summary_prompt,
+                    DEFAULT_SUMMARY_PROMPT,
+                ),
+                PromptKind::Plan => (
+                    &self.plan_editor,
+                    &self.form.plan_prompt,
+                    DEFAULT_PLAN_PROMPT,
+                ),
+            };
+            let reset = button(text("Reset").size(theme::TEXT_SMALL))
+                .padding([2, 8])
+                .style(theme::text_button)
+                .on_press_maybe(
+                    (current.trim() != default.trim()).then_some(Message::ResetPrompt(kind)),
+                );
             column![
-                checkbox(self.form.notifications)
-                    .label("Notify me when a report is ready")
-                    .text_size(theme::TEXT_BODY)
-                    .on_toggle(Message::Notifications),
-                small_muted("Some systems hide or block these notifications."),
+                row![
+                    text(label).size(theme::TEXT_SMALL),
+                    Space::new().width(Fill),
+                    reset
+                ]
+                .align_y(Center),
+                text_editor(content)
+                    .on_action(move |a| Message::Prompt(kind, a))
+                    .height(220)
+                    .padding(10)
+                    .size(theme::TEXT_SMALL)
+                    .style(theme::editor),
             ]
-            .spacing(theme::SPACING / 2.0),
-        )
-    }
-
-    fn summary_section(&self) -> Element<'_, Message> {
+            .spacing(theme::SPACING / 3.0)
+        };
         section(
-            "Summary style",
+            "Prompts",
             column![
-                input(
-                    "For example: under 150 words, plain tone",
-                    &self.form.summary_instructions
-                )
-                .on_input(Message::SummaryInstructions),
-                small_muted("Extra instructions added to the weekly summary prompt."),
+                editor("Work summary", PromptKind::Summary),
+                editor("Recommended tasks", PromptKind::Plan),
             ]
-            .spacing(theme::SPACING / 2.0),
+            .spacing(theme::SPACING * 1.25),
         )
     }
 
@@ -1279,11 +1306,11 @@ pub enum UnlockMessage {
 pub enum UnlockAction {
     None,
     Unlock(SecretString),
-    /// Continue without unlocking; LLM features wait.
+    /// Close without unlocking.
     Skip,
 }
 
-/// The password prompt shown at launch when a key file exists.
+/// The password prompt, opened from the lock icon.
 #[derive(Default)]
 pub struct UnlockView {
     password: String,
@@ -1351,16 +1378,13 @@ impl UnlockView {
             .padding([10, 18])
             .style(theme::primary_button)
             .on_press_maybe((!self.password.is_empty()).then_some(UnlockMessage::Submit));
-        let skip = button(text("Skip for now").size(theme::TEXT_SMALL))
+        let skip = button(text("Cancel").size(theme::TEXT_SMALL))
             .padding([4, 8])
             .style(theme::text_button)
             .on_press(UnlockMessage::Skip);
 
         let mut card = column![
-            theme::title("Fortnight"),
-            text("Enter your password to unlock the API key")
-                .size(theme::TEXT_BODY)
-                .style(theme::muted),
+            text("Unlock the API key").size(theme::TEXT_HEADING),
             Space::new().height(theme::SPACING / 2.0),
             field,
         ]
@@ -1374,10 +1398,11 @@ impl UnlockView {
         container(
             container(card)
                 .padding(theme::SPACING * 2.5)
-                .max_width(400)
-                .style(theme::card),
+                .max_width(380)
+                .style(theme::overlay_panel),
         )
         .center(Fill)
+        .style(theme::backdrop)
         .into()
     }
 }
@@ -1442,7 +1467,7 @@ mod tests {
         v.update(Message::PlanTime("07:05".into()));
         v.update(Message::WorkingDay(4, false));
         v.update(Message::WorkingDay(5, true));
-        v.update(Message::SummaryInstructions("Short.".into()));
+        v.update(Message::ResetPrompt(PromptKind::Plan));
         let Action::Save(s) = v.update(Message::Save) else {
             panic!("expected Save");
         };
@@ -1462,7 +1487,8 @@ mod tests {
                 Weekday::Saturday
             ]
         );
-        assert_eq!(s.summary_instructions, "Short.");
+        assert_eq!(s.summary_instructions, "");
+        assert_eq!(s.plan_prompt, "", "the built-in prompt is stored as empty");
     }
 
     #[test]
@@ -1495,61 +1521,95 @@ mod tests {
     }
 
     #[test]
-    fn set_key_validation() {
-        let cases = [
-            ("", "longenough", "longenough"),
-            ("sk-abc", "short", "short"),
-            ("sk-abc", "longenough", "different1"),
-        ];
-        for (key, pw, confirm) in cases {
-            let mut v = loaded(KeyState::NoKey);
-            typed(&mut v, SecretField::ApiKey, key);
-            typed(&mut v, SecretField::Password, pw);
-            typed(&mut v, SecretField::Confirm, confirm);
-            assert!(matches!(v.update(Message::SaveKey), Action::None));
-            assert!(v.key_error.is_some(), "{key}/{pw}/{confirm}");
-            // The typed values stay so the user can fix them.
-            assert_eq!(v.secrets.password, pw);
-        }
-    }
-
-    #[test]
-    fn valid_set_key_emits_and_clears_fields() {
+    fn save_key_asks_for_a_password_then_emits() {
         let mut v = loaded(KeyState::NoKey);
+        assert!(matches!(v.update(Message::SaveKey), Action::None));
+        assert!(v.key_error.is_some(), "no key typed");
+        assert!(!v.password_prompt);
+
         typed(&mut v, SecretField::ApiKey, " sk-abc ");
+        assert!(matches!(v.update(Message::SaveKey), Action::FocusPassword));
+        assert!(v.password_prompt);
+        typed(&mut v, SecretField::Password, "short");
+        assert!(matches!(v.update(Message::SubmitPassword), Action::None));
+        assert!(v.key_error.is_some());
+        assert!(v.password_prompt, "stays open to fix it");
+
         typed(&mut v, SecretField::Password, "correct horse");
-        typed(&mut v, SecretField::Confirm, "correct horse");
-        let Action::SetKey { api_key, password } = v.update(Message::SaveKey) else {
+        let Action::SetKey { api_key, password } = v.update(Message::SubmitPassword) else {
             panic!("expected SetKey");
         };
         assert_eq!(api_key.expose_secret(), "sk-abc");
         assert_eq!(password.expose_secret(), "correct horse");
         assert!(v.secrets.api_key.is_empty());
         assert!(v.secrets.password.is_empty());
-        assert!(v.secrets.confirm.is_empty());
+        assert!(!v.password_prompt);
         assert!(v.key_error.is_none());
+
+        // Cancel keeps the typed key but drops the password.
+        typed(&mut v, SecretField::ApiKey, "sk-2");
+        v.update(Message::SaveKey);
+        typed(&mut v, SecretField::Password, "something long");
+        v.update(Message::CancelPassword);
+        assert!(!v.password_prompt);
+        assert!(v.secrets.password.is_empty());
+        assert_eq!(v.secrets.api_key, "sk-2");
     }
 
     #[test]
-    fn change_password_validates_and_emits() {
-        let mut v = loaded(KeyState::Unlocked);
-        v.update(Message::ShowChangePassword);
-        typed(&mut v, SecretField::OldPassword, "old password");
-        typed(&mut v, SecretField::NewPassword, "new password");
-        typed(&mut v, SecretField::NewConfirm, "new passw0rd");
-        assert!(matches!(
-            v.update(Message::SubmitChangePassword),
-            Action::None
+    fn prompts_edit_reset_and_save() {
+        let mut v = loaded(KeyState::NoKey);
+        assert_eq!(v.form.summary_prompt, DEFAULT_SUMMARY_PROMPT);
+        v.update(Message::Prompt(
+            PromptKind::Summary,
+            text_editor::Action::Move(text_editor::Motion::DocumentStart),
         ));
-        assert!(v.key_error.is_some());
-        typed(&mut v, SecretField::NewConfirm, "new password");
-        let Action::ChangePassword { old, new } = v.update(Message::SubmitChangePassword) else {
-            panic!("expected ChangePassword");
+        v.update(Message::Prompt(
+            PromptKind::Summary,
+            text_editor::Action::Edit(text_editor::Edit::Paste(std::sync::Arc::new(
+                "Be brief. ".to_string(),
+            ))),
+        ));
+        let Action::Save(s) = v.update(Message::Save) else {
+            panic!("expected Save");
         };
-        assert_eq!(old.expose_secret(), "old password");
-        assert_eq!(new.expose_secret(), "new password");
-        assert!(v.secrets.new_confirm.is_empty());
-        assert_eq!(v.key_mode, KeyMode::Idle);
+        assert!(s.summary_prompt.starts_with("Be brief. You write"));
+        assert_eq!(s.plan_prompt, "");
+        v.update(Message::ResetPrompt(PromptKind::Summary));
+        assert!(
+            matches!(v.update(Message::Save), Action::None),
+            "back to unchanged"
+        );
+    }
+
+    #[test]
+    fn round2_summary_instructions_are_folded_into_the_prompt() {
+        let s = Settings {
+            summary_instructions: "Short.".into(),
+            ..Settings::default()
+        };
+        let mut v = SettingsView::new();
+        v.load(data(s.clone(), KeyState::NoKey));
+        assert!(v.form.summary_prompt.ends_with("\n\nShort."));
+        assert!(!v.is_dirty());
+        assert!(matches!(v.update(Message::Save), Action::None));
+        // Any other change keeps them as they are.
+        v.update(Message::Model("m".into()));
+        let Action::Save(saved) = v.update(Message::Save) else {
+            panic!("expected Save");
+        };
+        assert_eq!(saved.summary_instructions, "Short.");
+        assert_eq!(saved.summary_prompt, "");
+        // Editing the prompt folds them in for good.
+        v.update(Message::Prompt(
+            PromptKind::Summary,
+            text_editor::Action::Edit(text_editor::Edit::Insert('!')),
+        ));
+        let Action::Save(saved) = v.update(Message::Save) else {
+            panic!("expected Save");
+        };
+        assert_eq!(saved.summary_instructions, "");
+        assert!(saved.summary_prompt.contains("Short."));
     }
 
     #[test]
@@ -1589,13 +1649,7 @@ mod tests {
     #[test]
     fn settings_unlock_and_lock() {
         let mut v = loaded(KeyState::Locked);
-        assert!(matches!(v.update(Message::Unlock), Action::None));
-        typed(&mut v, SecretField::UnlockPassword, "hunter22");
-        let Action::Unlock(pw) = v.update(Message::Unlock) else {
-            panic!("expected Unlock");
-        };
-        assert_eq!(pw.expose_secret(), "hunter22");
-        assert!(v.secrets.unlock_password.is_empty());
+        assert!(matches!(v.update(Message::Unlock), Action::ShowUnlock));
         v.load(data(Settings::default(), KeyState::Unlocked));
         assert!(matches!(v.update(Message::Lock), Action::Lock));
     }
@@ -1648,19 +1702,16 @@ mod tests {
         v.update(Message::BaseUrl("https://api.anthropic.com".into()));
         v.update(Message::Model("claude-x".into()));
         v.update(Message::FocusHours(" 5.5 ".into()));
-        v.update(Message::Notifications(true));
         let Action::Save(s) = v.update(Message::Save) else {
             panic!("expected Save");
         };
         assert_eq!(s.llm.protocol, Protocol::Anthropic);
         assert_eq!(s.focus_minutes_per_day, 330);
-        assert!(s.notifications);
         // Saved settings come back from main.rs: the form matches them and
         // there is nothing left to save.
         v.load(data(s.clone(), KeyState::NoKey));
         assert_eq!(v.form.protocol, Protocol::Anthropic);
         assert_eq!(v.form.focus_hours, "5.5");
-        assert!(v.form.notifications);
         assert!(!v.is_dirty());
         assert!(matches!(v.update(Message::Save), Action::None));
     }
@@ -1679,15 +1730,15 @@ mod tests {
         assert_eq!(v.form.protocol, Protocol::OpenAi);
         assert_eq!(v.form.focus_hours, "6");
         assert!(!v.is_dirty());
-        v.update(Message::SummaryInstructions("Shorter.".into()));
+        v.update(Message::FocusHours("6.5".into()));
         let Action::Save(s) = v.update(Message::Save) else {
             panic!("expected Save");
         };
         assert_eq!(s.llm, round1.llm);
         assert_eq!(s.schedule, round1.schedule);
-        assert_eq!(s.focus_minutes_per_day, DEFAULT_FOCUS_MINUTES);
+        assert_eq!(s.focus_minutes_per_day, DEFAULT_FOCUS_MINUTES + 30);
         assert!(!s.notifications);
-        assert_eq!(s.summary_instructions, "Shorter.");
+        assert_eq!(s.summary_instructions, "Short.");
     }
 
     #[test]

@@ -1,4 +1,5 @@
 //! Domain types shared by every module. FROZEN (round 2): do not edit.
+//! (Round 3, at the user's request: `Settings` gained the two prompts.)
 //!
 //! Conventions:
 //! - Deadlines are civil dates (`jiff::civil::Date`), stored as `YYYY-MM-DD`.
@@ -497,8 +498,15 @@ pub struct Settings {
     /// Focus time available on each working day, in minutes (shown as
     /// hours). The capacity the load bars and plan facts compare against.
     pub focus_minutes_per_day: u32,
-    /// Show an OS notification when a report is ready.
+    /// Show an OS notification when a report is ready. Parked: not shown
+    /// in the app and not acted on.
     pub notifications: bool,
+    /// The system prompt for the work summary. Empty means the built-in
+    /// one (`report::DEFAULT_SUMMARY_PROMPT`).
+    pub summary_prompt: String,
+    /// The system prompt for recommended tasks. Empty means the built-in
+    /// one (`report::DEFAULT_PLAN_PROMPT`).
+    pub plan_prompt: String,
 }
 
 impl Default for Settings {
@@ -509,6 +517,8 @@ impl Default for Settings {
             summary_instructions: String::new(),
             focus_minutes_per_day: DEFAULT_FOCUS_MINUTES,
             notifications: false,
+            summary_prompt: String::new(),
+            plan_prompt: String::new(),
         }
     }
 }

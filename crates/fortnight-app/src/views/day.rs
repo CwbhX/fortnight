@@ -1,4 +1,4 @@
-//! The Today tab: one day's tasks (PLAN.md 4.2 "Today"). Owner: agent J.
+//! The Today tab: one day's tasks (PLAN.md 4.2 "Today").
 //!
 //! Sections, top to bottom:
 //!
@@ -6,44 +6,47 @@
 //!   tasks whose deadline has passed.
 //! - **The day**: open tasks whose [`Task::day`] is the shown day. On today
 //!   this also carries over open tasks planned for an earlier day whose
-//!   deadline has not passed.
-//! - **Done**, collapsed: done and dropped tasks whose day is the shown day,
-//!   dimmed.
-//! - **Log**: free-standing log lines dated the shown day, with an input to
-//!   add one (today only, see below).
-//! - **No date**, collapsed, with a count: open tasks with no day (the
-//!   inbox).
+//!   deadline has not passed (old data; the app no longer sets a planned
+//!   day).
+//! - **Side work**: free-standing log lines dated the shown day, shown as
+//!   ticked items, with an input to add one (today only, see below).
+//! - **Completed**, collapsed: tasks completed on the shown day.
+//! - **No date**, collapsed: open tasks with no day (the inbox).
+//! - **Deleted**, collapsed: every deleted task, newest first, each with
+//!   Restore and Delete forever. Delete moves a task here (status
+//!   `Dropped`); only Delete forever removes it.
 //!
 //! The quick-add bar and the date navigation live in the top bar.
 //!
 //! Clicking a row (or `Enter` on the selected row) expands it in place into
-//! an edit form, one row at a time: title, notes, project, due date, planned
-//! day, estimate, priority, private, status buttons and the task's log.
+//! an edit form, one row at a time: title, project, due date (a calendar),
+//! estimate, priority (Low, Medium, High), subtasks and notes. Subtasks are
+//! kept in the task's notes as Markdown checklist lines (`- [ ] text`), so
+//! they need no schema change and reach the summary with the notes.
 //! `↑` `↓` move a selection highlight through the visible rows (stopping at
 //! the ends), `Space` toggles done and `Escape` collapses the form, then
 //! clears the selection.
 //!
-//! The logic lives in pure functions ([`section_of`], [`section_tasks`],
-//! [`visible_rows`], [`EditForm::apply`]) and in [`DayView::update`] /
-//! [`DayView::on_key`], so it is tested without a window.
+//! The statuses `Doing` (in progress) are shown as plain open tasks; the app
+//! no longer sets it.
 //!
-//! Skipped for the prototype: drag ordering, delete confirmation (main.rs
-//! has undo), strikethrough on done tasks (iced text has none), the time of
-//! day on log lines (the view gets no time zone), and adding a free-standing
-//! log line to a day other than today (`Action::AddLog` has no date; main.rs
-//! stamps it now, so the input only shows on today).
+//! Skipped for the prototype: drag ordering, strikethrough on done tasks
+//! (iced text has none), and adding side work to a day other than today
+//! (`Action::AddLog` has no date; main.rs stamps it now).
 
 use std::cmp::Ordering;
 
-use fortnight_core::domain::{EventId, MAX_PRIORITY, Priority, Task, TaskId, TaskStatus};
+use fortnight_core::domain::{EventId, Priority, Task, TaskId, TaskStatus};
 use fortnight_core::parse;
+use fortnight_core::week::add_months;
 use iced::widget::{
     Column, Row, Space, button, checkbox, column, container, row, scrollable, text, text_editor,
     text_input,
 };
-use iced::{Center, Element, Fill, Theme};
-use jiff::Timestamp;
+use iced::{Center, Color, Element, Fill, Theme, border};
 use jiff::civil::Date;
+use jiff::tz::TimeZone;
+use jiff::{Timestamp, ToSpan};
 
 use super::NavKey;
 use crate::theme;
@@ -56,41 +59,46 @@ pub enum Message {
     Expand(TaskId),
     EditTitle(String),
     EditProject(String),
-    EditDue(String),
-    EditPlanned(String),
     EditEstimate(String),
     EditNotes(text_editor::Action),
     SetPriority(Priority),
-    SetPrivate(bool),
-    /// A status button in the open form (Start, Stop, Drop, Reopen).
-    SetStatus(TaskStatus),
-    /// The open form's log input.
-    EditTaskLog(String),
-    AddTaskLog,
-    /// The free-standing log input.
+    /// Open or close the due-date calendar.
+    ToggleCalendar,
+    /// Show the calendar month before (-1) or after (+1).
+    CalendarMonth(i32),
+    PickDue(Date),
+    ClearDue,
+    ToggleSubtask(usize, bool),
+    RemoveSubtask(usize),
+    EditNewSubtask(String),
+    AddSubtask,
+    /// The side work input.
     EditDayLog(String),
     AddDayLog,
     DeleteLog(EventId),
     Save,
+    /// Move the open task to Deleted.
     Delete,
     Close,
-    /// Show or hide the Done section.
+    /// Put a deleted task back.
+    Restore(TaskId),
+    /// Remove a deleted task for good.
+    DeleteForever(TaskId),
     ToggleShowDone,
-    /// Show or hide the No date section.
     ToggleShowNoDate,
+    ToggleShowDeleted,
 }
 
-/// What `main.rs` must do. FROZEN contract (round 2).
+/// What `main.rs` must do.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     None,
-    /// Set a task's status (checkbox: `Done`/`Todo`; also `Doing` for in
-    /// progress and `Dropped` for won't do).
+    /// Set a task's status: the checkbox (`Done`/`Todo`), Delete
+    /// (`Dropped`) and Restore (`Todo`).
     SetStatus(TaskId, TaskStatus),
-    /// Save the editable fields (title, notes, project, due_on, planned_for,
-    /// estimate_minutes, priority, private). `main.rs` records it for undo.
+    /// Save the editable fields. `main.rs` records it for undo.
     Update(Task),
-    /// Delete a task. `main.rs` keeps it for undo (Ctrl/Cmd+Z).
+    /// Remove a task for good (Delete forever).
     Delete(TaskId),
     /// Add a log line: attached to a task, or free-standing (`None`).
     /// `main.rs` stamps it with the current time.
@@ -101,7 +109,7 @@ pub enum Action {
     DeleteLog(EventId),
 }
 
-/// A log line, as the view needs it. FROZEN contract (round 2).
+/// A log line, as the view needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogLine {
     pub id: EventId,
@@ -113,18 +121,18 @@ pub struct LogLine {
     pub text: String,
 }
 
-/// Everything the view shows, supplied by `main.rs`. FROZEN contract
-/// (round 2).
+/// Everything the view shows, supplied by `main.rs`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DayData {
     /// The day shown (the shared selected date).
     pub day: Date,
     /// The local date today. Overdue is relative to this.
     pub today: Date,
-    /// Every task, done or not. The view picks what to show using
-    /// `Task::day()` and `Task::is_overdue(today)`.
+    /// For the local date a task was completed on.
+    pub tz: TimeZone,
+    /// Every task, in any status.
     pub tasks: Vec<Task>,
-    /// Every log line, oldest first.
+    /// Every log line, oldest first. Only free-standing ones are shown.
     pub logs: Vec<LogLine>,
 }
 
@@ -133,11 +141,12 @@ pub struct DayView {
     data: Option<DayData>,
     show_done: bool,
     show_no_date: bool,
+    show_deleted: bool,
     /// The keyboard selection highlight.
     selected: Option<TaskId>,
     /// The expanded row's form.
     editing: Option<EditForm>,
-    /// The free-standing log input.
+    /// The side work input.
     day_log: String,
 }
 
@@ -149,25 +158,39 @@ pub enum Section {
     Day,
     Done,
     NoDate,
+    Deleted,
 }
 
 impl Section {
-    /// Display order.
-    pub const ALL: [Section; 4] = [
+    /// Display order of the task sections (side work sits between Day and
+    /// Done).
+    pub const ALL: [Section; 5] = [
         Section::Overdue,
         Section::Day,
         Section::Done,
         Section::NoDate,
+        Section::Deleted,
     ];
+}
+
+/// The local date a done task was completed on; its day if the completion
+/// time is missing.
+fn completed_on(task: &Task, tz: &TimeZone) -> Option<Date> {
+    match task.completed_at {
+        Some(at) => Some(tz.to_datetime(at).date()),
+        None => task.day(),
+    }
 }
 
 /// The section `task` belongs in when `day` is shown, or `None` if it is not
 /// on screen. See the module doc for the rules.
-pub fn section_of(task: &Task, day: Date, today: Date) -> Option<Section> {
-    let shows_today = day == today;
-    if !task.status.is_open() {
-        return (task.day() == Some(day)).then_some(Section::Done);
+pub fn section_of(task: &Task, day: Date, today: Date, tz: &TimeZone) -> Option<Section> {
+    match task.status {
+        TaskStatus::Dropped => return Some(Section::Deleted),
+        TaskStatus::Done => return (completed_on(task, tz) == Some(day)).then_some(Section::Done),
+        TaskStatus::Todo | TaskStatus::Doing => {}
     }
+    let shows_today = day == today;
     let Some(task_day) = task.day() else {
         return Some(Section::NoDate);
     };
@@ -180,45 +203,45 @@ pub fn section_of(task: &Task, day: Date, today: Date) -> Option<Section> {
     }
 }
 
-/// Order for open tasks: in progress first, then higher priority, then
-/// earlier day (carried-over before today's), then manual position, then id.
+/// Order for open tasks: higher priority, then earlier day (carried-over
+/// before today's), then manual position, then id.
 fn open_order(a: &Task, b: &Task) -> Ordering {
-    let doing = |t: &Task| t.status != TaskStatus::Doing;
-    doing(a)
-        .cmp(&doing(b))
-        .then(b.priority.cmp(&a.priority))
+    b.priority
+        .cmp(&a.priority)
         .then(a.day().cmp(&b.day()))
         .then(a.position.total_cmp(&b.position))
         .then(a.id.cmp(&b.id))
 }
 
 /// The tasks in `section`, sorted. Overdue: oldest deadline first, then
-/// [`open_order`]. The day and No date: [`open_order`]. Done: most recently
-/// finished first (dropped tasks by when they were last changed).
+/// [`open_order`]. The day and No date: [`open_order`]. Completed: most
+/// recently finished first. Deleted: most recently deleted first.
 pub fn section_tasks(data: &DayData, section: Section) -> Vec<&Task> {
     let mut out: Vec<&Task> = data
         .tasks
         .iter()
-        .filter(|t| section_of(t, data.day, data.today) == Some(section))
+        .filter(|t| section_of(t, data.day, data.today, &data.tz) == Some(section))
         .collect();
     match section {
         Section::Overdue => out.sort_by(|a, b| a.due_on.cmp(&b.due_on).then(open_order(a, b))),
         Section::Day | Section::NoDate => out.sort_by(|a, b| open_order(a, b)),
-        Section::Done => out.sort_by(|a, b| {
-            let finished = |t: &Task| t.completed_at.unwrap_or(t.updated_at);
-            finished(b).cmp(&finished(a)).then(a.id.cmp(&b.id))
+        Section::Done | Section::Deleted => out.sort_by(|a, b| {
+            let when = |t: &Task| t.completed_at.unwrap_or(t.updated_at);
+            when(b).cmp(&when(a)).then(a.id.cmp(&b.id))
         }),
     }
     out
 }
 
-/// The rows on screen, top to bottom, skipping collapsed sections.
+/// The rows the keyboard moves through, top to bottom, skipping collapsed
+/// sections and Deleted.
 pub fn visible_rows(data: &DayData, show_done: bool, show_no_date: bool) -> Vec<TaskId> {
     Section::ALL
         .into_iter()
         .filter(|s| match s {
             Section::Done => show_done,
             Section::NoDate => show_no_date,
+            Section::Deleted => false,
             _ => true,
         })
         .flat_map(|s| section_tasks(data, s).into_iter().map(|t| t.id))
@@ -278,108 +301,144 @@ fn toggled(status: TaskStatus) -> TaskStatus {
     }
 }
 
+// ---------------------------------------------------------------- priority
+
+/// The three priorities the app offers, and the value each stores. Old
+/// data's 3 (`!!!`) shows as High.
+pub const PRIORITIES: [(&str, Priority); 3] = [("Low", 0), ("Medium", 1), ("High", 2)];
+
+/// The stored priority as Low (0), Medium (1) or High (2).
+fn priority_level(p: Priority) -> Priority {
+    p.min(2)
+}
+
+// ---------------------------------------------------------------- subtasks
+
+/// A checklist item kept in the notes as `- [ ] text` or `- [x] text`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subtask {
+    pub done: bool,
+    pub text: String,
+}
+
+/// One notes line as a subtask, if it is a checklist line.
+fn subtask_line(line: &str) -> Option<Subtask> {
+    let rest = line.trim_start().strip_prefix("- [")?;
+    let (mark, text) = rest.split_at_checked(1)?;
+    let text = text.strip_prefix("] ")?;
+    let done = match mark {
+        " " => false,
+        "x" | "X" => true,
+        _ => return None,
+    };
+    Some(Subtask {
+        done,
+        text: text.trim().to_string(),
+    })
+}
+
+/// Splits notes into their subtasks and the remaining text.
+pub fn split_notes(notes: &str) -> (Vec<Subtask>, String) {
+    let mut subtasks = Vec::new();
+    let mut rest = Vec::new();
+    for line in notes.lines() {
+        match subtask_line(line) {
+            Some(s) => subtasks.push(s),
+            None => rest.push(line),
+        }
+    }
+    (subtasks, rest.join("\n").trim().to_string())
+}
+
+/// Joins notes text and subtasks back into one notes string: the text, a
+/// blank line, then the checklist.
+pub fn join_notes(subtasks: &[Subtask], text: &str) -> String {
+    let list: Vec<String> = subtasks
+        .iter()
+        .map(|s| format!("- [{}] {}", if s.done { "x" } else { " " }, s.text))
+        .collect();
+    let text = text.trim();
+    match (text.is_empty(), list.is_empty()) {
+        (_, true) => text.to_string(),
+        (true, false) => list.join("\n"),
+        (false, false) => format!("{text}\n\n{}", list.join("\n")),
+    }
+}
+
+/// `(done, total)` subtasks in the notes.
+fn subtask_counts(notes: &str) -> (usize, usize) {
+    notes
+        .lines()
+        .filter_map(subtask_line)
+        .fold((0, 0), |(d, t), s| (d + usize::from(s.done), t + 1))
+}
+
+// ------------------------------------------------------------------- form
+
 /// The in-place edit form for one task.
 #[derive(Debug, Clone)]
 pub struct EditForm {
     pub id: TaskId,
     pub title: String,
     pub project: String,
-    pub due: String,
-    /// The due field as first shown, so an untouched field is not re-parsed.
-    pub original_due: String,
-    pub planned: String,
-    pub original_planned: String,
+    /// The task's one date: its deadline, or its old planned day.
+    pub due: Option<Date>,
+    pub original_due: Option<Date>,
+    /// The month the calendar shows, while it is open.
+    pub calendar: Option<Date>,
     pub estimate: String,
+    /// The estimate as first shown, so an untouched field is not re-parsed.
     pub original_estimate: String,
     pub priority: Priority,
-    pub private: bool,
+    pub subtasks: Vec<Subtask>,
+    pub new_subtask: String,
+    /// The notes without the subtasks.
     pub notes: text_editor::Content,
-    /// The log input under the task's log lines.
-    pub log: String,
+    original_split: (Vec<Subtask>, String),
     pub error: Option<String>,
-}
-
-/// Reads a date field: empty clears, unchanged keeps `current` without
-/// parsing, anything else goes through `parse_date`.
-fn read_date(
-    label: &str,
-    input: &str,
-    original: &str,
-    current: Option<Date>,
-    today: Date,
-    parse_date: &impl Fn(&str, Date) -> Option<Date>,
-) -> Result<Option<Date>, String> {
-    let input = input.trim();
-    if input.is_empty() {
-        Ok(None)
-    } else if input == original.trim() {
-        Ok(current)
-    } else {
-        parse_date(input, today).map(Some).ok_or_else(|| {
-            format!(
-                "Can't read \"{input}\" as a {} date. Try fri, tomorrow, nov 20 or +3d.",
-                label.to_lowercase()
-            )
-        })
-    }
 }
 
 impl EditForm {
     pub fn from_task(task: &Task) -> Self {
-        let date = |d: Option<Date>| d.map(|d| d.to_string()).unwrap_or_default();
         let estimate = task
             .estimate_minutes
             .map(parse::format_estimate)
             .unwrap_or_default();
+        let (subtasks, text) = split_notes(&task.notes);
+        let due = task.due_on.or(task.planned_for);
         Self {
             id: task.id,
             title: task.title.clone(),
             project: task.project.clone().unwrap_or_default(),
-            due: date(task.due_on),
-            original_due: date(task.due_on),
-            planned: date(task.planned_for),
-            original_planned: date(task.planned_for),
+            due,
+            original_due: due,
+            calendar: None,
             estimate: estimate.clone(),
             original_estimate: estimate,
-            priority: task.priority,
-            private: task.private,
-            notes: text_editor::Content::with_text(&task.notes),
-            log: String::new(),
+            priority: priority_level(task.priority),
+            subtasks: subtasks.clone(),
+            new_subtask: String::new(),
+            notes: text_editor::Content::with_text(&text),
+            original_split: (subtasks, text),
             error: None,
         }
     }
 
     /// Builds the updated task from the form, or an error message.
     ///
-    /// Date and estimate fields: empty clears; unchanged keeps the task's
-    /// value without parsing; anything else is parsed (`parse_date`,
-    /// [`parse::parse_estimate`]).
-    pub fn apply(
-        &self,
-        task: &Task,
-        today: Date,
-        parse_date: impl Fn(&str, Date) -> Option<Date>,
-    ) -> Result<Task, String> {
+    /// An unchanged due date keeps the task's dates as they are; a changed
+    /// one becomes the deadline and clears the old planned day. An unchanged
+    /// estimate is not re-parsed; a typed subtask not yet added is added.
+    pub fn apply(&self, task: &Task) -> Result<Task, String> {
         let title = self.title.trim();
         if title.is_empty() {
             return Err("The title can't be empty.".to_string());
         }
-        let due_on = read_date(
-            "Due",
-            &self.due,
-            &self.original_due,
-            task.due_on,
-            today,
-            &parse_date,
-        )?;
-        let planned_for = read_date(
-            "Planned",
-            &self.planned,
-            &self.original_planned,
-            task.planned_for,
-            today,
-            &parse_date,
-        )?;
+        let (due_on, planned_for) = if self.due == self.original_due {
+            (task.due_on, task.planned_for)
+        } else {
+            (self.due, None)
+        };
         let estimate = self.estimate.trim();
         let estimate_minutes = if estimate.is_empty() {
             None
@@ -390,6 +449,30 @@ impl EditForm {
                 format!("Can't read \"{estimate}\" as an estimate. Try 30m, 2h or 1h30m.")
             })?)
         };
+        let mut subtasks = self.subtasks.clone();
+        let typed = self.new_subtask.trim();
+        if !typed.is_empty() {
+            subtasks.push(Subtask {
+                done: false,
+                text: typed.to_string(),
+            });
+        }
+        let text = self.notes.text().trim().to_string();
+        let notes = if (subtasks.as_slice(), text.as_str())
+            == (
+                self.original_split.0.as_slice(),
+                self.original_split.1.as_str(),
+            ) {
+            task.notes.clone()
+        } else {
+            join_notes(&subtasks, &text)
+        };
+        // Keep an old `!!!` unless the priority was changed.
+        let priority = if self.priority == priority_level(task.priority) {
+            task.priority
+        } else {
+            self.priority
+        };
         let project = self.project.trim().trim_start_matches('#').trim();
         Ok(Task {
             title: title.to_string(),
@@ -397,9 +480,8 @@ impl EditForm {
             due_on,
             planned_for,
             estimate_minutes,
-            priority: self.priority.min(MAX_PRIORITY),
-            private: self.private,
-            notes: self.notes.text().trim_end().to_string(),
+            priority,
+            notes,
             ..task.clone()
         })
     }
@@ -412,12 +494,12 @@ impl DayView {
 
     /// Replaces what the view shows. `main.rs` calls this after EVERY
     /// message (and on the minute tick), so it must be cheap: if `data`
-    /// equals what the view already has, return early. It must keep
-    /// in-progress UI state (an open edit form, typed text, the selection)
-    /// unless the thing it belongs to is gone.
+    /// equals what the view already has, return early. It keeps in-progress
+    /// UI state (an open edit form, typed text, the selection) unless the
+    /// thing it belongs to is gone.
     ///
-    /// The open form closes when its task leaves the screen; if it moved
-    /// into a collapsed section (e.g. Drop), that section opens. When the
+    /// The open form closes when its task leaves the screen or is deleted;
+    /// if it moved into a collapsed section, that section opens. When the
     /// selected task leaves the visible rows, the selection moves to the
     /// next row that was below it (or above it, at the end), or none.
     pub fn load(&mut self, data: DayData) {
@@ -429,7 +511,7 @@ impl DayView {
 
         if let Some(form) = &self.editing {
             match self.section_of_id(form.id) {
-                None => self.editing = None,
+                None | Some(Section::Deleted) => self.editing = None,
                 Some(Section::Done) => self.show_done = true,
                 Some(Section::NoDate) => self.show_no_date = true,
                 Some(_) => {}
@@ -517,30 +599,48 @@ impl DayView {
             }
             Message::EditTitle(s) => self.edit(|f| f.title = s),
             Message::EditProject(s) => self.edit(|f| f.project = s),
-            Message::EditDue(s) => self.edit(|f| f.due = s),
-            Message::EditPlanned(s) => self.edit(|f| f.planned = s),
             Message::EditEstimate(s) => self.edit(|f| f.estimate = s),
             Message::EditNotes(action) => self.edit(|f| f.notes.perform(action)),
-            Message::SetPriority(p) => self.edit(|f| f.priority = p.min(MAX_PRIORITY)),
-            Message::SetPrivate(b) => self.edit(|f| f.private = b),
-            Message::EditTaskLog(s) => self.edit(|f| f.log = s),
-            Message::SetStatus(status) => match &self.editing {
-                Some(form) => Action::SetStatus(form.id, status),
-                None => Action::None,
-            },
-            Message::AddTaskLog => {
-                let Some(form) = self.editing.as_mut() else {
-                    return Action::None;
-                };
-                let text = std::mem::take(&mut form.log).trim().to_string();
-                if text.is_empty() {
-                    return Action::None;
-                }
-                Action::AddLog {
-                    task_id: Some(form.id),
-                    text,
-                }
+            Message::SetPriority(p) => self.edit(|f| f.priority = priority_level(p)),
+            Message::ToggleCalendar => {
+                let today = data.today;
+                self.edit(|f| {
+                    f.calendar = match f.calendar {
+                        Some(_) => None,
+                        None => Some(f.due.unwrap_or(today).first_of_month()),
+                    }
+                })
             }
+            Message::CalendarMonth(step) => self.edit(|f| {
+                if let Some(month) = &mut f.calendar {
+                    *month = add_months(*month, step).first_of_month();
+                }
+            }),
+            Message::PickDue(date) => self.edit(|f| {
+                f.due = Some(date);
+                f.calendar = None;
+            }),
+            Message::ClearDue => self.edit(|f| {
+                f.due = None;
+                f.calendar = None;
+            }),
+            Message::ToggleSubtask(i, done) => self.edit(|f| {
+                if let Some(s) = f.subtasks.get_mut(i) {
+                    s.done = done;
+                }
+            }),
+            Message::RemoveSubtask(i) => self.edit(|f| {
+                if i < f.subtasks.len() {
+                    f.subtasks.remove(i);
+                }
+            }),
+            Message::EditNewSubtask(s) => self.edit(|f| f.new_subtask = s),
+            Message::AddSubtask => self.edit(|f| {
+                let text = std::mem::take(&mut f.new_subtask).trim().to_string();
+                if !text.is_empty() {
+                    f.subtasks.push(Subtask { done: false, text });
+                }
+            }),
             Message::EditDayLog(s) => {
                 self.day_log = s;
                 Action::None
@@ -564,7 +664,7 @@ impl DayView {
                     self.editing = None;
                     return Action::None;
                 };
-                match form.apply(task, data.today, parse::parse_date) {
+                match form.apply(task) {
                     Ok(updated) => {
                         self.editing = None;
                         if &updated == task {
@@ -580,19 +680,25 @@ impl DayView {
                 }
             }
             Message::Delete => match self.editing.take() {
-                Some(form) => Action::Delete(form.id),
+                Some(form) => Action::SetStatus(form.id, TaskStatus::Dropped),
                 None => Action::None,
             },
             Message::Close => {
                 self.editing = None;
                 Action::None
             }
+            Message::Restore(id) => Action::SetStatus(id, TaskStatus::Todo),
+            Message::DeleteForever(id) => Action::Delete(id),
             Message::ToggleShowDone => {
                 self.show_done = !self.show_done;
                 Action::None
             }
             Message::ToggleShowNoDate => {
                 self.show_no_date = !self.show_no_date;
+                Action::None
+            }
+            Message::ToggleShowDeleted => {
+                self.show_deleted = !self.show_deleted;
                 Action::None
             }
         }
@@ -613,7 +719,7 @@ impl DayView {
 
     fn section_of_id(&self, id: TaskId) -> Option<Section> {
         let data = self.data.as_ref()?;
-        section_of(self.task(id)?, data.day, data.today)
+        section_of(self.task(id)?, data.day, data.today, &data.tz)
     }
 
     fn visible(&self) -> Vec<TaskId> {
@@ -662,30 +768,35 @@ impl DayView {
             content = content.push(self.group(heading, day_tasks, data));
         }
 
-        let done = section_tasks(data, Section::Done);
-        if !done.is_empty() {
-            content = content.push(self.collapsible(
-                "Done",
+        if let Some(side) = side_work(data, &self.day_log) {
+            content = content.push(side);
+        }
+
+        let collapsibles = [
+            (
+                Section::Done,
+                "Completed",
                 self.show_done,
                 Message::ToggleShowDone,
-                done,
-                data,
-            ));
-        }
-
-        if let Some(log) = day_log(data, &self.day_log) {
-            content = content.push(log);
-        }
-
-        let no_date = section_tasks(data, Section::NoDate);
-        if !no_date.is_empty() {
-            content = content.push(self.collapsible(
+            ),
+            (
+                Section::NoDate,
                 "No date",
                 self.show_no_date,
                 Message::ToggleShowNoDate,
-                no_date,
-                data,
-            ));
+            ),
+            (
+                Section::Deleted,
+                "Deleted",
+                self.show_deleted,
+                Message::ToggleShowDeleted,
+            ),
+        ];
+        for (section, label, open, toggle) in collapsibles {
+            let tasks = section_tasks(data, section);
+            if !tasks.is_empty() {
+                content = content.push(self.collapsible(section, label, open, toggle, tasks, data));
+            }
         }
 
         scrollable(
@@ -713,6 +824,7 @@ impl DayView {
 
     fn collapsible<'a>(
         &'a self,
+        section: Section,
         label: &'a str,
         open: bool,
         toggle: Message,
@@ -727,14 +839,19 @@ impl DayView {
                 .on_press(toggle);
         let mut group = column![header].spacing(theme::SPACING / 2.0);
         if open {
-            group = group.push(self.rows(tasks, data));
+            if section == Section::Deleted {
+                group = group
+                    .push(Column::with_children(tasks.into_iter().map(deleted_row)).spacing(2));
+            } else {
+                group = group.push(self.rows(tasks, data));
+            }
         }
         group.into()
     }
 
     fn rows<'a>(&'a self, tasks: Vec<&'a Task>, data: &'a DayData) -> Element<'a, Message> {
         Column::with_children(tasks.into_iter().map(|task| match &self.editing {
-            Some(form) if form.id == task.id => edit_card(task, form, &data.logs),
+            Some(form) if form.id == task.id => edit_card(task, form, data.today),
             _ => task_row(task, data.today, self.selected == Some(task.id)),
         }))
         .spacing(2)
@@ -742,8 +859,8 @@ impl DayView {
     }
 }
 
-/// A section heading with the open-task count and, if any task has an
-/// estimate, the total (`Today  3 · 4h30m`).
+/// A section heading with the task count and, if any task has an estimate,
+/// the total (`Today  3 · 4h30m`).
 fn heading_row<'a>(label: Element<'a, Message>, tasks: &[&Task]) -> Element<'a, Message> {
     let total: u32 = tasks.iter().filter_map(|t| t.estimate_minutes).sum();
     let mut count = tasks.len().to_string();
@@ -758,9 +875,10 @@ fn heading_row<'a>(label: Element<'a, Message>, tasks: &[&Task]) -> Element<'a, 
     .into()
 }
 
-/// The free-standing log for the shown day, or `None` when there is nothing
-/// to show (a day other than today with no lines).
-fn day_log<'a>(data: &'a DayData, input: &'a str) -> Option<Element<'a, Message>> {
+/// Side work for the shown day: free-standing log lines as ticked items,
+/// or `None` when there is nothing to show (a day other than today with
+/// none).
+fn side_work<'a>(data: &'a DayData, input: &'a str) -> Option<Element<'a, Message>> {
     let lines: Vec<&LogLine> = data
         .logs
         .iter()
@@ -770,38 +888,33 @@ fn day_log<'a>(data: &'a DayData, input: &'a str) -> Option<Element<'a, Message>
     if lines.is_empty() && !can_add {
         return None;
     }
-    let mut group = column![theme::section_heading("Log")].spacing(theme::SPACING / 2.0);
-    group = group.push(log_lines(lines));
-    if can_add {
-        group = group.push(
-            text_input("Log work that isn't a task", input)
-                .on_input(Message::EditDayLog)
-                .on_submit(Message::AddDayLog)
-                .padding([8, 10])
-                .size(theme::TEXT_SMALL)
-                .style(theme::input),
-        );
-    }
-    Some(group.into())
-}
-
-/// Log lines as quiet bullets with a delete button each.
-fn log_lines<'a>(lines: Vec<&'a LogLine>) -> Element<'a, Message> {
-    Column::with_children(lines.into_iter().map(|line| {
+    let mut group = column![theme::section_heading("Side work")].spacing(theme::SPACING / 2.0);
+    let items = Column::with_children(lines.into_iter().map(|line| {
         row![
-            text("·").size(theme::TEXT_BODY).style(theme::muted),
+            checkbox(true),
             text(&line.text).size(theme::TEXT_BODY).width(Fill),
             button(text("×").size(theme::TEXT_BODY))
                 .padding([0, 8])
                 .style(theme::text_button)
                 .on_press(Message::DeleteLog(line.id)),
         ]
-        .spacing(theme::SPACING / 2.0)
+        .spacing(theme::SPACING)
+        .padding([6, 0])
         .align_y(Center)
         .into()
-    }))
-    .spacing(4)
-    .into()
+    }));
+    group = group.push(items);
+    if can_add {
+        group = group.push(
+            text_input("Log side work", input)
+                .on_input(Message::EditDayLog)
+                .on_submit(Message::AddDayLog)
+                .padding([8, 10])
+                .size(theme::TEXT_BODY)
+                .style(theme::input),
+        );
+    }
+    Some(group.into())
 }
 
 /// A selected row: the hovered look of [`theme::row_button`], always.
@@ -809,20 +922,17 @@ fn selected_row(theme: &Theme, _status: button::Status) -> button::Style {
     theme::row_button(theme, button::Status::Hovered)
 }
 
-/// `!`, `!!` or `!!!` in the priority colour; `None` for normal priority.
+/// `!` for Medium, `!!` for High, in the priority colour; `None` for Low.
 fn priority_marker<'a>(priority: Priority) -> Option<Element<'a, Message>> {
-    (priority > 0).then(|| {
-        text("!".repeat(usize::from(priority.min(MAX_PRIORITY))))
+    let level = priority_level(priority);
+    (level > 0).then(|| {
+        text("!".repeat(usize::from(level)))
             .size(theme::TEXT_BODY)
             .style(move |theme: &Theme| text::Style {
-                color: theme::priority_color(theme, priority),
+                color: theme::priority_color(theme, level),
             })
             .into()
     })
-}
-
-fn private_marker<'a>() -> Element<'a, Message> {
-    theme::icon(theme::Icon::Lock).width(13).height(13).into()
 }
 
 fn task_row<'a>(task: &'a Task, today: Date, selected: bool) -> Element<'a, Message> {
@@ -841,22 +951,14 @@ fn task_row<'a>(task: &'a Task, today: Date, selected: bool) -> Element<'a, Mess
     if let Some(project) = &task.project {
         line = line.push(project_chip(project));
     }
-    if task.private {
-        line = line.push(private_marker());
-    }
     line = line.push(Space::new().width(Fill));
-    match task.status {
-        TaskStatus::Doing => {
-            line = line.push(
-                text("In progress")
-                    .size(theme::TEXT_SMALL)
-                    .style(theme::accent),
-            );
-        }
-        TaskStatus::Dropped => {
-            line = line.push(text("Dropped").size(theme::TEXT_SMALL).style(theme::muted));
-        }
-        TaskStatus::Todo | TaskStatus::Done => {}
+    let (done, total) = subtask_counts(&task.notes);
+    if total > 0 {
+        line = line.push(
+            text(format!("{done}/{total}"))
+                .size(theme::TEXT_SMALL)
+                .style(theme::muted),
+        );
     }
     if let Some(minutes) = task.estimate_minutes {
         line = line.push(
@@ -865,7 +967,7 @@ fn task_row<'a>(task: &'a Task, today: Date, selected: bool) -> Element<'a, Mess
                 .style(theme::muted),
         );
     }
-    if let Some(due) = task.due_on {
+    if open && let Some(due) = task.due_on {
         line = line.push(
             text(due_label(due, today))
                 .size(theme::TEXT_SMALL)
@@ -886,6 +988,28 @@ fn task_row<'a>(task: &'a Task, today: Date, selected: bool) -> Element<'a, Mess
             .on_press(Message::Expand(id)),
     ]
     .spacing(theme::SPACING / 2.0)
+    .align_y(Center)
+    .into()
+}
+
+/// A deleted task: its title, dimmed, with Restore and Delete forever.
+fn deleted_row(task: &Task) -> Element<'_, Message> {
+    row![
+        text(&task.title)
+            .size(theme::TEXT_BODY)
+            .style(theme::muted)
+            .width(Fill),
+        button(text("Restore").size(theme::TEXT_SMALL))
+            .padding([4, 10])
+            .style(theme::secondary_button)
+            .on_press(Message::Restore(task.id)),
+        button(text("Delete forever").size(theme::TEXT_SMALL))
+            .padding([4, 10])
+            .style(theme::danger_button)
+            .on_press(Message::DeleteForever(task.id)),
+    ]
+    .spacing(theme::SPACING / 2.0)
+    .padding([4, 10])
     .align_y(Center)
     .into()
 }
@@ -920,14 +1044,9 @@ fn field<'a>(
         .style(theme::input)
 }
 
-/// Normal, `!`, `!!`, `!!!` as a segmented control.
+/// Low, Medium, High as a segmented control.
 fn priority_picker<'a>(current: Priority) -> Element<'a, Message> {
-    let buttons = (0..=MAX_PRIORITY).map(|p| {
-        let label = if p == 0 {
-            "Normal".to_string()
-        } else {
-            "!".repeat(usize::from(p))
-        };
+    let buttons = PRIORITIES.into_iter().map(|(label, p)| {
         button(text(label).size(theme::TEXT_SMALL))
             .padding(theme::tab_padding())
             .style(theme::tab_button(current == p))
@@ -940,42 +1059,182 @@ fn priority_picker<'a>(current: Priority) -> Element<'a, Message> {
         .into()
 }
 
-/// Start / Stop / Drop / Reopen, depending on the status.
-fn status_buttons<'a>(status: TaskStatus) -> Element<'a, Message> {
-    let small = |label: &'a str, to: TaskStatus| {
-        button(text(label).size(theme::TEXT_SMALL))
-            .padding([5, 12])
-            .style(theme::secondary_button)
-            .on_press(Message::SetStatus(to))
+/// The due-date field: a button showing the date that opens the calendar.
+fn due_button(due: Option<Date>, today: Date) -> Element<'static, Message> {
+    let label = match due {
+        Some(d) if d.year() == today.year() => d.strftime("%a %-d %b").to_string(),
+        Some(d) => d.strftime("%a %-d %b %Y").to_string(),
+        None => String::new(),
     };
-    let drop = || {
-        button(text("Drop").size(theme::TEXT_SMALL))
-            .padding([5, 12])
-            .style(theme::text_button)
-            .on_press(Message::SetStatus(TaskStatus::Dropped))
-    };
-    let buttons: Row<'a, Message> = match status {
-        TaskStatus::Todo => row![small("Start", TaskStatus::Doing), drop()],
-        TaskStatus::Doing => row![
-            text("In progress")
-                .size(theme::TEXT_SMALL)
-                .style(theme::accent),
-            small("Stop", TaskStatus::Todo),
-            drop()
-        ],
-        TaskStatus::Done => row![
-            text("Done").size(theme::TEXT_SMALL).style(theme::muted),
-            small("Reopen", TaskStatus::Todo)
-        ],
-        TaskStatus::Dropped => row![
-            text("Dropped").size(theme::TEXT_SMALL).style(theme::muted),
-            small("Reopen", TaskStatus::Todo)
-        ],
-    };
-    buttons.spacing(theme::SPACING / 2.0).align_y(Center).into()
+    button(text(label).size(theme::TEXT_BODY))
+        .width(Fill)
+        .height(35)
+        .padding([8, 10])
+        .style(field_button)
+        .on_press(Message::ToggleCalendar)
+        .into()
 }
 
-fn edit_card<'a>(task: &'a Task, form: &'a EditForm, logs: &'a [LogLine]) -> Element<'a, Message> {
+/// A button that looks like [`theme::input`].
+fn field_button(theme: &Theme, status: button::Status) -> button::Style {
+    let p = theme.palette();
+    let mix = |t: f32| {
+        Color::from_rgb(
+            p.background.r + (p.text.r - p.background.r) * t,
+            p.background.g + (p.text.g - p.background.g) * t,
+            p.background.b + (p.text.b - p.background.b) * t,
+        )
+    };
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: Some(mix(if hovered { 0.11 } else { 0.075 }).into()),
+        text_color: p.text,
+        border: border::rounded(theme::RADIUS),
+        ..button::Style::default()
+    }
+}
+
+/// A month calendar for picking the due date, Monday first.
+fn calendar<'a>(month: Date, selected: Option<Date>, today: Date) -> Element<'a, Message> {
+    const CELL: f32 = 36.0;
+    let first = month.first_of_month();
+    let offset = i64::from(first.weekday().to_monday_zero_offset());
+    let start = first.saturating_sub(offset.days());
+
+    let arrow = |icon, step| {
+        button(theme::icon(icon))
+            .padding(theme::ICON_PADDING)
+            .style(theme::icon_button)
+            .on_press(Message::CalendarMonth(step))
+    };
+    let header = row![
+        arrow(theme::Icon::ChevronLeft, -1),
+        text(first.strftime("%B %Y").to_string())
+            .size(theme::TEXT_BODY)
+            .width(Fill)
+            .align_x(Center),
+        arrow(theme::Icon::ChevronRight, 1),
+    ]
+    .align_y(Center)
+    .width(CELL * 7.0);
+
+    let names = Row::with_children(["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"].map(|n| {
+        text(n)
+            .size(theme::TEXT_SMALL)
+            .style(theme::muted)
+            .width(CELL)
+            .align_x(Center)
+            .into()
+    }));
+
+    let mut weeks = Column::new().spacing(2);
+    for w in 0..6i64 {
+        let days = (0..7i64).map(|d| {
+            let date = start.saturating_add((w * 7 + d).days());
+            let in_month = date.month() == first.month();
+            let is_selected = selected == Some(date);
+            let is_today = date == today;
+            button(
+                text(date.day().to_string())
+                    .size(theme::TEXT_SMALL)
+                    .width(Fill)
+                    .align_x(Center),
+            )
+            .width(CELL)
+            .padding([7, 0])
+            .style(move |theme: &Theme, status| {
+                calendar_day(theme, status, in_month, is_selected, is_today)
+            })
+            .on_press(Message::PickDue(date))
+            .into()
+        });
+        weeks = weeks.push(Row::with_children(days).spacing(0));
+    }
+
+    let mut col = column![header, names, weeks].spacing(6);
+    if selected.is_some() {
+        col = col.push(
+            row![
+                Space::new().width(Fill),
+                button(text("Clear").size(theme::TEXT_SMALL))
+                    .padding([4, 10])
+                    .style(theme::text_button)
+                    .on_press(Message::ClearDue),
+            ]
+            .width(CELL * 7.0),
+        );
+    }
+    container(col)
+        .padding(theme::SPACING)
+        .style(|theme: &Theme| container::Style {
+            background: Some(theme.palette().background.into()),
+            border: border::rounded(theme::RADIUS),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+fn calendar_day(
+    theme: &Theme,
+    status: button::Status,
+    in_month: bool,
+    selected: bool,
+    today: bool,
+) -> button::Style {
+    let p = theme.palette();
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    let (background, text_color) = if selected {
+        (Some(theme::ACCENT.into()), Color::WHITE)
+    } else {
+        let color = if today {
+            theme::ACCENT
+        } else if in_month {
+            p.text
+        } else {
+            theme::muted_color(theme).scale_alpha(0.6)
+        };
+        (hovered.then(|| p.text.scale_alpha(0.08).into()), color)
+    };
+    button::Style {
+        background,
+        text_color,
+        border: border::rounded(6),
+        ..button::Style::default()
+    }
+}
+
+fn subtasks_view(form: &EditForm) -> Element<'_, Message> {
+    let mut list = Column::new().spacing(4);
+    for (i, s) in form.subtasks.iter().enumerate() {
+        let mut label = text(&s.text).size(theme::TEXT_BODY).width(Fill);
+        if s.done {
+            label = label.style(theme::muted);
+        }
+        list = list.push(
+            row![
+                checkbox(s.done).on_toggle(move |b| Message::ToggleSubtask(i, b)),
+                label,
+                button(text("×").size(theme::TEXT_BODY))
+                    .padding([0, 8])
+                    .style(theme::text_button)
+                    .on_press(Message::RemoveSubtask(i)),
+            ]
+            .spacing(theme::SPACING / 2.0)
+            .align_y(Center),
+        );
+    }
+    list.push(
+        text_input("Add a subtask", &form.new_subtask)
+            .on_input(Message::EditNewSubtask)
+            .on_submit(Message::AddSubtask)
+            .padding([8, 10])
+            .size(theme::TEXT_BODY)
+            .style(theme::input),
+    )
+    .into()
+}
+
+fn edit_card<'a>(task: &'a Task, form: &'a EditForm, today: Date) -> Element<'a, Message> {
     let id = task.id;
     let notes = text_editor(&form.notes)
         .placeholder("Notes")
@@ -993,58 +1252,29 @@ fn edit_card<'a>(task: &'a Task, form: &'a EditForm, logs: &'a [LogLine]) -> Ele
         .spacing(theme::SPACING / 2.0)
         .align_y(Center),
         row![
-            labelled(
-                "Project",
-                field("none", &form.project, Message::EditProject)
-            ),
-            labelled(
-                "Due",
-                field("fri, nov 20 or +3d", &form.due, Message::EditDue)
-            ),
-            labelled(
-                "Planned",
-                field("same as due", &form.planned, Message::EditPlanned)
-            ),
+            labelled("Project", field("", &form.project, Message::EditProject)),
+            labelled("Due", due_button(form.due, today)),
             labelled(
                 "Estimate",
-                field("2h, 30m or 1h30m", &form.estimate, Message::EditEstimate)
+                field("1h30m", &form.estimate, Message::EditEstimate)
             ),
         ]
         .spacing(theme::SPACING),
-        row![
-            priority_picker(form.priority),
-            checkbox(form.private)
-                .label("Private")
-                .text_size(theme::TEXT_SMALL)
-                .on_toggle(Message::SetPrivate),
-            Space::new().width(Fill),
-            status_buttons(task.status),
-        ]
-        .spacing(theme::SPACING)
-        .align_y(Center),
     ]
     .spacing(theme::SPACING);
+
+    if let Some(month) = form.calendar {
+        body = body.push(calendar(month, form.due, today));
+    }
+
+    body = body.push(labelled("Priority", priority_picker(form.priority)));
 
     if let Some(error) = &form.error {
         body = body.push(text(error).size(theme::TEXT_SMALL).style(theme::danger));
     }
 
+    body = body.push(labelled("Subtasks", subtasks_view(form)));
     body = body.push(labelled("Notes", notes));
-
-    let lines: Vec<&LogLine> = logs.iter().filter(|l| l.task_id == Some(id)).collect();
-    body = body.push(labelled(
-        "Log",
-        column![
-            log_lines(lines),
-            text_input("Add a log line", &form.log)
-                .on_input(Message::EditTaskLog)
-                .on_submit(Message::AddTaskLog)
-                .padding([8, 10])
-                .size(theme::TEXT_SMALL)
-                .style(theme::input),
-        ]
-        .spacing(theme::SPACING / 2.0),
-    ));
 
     body = body.push(
         row![
@@ -1108,10 +1338,18 @@ mod tests {
         t
     }
 
+    /// Completed at noon UTC on `day`.
+    fn done_on(t: Task, day: Date) -> Task {
+        let mut t = with_status(t, TaskStatus::Done);
+        t.completed_at = Some(TimeZone::UTC.to_timestamp(day.at(12, 0, 0, 0)).unwrap());
+        t
+    }
+
     fn data_for(day: Date, tasks: Vec<Task>) -> DayData {
         DayData {
             day,
             today: today(),
+            tz: TimeZone::UTC,
             tasks,
             logs: Vec::new(),
         }
@@ -1125,20 +1363,6 @@ mod tests {
 
     fn ids(tasks: &[&Task]) -> Vec<TaskId> {
         tasks.iter().map(|t| t.id).collect()
-    }
-
-    fn log(id: EventId, task_id: Option<TaskId>, day: Date, text: &str) -> LogLine {
-        LogLine {
-            id,
-            task_id,
-            at: Timestamp::UNIX_EPOCH,
-            date: day,
-            text: text.to_string(),
-        }
-    }
-
-    fn no_parse(_: &str, _: Date) -> Option<Date> {
-        panic!("parse_date must not be called")
     }
 
     /// A mix covering every section on Mon 16 Nov.
@@ -1156,15 +1380,16 @@ mod tests {
                 task(4, "planned overdue", Some(date(2026, 11, 10))),
                 today(),
             ),
-            with_status(task(5, "done today", Some(today())), TaskStatus::Done),
-            with_status(task(6, "dropped today", Some(today())), TaskStatus::Dropped),
+            done_on(task(5, "done today", Some(today())), today()),
+            with_status(task(6, "deleted", Some(today())), TaskStatus::Dropped),
             task(7, "inbox", None),
             task(8, "wednesday", Some(date(2026, 11, 18))),
-            with_status(
+            done_on(
                 task(9, "done wed", Some(date(2026, 11, 18))),
-                TaskStatus::Done,
+                date(2026, 11, 18),
             ),
-            with_status(task(10, "done no date", None), TaskStatus::Done),
+            // Due last week, done today: completed today.
+            done_on(task(10, "late but done", Some(date(2026, 11, 9))), today()),
             planned(task(11, "planned wed", None), date(2026, 11, 18)),
             with_status(task(12, "doing today", Some(today())), TaskStatus::Doing),
         ]
@@ -1174,15 +1399,20 @@ mod tests {
     fn sections_for_today() {
         let data = data_for(today(), mixed());
         assert_eq!(ids(&section_tasks(&data, Section::Overdue)), vec![4, 1]);
-        assert_eq!(ids(&section_tasks(&data, Section::Day)), vec![12, 3, 2]);
+        // Doing is a plain open task now.
+        assert_eq!(ids(&section_tasks(&data, Section::Day)), vec![3, 2, 12]);
         let mut done = ids(&section_tasks(&data, Section::Done));
         done.sort();
-        assert_eq!(done, vec![5, 6]);
+        assert_eq!(done, vec![5, 10]);
         assert_eq!(ids(&section_tasks(&data, Section::NoDate)), vec![7]);
-        // Future-day tasks and done-without-a-day are not shown.
-        for id in [8, 9, 10, 11] {
+        assert_eq!(ids(&section_tasks(&data, Section::Deleted)), vec![6]);
+        for id in [8, 9, 11] {
             let t = data.tasks.iter().find(|t| t.id == id).unwrap();
-            assert_eq!(section_of(t, today(), today()), None, "{id}");
+            assert_eq!(
+                section_of(t, today(), today(), &TimeZone::UTC),
+                None,
+                "{id}"
+            );
         }
     }
 
@@ -1194,12 +1424,8 @@ mod tests {
         assert_eq!(ids(&section_tasks(&data, Section::Day)), vec![8, 11]);
         assert_eq!(ids(&section_tasks(&data, Section::Done)), vec![9]);
         assert_eq!(ids(&section_tasks(&data, Section::NoDate)), vec![7]);
-
-        // A past day: its overdue task is in the day, nothing carries over.
-        let fri = date(2026, 11, 13);
-        let data = data_for(fri, mixed());
-        assert!(section_tasks(&data, Section::Overdue).is_empty());
-        assert_eq!(ids(&section_tasks(&data, Section::Day)), vec![1, 3]);
+        // Deleted shows on every day.
+        assert_eq!(ids(&section_tasks(&data, Section::Deleted)), vec![6]);
     }
 
     #[test]
@@ -1210,45 +1436,24 @@ mod tests {
         b.position = 1.0;
         let mut c = task(3, "c", Some(today()));
         c.priority = 2;
-        let d = with_status(task(4, "d", Some(today())), TaskStatus::Doing);
         let e = planned(task(5, "e", None), date(2026, 11, 12));
         let mut f = task(6, "f", Some(today()));
         f.priority = 1;
-        let data = data_for(today(), vec![a, b, c, d, e, f]);
-        // Doing, then priority, then earlier day, then position.
+        let data = data_for(today(), vec![a, b, c, e, f]);
         assert_eq!(
             ids(&section_tasks(&data, Section::Day)),
-            vec![4, 3, 6, 5, 2, 1]
+            vec![3, 6, 5, 2, 1]
         );
-
-        // Overdue: oldest deadline first.
-        let data = data_for(
-            today(),
-            vec![
-                task(1, "a", Some(date(2026, 11, 14))),
-                task(2, "b", Some(date(2026, 11, 2))),
-            ],
-        );
-        assert_eq!(ids(&section_tasks(&data, Section::Overdue)), vec![2, 1]);
-
-        // Done: most recently finished first.
-        let mut x = with_status(task(1, "x", Some(today())), TaskStatus::Done);
-        x.completed_at = Some(Timestamp::from_second(100).unwrap());
-        let mut y = with_status(task(2, "y", Some(today())), TaskStatus::Done);
-        y.completed_at = Some(Timestamp::from_second(200).unwrap());
-        let mut z = with_status(task(3, "z", Some(today())), TaskStatus::Dropped);
-        z.updated_at = Timestamp::from_second(150).unwrap();
-        let data = data_for(today(), vec![x, y, z]);
-        assert_eq!(ids(&section_tasks(&data, Section::Done)), vec![2, 3, 1]);
     }
 
     #[test]
-    fn visible_rows_skip_collapsed_sections() {
+    fn visible_rows_skip_collapsed_sections_and_deleted() {
         let data = data_for(today(), mixed());
-        assert_eq!(visible_rows(&data, false, false), vec![4, 1, 12, 3, 2]);
+        assert_eq!(visible_rows(&data, false, false), vec![4, 1, 3, 2, 12]);
         let all = visible_rows(&data, true, true);
         assert_eq!(all.len(), 8);
         assert_eq!(all.last(), Some(&7));
+        assert!(!all.contains(&6));
     }
 
     #[test]
@@ -1259,9 +1464,7 @@ mod tests {
             (date(2026, 11, 16), "Today"),
             (date(2026, 11, 17), "Tomorrow"),
             (date(2026, 11, 18), "Wed"),
-            (date(2026, 11, 22), "Sun"),
             (date(2026, 11, 23), "in 7d"),
-            (date(2026, 11, 29), "in 13d"),
             (date(2026, 11, 30), "Nov 30"),
             (date(2027, 1, 4), "Jan 4, 2027"),
         ];
@@ -1271,173 +1474,54 @@ mod tests {
     }
 
     #[test]
-    fn headings_and_empty_states() {
-        assert_eq!(day_heading(today(), today()), "Today");
-        assert_eq!(day_heading(date(2026, 11, 17), today()), "Tomorrow");
-        assert_eq!(day_heading(date(2026, 11, 15), today()), "Yesterday");
-        assert_eq!(day_heading(date(2026, 11, 18), today()), "Wed 18 Nov");
-        assert_eq!(
-            empty_message(date(2026, 11, 18), today()),
-            "Nothing planned for Wed 18 Nov"
-        );
-        assert!(empty_message(today(), today()).starts_with("Nothing planned for today"));
-    }
-
-    #[test]
-    fn keyboard_moves_and_stops_at_ends() {
+    fn keyboard_moves_toggles_and_closes() {
         let mut view = loaded(mixed());
-        // Rows: 4, 1, 12, 3, 2.
         view.on_key(NavKey::Down);
         assert_eq!(view.selected, Some(4));
         view.on_key(NavKey::Up);
         assert_eq!(view.selected, Some(4), "stops at the top");
-        for _ in 0..10 {
-            view.on_key(NavKey::Down);
-        }
-        assert_eq!(view.selected, Some(2), "stops at the bottom");
-        view.on_key(NavKey::Up);
-        assert_eq!(view.selected, Some(3));
-
-        // Up with nothing selected starts at the bottom.
-        view.on_key(NavKey::Close);
-        assert_eq!(view.selected, None);
-        view.on_key(NavKey::Up);
-        assert_eq!(view.selected, Some(2));
-
-        // Expanding No date adds its rows at the end.
-        view.update(Message::ToggleShowNoDate);
-        view.on_key(NavKey::Down);
-        assert_eq!(view.selected, Some(7));
-
-        // No rows: nothing selected.
-        let mut empty = loaded(Vec::new());
-        empty.on_key(NavKey::Down);
-        assert_eq!(empty.selected, None);
-        assert_eq!(empty.on_key(NavKey::Toggle), Action::None);
-    }
-
-    #[test]
-    fn keyboard_toggle_open_close() {
-        let mut view = loaded(mixed());
-        assert_eq!(view.on_key(NavKey::Toggle), Action::None, "no selection");
-        view.on_key(NavKey::Down);
         assert_eq!(
             view.on_key(NavKey::Toggle),
             Action::SetStatus(4, TaskStatus::Done)
         );
         view.on_key(NavKey::Open);
         assert_eq!(view.editing.as_ref().map(|f| f.id), Some(4));
-        // Enter again keeps typed text.
-        view.update(Message::EditTitle("typed".into()));
-        view.on_key(NavKey::Open);
-        assert_eq!(view.editing.as_ref().unwrap().title, "typed");
-        // Escape closes the form, then clears the selection.
         view.on_key(NavKey::Close);
         assert!(view.editing.is_none());
-        assert_eq!(view.selected, Some(4));
         view.on_key(NavKey::Close);
         assert_eq!(view.selected, None);
-
-        // Toggling a done row reopens it.
-        view.update(Message::ToggleShowDone);
-        view.selected = Some(5);
-        assert_eq!(
-            view.on_key(NavKey::Toggle),
-            Action::SetStatus(5, TaskStatus::Todo)
-        );
     }
 
     #[test]
-    fn selection_survives_load() {
-        let mut view = loaded(mixed());
-        view.selected = Some(12);
-        // Unrelated change: selection kept.
-        let mut tasks = mixed();
-        tasks[0].title = "renamed".into();
-        view.load(data_for(today(), tasks.clone()));
-        assert_eq!(view.selected, Some(12));
-
-        // The selected task is done (moves to the collapsed Done): the next
-        // row below is selected.
-        tasks.iter_mut().find(|t| t.id == 12).unwrap().status = TaskStatus::Done;
-        view.load(data_for(today(), tasks.clone()));
-        assert_eq!(view.selected, Some(3));
-
-        // The last row disappears: the one above is selected.
-        view.selected = Some(2);
-        tasks.retain(|t| t.id != 2);
-        view.load(data_for(today(), tasks.clone()));
-        assert_eq!(view.selected, Some(3));
-
-        // Paging to a day where none of the rows show: no selection.
-        view.load(data_for(date(2026, 11, 18), tasks));
-        assert_eq!(view.selected, None);
-    }
-
-    #[test]
-    fn load_keeps_form_and_follows_it_into_collapsed_sections() {
-        let mut view = loaded(mixed());
-        view.update(Message::Expand(2));
-        view.update(Message::EditTitle("typed".into()));
-        view.update(Message::EditDayLog("half a log".into()));
-        let mut tasks = mixed();
-        tasks.iter_mut().find(|t| t.id == 2).unwrap().status = TaskStatus::Dropped;
-        view.load(data_for(today(), tasks.clone()));
-        assert_eq!(view.editing.as_ref().unwrap().title, "typed");
-        assert!(view.show_done, "Done opens to keep the form on screen");
-        assert_eq!(view.day_log, "half a log");
-
-        // Gone from the screen: the form closes.
-        view.load(data_for(date(2026, 11, 18), tasks));
-        assert!(view.editing.is_none());
-    }
-
-    #[test]
-    fn toggling_returns_set_status() {
-        let mut view = loaded(vec![task(7, "t", None)]);
-        assert_eq!(
-            view.update(Message::Toggle(7, true)),
-            Action::SetStatus(7, TaskStatus::Done)
-        );
-        assert_eq!(
-            view.update(Message::Toggle(7, false)),
-            Action::SetStatus(7, TaskStatus::Todo)
-        );
-    }
-
-    #[test]
-    fn status_buttons_act_on_the_open_task() {
-        let mut view = loaded(vec![task(7, "t", Some(today()))]);
-        assert_eq!(
-            view.update(Message::SetStatus(TaskStatus::Doing)),
-            Action::None
-        );
-        view.update(Message::Expand(7));
-        for status in [TaskStatus::Doing, TaskStatus::Dropped, TaskStatus::Todo] {
-            assert_eq!(
-                view.update(Message::SetStatus(status)),
-                Action::SetStatus(7, status)
-            );
-        }
-        assert!(view.editing.is_some(), "status buttons keep the form open");
-    }
-
-    #[test]
-    fn delete_returns_delete_and_closes() {
+    fn delete_moves_to_deleted_and_restore_or_purge_from_there() {
         let mut view = loaded(vec![task(3, "t", None)]);
         view.update(Message::Expand(3));
-        assert_eq!(view.selected, Some(3));
-        assert_eq!(view.update(Message::Delete), Action::Delete(3));
+        assert_eq!(
+            view.update(Message::Delete),
+            Action::SetStatus(3, TaskStatus::Dropped)
+        );
         assert!(view.editing.is_none());
+        assert_eq!(
+            view.update(Message::Restore(3)),
+            Action::SetStatus(3, TaskStatus::Todo)
+        );
+        assert_eq!(view.update(Message::DeleteForever(3)), Action::Delete(3));
     }
 
     #[test]
-    fn only_one_row_expanded_and_click_again_collapses() {
-        let mut view = loaded(vec![task(1, "a", None), task(2, "b", None)]);
-        view.update(Message::Expand(1));
+    fn form_closes_when_its_task_is_deleted_and_follows_it_to_completed() {
+        let mut view = loaded(mixed());
         view.update(Message::Expand(2));
-        assert_eq!(view.editing.as_ref().map(|f| f.id), Some(2));
-        view.update(Message::Expand(2));
+        view.update(Message::EditTitle("typed".into()));
+        let mut tasks = mixed();
+        let t = tasks.iter_mut().find(|t| t.id == 2).unwrap();
+        *t = done_on(t.clone(), today());
+        view.load(data_for(today(), tasks.clone()));
+        assert_eq!(view.editing.as_ref().unwrap().title, "typed");
+        assert!(view.show_done);
+
+        tasks.iter_mut().find(|t| t.id == 2).unwrap().status = TaskStatus::Dropped;
+        view.load(data_for(today(), tasks));
         assert!(view.editing.is_none());
     }
 
@@ -1446,30 +1530,45 @@ mod tests {
         let mut t = task(4, "Same", Some(date(2026, 11, 20)));
         t.planned_for = Some(today());
         t.estimate_minutes = Some(90);
-        t.priority = 2;
-        t.private = true;
-        t.notes = "notes".into();
+        t.priority = 3;
+        t.notes = "- [x] one\nnotes\n- [ ] two".into();
         t.project = Some("work".into());
         let mut view = loaded(vec![t]);
         view.update(Message::Expand(4));
         assert_eq!(view.update(Message::Save), Action::None);
-        assert!(view.editing.is_none());
     }
 
     #[test]
-    fn edit_form_round_trip_every_field() {
-        let t = task(4, "Old", Some(date(2026, 11, 20)));
+    fn edit_form_round_trip() {
+        let mut t = task(4, "Old", Some(date(2026, 11, 20)));
+        t.planned_for = Some(date(2026, 11, 18));
         let mut view = loaded(vec![t.clone()]);
         view.update(Message::Expand(4));
+        assert_eq!(
+            view.editing.as_ref().unwrap().due,
+            Some(date(2026, 11, 20)),
+            "the deadline wins over the planned day"
+        );
         view.update(Message::EditTitle("  New title ".into()));
         view.update(Message::EditProject("#home".into()));
-        view.update(Message::EditDue("2026-11-27".into()));
-        view.update(Message::EditPlanned("tomorrow".into()));
+        view.update(Message::ToggleCalendar);
+        assert_eq!(
+            view.editing.as_ref().unwrap().calendar,
+            Some(date(2026, 11, 1))
+        );
+        view.update(Message::CalendarMonth(1));
+        view.update(Message::PickDue(date(2026, 12, 2)));
+        assert_eq!(view.editing.as_ref().unwrap().calendar, None);
         view.update(Message::EditEstimate("~1h30m".into()));
-        view.update(Message::SetPriority(9));
-        view.update(Message::SetPrivate(true));
+        view.update(Message::SetPriority(2));
+        view.update(Message::EditNewSubtask("first".into()));
+        view.update(Message::AddSubtask);
+        view.update(Message::EditNewSubtask("second".into()));
+        view.update(Message::AddSubtask);
+        view.update(Message::ToggleSubtask(0, true));
+        view.update(Message::EditNewSubtask("typed, not added".into()));
         view.update(Message::EditNotes(text_editor::Action::Edit(
-            text_editor::Edit::Paste(std::sync::Arc::new("line one\n".to_string())),
+            text_editor::Edit::Paste(std::sync::Arc::new("some notes".to_string())),
         )));
         let Action::Update(updated) = view.update(Message::Save) else {
             panic!("expected Update");
@@ -1479,105 +1578,63 @@ mod tests {
             Task {
                 title: "New title".into(),
                 project: Some("home".into()),
-                due_on: Some(date(2026, 11, 27)),
-                planned_for: Some(date(2026, 11, 17)),
+                due_on: Some(date(2026, 12, 2)),
+                planned_for: None,
                 estimate_minutes: Some(90),
-                priority: MAX_PRIORITY,
-                private: true,
-                notes: "line one".into(),
+                priority: 2,
+                notes: "some notes\n\n- [x] first\n- [ ] second\n- [ ] typed, not added".into(),
                 ..t
             }
         );
 
-        // And back: the form shows the saved values; clearing works.
-        let mut form = EditForm::from_task(&updated);
-        assert_eq!(form.estimate, "1h30m");
-        assert_eq!(form.planned, "2026-11-17");
-        assert_eq!(form.priority, MAX_PRIORITY);
-        assert!(form.private);
-        assert_eq!(form.apply(&updated, today(), no_parse).unwrap(), updated);
-        form.estimate.clear();
-        form.planned = " ".into();
-        form.due.clear();
-        let cleared = form.apply(&updated, today(), no_parse).unwrap();
-        assert_eq!(cleared.estimate_minutes, None);
-        assert_eq!(cleared.planned_for, None);
-        assert_eq!(cleared.due_on, None);
+        let form = EditForm::from_task(&updated);
+        assert_eq!(form.subtasks.len(), 3);
+        assert_eq!(form.notes.text().trim(), "some notes");
+        assert_eq!(form.apply(&updated).unwrap(), updated);
     }
 
     #[test]
-    fn apply_edit_rules() {
-        let t = task(1, "Title", Some(date(2026, 11, 20)));
-        let mut form = EditForm::from_task(&t);
-
-        // Empty due clears the date without parsing.
-        form.due = "  ".into();
-        form.project = " #work ".into();
-        let out = form.apply(&t, today(), no_parse).unwrap();
-        assert_eq!(out.due_on, None);
-        assert_eq!(out.project.as_deref(), Some("work"));
-
-        // A changed due is parsed; an invalid one is an error.
-        form.due = "fri".into();
-        let out = form
-            .apply(&t, today(), |s, _| (s == "fri").then(|| date(2026, 11, 20)))
-            .unwrap();
-        assert_eq!(out.due_on, Some(date(2026, 11, 20)));
-        form.due = "someday".into();
-        assert!(form.apply(&t, today(), |_, _| None).is_err());
-
-        // Empty title is an error; empty project is None.
-        form.due = form.original_due.clone();
-        form.project.clear();
-        assert_eq!(form.apply(&t, today(), no_parse).unwrap().project, None);
-        form.title = " ".into();
-        assert!(form.apply(&t, today(), no_parse).is_err());
-    }
-
-    #[test]
-    fn invalid_date_or_estimate_shows_error_and_saves_nothing() {
-        let mut view = loaded(vec![task(1, "Title", None)]);
+    fn clearing_the_due_date_and_invalid_estimate() {
+        let t = task(1, "t", Some(today()));
+        let mut view = loaded(vec![t]);
         view.update(Message::Expand(1));
-
-        view.update(Message::EditPlanned("blah".into()));
-        assert_eq!(view.update(Message::Save), Action::None);
-        let err = view.editing.as_ref().unwrap().error.clone().unwrap();
-        assert!(
-            err.contains("planned date") && err.contains("blah"),
-            "{err}"
-        );
-
-        // Editing clears the error.
-        view.update(Message::EditPlanned(String::new()));
-        assert!(view.editing.as_ref().unwrap().error.is_none());
-
-        view.update(Message::EditDue("someday".into()));
-        assert_eq!(view.update(Message::Save), Action::None);
-        let err = view.editing.as_ref().unwrap().error.clone().unwrap();
-        assert!(err.contains("due date") && err.contains("someday"), "{err}");
-        view.update(Message::EditDue(String::new()));
-
+        view.update(Message::ClearDue);
         view.update(Message::EditEstimate("lots".into()));
         assert_eq!(view.update(Message::Save), Action::None);
         let err = view.editing.as_ref().unwrap().error.clone().unwrap();
-        assert!(err.contains("estimate") && err.contains("lots"), "{err}");
-        assert!(view.editing.is_some(), "the form stays open");
+        assert!(err.contains("lots"), "{err}");
+        view.update(Message::EditEstimate(String::new()));
+        let Action::Update(updated) = view.update(Message::Save) else {
+            panic!("expected Update");
+        };
+        assert_eq!(updated.due_on, None);
     }
 
     #[test]
-    fn unchanged_estimate_is_not_reparsed() {
-        // 0 minutes formats as "0m", which does not parse back; leaving it
-        // untouched must keep it rather than error.
-        let mut t = task(1, "t", None);
-        t.estimate_minutes = Some(0);
-        let form = EditForm::from_task(&t);
-        assert_eq!(form.apply(&t, today(), no_parse).unwrap(), t);
+    fn notes_split_and_join() {
+        let (subs, text) = split_notes("intro\n- [ ] a\n  - [X] b\n- [y] not one\n");
+        assert_eq!(
+            subs,
+            vec![
+                Subtask {
+                    done: false,
+                    text: "a".into()
+                },
+                Subtask {
+                    done: true,
+                    text: "b".into()
+                },
+            ]
+        );
+        assert_eq!(text, "intro\n- [y] not one");
+        assert_eq!(join_notes(&subs, ""), "- [ ] a\n- [x] b");
+        assert_eq!(join_notes(&[], " x "), "x");
+        assert_eq!(subtask_counts("- [x] a\n- [ ] b\nc"), (1, 2));
     }
 
     #[test]
-    fn log_lines_add_and_delete() {
-        let mut view = loaded(vec![task(1, "t", Some(today()))]);
-        // Free-standing.
+    fn side_work_add_and_delete() {
+        let mut view = loaded(vec![]);
         assert_eq!(view.update(Message::AddDayLog), Action::None, "empty");
         view.update(Message::EditDayLog("  helped Sam debug the deploy ".into()));
         assert_eq!(
@@ -1588,42 +1645,28 @@ mod tests {
             }
         );
         assert!(view.day_log.is_empty());
-
-        // Attached to the open task.
-        assert_eq!(view.update(Message::AddTaskLog), Action::None, "no form");
-        view.update(Message::Expand(1));
-        view.update(Message::EditTaskLog("wrote the intro".into()));
-        assert_eq!(
-            view.update(Message::AddTaskLog),
-            Action::AddLog {
-                task_id: Some(1),
-                text: "wrote the intro".into()
-            }
-        );
-        assert!(view.editing.as_ref().unwrap().log.is_empty());
-        view.update(Message::EditTaskLog("   ".into()));
-        assert_eq!(view.update(Message::AddTaskLog), Action::None);
-
         assert_eq!(view.update(Message::DeleteLog(42)), Action::DeleteLog(42));
     }
 
     #[test]
     fn view_builds_in_every_state() {
-        // No window: just make sure building the element tree doesn't panic,
-        // including the expanded form with log lines and every status.
         let mut data = data_for(today(), mixed());
-        data.logs = vec![
-            log(1, None, today(), "free-standing"),
-            log(2, Some(12), today(), "on a task"),
-            log(3, None, date(2026, 11, 13), "another day"),
-        ];
+        data.logs = vec![LogLine {
+            id: 1,
+            task_id: None,
+            at: Timestamp::UNIX_EPOCH,
+            date: today(),
+            text: "side".into(),
+        }];
         let mut view = DayView::new();
         let _ = view.view();
         view.load(data.clone());
         view.update(Message::ToggleShowDone);
         view.update(Message::ToggleShowNoDate);
-        for id in [1, 12, 5, 6, 7] {
+        view.update(Message::ToggleShowDeleted);
+        for id in [1, 12, 5, 7] {
             view.update(Message::Expand(id));
+            view.update(Message::ToggleCalendar);
             let _ = view.view();
         }
         data.day = date(2026, 11, 20);

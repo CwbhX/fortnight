@@ -58,13 +58,13 @@ jobs:
       - name: Dependency check (macOS)
         if: matrix.platform == 'macos'
         run: |
-          ci/check-deps.sh target/release/fortnight macos
+          ci/check-deps.sh target/release/Fortnight macos
           ci/check-deps.sh target/release/fortnight-cli macos
 
       - name: Dependency check (Linux)
         if: matrix.platform == 'linux'
         run: |
-          ci/check-deps.sh target/release/fortnight linux
+          ci/check-deps.sh target/release/Fortnight linux
           ci/check-deps.sh target/release/fortnight-cli linux
 
       # dumpbin comes with the MSVC developer environment.
@@ -76,5 +76,5 @@ jobs:
         if: matrix.platform == 'windows'
         shell: pwsh
         run: |
-          ./ci/check-deps.ps1 target/release/fortnight.exe
+          ./ci/check-deps.ps1 target/release/Fortnight.exe
           ./ci/check-deps.ps1 target/release/fortnight-cli.exe

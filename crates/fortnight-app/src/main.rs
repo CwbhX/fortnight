@@ -6,10 +6,17 @@
 //! shared selected date, lock, gear, quick-add), then the active tab. Settings
 //! opens over the current view.
 //!
-//! Also here: undo (Ctrl/Cmd+Z: the last add, status change, edit or
-//! delete), the keyboard shortcuts of PLAN.md 4.4, OS notifications for
-//! scheduled reports, Lock, the data-folder lock file, the export dialog and
-//! the model list.
+//! Also here: undo (Ctrl/Cmd+Z, silent: the last add, status change, edit
+//! or delete), the keyboard shortcuts of PLAN.md 4.4, Lock and the unlock
+//! prompt (from the lock icon; the app never asks at launch), the data-folder
+//! lock file, the export dialog and the model list.
+//!
+//! The Week tab's Recommended tasks and Work summary update on their own:
+//! when the Week tab is shown, when its week changes and on the minute tick
+//! while it is showing, each report whose facts (or prompt) changed since its
+//! newest version is generated once. The summary is also kept up to date in
+//! the background from its scheduled day and time. An edited summary is
+//! never regenerated.
 
 use fortnight_app::theme;
 use fortnight_app::top_bar::{self, LockIcon, Tab};
@@ -89,13 +96,11 @@ enum Message {
     Models(Result<Vec<String>, String>),
     /// A keyboard shortcut (applied only where it makes sense).
     Key(Shortcut),
-    Undo,
     /// The export dialog finished: the path written, `None` if cancelled.
     Exported(Result<Option<PathBuf>, String>),
     DismissNotice,
     Unlocked(Result<SecretString, VaultError>),
     KeySaved(Result<SecretString, VaultError>),
-    PasswordChanged(Result<(), VaultError>),
     DismissError,
     Shoot,
     Shot(iced::window::Screenshot),
@@ -123,7 +128,7 @@ struct Generation {
     text: String,
     requested_model: String,
     host: Option<String>,
-    /// Started by the schedule (not a button): notify when it is ready.
+    /// Started by the schedule: badge the Week tab when it is ready.
     scheduled: bool,
     /// Aborts the request (Lock stops requests that hold the key).
     abort: iced::task::Handle,
@@ -171,8 +176,7 @@ struct Ready {
     month_view: MonthView,
     settings_view: SettingsView,
     unlock_view: UnlockView,
-    /// The unlock prompt is showing (launch with a key file, until unlocked
-    /// or skipped; or the lock icon while locked).
+    /// The unlock prompt is showing (opened from the lock icon).
     unlocking: bool,
 
     key_exists: bool,
@@ -180,8 +184,11 @@ struct Ready {
 
     generating: HashMap<ReportKey, Generation>,
     last_attempt: HashMap<ReportKey, Timestamp>,
-    /// Scheduled failures in a row per report, for the retry backoff.
+    /// Failures in a row per report, for the retry backoff.
     failures: HashMap<ReportKey, u32>,
+    /// When each prompt was last changed in Settings this session: versions
+    /// made before then are out of date.
+    prompt_changed: HashMap<ReportKind, Timestamp>,
     /// Identifies a generation, so a late message from an earlier stream for
     /// the same report can't finish a newer one.
     next_generation: u64,
@@ -191,7 +198,7 @@ struct Ready {
     models: Option<Result<Vec<String>, String>>,
     listing_models: bool,
     error: Option<String>,
-    /// A short, dismissable message (undo hint, export result, lock warning).
+    /// A short, dismissable message (export result, lock warning).
     notice: Option<String>,
     undo: Vec<Undo>,
     /// A report became ready while the Week tab wasn't showing.
@@ -307,7 +314,7 @@ impl Ready {
             Ok("settings") => (Tab::Today, true),
             _ => (Tab::Today, false),
         };
-        let unlocking = key_exists && std::env::var_os("FORTNIGHT_SKIP_UNLOCK").is_none();
+        let unlocking = false;
         // One writer at a time (PLAN.md 3.5): warn, never refuse.
         let (lock, notice) = match datadir::acquire_lock(&dir) {
             Ok((lock, None)) => (Some(lock), None),
@@ -353,6 +360,7 @@ impl Ready {
             generating: HashMap::new(),
             last_attempt: HashMap::new(),
             failures: HashMap::new(),
+            prompt_changed: HashMap::new(),
             next_generation: 0,
             testing: false,
             test_result: None,
@@ -387,9 +395,9 @@ impl Ready {
     /// Why the LLM can't be used right now, if it can't.
     fn blocked(&self) -> Option<String> {
         if !self.settings.llm.is_configured() {
-            Some("Set up an endpoint in Settings to generate.".into())
+            Some("no endpoint is set up in Settings.".into())
         } else if self.key_exists && self.api_key.is_none() {
-            Some("Unlock the API key to generate.".into())
+            Some("the API key is locked.".into())
         } else {
             None
         }
@@ -433,6 +441,7 @@ impl Ready {
                 let logs = self
                     .events
                     .iter()
+                    .filter(|e| e.task_id.is_none())
                     .filter_map(|e| {
                         Some(LogLine {
                             id: e.id,
@@ -446,6 +455,7 @@ impl Ready {
                 self.day_view.load(DayData {
                     day: self.selected,
                     today,
+                    tz: self.tz.clone(),
                     tasks: self.tasks.clone(),
                     logs,
                 });
@@ -499,27 +509,58 @@ impl Ready {
         }
     }
 
-    /// Which reports the panel offers for `week` (PLAN.md 4.2): a past week
-    /// its Summary; the current week Advice, plus the Summary once due; a
-    /// future week Advice.
+    /// Which reports the Week tab shows for `week`: a past week its
+    /// Summary; the current week Recommended tasks and the Summary; a future
+    /// week Recommended tasks.
     fn panel_kinds(&self, week: WeekRef) -> Vec<ReportKind> {
         let current = self.current_week();
         if week < current {
             vec![ReportKind::Summary]
         } else if week > current {
             vec![ReportKind::Plan]
-        } else if self.summary_due(current) {
-            vec![ReportKind::Summary, ReportKind::Plan]
         } else {
-            vec![ReportKind::Plan]
+            vec![ReportKind::Plan, ReportKind::Summary]
         }
     }
 
-    /// The summary for `week` is due (its summary day and time have passed).
-    fn summary_due(&self, week: WeekRef) -> bool {
-        due_reports(&self.now(), &self.settings.schedule, &[])
-            .iter()
-            .any(|job| job.kind == ReportKind::Summary && job.week == week)
+    /// Whether `kind` for `week` has nothing to work from, and whether it
+    /// needs (re)generating: no ready version, or the newest one was built
+    /// from other facts or before its prompt changed. An edited version
+    /// never needs it.
+    fn freshness(&self, kind: ReportKind, week: WeekRef) -> (bool, bool) {
+        let today = self.today();
+        let empty = match kind {
+            ReportKind::Summary => report::summary_is_empty(&report::summary_facts(
+                &self.tasks,
+                &self.events,
+                week,
+                today,
+                &self.tz,
+            )),
+            ReportKind::Plan => report::plan_is_empty(&report::plan_facts(
+                &self.tasks,
+                &self.events,
+                week,
+                today,
+                &self.settings,
+            )),
+        };
+        let ready = match self.store.latest_report(kind, week.start) {
+            Ok(r) => r,
+            Err(_) => return (empty, false),
+        };
+        let stale = match ready {
+            Some(r) if r.edited_md.is_some() => false,
+            Some(r) => {
+                r.digest_json != self.prepare(kind, week).digest_json
+                    || self
+                        .prompt_changed
+                        .get(&kind)
+                        .is_some_and(|at| r.created_at < *at)
+            }
+            None => !empty,
+        };
+        (empty, stale)
     }
 
     fn prepare(&self, kind: ReportKind, week: WeekRef) -> Prepared {
@@ -540,27 +581,9 @@ impl Ready {
     }
 
     fn panel_data(&mut self, week: WeekRef) -> ReportPanelData {
-        let today = self.today();
         let blocked = self.blocked();
         let mut slots = Vec::new();
         for kind in self.panel_kinds(week) {
-            let facts_md = match kind {
-                ReportKind::Summary => report::summary_facts_markdown(&report::summary_facts(
-                    &self.tasks,
-                    &self.events,
-                    week,
-                    today,
-                    &self.tz,
-                )),
-                ReportKind::Plan => report::plan_facts_markdown(&report::plan_facts(
-                    &self.tasks,
-                    &self.events,
-                    week,
-                    today,
-                    &self.settings,
-                )),
-            };
-            let preview = report::request_preview(&self.prepare(kind, week).request);
             let versions = match self.store.list_reports(kind, week.start) {
                 Ok(v) => v,
                 Err(e) => {
@@ -572,13 +595,14 @@ impl Ready {
                 kind,
                 week_start: week.start,
             };
+            let (empty, stale) = self.freshness(kind, week);
             slots.push(ReportSlot {
                 kind,
-                facts_md,
-                preview,
                 versions,
                 streaming: self.generating.get(&key).map(|g| g.text.clone()),
                 blocked: blocked.clone(),
+                empty,
+                stale,
             });
         }
         ReportPanelData {
@@ -586,6 +610,42 @@ impl Ready {
             week_label: week_label(week),
             slots,
         }
+    }
+
+    /// Generates the Week tab's reports that are out of date, once each
+    /// (none while one is in flight, and failures back off).
+    fn update_week_reports(&mut self) -> Task<Message> {
+        if self.tab != Tab::Week || self.blocked().is_some() {
+            return Task::none();
+        }
+        let week = self.week_of(self.selected);
+        let mut tasks = Vec::new();
+        for kind in self.panel_kinds(week) {
+            let key = ReportKey {
+                kind,
+                week_start: week.start,
+            };
+            let (empty, stale) = self.freshness(kind, week);
+            if !empty && stale && !self.backing_off(key) {
+                tasks.push(self.generate(kind, week, false));
+            }
+        }
+        Task::batch(tasks)
+    }
+
+    /// A recent attempt at `key` failed and its retry wait hasn't passed:
+    /// `RETRY_AFTER_MINUTES`, doubling with each further failure.
+    fn backing_off(&self, key: ReportKey) -> bool {
+        let failures = self.failures.get(&key).copied().unwrap_or(0);
+        if failures == 0 {
+            return false;
+        }
+        let wait = RETRY_AFTER_MINUTES
+            .saturating_mul(1 << (failures - 1).min(10))
+            .min(RETRY_MAX_MINUTES);
+        self.last_attempt
+            .get(&key)
+            .is_some_and(|t| Timestamp::now().duration_since(*t) < SignedDuration::from_mins(wait))
     }
 
     fn key_state(&self) -> KeyState {
@@ -651,54 +711,20 @@ impl Ready {
             return Task::none();
         };
         let ok = result.is_ok();
-        if g.scheduled {
-            if ok {
-                self.failures.remove(&key);
-                // The CLI's `run-due` may have stored one meanwhile.
-                if self
-                    .store
-                    .ready_report_keys()
-                    .is_ok_and(|keys| keys.contains(&key))
-                {
-                    return Task::none();
-                }
-            } else {
-                *self.failures.entry(key).or_insert(0) += 1;
-            }
+        if ok {
+            self.failures.remove(&key);
+        } else {
+            *self.failures.entry(key).or_insert(0) += 1;
         }
         let new = report::finish(g.prepared, result, &g.requested_model, g.host);
         if let Err(e) = self.store.insert_report(new) {
             self.error = Some(e.to_string());
             return Task::none();
         }
-        if !(ok && g.scheduled) {
-            return Task::none();
-        }
-        if self.tab != Tab::Week {
+        if ok && g.scheduled && self.tab != Tab::Week {
             self.week_badge = true;
         }
-        if !self.settings.notifications {
-            return Task::none();
-        }
-        let body = match key.kind {
-            ReportKind::Summary => "Your weekly summary is ready.",
-            ReportKind::Plan => "Advice for your week is ready.",
-        };
-        // Best-effort (PLAN.md 3.5): failures are ignored.
-        Task::perform(
-            async move {
-                let _ = tokio::task::spawn_blocking(move || {
-                    notify_rust::Notification::new()
-                        .summary("Fortnight")
-                        .body(body)
-                        .show()
-                        .map(|_| ())
-                })
-                .await;
-            },
-            |()| Message::DismissNotice,
-        )
-        .discard()
+        Task::none()
     }
 
     /// Remembers a change for undo.
@@ -712,7 +738,6 @@ impl Ready {
     /// Takes back the last change (Ctrl/Cmd+Z).
     fn undo(&mut self) {
         let Some(last) = self.undo.pop() else {
-            self.notice = Some("Nothing to undo.".into());
             return;
         };
         let result = match &last {
@@ -729,7 +754,7 @@ impl Ready {
                 .map_err(|e| e.to_string()),
         };
         match result {
-            Ok(what) => self.notice = Some(what.into()),
+            Ok(_) => {}
             Err(e) => {
                 self.error = Some(format!("Could not undo: {e}"));
                 // Keep the entry (and its saved copy) for another try.
@@ -777,38 +802,32 @@ impl Ready {
         self.tasks.iter().find(|t| t.id == id)
     }
 
-    /// The schedule: generates whatever is due (PLAN.md section 8). Runs at
-    /// launch and every minute. Waits quietly while locked or unconfigured;
-    /// a failed attempt is retried after `RETRY_AFTER_MINUTES`, doubling with
-    /// each further failure.
+    /// The schedule (PLAN.md section 8), at launch and every minute: from
+    /// its day and time the summary is kept up to date (generated when
+    /// missing or out of date); Recommended tasks are generated when
+    /// missing (otherwise only when the Week tab is shown). Waits quietly
+    /// while locked or unconfigured; failures back off.
     fn run_due(&mut self) -> Task<Message> {
         if self.blocked().is_some() || self.tasks.is_empty() {
             return Task::none();
         }
-        let existing = match self.store.ready_report_keys() {
-            Ok(k) => k,
-            Err(e) => {
-                self.error = Some(e.to_string());
-                return Task::none();
-            }
-        };
-        let now = Timestamp::now();
-        let jobs = due_reports(&self.now(), &self.settings.schedule, &existing);
+        let jobs = due_reports(&self.now(), &self.settings.schedule, &[]);
         let mut tasks = Vec::new();
         for job in jobs {
             let key = ReportKey {
                 kind: job.kind,
                 week_start: job.week.start,
             };
-            let failures = self.failures.get(&key).copied().unwrap_or(0);
-            let wait = RETRY_AFTER_MINUTES
-                .saturating_mul(1 << failures.saturating_sub(1).min(10))
-                .min(RETRY_MAX_MINUTES);
-            let recently_tried = self
-                .last_attempt
-                .get(&key)
-                .is_some_and(|t| now.duration_since(*t) < SignedDuration::from_mins(wait));
-            if !recently_tried {
+            let (empty, stale) = self.freshness(job.kind, job.week);
+            let missing = !matches!(
+                self.store.latest_report(job.kind, job.week.start),
+                Ok(Some(_))
+            );
+            let wanted = match job.kind {
+                ReportKind::Summary => stale,
+                ReportKind::Plan => missing,
+            };
+            if wanted && !empty && !self.backing_off(key) {
                 tasks.push(self.generate(job.kind, job.week, true));
             }
         }
@@ -866,7 +885,7 @@ impl Ready {
                 }
                 UnlockAction::Unlock(password) => self.unlock(password),
             },
-            Message::Tick => self.run_due(),
+            Message::Tick => Task::batch([self.run_due(), self.update_week_reports()]),
             Message::Stream(key, id, item) => match item {
                 Ok(ChatEvent::Delta(d)) if self.generating.contains_key(&key) => {
                     if let Some(g) = self.generating.get_mut(&key) {
@@ -906,10 +925,6 @@ impl Ready {
                 Task::none()
             }
             Message::Key(shortcut) => self.shortcut(shortcut),
-            Message::Undo => {
-                self.undo();
-                Task::none()
-            }
             Message::Exported(result) => {
                 match result {
                     Ok(Some(path)) => {
@@ -929,32 +944,22 @@ impl Ready {
                     Ok(key) => {
                         self.api_key = Some(key);
                         self.unlocking = false;
-                        self.key_message = Some(Ok("Unlocked.".into()));
+                        self.key_message = None;
                     }
-                    Err(e) => {
-                        self.unlock_view.set_error(e.to_string());
-                        self.key_message = Some(Err(e.to_string()));
-                    }
+                    Err(e) => self.unlock_view.set_error(e.to_string()),
                 }
-                self.run_due()
+                Task::batch([self.run_due(), self.update_week_reports()])
             }
             Message::KeySaved(result) => {
                 match result {
                     Ok(key) => {
                         self.api_key = Some(key);
                         self.key_exists = true;
-                        self.key_message = Some(Ok("API key saved and encrypted.".into()));
+                        self.key_message = Some(Ok("Saved.".into()));
                     }
                     Err(e) => self.key_message = Some(Err(e.to_string())),
                 }
-                self.run_due()
-            }
-            Message::PasswordChanged(result) => {
-                self.key_message = Some(match result {
-                    Ok(()) => Ok("Password changed.".into()),
-                    Err(e) => Err(e.to_string()),
-                });
-                Task::none()
+                Task::batch([self.run_due(), self.update_week_reports()])
             }
             Message::DismissError => {
                 self.error = None;
@@ -973,19 +978,19 @@ impl Ready {
                 if tab == Tab::Week {
                     self.week_badge = false;
                 }
-                Task::none()
+                self.update_week_reports()
             }
             top_bar::Message::Prev => {
                 self.selected = top_bar::step(self.tab, self.selected, -1);
-                Task::none()
+                self.update_week_reports()
             }
             top_bar::Message::Next => {
                 self.selected = top_bar::step(self.tab, self.selected, 1);
-                Task::none()
+                self.update_week_reports()
             }
             top_bar::Message::Today => {
                 self.selected = self.today();
-                Task::none()
+                self.update_week_reports()
             }
             top_bar::Message::Lock => {
                 if self.api_key.is_some() {
@@ -1054,15 +1059,6 @@ impl Ready {
             }
             day::Action::Delete(id) => match self.store.delete_task(id) {
                 Ok(deleted) => {
-                    self.notice = Some(format!(
-                        "Deleted \"{}\". Press {}Z to undo.",
-                        deleted.task.title,
-                        if cfg!(target_os = "macos") {
-                            "⌘"
-                        } else {
-                            "Ctrl+"
-                        }
-                    ));
                     self.remember(Undo::Deleted(Box::new(deleted)));
                     Ok(())
                 }
@@ -1081,9 +1077,15 @@ impl Ready {
     fn panel_action(&mut self, action: report_panel::Action) -> Task<Message> {
         match action {
             report_panel::Action::None => Task::none(),
-            report_panel::Action::Generate(kind, week) => self.generate(kind, week, false),
+            report_panel::Action::Generate(kind, week) => {
+                self.failures.remove(&ReportKey {
+                    kind,
+                    week_start: week.start,
+                });
+                self.generate(kind, week, false)
+            }
             report_panel::Action::SaveEdit(id, text) => {
-                if let Err(e) = self.store.set_report_edit(id, Some(&text)) {
+                if let Err(e) = self.store.set_report_edit(id, text.as_deref()) {
                     self.error = Some(e.to_string());
                 }
                 Task::none()
@@ -1132,6 +1134,9 @@ impl Ready {
     /// showing, only the keys that close or toggle them apply.
     fn shortcut(&mut self, shortcut: Shortcut) -> Task<Message> {
         if self.unlocking {
+            if shortcut == Shortcut::Escape {
+                self.unlocking = false;
+            }
             return Task::none();
         }
         if self.settings_open {
@@ -1189,7 +1194,7 @@ impl Ready {
         }
         self.testing = false;
         self.listing_models = false;
-        self.key_message = Some(Ok("Locked.".into()));
+        self.key_message = None;
     }
 
     fn settings_action(&mut self, action: settings::Action) -> Task<Message> {
@@ -1201,11 +1206,20 @@ impl Ready {
                 Task::none()
             }
             settings::Action::Save(s) => {
+                let now = Timestamp::now();
+                if report::summary_prompt(&s) != report::summary_prompt(&self.settings)
+                    || s.summary_instructions != self.settings.summary_instructions
+                {
+                    self.prompt_changed.insert(ReportKind::Summary, now);
+                }
+                if report::plan_prompt(&s) != report::plan_prompt(&self.settings) {
+                    self.prompt_changed.insert(ReportKind::Plan, now);
+                }
                 match self.store.save_settings(&s) {
                     Ok(()) => self.settings = s,
                     Err(e) => self.error = Some(e.to_string()),
                 }
-                self.run_due()
+                Task::batch([self.run_due(), self.update_week_reports()])
             }
             settings::Action::Test(llm) => match self.client_for(&llm) {
                 Ok((client, _)) => {
@@ -1254,13 +1268,6 @@ impl Ready {
                     Message::KeySaved,
                 )
             }
-            settings::Action::ChangePassword { old, new } => {
-                self.key_message = None;
-                blocking(
-                    move || vault::change_password(&key_path, &old, &new),
-                    Message::PasswordChanged,
-                )
-            }
             settings::Action::RemoveKey => {
                 match vault::remove(&key_path) {
                     Ok(()) => {
@@ -1276,7 +1283,11 @@ impl Ready {
                 self.lock();
                 Task::none()
             }
-            settings::Action::Unlock(password) => self.unlock(password),
+            settings::Action::ShowUnlock => {
+                self.unlocking = true;
+                UnlockView::focus().map(Message::Unlock)
+            }
+            settings::Action::FocusPassword => operation::focus(settings::PASSWORD_INPUT_ID),
         }
     }
 
@@ -1288,10 +1299,14 @@ impl Ready {
     // ---- view ----
 
     fn view(&self) -> Element<'_, Message> {
-        if self.unlocking {
-            return self.unlock_view.view().map(Message::Unlock);
+        let base = self.main_view();
+        if !self.unlocking {
+            return base;
         }
+        stack![base, opaque(self.unlock_view.view().map(Message::Unlock))].into()
+    }
 
+    fn main_view(&self) -> Element<'_, Message> {
         let today = self.today();
         let bar = top_bar::view(top_bar::Bar {
             tab: self.tab,
@@ -1319,13 +1334,6 @@ impl Ready {
             let mut bar = row![text(n.as_str()).width(Fill).style(theme::muted)]
                 .spacing(theme::SPACING)
                 .align_y(iced::Center);
-            if n.starts_with("Deleted") && !self.undo.is_empty() {
-                bar = bar.push(
-                    button(text("Undo"))
-                        .style(theme::secondary_button)
-                        .on_press(Message::Undo),
-                );
-            }
             bar = bar.push(
                 button(text("Dismiss"))
                     .style(theme::text_button)
