@@ -31,7 +31,7 @@
 use crate::theme;
 use crate::views::report_panel::{self, ReportPanel, ReportPanelData};
 use fortnight_core::domain::{ReportKind, Task, TaskId, TaskStatus, WeekRef};
-use fortnight_core::report::DayLoad;
+use fortnight_core::report::{self, ColumnLoad, DayLoad, fmt_hours};
 use iced::widget::text::Wrapping;
 use iced::widget::{
     Column, Row, button, checkbox, column, container, mouse_area, pin, progress_bar, row,
@@ -57,6 +57,9 @@ pub enum Message {
     /// While dragging, the pointer entered a day column's free space
     /// (`None`) or the card of this task.
     Hover(Date, Option<TaskId>),
+    /// While dragging, the pointer left what `Hover` with the same day and
+    /// card reported entering.
+    Leave(Date, Option<TaskId>),
     /// A dragged card was let go there.
     DropOn(Date, Option<TaskId>),
     /// The mouse button went up: the drag (if any) is over.
@@ -74,7 +77,11 @@ impl Message {
     pub fn is_pointer_move(&self) -> bool {
         matches!(
             self,
-            Message::Press(_) | Message::Moved(_) | Message::Hover(..) | Message::EndDrag
+            Message::Press(_)
+                | Message::Moved(_)
+                | Message::Hover(..)
+                | Message::Leave(..)
+                | Message::EndDrag
         )
     }
 }
@@ -134,6 +141,8 @@ pub struct WeekData {
 #[derive(Debug, Default)]
 pub struct WeekView {
     data: Option<WeekData>,
+    /// Worked out from `data` by `load`; `view` only reads it.
+    layout: Layout,
     panel: ReportPanel,
     drag: Option<Drag>,
 }
@@ -152,6 +161,7 @@ impl WeekView {
             return;
         }
         self.panel.load(data.panel.clone());
+        self.layout = Layout::new(&data);
         self.data = Some(data);
     }
 
@@ -198,6 +208,16 @@ impl WeekView {
                 }
                 Action::None
             }
+            // Only if it is still the target: leaving one target and
+            // entering the next may arrive in either order.
+            Message::Leave(day, card) => {
+                if let Some(drag) = &mut self.drag
+                    && drag.over == Some((day, card))
+                {
+                    drag.over = None;
+                }
+                Action::None
+            }
             Message::DropOn(day, before) => {
                 let Some(drag) = self.drag.take().filter(|d| d.active) else {
                     return Action::None;
@@ -205,7 +225,10 @@ impl WeekView {
                 let Some(data) = &self.data else {
                     return Action::None;
                 };
-                match drop_position(&data.tasks, drag.id, day, before) {
+                let Some(task) = data.tasks.iter().find(|t| t.id == drag.id) else {
+                    return Action::None;
+                };
+                match drop_position(task, &self.layout.tasks(&data.tasks, day), day, before) {
                     Some(position) => Action::Move(drag.id, day, position),
                     None => Action::None,
                 }
@@ -227,15 +250,17 @@ impl WeekView {
         let Some(data) = &self.data else {
             return text("Loading…").style(theme::muted).into();
         };
-        let specs = columns(data);
         let dragging = self.dragging();
+        // The dragged task, if it still exists.
+        let held = dragging.and_then(|d| data.tasks.iter().find(|t| t.id == d.id));
 
         // Equal heights: the backgrounds are pushed under the contents in a
         // stack, so they take the height of the tallest column (iced's row
         // can't stretch its children to the tallest one inside a scrollable).
         let mut backgrounds = Row::new().spacing(theme::SPACING);
         let mut contents = Row::new().spacing(theme::SPACING);
-        for spec in &specs {
+        for column in &self.layout.columns {
+            let spec = &column.spec;
             let day = spec.days[0];
             let mut free =
                 mouse_area(container(space()).width(Fill).height(Fill).style(
@@ -250,10 +275,11 @@ impl WeekView {
                 // The column's free space: drop after its open tasks.
                 free = free
                     .on_enter(Message::Hover(day, None))
+                    .on_exit(Message::Leave(day, None))
                     .on_release(Message::DropOn(day, None));
             }
             backgrounds = backgrounds.push(free);
-            contents = contents.push(day_column(data, spec, dragging));
+            contents = contents.push(day_column(data, &self.layout, column, dragging, held));
         }
         let base = row![
             space().width(0).height(MIN_COLUMN_HEIGHT),
@@ -274,7 +300,7 @@ impl WeekView {
         let mut layers = stack![body.padding(theme::SPACING * 2.0)];
         if let Some(drag) = dragging
             && let Some(at) = drag.at
-            && let Some(task) = data.tasks.iter().find(|t| t.id == drag.id)
+            && let Some(task) = held
         {
             let ghost = container(task_card(
                 task,
@@ -358,6 +384,69 @@ fn title_bar_style(theme: &Theme, radius: f32) -> container::Style {
     }
 }
 
+/// What `view` shows, worked out once per `load` rather than on every
+/// frame (`view` runs on every pointer move while dragging, and
+/// `WeekData::tasks` holds every task there is).
+#[derive(Debug, Default)]
+struct Layout {
+    /// Each day of the week with its tasks in `by_day` order, as indices
+    /// into `WeekData::tasks`.
+    days: Vec<(Date, Vec<usize>)>,
+    columns: Vec<DayColumn>,
+}
+
+impl Layout {
+    fn new(data: &WeekData) -> Self {
+        let days = by_day(&data.tasks, &data.week.days());
+        let columns = columns(data, &days)
+            .into_iter()
+            .map(|spec| {
+                let (name, dates) = heading_text(&spec);
+                let open_day = spec
+                    .days
+                    .iter()
+                    .copied()
+                    .find(|d| !on(&days, *d).is_empty())
+                    .unwrap_or(spec.days[0]);
+                let load = load_line(&report::column_load(&data.tasks, &spec.days, &data.loads));
+                DayColumn {
+                    spec,
+                    name,
+                    dates,
+                    open_day,
+                    load,
+                }
+            })
+            .collect();
+        Layout { days, columns }
+    }
+
+    /// The tasks on `day` (one of the week's), in `by_day` order.
+    fn tasks<'a>(&self, tasks: &'a [Task], day: Date) -> Vec<&'a Task> {
+        on(&self.days, day).iter().map(|&i| &tasks[i]).collect()
+    }
+}
+
+/// The indices listed for `day` in `by_day`'s output (none for a day it
+/// doesn't list).
+fn on(days: &[(Date, Vec<usize>)], day: Date) -> &[usize] {
+    days.iter()
+        .find(|(d, _)| *d == day)
+        .map_or(&[], |(_, tasks)| tasks.as_slice())
+}
+
+/// One column as shown: what it lists, its heading and its load bar.
+#[derive(Debug, Clone, PartialEq)]
+struct DayColumn {
+    spec: ColumnSpec,
+    /// The heading: weekday name(s), then the date(s) (`heading_text`).
+    name: String,
+    dates: String,
+    /// The day the heading opens: the first one with tasks.
+    open_day: Date,
+    load: LoadLine,
+}
+
 /// One column of the grid: the days it lists, in order.
 #[derive(Debug, Clone, PartialEq)]
 struct ColumnSpec {
@@ -368,10 +457,12 @@ struct ColumnSpec {
 }
 
 /// The columns to show: every working day in week order, then the shared
-/// non-working column when one of its days has tasks.
-fn columns(data: &WeekData) -> Vec<ColumnSpec> {
-    let days = data.week.days();
-    let (working, other): (Vec<Date>, Vec<Date>) = days
+/// non-working column when one of its days has tasks (`days` from
+/// `by_day`).
+fn columns(data: &WeekData, days: &[(Date, Vec<usize>)]) -> Vec<ColumnSpec> {
+    let (working, other): (Vec<Date>, Vec<Date>) = data
+        .week
+        .days()
         .into_iter()
         .partition(|d| data.working_days.contains(&d.weekday()));
     let mut out: Vec<ColumnSpec> = working
@@ -382,7 +473,7 @@ fn columns(data: &WeekData) -> Vec<ColumnSpec> {
             is_today: d == data.today,
         })
         .collect();
-    if other.iter().any(|d| !tasks_on(&data.tasks, *d).is_empty()) {
+    if other.iter().any(|d| !on(days, *d).is_empty()) {
         out.push(ColumnSpec {
             is_today: other.contains(&data.today),
             days: other,
@@ -392,33 +483,31 @@ fn columns(data: &WeekData) -> Vec<ColumnSpec> {
     out
 }
 
-/// Tasks whose `Task::day()` is `day`, without dropped ones: open first,
-/// then done; by position.
-fn tasks_on(tasks: &[Task], day: Date) -> Vec<&Task> {
-    let mut out: Vec<&Task> = tasks
-        .iter()
-        .filter(|t| t.day() == Some(day) && t.status != TaskStatus::Dropped)
-        .collect();
-    out.sort_by(|a, b| {
-        (!a.status.is_open())
-            .cmp(&!b.status.is_open())
-            .then(a.position.total_cmp(&b.position))
-            .then(a.id.cmp(&b.id))
-    });
+/// For each of `days`, the tasks whose `Task::day()` it is, without
+/// dropped ones, as indices into `tasks`: open first, then done; by
+/// position.
+fn by_day(tasks: &[Task], days: &[Date]) -> Vec<(Date, Vec<usize>)> {
+    let mut out: Vec<(Date, Vec<usize>)> = days.iter().map(|d| (*d, Vec::new())).collect();
+    for (i, t) in tasks.iter().enumerate() {
+        if t.status == TaskStatus::Dropped {
+            continue;
+        }
+        if let Some(day) = t.day()
+            && let Some((_, list)) = out.iter_mut().find(|(d, _)| *d == day)
+        {
+            list.push(i);
+        }
+    }
+    for (_, list) in &mut out {
+        list.sort_by(|&a, &b| {
+            let (a, b) = (&tasks[a], &tasks[b]);
+            (!a.status.is_open())
+                .cmp(&!b.status.is_open())
+                .then(a.position.total_cmp(&b.position))
+                .then(a.id.cmp(&b.id))
+        });
+    }
     out
-}
-
-/// Minutes as a short duration: 30 → "30m", 90 → "1.5h", 120 → "2h".
-fn duration(minutes: u32) -> String {
-    if minutes < 60 {
-        return format!("{minutes}m");
-    }
-    let tenths = (minutes * 10 + 30) / 60;
-    if tenths.is_multiple_of(10) {
-        format!("{}h", tenths / 10)
-    } else {
-        format!("{}.{}h", tenths / 10, tenths % 10)
-    }
 }
 
 /// The column heading: the weekday (or "Sat–Sun") and the date(s).
@@ -458,7 +547,7 @@ fn date_label(d: Date) -> String {
 fn meta_line(task: &Task) -> String {
     let mut parts = Vec::new();
     if let Some(m) = task.estimate_minutes {
-        parts.push(duration(m));
+        parts.push(fmt_hours(m));
     }
     if let Some(p) = &task.project {
         parts.push(format!("#{p}"));
@@ -474,33 +563,41 @@ fn due_corner(task: &Task, column_day: Date) -> Option<String> {
         .map(|due| due.strftime("%a %-d").to_string())
 }
 
+/// A column: its title bar over its cards.
 fn day_column<'a>(
     data: &'a WeekData,
-    spec: &ColumnSpec,
+    layout: &Layout,
+    column: &DayColumn,
     drag: Option<&Drag>,
+    held: Option<&Task>,
 ) -> Element<'a, Message> {
-    let dragged = drag.map(|d| d.id);
-    let over = drag.and_then(|d| d.over);
-    let (name, dates) = heading_text(spec);
+    let list = card_list(data, layout, &column.spec, drag, held);
+    container(column![
+        column_title(column),
+        container(Column::new().spacing(8).width(Fill).push(list)).padding(theme::SPACING)
+    ])
+    .padding(COLUMN_RING)
+    .width(Fill)
+    .into()
+}
+
+/// A column's title bar: the heading (opens the day), the `+` and the load
+/// bar.
+fn column_title<'a>(column: &DayColumn) -> Element<'a, Message> {
+    let spec = &column.spec;
     let name_style: fn(&Theme) -> text::Style = if spec.is_today {
         theme::accent
     } else {
         text::default
     };
-    let open_day = spec
-        .days
-        .iter()
-        .copied()
-        .find(|d| !tasks_on(&data.tasks, *d).is_empty())
-        .unwrap_or(spec.days[0]);
     let heading = button(
         row![
-            text(name)
+            text(column.name.clone())
                 .size(theme::TEXT_BODY)
                 .style(name_style)
                 .font(theme::FONT_BOLD)
                 .wrapping(Wrapping::None),
-            text(dates)
+            text(column.dates.clone())
                 .size(theme::TEXT_SMALL)
                 .style(theme::muted)
                 .wrapping(Wrapping::None),
@@ -511,7 +608,7 @@ fn day_column<'a>(
     .padding(0)
     .width(Fill)
     .style(theme::text_button)
-    .on_press(Message::OpenDay(open_day));
+    .on_press(Message::OpenDay(column.open_day));
     // `+` in the top right: a new task for the column's (first) day.
     let add = tooltip(
         button(theme::icon(theme::Icon::Plus))
@@ -523,41 +620,29 @@ fn day_column<'a>(
     );
     // The heading sits in a title bar like the Work Summary's, inset by
     // today's ring so the ring stays visible around it.
-    let mut bar = Column::new()
+    let bar = Column::new()
         .spacing(6)
-        .push(row![heading, add].align_y(Center));
-    // Non-working days have no capacity of their own: they get a working
-    // day's for each of their days that has tasks.
-    let capacity: u32 = data
-        .loads
-        .iter()
-        .filter(|l| spec.days.contains(&l.date))
-        .map(|l| l.capacity_minutes)
-        .sum();
-    let day_tasks: Vec<&Task> = spec
-        .days
-        .iter()
-        .flat_map(|d| tasks_on(&data.tasks, *d))
-        .collect();
-    let capacity = if capacity > 0 {
-        capacity
-    } else {
-        let busy = spec
-            .days
-            .iter()
-            .filter(|d| !tasks_on(&data.tasks, **d).is_empty())
-            .count()
-            .max(1) as u32;
-        nominal_capacity(&data.loads) * busy
-    };
-    bar = bar.push(load_view(load_line(&day_tasks, capacity)));
-    let heading = container(bar)
+        .push(row![heading, add].align_y(Center))
+        .push(load_view(&column.load));
+    container(bar)
         .padding([theme::SPACING * 0.6, theme::SPACING])
         .width(Fill)
-        .style(title_bar(theme::RADIUS - COLUMN_RING));
+        .style(title_bar(theme::RADIUS - COLUMN_RING))
+        .into()
+}
 
-    let mut col = Column::new().spacing(8).width(Fill);
-
+/// A column's cards, day by day (with a small heading per day in the
+/// shared non-working column), or "Nothing planned". `held` is the dragged
+/// task.
+fn card_list<'a>(
+    data: &'a WeekData,
+    layout: &Layout,
+    spec: &ColumnSpec,
+    drag: Option<&Drag>,
+    held: Option<&Task>,
+) -> Element<'a, Message> {
+    let dragged = drag.map(|d| d.id);
+    let over = drag.and_then(|d| d.over);
     // Cards sit on fixed 8 px slots that double as the landing line, so
     // showing the line never moves anything (which would move the target
     // under the pointer and make the line jump back and forth).
@@ -565,13 +650,12 @@ fn day_column<'a>(
     let mut any = false;
     // The line shows only where a drop would change something, and only
     // among other open tasks (not in an empty day).
-    let shows_line = |day: Date, before: Option<TaskId>| {
-        dragged.is_some_and(|id| {
-            over == Some((day, before)) && line_wanted(&data.tasks, id, day, before)
-        })
+    let shows_line = |day: Date, tasks: &[&Task], before: Option<TaskId>| {
+        over == Some((day, before))
+            && held.is_some_and(|held| line_wanted(held, tasks, day, before))
     };
     for day in &spec.days {
-        let tasks = tasks_on(&data.tasks, *day);
+        let tasks = layout.tasks(&data.tasks, *day);
         if tasks.is_empty() {
             continue;
         }
@@ -579,17 +663,17 @@ fn day_column<'a>(
             list = list.push(theme::section_heading(day.strftime("%a %-d").to_string()));
         }
         let open = tasks.iter().filter(|t| t.status.is_open()).count();
-        for (i, task) in tasks.into_iter().enumerate() {
+        for (i, task) in tasks.iter().enumerate() {
             any = true;
             list = list.push(task_row(
                 task,
                 *day,
                 data.today,
                 dragged.is_some().then_some(dragged == Some(task.id)),
-                shows_line(*day, Some(task.id)),
+                shows_line(*day, &tasks, Some(task.id)),
             ));
             if i + 1 == open {
-                list = list.push(slot(shows_line(*day, None)));
+                list = list.push(slot(shows_line(*day, &tasks, None)));
             }
         }
     }
@@ -600,22 +684,7 @@ fn day_column<'a>(
                 .style(theme::muted),
         );
     }
-    col = col.push(list);
-
-    container(column![heading, container(col).padding(theme::SPACING)])
-        .padding(COLUMN_RING)
-        .width(Fill)
-        .into()
-}
-
-/// A working day's capacity (the largest in the week; 8h if none).
-fn nominal_capacity(loads: &[DayLoad]) -> u32 {
-    loads
-        .iter()
-        .map(|l| l.capacity_minutes)
-        .max()
-        .filter(|m| *m > 0)
-        .unwrap_or(480)
+    list.into()
 }
 
 /// Width of today's accent ring (`theme::day_column`); the title bar sits
@@ -639,60 +708,41 @@ struct LoadLine {
     figures: String,
 }
 
-/// The load bar for `tasks` (one column's, deleted ones left out) against
-/// `capacity` minutes.
-fn load_line(tasks: &[&Task], capacity: u32) -> LoadLine {
-    let capacity = capacity.max(1);
-    let estimated: u32 = tasks.iter().filter_map(|t| t.estimate_minutes).sum();
-    let untimed = tasks
-        .iter()
-        .filter(|t| t.estimate_minutes.is_none())
-        .count() as u32;
-    // Each untimed task's share of what the estimates leave free.
-    let share = match untimed {
-        0 => 0.0,
-        n => capacity.saturating_sub(estimated) as f32 / n as f32,
-    };
-    let minutes = |t: &Task| t.estimate_minutes.map_or(share, |m| m as f32);
-    let planned: f32 = tasks.iter().map(|t| minutes(t)).sum();
-    let done: f32 = tasks
-        .iter()
-        .filter(|t| t.status == TaskStatus::Done)
-        .map(|t| minutes(t))
-        .sum();
-    let over_by = (estimated > capacity).then(|| estimated - capacity);
-
+/// The bar's figures for a column's load.
+fn load_line(load: &ColumnLoad) -> LoadLine {
     let mut figures = vec![format!(
         "{} of {} estimated",
-        duration(estimated),
-        duration(capacity)
+        fmt_hours(load.estimated_minutes),
+        fmt_hours(load.capacity_minutes)
     )];
-    if untimed > 0 {
-        let each = if share >= 1.0 {
-            format!("{} each", duration(share.round() as u32))
+    if load.untimed > 0 {
+        let each = if load.untimed_share >= 1.0 {
+            format!("{} each", fmt_hours(load.untimed_share.round() as u32))
         } else {
             "no time left".to_string()
         };
-        figures.push(format!("{untimed} without a time: {each}"));
+        figures.push(format!("{} without a time: {each}", load.untimed));
     }
-    if done > 0.0 {
-        figures.push(format!("{} done", duration(done.round() as u32)));
+    if load.done_minutes > 0.0 {
+        figures.push(format!(
+            "{} done",
+            fmt_hours(load.done_minutes.round() as u32)
+        ));
     }
-    if let Some(over) = over_by {
-        figures.push(format!("over by {}", duration(over)));
+    if let Some(over) = load.over_by {
+        figures.push(format!("over by {}", fmt_hours(over)));
     }
-    let cap = capacity as f32;
     LoadLine {
-        fraction: (planned / cap).min(1.0),
-        done_fraction: (done / cap).min(1.0),
-        over_by,
+        fraction: load.fraction(),
+        done_fraction: load.done_fraction(),
+        over_by: load.over_by,
         figures: figures.join(" · "),
     }
 }
 
 /// The load bar in a column's title bar, with the figures in its tooltip
 /// and a warning sign after it when over capacity.
-fn load_view<'a>(line: LoadLine) -> Element<'a, Message> {
+fn load_view<'a>(line: &LoadLine) -> Element<'a, Message> {
     // The track with the whole share, then the done part on top.
     let bar = stack![
         progress_bar(0.0..=1.0, line.fraction)
@@ -704,7 +754,7 @@ fn load_view<'a>(line: LoadLine) -> Element<'a, Message> {
     ];
     let mut row = row![tooltip(
         bar,
-        theme::tip(line.figures),
+        theme::tip(line.figures.clone()),
         tooltip::Position::Bottom
     )]
     .spacing(6)
@@ -755,19 +805,18 @@ fn task_row<'a>(
     if dragging.is_some() {
         area = area
             .on_enter(Message::Hover(day, Some(task.id)))
+            .on_exit(Message::Leave(day, Some(task.id)))
             .on_release(Message::DropOn(day, Some(task.id)));
     }
     area.into()
 }
 
-/// Whether dropping task `id` on `day` before `before` deserves the landing
+/// Whether dropping `task` on `day` before `before` deserves the landing
 /// line: another open task is there to order against, and the drop would
-/// change something.
-fn line_wanted(tasks: &[Task], id: TaskId, day: Date, before: Option<TaskId>) -> bool {
-    tasks_on(tasks, day)
-        .iter()
-        .any(|t| t.status.is_open() && t.id != id)
-        && drop_position(tasks, id, day, before).is_some()
+/// change something. `on_day` is the day's tasks (`Layout::tasks`).
+fn line_wanted(task: &Task, on_day: &[&Task], day: Date, before: Option<TaskId>) -> bool {
+    on_day.iter().any(|t| t.status.is_open() && t.id != task.id)
+        && drop_position(task, on_day, day, before).is_some()
 }
 
 /// The 8 px gap above a card (and after a day's open cards): empty, or the
@@ -789,13 +838,15 @@ fn slot<'a>(line: bool) -> Element<'a, Message> {
     container(inner).width(Fill).height(8).center_y(8).into()
 }
 
-/// Where task `id` goes when dropped on `day`, before the open task
-/// `before` (or after the day's open tasks): its new `position`, between its
-/// new neighbours. `None` when nothing would change (same day, same place).
-fn drop_position(tasks: &[Task], id: TaskId, day: Date, before: Option<TaskId>) -> Option<f64> {
-    let task = tasks.iter().find(|t| t.id == id)?;
-    let open: Vec<&Task> = tasks_on(tasks, day)
-        .into_iter()
+/// Where `task` goes when dropped on `day`, before the open task `before`
+/// (or after the day's open tasks): its new `position`, between its new
+/// neighbours. `None` when nothing would change (same day, same place).
+/// `on_day` is the day's tasks (`Layout::tasks`).
+fn drop_position(task: &Task, on_day: &[&Task], day: Date, before: Option<TaskId>) -> Option<f64> {
+    let id = task.id;
+    let open: Vec<&Task> = on_day
+        .iter()
+        .copied()
         .filter(|t| t.status.is_open())
         .collect();
     let others: Vec<&Task> = open.iter().copied().filter(|t| t.id != id).collect();
@@ -970,17 +1021,45 @@ mod tests {
         }
     }
 
-    fn load(date: Date, load: u32, capacity: u32, unestimated: usize) -> DayLoad {
+    fn load(date: Date, capacity: u32) -> DayLoad {
         DayLoad {
             date,
-            load_minutes: load,
+            load_minutes: 0,
             capacity_minutes: capacity,
-            unestimated,
+            unestimated: 0,
         }
     }
 
+    fn specs(d: &WeekData) -> Vec<ColumnSpec> {
+        columns(d, &by_day(&d.tasks, &d.week.days()))
+    }
+
+    fn on_day(tasks: &[Task], day: Date) -> Vec<&Task> {
+        by_day(tasks, &[day])[0]
+            .1
+            .iter()
+            .map(|&i| &tasks[i])
+            .collect()
+    }
+
+    /// `drop_position` as the view calls it, from all the tasks.
+    fn drop_at(tasks: &[Task], id: TaskId, day: Date, before: Option<TaskId>) -> Option<f64> {
+        let task = tasks.iter().find(|t| t.id == id)?;
+        drop_position(task, &on_day(tasks, day), day, before)
+    }
+
+    fn line_at(tasks: &[Task], id: TaskId, day: Date, before: Option<TaskId>) -> bool {
+        let task = tasks.iter().find(|t| t.id == id).unwrap();
+        line_wanted(task, &on_day(tasks, day), day, before)
+    }
+
+    /// The load line of a one-day column with 8h of capacity.
+    fn line_of(tasks: &[Task], d: Date) -> LoadLine {
+        load_line(&report::column_load(tasks, &[d], &[load(d, 480)]))
+    }
+
     #[test]
-    fn tasks_on_uses_planned_day_and_puts_open_first() {
+    fn tasks_are_bucketed_by_planned_day_open_first() {
         let d = date(2026, 11, 18);
         let mut planned = task(3, Some(date(2026, 11, 25)), TaskStatus::Todo);
         planned.planned_for = Some(d);
@@ -995,18 +1074,21 @@ mod tests {
             task(6, Some(d), TaskStatus::Dropped),
             task(7, Some(d), TaskStatus::Doing),
         ];
-        let ids: Vec<_> = tasks_on(&tasks, d).iter().map(|t| t.id).collect();
+        let ids: Vec<_> = on_day(&tasks, d).iter().map(|t| t.id).collect();
         assert_eq!(ids, vec![2, 3, 7, 1]);
-        let ids: Vec<_> = tasks_on(&tasks, date(2026, 11, 19))
+        let ids: Vec<_> = on_day(&tasks, date(2026, 11, 19))
             .iter()
             .map(|t| t.id)
             .collect();
         assert_eq!(ids, vec![4, 5]);
+        // A day the buckets don't list has nothing.
+        let buckets = by_day(&tasks, &[d]);
+        assert!(on(&buckets, date(2026, 11, 19)).is_empty());
     }
 
     #[test]
     fn columns_are_the_working_days_and_mark_today() {
-        let cols = columns(&data(vec![]));
+        let cols = specs(&data(vec![]));
         assert_eq!(cols.len(), 5);
         assert!(cols.iter().all(|c| !c.weekend && c.days.len() == 1));
         assert_eq!(cols[0].days, vec![date(2026, 11, 16)]);
@@ -1018,13 +1100,13 @@ mod tests {
     #[test]
     fn weekend_column_only_when_a_weekend_day_has_tasks() {
         // A dropped weekend task, and one from another week: no column.
-        let cols = columns(&data(vec![
+        let cols = specs(&data(vec![
             task(1, Some(date(2026, 11, 22)), TaskStatus::Dropped),
             task(2, Some(date(2026, 11, 29)), TaskStatus::Todo),
         ]));
         assert_eq!(cols.len(), 5);
 
-        let cols = columns(&data(vec![task(
+        let cols = specs(&data(vec![task(
             1,
             Some(date(2026, 11, 22)),
             TaskStatus::Done,
@@ -1041,7 +1123,7 @@ mod tests {
 
     #[test]
     fn headings_show_weekday_and_date() {
-        let cols = columns(&data(vec![]));
+        let cols = specs(&data(vec![]));
         assert_eq!(
             heading_text(&cols[0]),
             ("Mon".to_string(), "16 Nov".to_string())
@@ -1058,8 +1140,7 @@ mod tests {
         };
         // Four tasks without a time: a quarter of the day each.
         let four: Vec<Task> = (1..=4).map(|i| est(i, TaskStatus::Todo, None)).collect();
-        let refs: Vec<&Task> = four.iter().collect();
-        let line = load_line(&refs, 480);
+        let line = line_of(&four, d);
         assert_eq!(line.fraction, 1.0);
         assert_eq!(line.done_fraction, 0.0);
         assert_eq!(
@@ -1074,14 +1155,13 @@ mod tests {
             est(3, TaskStatus::Done, None),
             est(4, TaskStatus::Todo, None),
         ];
-        let refs: Vec<&Task> = mixed.iter().collect();
-        let line = load_line(&refs, 480);
+        let line = line_of(&mixed, d);
         assert_eq!(line.fraction, 1.0);
         assert_eq!(line.done_fraction, 0.5);
         assert_eq!(line.over_by, None);
 
         // Only timed tasks: their share, nothing more.
-        let line = load_line(&refs[..2], 480);
+        let line = line_of(&mixed[..2], d);
         assert_eq!(line.fraction, 0.5);
         assert_eq!(line.done_fraction, 0.25);
         assert_eq!(line.figures, "4h of 8h estimated · 2h done");
@@ -1092,29 +1172,42 @@ mod tests {
             est(1, TaskStatus::Todo, Some(540)),
             est(2, TaskStatus::Done, None),
         ];
-        let refs: Vec<&Task> = over.iter().collect();
-        let line = load_line(&refs, 480);
+        let line = line_of(&over, d);
         assert_eq!(line.fraction, 1.0);
         assert_eq!(line.done_fraction, 0.0);
         assert_eq!(line.over_by, Some(60));
         assert!(line.figures.contains("1 without a time: no time left"));
+        assert!(line.figures.ends_with("over by 1h"));
 
         // No tasks: an empty bar.
-        let line = load_line(&[], 480);
+        let line = line_of(&[], d);
         assert_eq!((line.fraction, line.done_fraction), (0.0, 0.0));
-        assert_eq!(nominal_capacity(&[]), 480);
-        // A weekend column borrows a working day's capacity.
-        let week = [load(d, 0, 420, 0), load(date(2026, 11, 21), 0, 0, 0)];
-        assert_eq!(nominal_capacity(&week), 420);
+        assert_eq!(line.figures, "0m of 8h estimated");
     }
 
     #[test]
-    fn durations_are_short() {
-        assert_eq!(duration(30), "30m");
-        assert_eq!(duration(60), "1h");
-        assert_eq!(duration(90), "1.5h");
-        assert_eq!(duration(100), "1.7h");
-        assert_eq!(duration(480), "8h");
+    fn the_weekend_column_borrows_a_working_days_capacity() {
+        // Wednesday has 7h; Saturday and Sunday none. Only Saturday has a
+        // task, so the column gets one working day's capacity.
+        let sat = date(2026, 11, 21);
+        let mut d = data(vec![task(1, Some(sat), TaskStatus::Todo)]);
+        d.loads = vec![
+            load(date(2026, 11, 18), 420),
+            load(sat, 0),
+            load(date(2026, 11, 22), 0),
+        ];
+        let layout = Layout::new(&d);
+        let weekend = layout.columns.last().unwrap();
+        assert!(weekend.spec.weekend);
+        assert_eq!(
+            weekend.load.figures,
+            "0m of 7h estimated · 1 without a time: 7h each"
+        );
+        assert_eq!(weekend.open_day, sat);
+        assert_eq!(
+            (weekend.name.as_str(), weekend.dates.as_str()),
+            ("Sat to Sun", "21 to 22 Nov")
+        );
     }
 
     #[test]
@@ -1186,24 +1279,21 @@ mod tests {
         ];
         // Positions are the ids: 1, 2, 3 (open), 4 (done), 5.
         // Before the first: below it.
-        assert_eq!(drop_position(&tasks, 3, tue, Some(1)), Some(0.0));
+        assert_eq!(drop_at(&tasks, 3, tue, Some(1)), Some(0.0));
         // Between two.
-        assert_eq!(drop_position(&tasks, 3, tue, Some(2)), Some(1.5));
+        assert_eq!(drop_at(&tasks, 3, tue, Some(2)), Some(1.5));
         // To the end of the open ones.
-        assert_eq!(drop_position(&tasks, 1, tue, None), Some(4.0));
+        assert_eq!(drop_at(&tasks, 1, tue, None), Some(4.0));
         // Already there: nothing.
-        assert_eq!(drop_position(&tasks, 3, tue, None), None);
-        assert_eq!(drop_position(&tasks, 2, tue, Some(3)), None);
-        assert_eq!(drop_position(&tasks, 2, tue, Some(2)), None);
+        assert_eq!(drop_at(&tasks, 3, tue, None), None);
+        assert_eq!(drop_at(&tasks, 2, tue, Some(3)), None);
+        assert_eq!(drop_at(&tasks, 2, tue, Some(2)), None);
         // Another day: before its card, or alone in an empty day.
-        assert_eq!(drop_position(&tasks, 1, wed, Some(5)), Some(4.0));
-        assert_eq!(drop_position(&tasks, 1, wed, None), Some(6.0));
-        assert_eq!(
-            drop_position(&tasks, 1, date(2026, 11, 19), None),
-            Some(1.0)
-        );
+        assert_eq!(drop_at(&tasks, 1, wed, Some(5)), Some(4.0));
+        assert_eq!(drop_at(&tasks, 1, wed, None), Some(6.0));
+        assert_eq!(drop_at(&tasks, 1, date(2026, 11, 19), None), Some(1.0));
         tasks.clear();
-        assert_eq!(drop_position(&tasks, 1, tue, None), None);
+        assert_eq!(drop_at(&tasks, 1, tue, None), None);
 
         // The landing line: not in an empty day, not for a day's only
         // task, not where nothing would change.
@@ -1212,12 +1302,12 @@ mod tests {
             task(2, Some(tue), TaskStatus::Todo),
             task(3, Some(wed), TaskStatus::Todo),
         ];
-        assert!(!line_wanted(&tasks, 1, date(2026, 11, 19), None));
-        assert!(!line_wanted(&tasks, 3, wed, None));
-        assert!(!line_wanted(&tasks, 2, tue, None));
-        assert!(line_wanted(&tasks, 1, tue, None));
-        assert!(line_wanted(&tasks, 2, tue, Some(1)));
-        assert!(line_wanted(&tasks, 3, tue, Some(2)));
+        assert!(!line_at(&tasks, 1, date(2026, 11, 19), None));
+        assert!(!line_at(&tasks, 3, wed, None));
+        assert!(!line_at(&tasks, 2, tue, None));
+        assert!(line_at(&tasks, 1, tue, None));
+        assert!(line_at(&tasks, 2, tue, Some(1)));
+        assert!(line_at(&tasks, 3, tue, Some(2)));
 
         let mut v = WeekView::new();
         v.load(data(vec![
@@ -1233,6 +1323,46 @@ mod tests {
             v.update(Message::DropOn(tue, Some(1))),
             Action::Move(2, tue, 0.0)
         );
+    }
+
+    #[test]
+    fn leaving_the_target_clears_it() {
+        let (tue, wed) = (date(2026, 11, 17), date(2026, 11, 18));
+        let mut v = WeekView::new();
+        v.load(data(vec![
+            task(1, Some(tue), TaskStatus::Todo),
+            task(2, Some(tue), TaskStatus::Todo),
+        ]));
+        v.update(Message::Press(2));
+        v.update(Message::Moved(Point::new(0.0, 0.0)));
+        v.update(Message::Moved(Point::new(0.0, 40.0)));
+        let over = |v: &WeekView| v.drag.as_ref().and_then(|d| d.over);
+
+        // Onto card 1, then off it into a gap: no target.
+        v.update(Message::Hover(tue, Some(1)));
+        v.update(Message::Leave(tue, Some(1)));
+        assert_eq!(over(&v), None);
+
+        // From the free space onto a card: the enter may come before the
+        // exit; either way the card stays the target.
+        v.update(Message::Hover(tue, None));
+        v.update(Message::Hover(tue, Some(1)));
+        v.update(Message::Leave(tue, None));
+        assert_eq!(over(&v), Some((tue, Some(1))));
+        v.update(Message::Leave(tue, Some(1)));
+        v.update(Message::Hover(wed, None));
+        assert_eq!(over(&v), Some((wed, None)));
+        let _ = v.view();
+
+        // Let go with no target: only `EndDrag` arrives, nothing moves.
+        v.update(Message::Leave(wed, None));
+        assert_eq!(over(&v), None);
+        assert_eq!(v.update(Message::EndDrag), Action::None);
+        assert!(v.drag.is_none());
+
+        // Without a drag it does nothing.
+        assert_eq!(v.update(Message::Leave(tue, None)), Action::None);
+        assert!(Message::Leave(tue, None).is_pointer_move());
     }
 
     #[test]

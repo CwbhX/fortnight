@@ -1236,7 +1236,9 @@ impl Ready {
         let pointer = matches!(
             &message,
             Message::Day(day::Message::Moved(_) | day::Message::Enter(_) | day::Message::Leave(_))
-                | Message::Week(week::Message::Moved(_) | week::Message::Hover(..))
+                | Message::Week(
+                    week::Message::Moved(_) | week::Message::Hover(..) | week::Message::Leave(..)
+                )
         );
         let task = self.handle_message(message);
         if pointer {
