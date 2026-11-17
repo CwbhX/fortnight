@@ -1,0 +1,16 @@
+[package]
+name = "fortnight-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fortnight"
+path = "src/main.rs"
+
+[dependencies]
+fortnight-core.workspace = true
+iced.workspace = true
+jiff.workspace = true
+secrecy.workspace = true
+tokio.workspace = true
