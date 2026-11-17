@@ -20,9 +20,12 @@
 //! short for three titles it shows fewer (the "+N more" grows); below one
 //! title per cell it keeps a minimum height and scrolls.
 //!
-//! Skipped (prototype scope): keyboard navigation inside the grid, hover
-//! tooltips with full titles, and pixel-exact truncation (titles are cut to
-//! an estimated character count with "…" and clipped at the cell edge).
+//! Titles are cut to the card's width with "…", measured with the app's
+//! text engine (the priority marks keep their own measured room), so a
+//! card uses its full width whatever the letters.
+//!
+//! Skipped (prototype scope): keyboard navigation inside the grid and hover
+//! tooltips with full titles.
 
 use crate::theme;
 use fortnight_core::domain::{Task, TaskStatus, WeekRef};
@@ -160,9 +163,6 @@ const LINE: f32 = 1.25;
 const LINE_GAP: f32 = 2.0;
 /// Height of the weekday header row (text plus the gap under it).
 const HEADER_HEIGHT: f32 = DATE_SIZE * LINE + GAP;
-/// Average glyph width of Inter as a fraction of the font size; slightly
-/// generous so titles are cut before they reach the clip edge.
-const GLYPH_WIDTH: f32 = 0.54;
 
 /// Height of one task card line, with the gap above it.
 const LINE_HEIGHT: f32 = TITLE_SIZE * LINE + PILL_PAD_Y * 2.0 + LINE_GAP;
@@ -203,10 +203,8 @@ fn grid(data: &MonthData, open: Option<Date>, size: Size) -> Element<'_, Message
     let lines = lines_that_fit(row_height).min(MAX_TITLES + 1);
 
     let cell_width = (size.width - OUTER_PAD_X * 2.0 - LABEL_WIDTH - GAP * 7.0) / 7.0;
-    let max_chars = ((cell_width - CELL_PAD_X * 2.0 - PILL_PAD_X * 2.0)
-        / (TITLE_SIZE * GLYPH_WIDTH))
-        .floor()
-        .max(1.0) as usize;
+    // Room for a title (and its marks) inside a card.
+    let max_width = cell_width - CELL_PAD_X * 2.0 - PILL_PAD_X * 2.0;
 
     let mut header = Row::new()
         .spacing(GAP)
@@ -228,7 +226,7 @@ fn grid(data: &MonthData, open: Option<Date>, size: Size) -> Element<'_, Message
             .height(row_height)
             .push(week_label(*week, has_summary(data, *week)));
         for (c, day) in week.days().into_iter().enumerate() {
-            line = line.push(day_cell(data, day, lines, max_chars));
+            line = line.push(day_cell(data, day, lines, max_width));
             if open == Some(day) {
                 let due = due_tasks(&data.tasks, day);
                 if !due.is_empty() {
@@ -295,7 +293,7 @@ fn week_label<'a>(week: WeekRef, summary: bool) -> Element<'a, Message> {
 }
 
 /// One day of the grid.
-fn day_cell(data: &MonthData, day: Date, lines: usize, max_chars: usize) -> Element<'_, Message> {
+fn day_cell(data: &MonthData, day: Date, lines: usize, max_width: f32) -> Element<'_, Message> {
     let kind = theme::Cell {
         today: day == data.today,
         weekend: !data.working_days.contains(&day.weekday()),
@@ -322,7 +320,7 @@ fn day_cell(data: &MonthData, day: Date, lines: usize, max_chars: usize) -> Elem
 
     let mut cards = Column::new().spacing(LINE_GAP);
     for t in &content.titles {
-        cards = cards.push(task_pill(t, max_chars));
+        cards = cards.push(task_pill(t, max_width));
     }
     if content.more > 0 {
         cards = cards.push(
@@ -356,15 +354,16 @@ fn day_cell(data: &MonthData, day: Date, lines: usize, max_chars: usize) -> Elem
 /// One task as a small card, like the Week tab's: the title, then the
 /// priority `!` in its colour. Overdue is red on a red tint; done or dropped is
 /// faint on a fainter fill.
-fn task_pill<'a>(t: &TitleLine, max_chars: usize) -> Element<'a, Message> {
+fn task_pill<'a>(t: &TitleLine, max_width: f32) -> Element<'a, Message> {
     let (done, overdue) = (t.done, t.overdue);
     let level = if done { 0 } else { t.priority.min(2) };
-    let chars = match level {
-        0 => max_chars,
-        _ => max_chars.saturating_sub(usize::from(level) + 1),
+    // The marks keep their own measured width; the title gets the rest.
+    let marks = match level {
+        0 => 0.0,
+        _ => measure(&format!("\u{a0}{}", "!".repeat(usize::from(level)))),
     };
     let line = theme::title_with_marks(
-        truncate(&t.title, chars.max(1)),
+        fit_cached(&t.title, max_width - marks),
         level,
         move |theme: &Theme| text::Style {
             color: Some(if overdue {
@@ -480,7 +479,7 @@ fn due_dropdown<'a>(due: Vec<&Task>, today: Date) -> Element<'a, Message> {
             overdue: t.is_overdue(today),
             priority: t.priority,
         };
-        list = list.push(task_pill(&line, 34));
+        list = list.push(task_pill(&line, DROPDOWN_WIDTH - 20.0 - PILL_PAD_X * 2.0));
     }
     container(list.width(Fill))
         .padding(10)
@@ -631,16 +630,71 @@ fn due_done(tasks: &[Task], day: Date) -> Option<DueDone> {
     })
 }
 
-/// `s` cut to at most `max` characters, ending in "…" when cut.
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+/// The width of `s` as a card title draws it (Inter at [`TITLE_SIZE`]),
+/// measured with the same text engine the app renders with.
+fn measure(s: &str) -> f32 {
+    use iced::advanced::text::{self as adv, Paragraph as _};
+    type Para = <iced::Renderer as adv::Renderer>::Paragraph;
+    Para::with_text(adv::Text {
+        content: s,
+        bounds: Size::INFINITE,
+        size: TITLE_SIZE.into(),
+        line_height: LINE.into(),
+        font: theme::FONT,
+        align_x: adv::Alignment::Default,
+        align_y: iced::alignment::Vertical::Top,
+        shaping: adv::Shaping::Advanced,
+        wrapping: adv::Wrapping::None,
+    })
+    .min_width()
+}
+
+/// [`fit`] with [`measure`], remembered per title and width: the grid is
+/// rebuilt often and shaping text is not free.
+fn fit_cached(s: &str, max_width: f32) -> String {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static CACHE: RefCell<HashMap<(String, i32), String>> = RefCell::new(HashMap::new());
+    }
+    let key = (s.to_string(), max_width.floor() as i32);
+    CACHE.with_borrow_mut(|cache| {
+        if cache.len() > 4096 {
+            cache.clear();
+        }
+        cache
+            .entry(key)
+            .or_insert_with(|| fit(s, max_width, measure))
+            .clone()
+    })
+}
+
+/// `s` as it fits in `max_width`: whole when it does, otherwise the
+/// longest start that fits with "…" after it (at least "…").
+fn fit(s: &str, max_width: f32, width: impl Fn(&str) -> f32) -> String {
+    // A pixel of slack so rounding never pushes the last glyph past the clip.
+    let max_width = max_width - 1.0;
+    if width(s) <= max_width {
         return s.to_string();
     }
-    let keep = max.saturating_sub(1);
-    let mut out: String = s.chars().take(keep).collect();
-    out.truncate(out.trim_end().len());
-    out.push('…');
-    out
+    let chars: Vec<char> = s.chars().collect();
+    let cut = |n: usize| {
+        let mut out: String = chars[..n].iter().collect();
+        out.truncate(out.trim_end().len());
+        out.push('…');
+        out
+    };
+    // The most characters kept such that the cut text fits.
+    let (mut lo, mut hi) = (0, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if width(&cut(mid)) <= max_width {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    cut(lo)
 }
 
 /// The seven weekdays in grid order, starting at `start`.
@@ -830,10 +884,15 @@ mod tests {
 
     #[test]
     fn titles_truncate_with_an_ellipsis() {
-        assert_eq!(truncate("short", 10), "short");
-        assert_eq!(truncate("exactly10!", 10), "exactly10!");
-        assert_eq!(truncate("Write the Q4 report", 10), "Write the…");
-        assert_eq!(truncate("Write the Q4 report", 1), "…");
+        // Every character 10 px wide, plus the 1 px slack.
+        let w = |s: &str| s.chars().count() as f32 * 10.0;
+        assert_eq!(fit("short", 51.0, w), "short");
+        assert_eq!(fit("exactly10!", 101.0, w), "exactly10!");
+        assert_eq!(fit("Write the Q4 report", 101.0, w), "Write the…");
+        assert_eq!(fit("Write the Q4 report", 5.0, w), "…");
+        // Narrow letters fit more: width decides, not the character count.
+        let narrow = |s: &str| s.chars().map(|c| if c == 'i' { 3.0 } else { 10.0 }).sum();
+        assert_eq!(fit("iiiiiiiiiiiiiiii", 60.0, narrow), "iiiiiiiiiiiiiiii");
     }
 
     #[test]
