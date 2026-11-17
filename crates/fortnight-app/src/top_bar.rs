@@ -195,8 +195,13 @@ pub fn view<'a>(bar: Bar<'a>) -> Element<'a, Message> {
         container(
             text(period_label(bar.tab, bar.selected, bar.today, bar.schedule))
                 .size(theme::TEXT_BODY)
+                .wrapping(iced::widget::text::Wrapping::None)
         )
-        .center_x(150),
+        .center_x(match bar.tab {
+            Tab::Today => 140,
+            Tab::Week => 220,
+            Tab::Month => 170,
+        }),
         icon_button(Icon::ChevronRight, Message::Next, "Next (→)"),
     ]
     .spacing(2)

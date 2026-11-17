@@ -249,6 +249,14 @@ impl App {
         Subscription::batch([
             iced::time::every(Duration::from_secs(60)).map(|_| Message::Tick),
             iced::system::theme_changes().map(Message::ThemeMode),
+            // Ends a Week-tab card drag even when the button is let go
+            // outside the window.
+            iced::event::listen_with(|event, _, _| match event {
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )) => Some(Message::Week(week::Message::EndDrag)),
+                _ => None,
+            }),
             keyboard::listen().filter_map(|event| {
                 let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
                     return None;
@@ -843,8 +851,33 @@ impl Ready {
                 let action = self.day_view.update(m);
                 self.day_action(action)
             }
+            Message::Week(m) if m.is_pointer_move() => {
+                // Drag bookkeeping only: no data changed, skip the refresh.
+                self.week_view.update(m);
+                return Task::none();
+            }
             Message::Week(m) => match self.week_view.update(m) {
                 week::Action::None => Task::none(),
+                week::Action::Move(id, day) => {
+                    if let Some(task) = self.task(id).cloned() {
+                        let undo = self.snapshot(id, "Move undone.");
+                        let moved = CoreTask {
+                            due_on: Some(day),
+                            planned_for: None,
+                            ..task
+                        };
+                        match self.store.update_task(&moved) {
+                            Ok(()) => {
+                                if let Some(undo) = undo {
+                                    self.remember(undo);
+                                }
+                            }
+                            Err(e) => self.error = Some(e.to_string()),
+                        }
+                        self.reload_tasks();
+                    }
+                    Task::none()
+                }
                 week::Action::SetStatus(id, status) => {
                     self.set_status(id, status);
                     Task::none()
