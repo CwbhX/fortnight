@@ -107,12 +107,16 @@ pub struct LockInfo {
 #[derive(Debug)]
 pub struct DataLock {
     path: PathBuf,
+    /// What we wrote, to recognise our own file on drop.
+    info: LockInfo,
 }
 
 impl Drop for DataLock {
     fn drop(&mut self) {
-        // STUB: agent G removes the file only if it still holds our info.
-        let _ = &self.path;
+        // Another instance may have taken over: only remove what is ours.
+        if read_file(&self.path).as_ref() == Some(&self.info) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -123,7 +127,27 @@ pub fn lock_path(dir: &Path) -> PathBuf {
 
 /// The name of this machine, or "unknown".
 pub fn host_name() -> String {
-    "unknown".into() // STUB
+    let clean = |s: &str| {
+        let s = s.trim();
+        (!s.is_empty()).then(|| s.to_string())
+    };
+    for var in ["HOSTNAME", "COMPUTERNAME"] {
+        if let Some(name) = std::env::var(var).ok().and_then(|v| clean(&v)) {
+            return name;
+        }
+    }
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| clean(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// Parses a lock file; `None` if missing or not valid.
+fn read_file(path: &Path) -> Option<LockInfo> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
 }
 
 /// Takes the lock, replacing any existing lock file. Returns the lock and,
@@ -131,19 +155,50 @@ pub fn host_name() -> String {
 /// crash), what it said, so the caller can warn. An unreadable existing
 /// file is reported as a `LockInfo` with host "unknown".
 pub fn acquire_lock(dir: &Path) -> Result<(DataLock, Option<LockInfo>), DataDirError> {
-    // STUB: agent G implements.
-    Ok((
-        DataLock {
-            path: lock_path(dir),
-        },
-        None,
-    ))
+    let path = lock_path(dir);
+    let now = jiff::Timestamp::now();
+    let previous = match path.try_exists() {
+        Ok(false) => None,
+        // Exists (or cannot tell): report what it says, or "unknown".
+        _ => Some(read_file(&path).unwrap_or_else(|| LockInfo {
+            host: "unknown".into(),
+            pid: 0,
+            since: now,
+        })),
+    };
+    let host = host_name();
+    let pid = std::process::id();
+    let mut since = now;
+    // Keep our info distinguishable from a previous lock of this same
+    // process (a coarse clock could otherwise repeat the timestamp).
+    if let Some(prev) = previous.as_ref().filter(|p| p.host == host && p.pid == pid)
+        && since <= prev.since
+    {
+        since = prev.since + jiff::SignedDuration::from_nanos(1);
+    }
+    let info = LockInfo { host, pid, since };
+
+    let not_writable = |e: std::io::Error| DataDirError::NotWritable {
+        path: dir.to_path_buf(),
+        reason: e.to_string(),
+    };
+    let json = serde_json::to_string_pretty(&info).map_err(|e| DataDirError::NotWritable {
+        path: dir.to_path_buf(),
+        reason: e.to_string(),
+    })?;
+    // Write beside the target, then rename, so readers never see half a file.
+    let tmp = dir.join(format!(".fortnight.lock.{pid}.tmp"));
+    std::fs::write(&tmp, json).map_err(not_writable)?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(not_writable(e));
+    }
+    Ok((DataLock { path, info }, previous))
 }
 
 /// What the lock file says, if there is one.
 pub fn read_lock(dir: &Path) -> Option<LockInfo> {
-    let _ = dir;
-    None // STUB
+    read_file(&lock_path(dir))
 }
 
 #[cfg(test)]
@@ -229,5 +284,84 @@ mod tests {
         if !writable_anyway {
             assert!(matches!(result, Err(DataDirError::NotWritable { .. })));
         }
+    }
+
+    #[test]
+    fn acquire_on_empty_dir_has_no_previous() {
+        let dir = temp_dir("lock-empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (lock, previous) = acquire_lock(&dir).unwrap();
+        assert_eq!(previous, None);
+        assert!(lock_path(&dir).is_file());
+        let info = read_lock(&dir).unwrap();
+        assert_eq!(info.pid, std::process::id());
+        assert_eq!(info.host, host_name());
+        drop(lock);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn second_acquire_reports_the_first() {
+        let dir = temp_dir("lock-second");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (first, _) = acquire_lock(&dir).unwrap();
+        let first_info = read_lock(&dir).unwrap();
+        let (second, previous) = acquire_lock(&dir).unwrap();
+        assert_eq!(previous, Some(first_info));
+        drop(second);
+        drop(first);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn drop_removes_our_lock_file() {
+        let dir = temp_dir("lock-drop");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (lock, _) = acquire_lock(&dir).unwrap();
+        drop(lock);
+        assert!(!lock_path(&dir).exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn drop_leaves_a_lock_another_acquire_replaced() {
+        let dir = temp_dir("lock-replaced");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (first, _) = acquire_lock(&dir).unwrap();
+        let (second, _) = acquire_lock(&dir).unwrap();
+        let second_info = read_lock(&dir).unwrap();
+        drop(first);
+        assert_eq!(read_lock(&dir), Some(second_info));
+        drop(second);
+        assert!(!lock_path(&dir).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn garbage_lock_file_reports_unknown() {
+        let dir = temp_dir("lock-garbage");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(lock_path(&dir), b"not json {{").unwrap();
+        assert_eq!(read_lock(&dir), None);
+        let (lock, previous) = acquire_lock(&dir).unwrap();
+        let previous = previous.unwrap();
+        assert_eq!(previous.host, "unknown");
+        assert_eq!(previous.pid, 0);
+        drop(lock);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_lock_missing_is_none() {
+        let dir = temp_dir("lock-missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(read_lock(&dir), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn host_name_is_never_empty() {
+        assert!(!host_name().trim().is_empty());
     }
 }
