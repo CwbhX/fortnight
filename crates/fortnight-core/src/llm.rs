@@ -209,11 +209,11 @@ pub fn env_decision_api_key() -> Option<SecretString> {
 }
 
 /// A key from an environment variable's value: trimmed, `None` if blank.
+/// The plain copy is wiped.
 fn env_key(value: Option<String>) -> Option<SecretString> {
-    value
-        .map(|k| k.trim().to_string())
-        .filter(|k| !k.is_empty())
-        .map(SecretString::from)
+    let value = zeroize::Zeroizing::new(value?);
+    let key = value.trim();
+    (!key.is_empty()).then(|| SecretString::from(key))
 }
 
 /// A client that returns canned replies and records requests. For tests.

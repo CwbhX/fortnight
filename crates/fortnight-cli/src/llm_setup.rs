@@ -168,14 +168,6 @@ fn read_password(
     Ok(SecretString::from(line.as_str()))
 }
 
-/// The key in environment variable `name`, trimmed, if set and not blank.
-/// For this process only, never persisted. The plain copy is wiped.
-fn env_key(name: &str) -> Option<SecretString> {
-    let value = Zeroizing::new(std::env::var(name).ok()?);
-    let key = value.trim();
-    (!key.is_empty()).then(|| SecretString::from(key))
-}
-
 /// `connect`'s error as a CLI error: "not configured" is a usage error
 /// (exit 2); anything else (such as refusing to send a key over plain
 /// http) is a failure with its own message.
@@ -304,8 +296,8 @@ pub fn connect_from_settings(
         Process {
             var: &|n| std::env::var(n).ok(),
             keys: (
-                env_key("FORTNIGHT_LLM_API_KEY"),
-                env_key("FORTNIGHT_DECISION_API_KEY"),
+                llm::env_api_key(),
+                llm::env_decision_api_key(),
             ),
             stdin: &mut stdin.lock(),
             prompt: &mut || rpassword::prompt_password("API key password: "),
