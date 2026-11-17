@@ -34,6 +34,7 @@ fn add_task(store: &SqliteStore, title: &str, due: Option<Date>) -> Task {
         .add_task(NewTask {
             title: title.into(),
             due_on: due,
+            planned_for: due,
             ..NewTask::default()
         })
         .unwrap()
@@ -70,11 +71,12 @@ fn add_parses_quick_add_and_prints_id_and_summary() {
     let out = text(out);
     assert_eq!(
         out,
-        "Added 1: write report (due 2026-11-20, #work, ~2h, !!)\n"
+        "Added 1: write report (on 2026-11-20, #work, ~2h, !!)\n"
     );
     let t = s.get_task(1).unwrap().unwrap();
     assert_eq!(t.title, "write report");
-    assert_eq!(t.due_on, Some(date(2026, 11, 20)));
+    assert_eq!(t.planned_for, Some(date(2026, 11, 20)));
+    assert_eq!(t.due_on, None);
     assert_eq!(t.project.as_deref(), Some("work"));
     assert_eq!(t.estimate_minutes, Some(120));
     assert_eq!(t.priority, 2);

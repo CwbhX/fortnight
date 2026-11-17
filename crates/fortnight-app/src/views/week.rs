@@ -952,6 +952,7 @@ mod tests {
             title: format!("t{id}"),
             status,
             due_on: day,
+            planned_for: day,
             position: id as f64,
             ..Task::default()
         }

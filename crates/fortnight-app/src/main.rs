@@ -863,9 +863,10 @@ impl Ready {
                         let undo = self.snapshot(id, "Move undone.");
                         let mut result = Ok(());
                         if task.day() != Some(day) {
+                            // Dropping on a day plans it there; the
+                            // deadline stays as it is.
                             result = self.store.update_task(&CoreTask {
-                                due_on: Some(day),
-                                planned_for: None,
+                                planned_for: Some(day),
                                 ..task
                             });
                         }

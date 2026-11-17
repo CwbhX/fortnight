@@ -50,14 +50,15 @@ pub fn add(store: &dyn Store, words: &[String], today: Date, out: &mut dyn Write
     let task = store.add_task(NewTask {
         title: parsed.title,
         project: parsed.project,
-        due_on: parsed.due_on,
+        // A quick-add date is the day you plan to do it.
+        planned_for: parsed.due_on,
         estimate_minutes: parsed.estimate_minutes,
         priority: parsed.priority,
         ..NewTask::default()
     })?;
     let mut extras = Vec::new();
-    if let Some(d) = task.due_on {
-        extras.push(format!("due {d}"));
+    if let Some(d) = task.planned_for {
+        extras.push(format!("on {d}"));
     }
     if let Some(p) = &task.project {
         extras.push(format!("#{p}"));
@@ -140,17 +141,18 @@ fn status_mark(s: TaskStatus) -> &'static str {
     }
 }
 
-/// Aligned plain-text table: id, status mark, title, project, due, estimate,
-/// priority.
+/// Aligned plain-text table: id, status mark, title, project, planned day,
+/// due, estimate, priority.
 pub fn format_list(tasks: &[Task]) -> String {
     if tasks.is_empty() {
         return "No tasks.\n".to_string();
     }
-    let mut rows: Vec<[String; 7]> = vec![[
+    let mut rows: Vec<[String; 8]> = vec![[
         "ID".into(),
         "ST".into(),
         "TITLE".into(),
         "PROJECT".into(),
+        "DAY".into(),
         "DUE".into(),
         "EST".into(),
         "PRI".into(),
@@ -161,6 +163,7 @@ pub fn format_list(tasks: &[Task]) -> String {
             status_mark(t.status).to_string(),
             t.title.clone(),
             t.project.clone().unwrap_or_default(),
+            t.day().map(|d| d.to_string()).unwrap_or_default(),
             t.due_on.map(|d| d.to_string()).unwrap_or_default(),
             t.estimate_minutes
                 .map(parse::format_estimate)
@@ -168,7 +171,7 @@ pub fn format_list(tasks: &[Task]) -> String {
             "!".repeat(usize::from(t.priority)),
         ]);
     }
-    let mut widths = [0usize; 7];
+    let mut widths = [0usize; 8];
     for row in &rows {
         for (w, cell) in widths.iter_mut().zip(row) {
             *w = (*w).max(cell.chars().count());

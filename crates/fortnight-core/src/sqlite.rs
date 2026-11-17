@@ -120,6 +120,10 @@ const MIGRATIONS: &[&str] = &[
         FROM tasks
         WHERE status <> 'todo'
         ORDER BY COALESCE(completed_at, updated_at), id;",
+    // 3: `Task::day` became the planned day only (it used to fall back to
+    // the deadline). Copy the deadline into an empty planned day so every
+    // task stays on the day it was shown on.
+    "UPDATE tasks SET planned_for = due_on WHERE planned_for IS NULL AND due_on IS NOT NULL;",
 ];
 
 const SETTINGS_KEY: &str = "settings";
@@ -1386,7 +1390,7 @@ mod tests {
         assert_eq!(user_version(&Connection::open(&tmp.0).unwrap()), 1);
 
         let s = SqliteStore::open(&tmp.0).unwrap();
-        assert_eq!(user_version(&s.conn), 2);
+        assert_eq!(user_version(&s.conn), 3);
 
         // Tasks: every value survives; the round 2 fields take defaults.
         let tasks = s.list_tasks().unwrap();
@@ -1449,7 +1453,8 @@ mod tests {
             ]
         );
         for t in &tasks {
-            assert_eq!(t.planned_for, None);
+            // Migration 3: the deadline became the planned day.
+            assert_eq!(t.planned_for, t.due_on);
             assert_eq!(t.estimate_minutes, None);
             assert_eq!(t.priority, 0);
             assert!(!t.private);
@@ -1528,7 +1533,7 @@ mod tests {
 
         // Reopening is a no-op.
         let s = SqliteStore::open(&tmp.0).unwrap();
-        assert_eq!(user_version(&s.conn), 2);
+        assert_eq!(user_version(&s.conn), 3);
         assert_eq!(&s.list_tasks().unwrap()[..6], &tasks[..]);
         assert_eq!(s.all_reports().unwrap(), reports);
         assert_eq!(s.load_settings().unwrap(), settings);
@@ -1562,7 +1567,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         v1_connection(&conn);
         let s = SqliteStore::init(conn).unwrap();
-        assert_eq!(user_version(&s.conn), 2);
+        assert_eq!(user_version(&s.conn), 3);
 
         let tasks = s.list_tasks().unwrap();
         assert_eq!(tasks.len(), 2);

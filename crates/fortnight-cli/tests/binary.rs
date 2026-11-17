@@ -52,7 +52,7 @@ fn add_then_list_then_done() {
     assert!(added.status.success(), "{}", stderr(&added));
     assert_eq!(
         stdout(&added),
-        "Added 1: write report (due 2026-11-20, #work, ~2h, !)\n"
+        "Added 1: write report (on 2026-11-20, #work, ~2h, !)\n"
     );
 
     let listed = run(&dir, &["list"]);

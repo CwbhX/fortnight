@@ -1656,8 +1656,11 @@ mod tests {
         t
     }
 
+    /// Due on `d`, and planned then too unless already planned (as
+    /// migration 3 leaves older tasks).
     fn due(mut t: Task, d: Date) -> Task {
         t.due_on = Some(d);
+        t.planned_for = t.planned_for.or(Some(d));
         t
     }
 

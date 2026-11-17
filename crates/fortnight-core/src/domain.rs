@@ -1,5 +1,6 @@
 //! Domain types shared by every module. FROZEN (round 2): do not edit.
-//! (Round 3, at the user's request: `Settings` gained the two prompts.)
+//! (Round 3, at the user's request: `Settings` gained the two prompts, and
+//! `Task::day` became the planned day only.)
 //!
 //! Conventions:
 //! - Deadlines are civil dates (`jiff::civil::Date`), stored as `YYYY-MM-DD`.
@@ -67,9 +68,10 @@ pub struct Task {
     pub notes: String,
     pub status: TaskStatus,
     pub project: Option<String>,
-    /// The deadline.
+    /// The deadline. It never decides where the task is shown.
     pub due_on: Option<Date>,
-    /// The day you intend to do it, if different from the deadline.
+    /// The day you intend to do it: the day it is shown on. Set by quick
+    /// add and by dragging the task to a day.
     pub planned_for: Option<Date>,
     /// Estimated effort in minutes (`~2h` → 120).
     pub estimate_minutes: Option<u32>,
@@ -89,11 +91,13 @@ impl Task {
         self.status == TaskStatus::Done
     }
 
-    /// The day the task is shown on in the Today, Week and Month tabs:
-    /// `planned_for` if set, otherwise `due_on`. `None` means "No date"
+    /// The day the task is shown on in the Today, Week and Month tabs: its
+    /// planned day. The deadline does not move it. `None` means "No date"
     /// (the inbox). Every view and the load maths use this one rule.
+    /// (Schema migration 3 copied the deadline into the planned day where
+    /// that was empty, so older tasks stay where they were.)
     pub fn day(&self) -> Option<Date> {
-        self.planned_for.or(self.due_on)
+        self.planned_for
     }
 
     /// Open and its deadline is before `today`.
@@ -566,12 +570,12 @@ mod tests {
     }
 
     #[test]
-    fn task_day_prefers_planned() {
+    fn task_day_is_the_planned_day_only() {
         let mut t = Task {
             due_on: Some(jiff::civil::date(2026, 11, 20)),
             ..Task::default()
         };
-        assert_eq!(t.day(), t.due_on);
+        assert_eq!(t.day(), None);
         t.planned_for = Some(jiff::civil::date(2026, 11, 18));
         assert_eq!(t.day(), t.planned_for);
         assert!(t.is_overdue(jiff::civil::date(2026, 11, 21)));

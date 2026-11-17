@@ -4,14 +4,13 @@
 //!
 //! - **Overdue** (only when the shown day is today, and only if any): open
 //!   tasks whose deadline has passed.
-//! - **The day**: open tasks whose [`Task::day`] is the shown day. On today
-//!   this also carries over open tasks planned for an earlier day whose
-//!   deadline has not passed (old data; the app no longer sets a planned
-//!   day).
+//! - **The day**: open tasks whose [`Task::day`] (the planned day) is the
+//!   shown day. On today this also carries over open tasks planned for an
+//!   earlier day whose deadline has not passed.
 //! - **Side work**: free-standing log lines dated the shown day, shown as
 //!   ticked items, with an input to add one (today only, see below).
 //! - **Completed**, collapsed: tasks completed on the shown day.
-//! - **No date**, collapsed: open tasks with no day (the inbox).
+//! - **No date**, collapsed: open tasks with no planned day (the inbox).
 //! - **Deleted**, collapsed: every deleted task, newest first, each with
 //!   Restore and Delete forever. Delete moves a task here (status
 //!   `Dropped`); only Delete forever removes it.
@@ -19,7 +18,10 @@
 //! The quick-add bar and the date navigation live in the top bar.
 //!
 //! Clicking a row (or `Enter` on the selected row) expands it in place into
-//! an edit form, one row at a time: title, project, due date (a calendar),
+//! an edit form, one row at a time: title, project (with a list of the
+//! projects of open tasks), due date (a calendar; only the deadline, it
+//! does not move the task: the planned day is set by quick add or by
+//! dragging in the Week tab),
 //! estimate, priority (Low, Medium, High), subtasks and notes. Subtasks are
 //! kept in the task's notes as Markdown checklist lines (`- [ ] text`), so
 //! they need no schema change and reach the summary with the notes.
@@ -39,9 +41,10 @@ use std::cmp::Ordering;
 use fortnight_core::domain::{EventId, Priority, Task, TaskId, TaskStatus};
 use fortnight_core::parse;
 use fortnight_core::week::add_months;
+use iced::widget::overlay::menu;
 use iced::widget::{
-    Column, Row, Space, button, checkbox, column, container, row, scrollable, text, text_editor,
-    text_input,
+    Column, Row, Space, button, checkbox, column, combo_box, container, row, scrollable, text,
+    text_editor, text_input,
 };
 use iced::{Center, Color, Element, Fill, Theme, border};
 use jiff::civil::Date;
@@ -59,6 +62,8 @@ pub enum Message {
     Expand(TaskId),
     EditTitle(String),
     EditProject(String),
+    /// A project picked from the list.
+    PickProject(String),
     EditEstimate(String),
     EditNotes(text_editor::Action),
     SetPriority(Priority),
@@ -383,9 +388,10 @@ pub struct EditForm {
     pub id: TaskId,
     pub title: String,
     pub project: String,
-    /// The task's one date: its deadline, or its old planned day.
+    /// The projects of open tasks, for the project field's list.
+    pub projects: combo_box::State<String>,
+    /// The deadline.
     pub due: Option<Date>,
-    pub original_due: Option<Date>,
     /// The month the calendar shows, while it is open.
     pub calendar: Option<Date>,
     pub estimate: String,
@@ -407,13 +413,12 @@ impl EditForm {
             .map(parse::format_estimate)
             .unwrap_or_default();
         let (subtasks, text) = split_notes(&task.notes);
-        let due = task.due_on.or(task.planned_for);
         Self {
             id: task.id,
             title: task.title.clone(),
             project: task.project.clone().unwrap_or_default(),
-            due,
-            original_due: due,
+            projects: combo_box::State::default(),
+            due: task.due_on,
             calendar: None,
             estimate: estimate.clone(),
             original_estimate: estimate,
@@ -428,19 +433,14 @@ impl EditForm {
 
     /// Builds the updated task from the form, or an error message.
     ///
-    /// An unchanged due date keeps the task's dates as they are; a changed
-    /// one becomes the deadline and clears the old planned day. An unchanged
-    /// estimate is not re-parsed; a typed subtask not yet added is added.
+    /// The due date is only the deadline: the planned day (where the task
+    /// is shown) is kept. An unchanged estimate is not re-parsed; a typed
+    /// subtask not yet added is added.
     pub fn apply(&self, task: &Task) -> Result<Task, String> {
         let title = self.title.trim();
         if title.is_empty() {
             return Err("The title can't be empty.".to_string());
         }
-        let (due_on, planned_for) = if self.due == self.original_due {
-            (task.due_on, task.planned_for)
-        } else {
-            (self.due, None)
-        };
         let estimate = self.estimate.trim();
         let estimate_minutes = if estimate.is_empty() {
             None
@@ -479,13 +479,32 @@ impl EditForm {
         Ok(Task {
             title: title.to_string(),
             project: (!project.is_empty()).then(|| project.to_string()),
-            due_on,
-            planned_for,
+            due_on: self.due,
             estimate_minutes,
             priority,
             notes,
             ..task.clone()
         })
+    }
+}
+
+/// The distinct projects of open tasks, sorted case-insensitively.
+pub fn open_projects(tasks: &[Task]) -> Vec<String> {
+    let mut out: Vec<String> = tasks
+        .iter()
+        .filter(|t| t.status.is_open())
+        .filter_map(|t| t.project.clone())
+        .collect();
+    out.sort_by_key(|p| p.to_lowercase());
+    out.dedup();
+    out
+}
+
+/// The edit form for `task`, with the project list from `tasks`.
+fn open_form(task: &Task, tasks: &[Task]) -> EditForm {
+    EditForm {
+        projects: combo_box::State::new(open_projects(tasks)),
+        ..EditForm::from_task(task)
     }
 }
 
@@ -561,8 +580,9 @@ impl DayView {
             NavKey::Open => {
                 if let Some(task) = self.selected.and_then(|id| self.task(id))
                     && self.editing.as_ref().is_none_or(|f| f.id != task.id)
+                    && let Some(data) = &self.data
                 {
-                    self.editing = Some(EditForm::from_task(task));
+                    self.editing = Some(open_form(task, &data.tasks));
                 }
                 Action::None
             }
@@ -594,13 +614,13 @@ impl DayView {
                 if self.editing.as_ref().is_some_and(|f| f.id == id) {
                     self.editing = None;
                 } else if let Some(task) = data.tasks.iter().find(|t| t.id == id) {
-                    self.editing = Some(EditForm::from_task(task));
+                    self.editing = Some(open_form(task, &data.tasks));
                     self.selected = Some(id);
                 }
                 Action::None
             }
             Message::EditTitle(s) => self.edit(|f| f.title = s),
-            Message::EditProject(s) => self.edit(|f| f.project = s),
+            Message::EditProject(s) | Message::PickProject(s) => self.edit(|f| f.project = s),
             Message::EditEstimate(s) => self.edit(|f| f.estimate = s),
             Message::EditNotes(action) => self.edit(|f| f.notes.perform(action)),
             Message::SetPriority(p) => self.edit(|f| f.priority = priority_level(p)),
@@ -857,7 +877,7 @@ impl DayView {
             Some(form) if form.id == task.id => edit_card(task, form, data.today),
             _ => task_row(task, data.today, self.selected == Some(task.id)),
         }))
-        .spacing(2)
+        .spacing(6)
         .into()
     }
 }
@@ -920,9 +940,38 @@ fn side_work<'a>(data: &'a DayData, input: &'a str) -> Option<Element<'a, Messag
     Some(group.into())
 }
 
-/// A selected row: the hovered look of [`theme::row_button`], always.
-fn selected_row(theme: &Theme, _status: button::Status) -> button::Style {
-    theme::row_button(theme, button::Status::Hovered)
+/// The background moved `amount` (0–1) towards the text colour.
+fn tinted(theme: &Theme, amount: f32) -> Color {
+    let p = theme.palette();
+    Color::from_rgb(
+        p.background.r + (p.text.r - p.background.r) * amount,
+        p.background.g + (p.text.g - p.background.g) * amount,
+        p.background.b + (p.text.b - p.background.b) * amount,
+    )
+}
+
+/// A task card, as in the Week tab: a raised fill, lighter on hover,
+/// quieter when done, with an accent ring when selected.
+fn task_card_style(done: bool, selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        let amount = match (done, hovered || selected) {
+            (true, false) => 0.035,
+            (true, true) => 0.06,
+            (false, false) => 0.065,
+            (false, true) => 0.095,
+        };
+        button::Style {
+            background: Some(tinted(theme, amount).into()),
+            text_color: theme.palette().text,
+            border: border::rounded(theme::RADIUS).width(1).color(if selected {
+                theme::ACCENT.scale_alpha(0.7)
+            } else {
+                Color::TRANSPARENT
+            }),
+            ..button::Style::default()
+        }
+    }
 }
 
 /// `!` for Medium, `!!` for High, in the priority colour; `None` for Low.
@@ -978,20 +1027,20 @@ fn task_row<'a>(task: &'a Task, today: Date, selected: bool) -> Element<'a, Mess
         );
     }
 
-    row![
-        checkbox(task.is_done()).on_toggle(move |b| Message::Toggle(id, b)),
-        button(line)
-            .width(Fill)
-            .padding([9, 10])
-            .style(if selected {
-                selected_row
-            } else {
-                theme::row_button
-            })
-            .on_press(Message::Expand(id)),
-    ]
-    .spacing(theme::SPACING / 2.0)
-    .align_y(Center)
+    // The checkbox sits inside the card; it captures its own clicks, so
+    // they don't open the form.
+    button(
+        row![
+            checkbox(task.is_done()).on_toggle(move |b| Message::Toggle(id, b)),
+            line,
+        ]
+        .spacing(theme::SPACING * 0.75)
+        .align_y(Center),
+    )
+    .width(Fill)
+    .padding([11, 14])
+    .style(task_card_style(!open, selected))
+    .on_press(Message::Expand(id))
     .into()
 }
 
@@ -1018,9 +1067,13 @@ fn deleted_row(task: &Task) -> Element<'_, Message> {
 }
 
 fn project_chip(project: &str) -> Element<'_, Message> {
+    // `theme::chip`, a step lighter so it shows on a task card.
     container(text(format!("#{project}")).size(theme::TEXT_SMALL))
         .padding(theme::chip_padding())
-        .style(theme::chip)
+        .style(|theme: &Theme| container::Style {
+            background: Some(tinted(theme, 0.13).into()),
+            ..theme::chip(theme)
+        })
         .into()
 }
 
@@ -1080,18 +1133,10 @@ fn due_button(due: Option<Date>, today: Date) -> Element<'static, Message> {
 
 /// A button that looks like [`theme::input`].
 fn field_button(theme: &Theme, status: button::Status) -> button::Style {
-    let p = theme.palette();
-    let mix = |t: f32| {
-        Color::from_rgb(
-            p.background.r + (p.text.r - p.background.r) * t,
-            p.background.g + (p.text.g - p.background.g) * t,
-            p.background.b + (p.text.b - p.background.b) * t,
-        )
-    };
     let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
     button::Style {
-        background: Some(mix(if hovered { 0.11 } else { 0.075 }).into()),
-        text_color: p.text,
+        background: Some(tinted(theme, if hovered { 0.11 } else { 0.075 }).into()),
+        text_color: theme.palette().text,
         border: border::rounded(theme::RADIUS),
         ..button::Style::default()
     }
@@ -1213,35 +1258,81 @@ fn calendar_day(
     }
 }
 
+/// A subtask's card: the input fill, quieter when done.
+fn subtask_card(done: bool) -> impl Fn(&Theme) -> container::Style {
+    move |theme| container::Style {
+        background: Some(tinted(theme, if done { 0.05 } else { 0.075 }).into()),
+        border: border::rounded(theme::RADIUS),
+        ..container::Style::default()
+    }
+}
+
 fn subtasks_view(form: &EditForm) -> Element<'_, Message> {
-    let mut list = Column::new().spacing(4);
+    let mut list = Column::new().spacing(6);
     for (i, s) in form.subtasks.iter().enumerate() {
         let mut label = text(&s.text).size(theme::TEXT_BODY).width(Fill);
         if s.done {
             label = label.style(theme::muted);
         }
         list = list.push(
-            row![
-                checkbox(s.done).on_toggle(move |b| Message::ToggleSubtask(i, b)),
-                label,
-                button(text("×").size(theme::TEXT_BODY))
-                    .padding([0, 8])
-                    .style(theme::text_button)
-                    .on_press(Message::RemoveSubtask(i)),
-            ]
-            .spacing(theme::SPACING / 2.0)
-            .align_y(Center),
+            container(
+                row![
+                    checkbox(s.done).on_toggle(move |b| Message::ToggleSubtask(i, b)),
+                    label,
+                    button(text("×").size(theme::TEXT_BODY))
+                        .padding([0, 8])
+                        .style(theme::text_button)
+                        .on_press(Message::RemoveSubtask(i)),
+                ]
+                .spacing(theme::SPACING * 0.75)
+                .align_y(Center),
+            )
+            .padding([7, 12])
+            .width(Fill)
+            .style(subtask_card(s.done)),
         );
     }
     list.push(
         text_input("Add a subtask", &form.new_subtask)
             .on_input(Message::EditNewSubtask)
             .on_submit(Message::AddSubtask)
-            .padding([8, 10])
+            .padding([9, 12])
             .size(theme::TEXT_BODY)
             .style(theme::input),
     )
     .into()
+}
+
+/// The project field: type a name, or pick one from the projects of open
+/// tasks, listed when the field is clicked.
+fn project_field(form: &EditForm) -> Element<'_, Message> {
+    let current = (!form.project.is_empty()).then_some(&form.project);
+    combo_box(&form.projects, &form.project, current, Message::PickProject)
+        .on_input(Message::EditProject)
+        .padding([8, 10])
+        .size(theme::TEXT_BODY)
+        .input_style(theme::input)
+        .menu_style(project_menu)
+        .into()
+}
+
+/// The project list: a raised panel like the calendar.
+fn project_menu(theme: &Theme) -> menu::Style {
+    let p = theme.palette();
+    menu::Style {
+        background: tinted(theme, 0.06).into(),
+        border: border::rounded(theme::RADIUS)
+            .width(1)
+            .color(theme::muted_color(theme).scale_alpha(0.25)),
+        text_color: p.text,
+        selected_text_color: Color::WHITE,
+        selected_background: theme::ACCENT.into(),
+        shadow: iced::Shadow {
+            color: Color::BLACK.scale_alpha(0.3),
+            offset: iced::Vector::new(0.0, 6.0),
+            blur_radius: 18.0,
+        },
+    }
 }
 
 fn edit_card<'a>(task: &'a Task, form: &'a EditForm, today: Date) -> Element<'a, Message> {
@@ -1262,7 +1353,7 @@ fn edit_card<'a>(task: &'a Task, form: &'a EditForm, today: Date) -> Element<'a,
         .spacing(theme::SPACING / 2.0)
         .align_y(Center),
         row![
-            labelled("Project", field("", &form.project, Message::EditProject)),
+            labelled("Project", project_field(form)),
             labelled(
                 "Due",
                 popup::Popup::new(
@@ -1291,19 +1382,19 @@ fn edit_card<'a>(task: &'a Task, form: &'a EditForm, today: Date) -> Element<'a,
 
     body = body.push(
         row![
-            button(text("Save").size(theme::TEXT_BODY))
-                .padding([6, 16])
-                .style(theme::primary_button)
-                .on_press(Message::Save),
-            button(text("Close").size(theme::TEXT_BODY))
-                .padding([6, 12])
-                .style(theme::text_button)
-                .on_press(Message::Close),
-            Space::new().width(Fill),
             button(text("Delete").size(theme::TEXT_BODY))
                 .padding([6, 12])
                 .style(theme::danger_button)
                 .on_press(Message::Delete),
+            Space::new().width(Fill),
+            button(text("Close").size(theme::TEXT_BODY))
+                .padding([6, 12])
+                .style(theme::text_button)
+                .on_press(Message::Close),
+            button(text("Save").size(theme::TEXT_BODY))
+                .padding([6, 16])
+                .style(theme::primary_button)
+                .on_press(Message::Save),
         ]
         .spacing(theme::SPACING / 2.0)
         .align_y(Center),
@@ -1598,11 +1689,13 @@ mod tests {
         date(2026, 11, 16)
     }
 
+    /// Due and planned on `due` (as migration 3 leaves older tasks).
     fn task(id: TaskId, title: &str, due: Option<Date>) -> Task {
         Task {
             id,
             title: title.to_string(),
             due_on: due,
+            planned_for: due,
             position: id as f64,
             ..Task::default()
         }
@@ -1859,7 +1952,6 @@ mod tests {
                 title: "New title".into(),
                 project: Some("home".into()),
                 due_on: Some(date(2026, 12, 2)),
-                planned_for: None,
                 estimate_minutes: Some(90),
                 priority: 2,
                 notes: "some notes\n\n- [x] first\n- [ ] second\n- [ ] typed, not added".into(),
@@ -1871,6 +1963,40 @@ mod tests {
         assert_eq!(form.subtasks.len(), 3);
         assert_eq!(form.notes.text().trim(), "some notes");
         assert_eq!(form.apply(&updated).unwrap(), updated);
+    }
+
+    #[test]
+    fn setting_the_due_date_keeps_the_planned_day() {
+        let t = planned(task(1, "t", None), date(2026, 11, 17));
+        let mut view = loaded(vec![t]);
+        view.update(Message::Expand(1));
+        view.update(Message::PickDue(date(2026, 11, 18)));
+        let Action::Update(updated) = view.update(Message::Save) else {
+            panic!("expected Update");
+        };
+        assert_eq!(updated.due_on, Some(date(2026, 11, 18)));
+        assert_eq!(updated.planned_for, Some(date(2026, 11, 17)));
+
+        // An inbox task stays in the inbox with a deadline.
+        let mut inbox = task(2, "inbox", None);
+        inbox.due_on = Some(date(2026, 11, 18));
+        assert_eq!(
+            section_of(&inbox, date(2026, 11, 18), today(), &TimeZone::UTC),
+            Some(Section::NoDate)
+        );
+    }
+
+    #[test]
+    fn project_list_is_open_tasks_only() {
+        let mut a = task(1, "a", None);
+        a.project = Some("work".into());
+        let mut b = task(2, "b", None);
+        b.project = Some("Home".into());
+        let mut c = with_status(task(3, "c", None), TaskStatus::Done);
+        c.project = Some("old".into());
+        let mut d = task(4, "d", None);
+        d.project = Some("work".into());
+        assert_eq!(open_projects(&[a, b, c, d]), ["Home", "work"]);
     }
 
     #[test]

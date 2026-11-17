@@ -529,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn tasks_are_placed_by_planned_day_then_due_date() {
+    fn tasks_are_placed_by_planned_day_not_due_date() {
         let mut planned = task(1, "planned", date(2026, 11, 18), TaskStatus::Todo);
         planned.due_on = Some(date(2026, 11, 20));
         let mut due = task(2, "due", date(2026, 11, 20), TaskStatus::Todo);
@@ -537,7 +537,7 @@ mod tests {
         due.due_on = Some(date(2026, 11, 20));
         let tasks = vec![planned, due];
         let c = cell_content(&tasks, date(2026, 11, 20), TODAY, 4);
-        assert_eq!(titles(&c), ["due"]);
+        assert!(titles(&c).is_empty());
         let c = cell_content(&tasks, date(2026, 11, 18), TODAY, 4);
         assert_eq!(titles(&c), ["planned"]);
         assert_eq!(

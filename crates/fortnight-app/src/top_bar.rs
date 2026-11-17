@@ -131,20 +131,22 @@ pub fn period_label(tab: Tab, selected: Date, today: Date, schedule: &Schedule) 
 }
 
 /// The task a quick-add line creates, or `None` if it has no title.
-/// In the Today tab a line without a date is due on the day shown.
+/// A date in the line is the day you plan to do it (where the task is
+/// shown), not a deadline. In the Today tab a line without a date is
+/// planned for the day shown.
 pub fn quick_add_task(input: &str, tab: Tab, selected: Date, today: Date) -> Option<NewTask> {
     let parsed = parse::parse_quick_add(input, today);
     if parsed.title.trim().is_empty() {
         return None;
     }
-    let due_on = match tab {
+    let planned_for = match tab {
         Tab::Today => parsed.due_on.or(Some(selected)),
         _ => parsed.due_on,
     };
     Some(NewTask {
         title: parsed.title,
         project: parsed.project,
-        due_on,
+        planned_for,
         estimate_minutes: parsed.estimate_minutes,
         priority: parsed.priority,
         ..NewTask::default()
@@ -291,16 +293,16 @@ mod tests {
     fn quick_add_dates_undated_tasks_on_the_day_shown() {
         let shown = date(2026, 11, 18);
         let t = quick_add_task("Buy milk #home", Tab::Today, shown, today()).unwrap();
-        assert_eq!(t.due_on, Some(shown));
-        assert_eq!(t.planned_for, None);
+        assert_eq!(t.planned_for, Some(shown));
+        assert_eq!(t.due_on, None);
         assert_eq!(t.project.as_deref(), Some("home"));
 
         let t = quick_add_task("Report fri", Tab::Today, shown, today()).unwrap();
-        assert_eq!(t.planned_for, None);
-        assert_eq!(t.due_on, Some(date(2026, 11, 20)));
+        assert_eq!(t.planned_for, Some(date(2026, 11, 20)));
+        assert_eq!(t.due_on, None);
 
         let t = quick_add_task("Inbox item", Tab::Week, shown, today()).unwrap();
-        assert_eq!(t.due_on, None);
+        assert_eq!(t.planned_for, None);
 
         assert_eq!(quick_add_task("   ", Tab::Today, shown, today()), None);
         assert_eq!(quick_add_task("#work", Tab::Today, shown, today()), None);
