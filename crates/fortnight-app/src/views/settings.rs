@@ -1,37 +1,44 @@
 //! Settings overlay and the unlock prompt. Owner: agent M (round 2; was
 //! agent I).
 //!
-//! STEP 1: round 1's view behind the round 2 contract. The protocol, focus
-//! hours and notification switch are carried through Save unchanged but not
-//! yet editable; the model list and Close are not wired. Agent M adds them.
+//! Settings opens as an overlay panel over the current tab. It is one
+//! scrollable column under a fixed header that holds the title, the single
+//! Save button (it saves the whole form: endpoint and protocol, schedule,
+//! capacity, notifications, summary style) and a close button. Closing with
+//! unsaved changes is allowed: the header says "Unsaved changes", and the
+//! edits stay in the form until the saved settings change.
 //!
-//! Settings is one scrollable column under a fixed header that holds the
-//! title and the single Save button (it saves the whole form: endpoint,
-//! schedule, summary style). The API key controls act immediately and are
-//! not part of Save.
+//! The API key controls act immediately and are not part of Save. "Load
+//! models" asks `main.rs` for the endpoint's model list; the result is
+//! offered in a pick list beside the free-text model field, and is hidden
+//! once the protocol or base URL is edited away from the listed endpoint.
+//!
+//! Focus hours per day are typed as decimal hours (`5.5`) and stored as
+//! whole minutes; an invalid value blocks Save like an invalid time does.
 //!
 //! Secrets (API key, passwords) live in the form as `String` only while
 //! typed. They are moved into a `SecretString` when an action is emitted,
 //! and every other secret field is wiped at the same time. `Message` prints
 //! them as `***` in `Debug` output.
 //!
-//! Skipped for the prototype: protocol picker, model list, payload preview,
-//! capacity hours, a "working…" indicator while Argon2 runs, selectable
-//! data-folder text (iced 0.14 has no selectable text widget).
+//! Skipped for the prototype: summary length/tone presets (free-form
+//! instructions only), a "working…" indicator while Argon2 runs, selectable
+//! data-folder text (iced 0.14 has no selectable text widget), and a
+//! confirmation before closing with unsaved changes.
 
 use fortnight_core::domain::{LlmSettings, Protocol, Schedule, Settings};
 use fortnight_core::vault::MIN_PASSWORD_LEN;
 use iced::widget::{
-    Space, button, checkbox, column, container, operation, pick_list, row, scrollable, text,
+    Space, button, checkbox, column, container, operation, pick_list, row, rule, scrollable, text,
     text_input,
 };
-use iced::{Background, Border, Center, Color, Element, Fill, Theme};
+use iced::{Background, Border, Center, Color, Element, Fill, Length, Theme};
 use jiff::civil::{Time, Weekday};
 use secrecy::SecretString;
 use std::fmt;
 use std::path::PathBuf;
 
-use crate::theme;
+use crate::theme::{self, Icon};
 
 /// The state of the encrypted API key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,8 +73,16 @@ pub enum SecretField {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Protocol(Protocol),
     BaseUrl(String),
     Model(String),
+    /// Ask the endpoint for its model list.
+    LoadModels,
+    /// A model picked from the listed ones.
+    PickModel(String),
+    FocusHours(String),
+    Notifications(bool),
+    Close,
     Save,
     Test,
     WeekStart(Weekday),
@@ -201,6 +216,41 @@ pub fn format_time(t: Time) -> String {
     format!("{:02}:{:02}", t.hour(), t.minute())
 }
 
+/// Decimal hours per day (`6`, `5.5`, `7,25`) as whole minutes. More than 0
+/// and at most 24 hours.
+pub fn parse_hours(s: &str) -> Option<u32> {
+    let s = s.trim().replace(',', ".");
+    if s.is_empty() || !s.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    let hours: f64 = s.parse().ok()?;
+    let minutes = (hours * 60.0).round();
+    (1.0..=24.0 * 60.0)
+        .contains(&minutes)
+        .then_some(minutes as u32)
+}
+
+/// Minutes as decimal hours with at most two decimals: 360 → `6`,
+/// 330 → `5.5`. [`parse_hours`] reads it back to the same minutes.
+pub fn format_hours(minutes: u32) -> String {
+    if minutes.is_multiple_of(60) {
+        return (minutes / 60).to_string();
+    }
+    let s = format!("{:.2}", f64::from(minutes) / 60.0);
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// What the model-list area shows.
+#[derive(Debug, PartialEq, Eq)]
+enum ModelsState<'a> {
+    Hidden,
+    Busy,
+    /// The endpoint answered but listed no models.
+    Empty,
+    Error(&'a str),
+    List(&'a [String]),
+}
+
 /// The editable copy of the non-secret settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Form {
@@ -215,7 +265,8 @@ struct Form {
     working_days: [bool; 7],
     summary_instructions: String,
     protocol: Protocol,
-    focus_minutes_per_day: u32,
+    /// Decimal hours as typed, e.g. `5.5`.
+    focus_hours: String,
     notifications: bool,
 }
 
@@ -239,12 +290,13 @@ impl Form {
             working_days: WEEK.map(|d| sched.working_days.contains(&d)),
             summary_instructions: s.summary_instructions.clone(),
             protocol: s.llm.protocol,
-            focus_minutes_per_day: s.focus_minutes_per_day,
+            focus_hours: format_hours(s.focus_minutes_per_day),
             notifications: s.notifications,
         }
     }
 
-    /// The settings this form describes, or `None` if a time is invalid.
+    /// The settings this form describes, or `None` if a time or the focus
+    /// hours are invalid.
     fn to_settings(&self) -> Option<Settings> {
         Some(Settings {
             llm: self.llm(),
@@ -262,7 +314,7 @@ impl Form {
                     .collect(),
             },
             summary_instructions: self.summary_instructions.trim().to_string(),
-            focus_minutes_per_day: self.focus_minutes_per_day,
+            focus_minutes_per_day: parse_hours(&self.focus_hours)?,
             notifications: self.notifications,
         })
     }
@@ -369,6 +421,11 @@ pub struct SettingsView {
     key_mode: KeyMode,
     /// Local validation error for the key forms.
     key_error: Option<String>,
+    models: Option<Result<Vec<String>, String>>,
+    listing_models: bool,
+    /// The endpoint of the last "Load models" request, to hide a list that
+    /// belongs to an endpoint the form no longer names.
+    listed_for: Option<(Protocol, String)>,
 }
 
 impl Default for SettingsView {
@@ -384,6 +441,9 @@ impl Default for SettingsView {
             secrets: Secrets::default(),
             key_mode: KeyMode::Idle,
             key_error: None,
+            models: None,
+            listing_models: false,
+            listed_for: None,
         }
     }
 }
@@ -412,6 +472,8 @@ impl SettingsView {
         self.test_result = data.test_result;
         self.testing = data.testing;
         self.key_message = data.key_message;
+        self.models = data.models;
+        self.listing_models = data.listing_models;
     }
 
     /// The settings the form would save, if they differ from the loaded
@@ -431,11 +493,43 @@ impl SettingsView {
         self.form.llm().is_configured() && !self.testing
     }
 
+    fn can_list_models(&self) -> bool {
+        !self.form.base_url.trim().is_empty() && !self.listing_models
+    }
+
+    fn models_state(&self) -> ModelsState<'_> {
+        if self.listing_models {
+            return ModelsState::Busy;
+        }
+        if let Some((protocol, base_url)) = &self.listed_for
+            && (*protocol != self.form.protocol || *base_url != self.form.base_url.trim())
+        {
+            return ModelsState::Hidden;
+        }
+        match &self.models {
+            None => ModelsState::Hidden,
+            Some(Ok(ids)) if ids.is_empty() => ModelsState::Empty,
+            Some(Ok(ids)) => ModelsState::List(ids),
+            Some(Err(e)) => ModelsState::Error(e),
+        }
+    }
+
     pub fn update(&mut self, message: Message) -> Action {
         let form = &mut self.form;
         match message {
+            Message::Protocol(p) => form.protocol = p,
             Message::BaseUrl(s) => form.base_url = s,
-            Message::Model(s) => form.model = s,
+            Message::Model(s) | Message::PickModel(s) => form.model = s,
+            Message::FocusHours(s) => form.focus_hours = s,
+            Message::Notifications(on) => form.notifications = on,
+            Message::LoadModels => {
+                if self.can_list_models() {
+                    let llm = self.form.llm();
+                    self.listed_for = Some((llm.protocol, llm.base_url.clone()));
+                    return Action::ListModels(llm);
+                }
+            }
+            Message::Close => return Action::Close,
             Message::WeekStart(d) => form.week_start = d,
             Message::SummaryDay(d) => form.summary_day = d,
             Message::SummaryTime(s) => form.summary_time = s,
@@ -541,6 +635,10 @@ impl SettingsView {
             .padding([8, 18])
             .style(theme::primary_button)
             .on_press_maybe(self.savable().map(|_| Message::Save));
+        let close = button(theme::icon(Icon::Close))
+            .padding(theme::ICON_PADDING)
+            .style(theme::icon_button)
+            .on_press(Message::Close);
         let status: Element<'_, Message> = if !self.is_dirty() {
             Space::new().into()
         } else if self.form.to_settings().is_none() {
@@ -559,52 +657,133 @@ impl SettingsView {
                 theme::title("Settings"),
                 Space::new().width(Fill),
                 status,
-                save
+                save,
+                close
             ]
             .spacing(theme::SPACING)
             .align_y(Center),
         )
-        .padding(theme::SPACING * 2.0)
-        .max_width(theme::CONTENT_WIDTH);
-        let header = container(header).center_x(Fill);
+        .padding(iced::Padding {
+            top: theme::SPACING * 1.5,
+            bottom: theme::SPACING * 1.5,
+            left: theme::SPACING * 2.0,
+            right: theme::SPACING * 1.5,
+        })
+        .width(Fill);
 
         let content = column![
             self.endpoint_section(),
             self.key_section(),
             self.schedule_section(),
+            self.capacity_section(),
+            self.notifications_section(),
             self.summary_section(),
             self.data_section(),
         ]
         .spacing(theme::SPACING * 2.5)
         .padding(iced::Padding {
-            top: 0.0,
+            top: theme::SPACING,
             bottom: theme::SPACING * 3.0,
             left: theme::SPACING * 2.0,
             right: theme::SPACING * 2.0,
         })
-        .max_width(theme::CONTENT_WIDTH);
+        .width(Fill);
 
         column![
             header,
-            scrollable(container(content).center_x(Fill)).height(Fill)
+            rule::horizontal(1).style(divider),
+            scrollable(content)
+                .direction(scrollable::Direction::Vertical(
+                    scrollable::Scrollbar::new()
+                        .width(6)
+                        .scroller_width(6)
+                        .margin(4)
+                ))
+                .height(Fill)
         ]
         .into()
     }
 
     fn endpoint_section(&self) -> Element<'_, Message> {
+        let f = &self.form;
+        let protocol = labelled(
+            "Protocol",
+            pick_list(Protocol::ALL, Some(f.protocol), Message::Protocol)
+                .padding([8, 12])
+                .text_size(theme::TEXT_BODY)
+                .width(Fill)
+                .style(picker),
+        );
         let base_url = labelled(
             "Base URL",
-            input("https://api.openai.com/v1", &self.form.base_url).on_input(Message::BaseUrl),
+            input(f.protocol.example_base_url(), &f.base_url).on_input(Message::BaseUrl),
         );
+        let model_placeholder = match f.protocol {
+            Protocol::OpenAi => "e.g. llama3.2 or gpt-4o",
+            Protocol::Anthropic => "e.g. claude-sonnet-5-5",
+        };
+        let load_label = if self.listing_models {
+            "Loading…"
+        } else {
+            "Load models"
+        };
+        let load = button(text(load_label).size(theme::TEXT_BODY))
+            .padding([8, 14])
+            .style(theme::secondary_button)
+            .on_press_maybe(self.can_list_models().then_some(Message::LoadModels));
         let model = labelled(
             "Model",
-            input("gpt-…", &self.form.model).on_input(Message::Model),
+            row![
+                input(model_placeholder, &f.model).on_input(Message::Model),
+                load
+            ]
+            .spacing(theme::SPACING / 2.0)
+            .align_y(Center),
         );
-        let hint = small_muted(
-            "Any OpenAI-compatible endpoint works, e.g. Ollama at http://localhost:11434/v1.",
-        );
+        let models: Element<'_, Message> = match self.models_state() {
+            ModelsState::Hidden => Space::new().into(),
+            ModelsState::Busy => small_muted("Asking the endpoint for its models…"),
+            ModelsState::Empty => {
+                small_muted("The endpoint didn't list any models: type the model name above.")
+            }
+            ModelsState::Error(e) => text(format!("Couldn't load models: {}", shorten(e, 160)))
+                .size(theme::TEXT_SMALL)
+                .style(theme::danger)
+                .into(),
+            ModelsState::List(ids) => {
+                let selected = ids.iter().find(|id| **id == f.model.trim()).cloned();
+                row![
+                    text(format!(
+                        "{} model{} listed",
+                        ids.len(),
+                        if ids.len() == 1 { "" } else { "s" }
+                    ))
+                    .size(theme::TEXT_SMALL)
+                    .style(theme::muted),
+                    pick_list(ids, selected, Message::PickModel)
+                        .placeholder("Choose a model")
+                        .padding([6, 12])
+                        .text_size(theme::TEXT_BODY)
+                        .width(Fill)
+                        .style(picker),
+                ]
+                .spacing(theme::SPACING)
+                .align_y(Center)
+                .into()
+            }
+        };
+        let hint = small_muted(match f.protocol {
+            Protocol::OpenAi => {
+                "Any OpenAI-compatible endpoint works, e.g. Ollama at http://localhost:11434/v1."
+            }
+            Protocol::Anthropic => "Anthropic's Messages API, e.g. https://api.anthropic.com.",
+        });
 
-        let test_label = if self.testing { "Testing…" } else { "Test" };
+        let test_label = if self.testing {
+            "Testing…"
+        } else {
+            "Test connection"
+        };
         let test = button(text(test_label).size(theme::TEXT_BODY))
             .padding([8, 18])
             .style(theme::secondary_button)
@@ -614,16 +793,18 @@ impl SettingsView {
             match &self.test_result {
                 Some(Ok(reply)) => {
                     test_row = test_row.push(
-                        text(format!("Connected. Model replied: {}", shorten(reply, 80)))
+                        text(format!("Connected. {}", shorten(reply, 80)))
                             .size(theme::TEXT_SMALL)
-                            .style(success),
+                            .style(success)
+                            .width(Fill),
                     )
                 }
                 Some(Err(e)) => {
                     test_row = test_row.push(
                         text(shorten(e, 160))
                             .size(theme::TEXT_SMALL)
-                            .style(theme::danger),
+                            .style(theme::danger)
+                            .width(Fill),
                     )
                 }
                 None if self.key_state == KeyState::Locked => {
@@ -634,10 +815,16 @@ impl SettingsView {
         }
 
         section(
-            "ENDPOINT",
+            "LLM",
             column![
-                row![base_url, model].spacing(theme::SPACING),
+                row![
+                    container(protocol).width(Length::FillPortion(2)),
+                    container(base_url).width(Length::FillPortion(3))
+                ]
+                .spacing(theme::SPACING),
                 hint,
+                model,
+                models,
                 test_row
             ]
             .spacing(theme::SPACING),
@@ -826,6 +1013,15 @@ impl SettingsView {
             Message::PlanTime,
         );
 
+        section(
+            "SCHEDULE",
+            column![week_start, row![summary, plan].spacing(theme::SPACING)]
+                .spacing(theme::SPACING * 1.25),
+        )
+    }
+
+    fn capacity_section(&self) -> Element<'_, Message> {
+        let f = &self.form;
         let mut days = row![].spacing(theme::SPACING * 1.25);
         for (i, day) in WEEK.iter().enumerate() {
             days = days.push(
@@ -835,16 +1031,50 @@ impl SettingsView {
                     .on_toggle(move |on| Message::WorkingDay(i, on)),
             );
         }
-
+        let mut hours = column![
+            text("Focus hours per day").size(theme::TEXT_SMALL),
+            row![
+                input("6", &f.focus_hours)
+                    .on_input(Message::FocusHours)
+                    .width(90),
+                small_muted("Hours of real work a day; the Week tab compares estimates with it."),
+            ]
+            .spacing(theme::SPACING)
+            .align_y(Center),
+        ]
+        .spacing(theme::SPACING / 3.0);
+        if parse_hours(&f.focus_hours).is_none() {
+            hours = hours.push(
+                text("Use hours between 0 and 24, e.g. 6 or 5.5")
+                    .size(theme::TEXT_SMALL)
+                    .style(theme::danger),
+            );
+        }
         section(
-            "SCHEDULE",
+            "CAPACITY",
             column![
-                week_start,
-                row![summary, plan].spacing(theme::SPACING),
                 column![text("Working days").size(theme::TEXT_SMALL), days]
                     .spacing(theme::SPACING / 2.0),
+                hours,
             ]
             .spacing(theme::SPACING * 1.25),
+        )
+    }
+
+    fn notifications_section(&self) -> Element<'_, Message> {
+        section(
+            "NOTIFICATIONS",
+            column![
+                checkbox(self.form.notifications)
+                    .label("Notify me when a report is ready")
+                    .text_size(theme::TEXT_BODY)
+                    .on_toggle(Message::Notifications),
+                small_muted(
+                    "Uses the system's notifications, which are best-effort: \
+                     some systems hide or block them."
+                ),
+            ]
+            .spacing(theme::SPACING / 2.0),
         )
     }
 
@@ -989,6 +1219,16 @@ fn shorten(s: &str, max: usize) -> String {
 fn success(theme: &Theme) -> text::Style {
     text::Style {
         color: Some(theme.palette().success),
+    }
+}
+
+/// The thin line under the fixed header.
+fn divider(theme: &Theme) -> rule::Style {
+    rule::Style {
+        color: theme::muted_color(theme).scale_alpha(0.25),
+        radius: 0.0.into(),
+        fill_mode: rule::FillMode::Full,
+        snap: true,
     }
 }
 
@@ -1142,6 +1382,7 @@ impl UnlockView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fortnight_core::domain::DEFAULT_FOCUS_MINUTES;
     use secrecy::ExposeSecret;
 
     fn data(settings: Settings, key_state: KeyState) -> SettingsData {
@@ -1394,6 +1635,157 @@ mod tests {
         assert_eq!(pw.expose_secret(), "hunter22");
         assert!(u.password.is_empty());
         assert!(matches!(u.update(UnlockMessage::Skip), UnlockAction::Skip));
+    }
+
+    #[test]
+    fn protocol_and_focus_hours_round_trip_through_save() {
+        let mut v = loaded(KeyState::NoKey);
+        assert_eq!(v.form.focus_hours, "6");
+        v.update(Message::Protocol(Protocol::Anthropic));
+        v.update(Message::BaseUrl("https://api.anthropic.com".into()));
+        v.update(Message::Model("claude-x".into()));
+        v.update(Message::FocusHours(" 5.5 ".into()));
+        v.update(Message::Notifications(true));
+        let Action::Save(s) = v.update(Message::Save) else {
+            panic!("expected Save");
+        };
+        assert_eq!(s.llm.protocol, Protocol::Anthropic);
+        assert_eq!(s.focus_minutes_per_day, 330);
+        assert!(s.notifications);
+        // Saved settings come back from main.rs: the form matches them and
+        // there is nothing left to save.
+        v.load(data(s.clone(), KeyState::NoKey));
+        assert_eq!(v.form.protocol, Protocol::Anthropic);
+        assert_eq!(v.form.focus_hours, "5.5");
+        assert!(v.form.notifications);
+        assert!(!v.is_dirty());
+        assert!(matches!(v.update(Message::Save), Action::None));
+    }
+
+    #[test]
+    fn round1_settings_load_with_defaults_and_save_unchanged() {
+        // Round 1 settings JSON has no protocol, focus minutes or
+        // notifications; core's serde defaults fill them in (tested in
+        // `domain`), which gives this value.
+        let mut round1 = Settings::default();
+        round1.llm.base_url = "http://localhost:11434/v1".into();
+        round1.llm.model = "llama3.2".into();
+        round1.summary_instructions = "Short.".into();
+        let mut v = SettingsView::new();
+        v.load(data(round1.clone(), KeyState::NoKey));
+        assert_eq!(v.form.protocol, Protocol::OpenAi);
+        assert_eq!(v.form.focus_hours, "6");
+        assert!(!v.is_dirty());
+        v.update(Message::SummaryInstructions("Shorter.".into()));
+        let Action::Save(s) = v.update(Message::Save) else {
+            panic!("expected Save");
+        };
+        assert_eq!(s.llm, round1.llm);
+        assert_eq!(s.schedule, round1.schedule);
+        assert_eq!(s.focus_minutes_per_day, DEFAULT_FOCUS_MINUTES);
+        assert!(!s.notifications);
+        assert_eq!(s.summary_instructions, "Shorter.");
+    }
+
+    #[test]
+    fn invalid_focus_hours_block_save() {
+        let mut v = loaded(KeyState::NoKey);
+        for bad in ["", "0", "abc", "25", "-3", "5h", "1.2.3"] {
+            v.update(Message::FocusHours(bad.into()));
+            assert!(matches!(v.update(Message::Save), Action::None), "{bad}");
+            assert!(v.is_dirty());
+        }
+        v.update(Message::FocusHours("7,5".into()));
+        let Action::Save(s) = v.update(Message::Save) else {
+            panic!("expected Save");
+        };
+        assert_eq!(s.focus_minutes_per_day, 450);
+    }
+
+    #[test]
+    fn hours_format_and_parse_round_trip() {
+        assert_eq!(format_hours(360), "6");
+        assert_eq!(format_hours(330), "5.5");
+        assert_eq!(format_hours(345), "5.75");
+        for minutes in 1..=24 * 60 {
+            assert_eq!(
+                parse_hours(&format_hours(minutes)),
+                Some(minutes),
+                "{minutes}"
+            );
+        }
+        assert_eq!(parse_hours("24"), Some(1440));
+        assert_eq!(parse_hours("24.5"), None);
+    }
+
+    #[test]
+    fn list_models_carries_current_fields() {
+        let mut v = loaded(KeyState::NoKey);
+        // Needs a base URL.
+        assert!(matches!(v.update(Message::LoadModels), Action::None));
+        v.update(Message::Protocol(Protocol::Anthropic));
+        v.update(Message::BaseUrl(" https://api.anthropic.com ".into()));
+        v.update(Message::Model("typed".into()));
+        let Action::ListModels(llm) = v.update(Message::LoadModels) else {
+            panic!("expected ListModels");
+        };
+        assert_eq!(llm.protocol, Protocol::Anthropic);
+        assert_eq!(llm.base_url, "https://api.anthropic.com");
+        assert_eq!(llm.model, "typed");
+        // Not while a fetch is in flight.
+        let mut d = data(Settings::default(), KeyState::NoKey);
+        d.listing_models = true;
+        v.load(d);
+        assert_eq!(v.models_state(), ModelsState::Busy);
+        assert!(matches!(v.update(Message::LoadModels), Action::None));
+    }
+
+    #[test]
+    fn models_result_handling() {
+        let mut v = loaded(KeyState::NoKey);
+        v.update(Message::BaseUrl("http://localhost:11434/v1".into()));
+        assert_eq!(v.models_state(), ModelsState::Hidden);
+        v.update(Message::LoadModels);
+
+        let with = |models| {
+            let mut d = data(Settings::default(), KeyState::NoKey);
+            d.models = Some(models);
+            d
+        };
+        v.load(with(Ok(vec![])));
+        assert_eq!(v.models_state(), ModelsState::Empty);
+
+        v.load(with(Err("404 Not Found".into())));
+        assert_eq!(v.models_state(), ModelsState::Error("404 Not Found"));
+
+        let ids = vec!["llama3.2".to_string(), "qwen3".to_string()];
+        v.load(with(Ok(ids.clone())));
+        assert_eq!(v.models_state(), ModelsState::List(&ids));
+        v.update(Message::PickModel("qwen3".into()));
+        assert_eq!(v.form.model, "qwen3");
+        // Free text still works after picking.
+        v.update(Message::Model("qwen3:8b".into()));
+        assert_eq!(v.form.model, "qwen3:8b");
+        let Action::Save(s) = v.update(Message::Save) else {
+            panic!("expected Save");
+        };
+        assert_eq!(s.llm.model, "qwen3:8b");
+
+        // A list for another endpoint is hidden.
+        v.update(Message::Protocol(Protocol::Anthropic));
+        assert_eq!(v.models_state(), ModelsState::Hidden);
+        v.update(Message::Protocol(Protocol::OpenAi));
+        assert_eq!(v.models_state(), ModelsState::List(&ids));
+    }
+
+    #[test]
+    fn close_emits_close_and_keeps_edits() {
+        let mut v = loaded(KeyState::NoKey);
+        assert!(matches!(v.update(Message::Close), Action::Close));
+        v.update(Message::Model("unsaved".into()));
+        assert!(matches!(v.update(Message::Close), Action::Close));
+        v.load(data(Settings::default(), KeyState::NoKey));
+        assert_eq!(v.form.model, "unsaved");
     }
 
     #[test]
