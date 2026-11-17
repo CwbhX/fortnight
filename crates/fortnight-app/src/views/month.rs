@@ -6,7 +6,8 @@
 //! the week in the Week tab and carries an accent dot when the week has a
 //! ready summary. Each day cell shows the date and up to three tasks as
 //! small cards like the Week tab's (open first, with the priority `!`; done
-//! or dropped dimmed; overdue red), then "+N more".
+//! dimmed; overdue red), then "+N more". Deleted (`Dropped`) tasks are
+//! left out, as in the Week tab.
 //! Clicking a cell opens the day in the Today tab.
 //!
 //! The grid fills the content area with equal cells. When the rows get too
@@ -18,7 +19,7 @@
 //! an estimated character count with "…" and clipped at the cell edge).
 
 use crate::theme;
-use fortnight_core::domain::{Task, WeekRef};
+use fortnight_core::domain::{Task, TaskStatus, WeekRef};
 use fortnight_core::week::month_weeks;
 use iced::border::{self, Border};
 use iced::widget::text::Wrapping;
@@ -374,7 +375,7 @@ fn mix(a: Color, b: Color, amount: f32) -> Color {
 #[derive(Debug, Clone, PartialEq)]
 struct TitleLine {
     title: String,
-    /// Done or dropped: dimmed.
+    /// Done: dimmed.
     done: bool,
     /// Open with a deadline before today: red.
     overdue: bool,
@@ -392,10 +393,13 @@ struct CellContent {
 
 /// The tasks on `day` (by `Task::day()`) as a cell lists them, given room
 /// for `lines` text lines under the date (a "+N more" line counts as one).
-/// Open tasks first (higher priority, then manual order), then done and
-/// dropped ones; at most [`MAX_TITLES`] titles.
+/// Open tasks first (higher priority, then manual order), then done ones;
+/// at most [`MAX_TITLES`] titles. Deleted (`Dropped`) tasks are left out.
 fn cell_content(tasks: &[Task], day: Date, today: Date, lines: usize) -> CellContent {
-    let mut on_day: Vec<&Task> = tasks.iter().filter(|t| t.day() == Some(day)).collect();
+    let mut on_day: Vec<&Task> = tasks
+        .iter()
+        .filter(|t| t.day() == Some(day) && t.status != TaskStatus::Dropped)
+        .collect();
     on_day.sort_by(|a, b| {
         let open = |t: &Task| !t.status.is_open();
         open(a)
@@ -481,7 +485,6 @@ fn has_summary(data: &MonthData, week: WeekRef) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fortnight_core::domain::TaskStatus;
     use jiff::civil::date;
 
     const TODAY: Date = date(2026, 11, 16);
@@ -570,8 +573,9 @@ mod tests {
             task(5, "other day", date(2026, 11, 19), TaskStatus::Todo),
         ];
         let c = cell_content(&tasks, d, TODAY, 4);
+        // The dropped (deleted) task is not listed or counted.
         assert_eq!(titles(&c), ["urgent", "late", "done"]);
-        assert_eq!(c.more, 1);
+        assert_eq!(c.more, 0);
         assert!(!c.titles[0].done && !c.titles[0].overdue);
         assert!(c.titles[1].overdue && !c.titles[1].done);
         assert!(c.titles[2].done && !c.titles[2].overdue);
