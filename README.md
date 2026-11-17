@@ -5,9 +5,25 @@
 
 # Fortnight
 
-Fortnight is a portable todo app. It keeps your tasks and their history in a SQLite file on your machine. Once a week it sends that history to an LLM endpoint you choose, which writes a summary of your week and recommends what to work on next. Nothing else leaves your machine. It is built and tested on macOS. [PLAN.md](PLAN.md) is the full design.
+Fortnight is a portable todo app. It keeps your tasks and their history in a SQLite file on your machine. It sends that history to an LLM endpoint you choose, which writes a summary of your week and recommends what to work on next. Nothing else leaves your machine. It is built and tested on macOS. [PLAN.md](PLAN.md) is the full design.
 
 Created in [T3 Code](https://t3.codes).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/week-dark.png">
+  <img src="assets/screenshots/week.png" alt="Week tab: a column per working day with load bars and priority marks, and the Work Summary below">
+</picture>
+
+<table>
+  <tr>
+    <td width="50%"><img src="assets/screenshots/today.png" alt="Today tab: three numbered recommended tasks, an overdue expense report and the day's tasks"></td>
+    <td width="50%"><img src="assets/screenshots/month.png" alt="Month tab: November as a calendar with done shares per day"></td>
+  </tr>
+  <tr>
+    <td>Today: recommended tasks, overdue tasks in red, and quick add.</td>
+    <td>Month: every task in the month, with the share done on each day.</td>
+  </tr>
+</table>
 
 ## Quick start
 
@@ -33,17 +49,24 @@ Your data goes in a `fortnight-data` folder beside the program, here `target/rel
 
 ## What it does
 
-- Three tabs show the same tasks around one selected date. Today lists overdue tasks, the day's tasks and a collapsed No date inbox. Week has a column per working day with a load bar, and the report panel below. Month is a calendar; click a day or a week to open it. `‹` and `›` move by a day, a week or a month, and Today jumps back.
-- One quick-add bar is always visible. `Write Q4 report fri #work ~2h !` creates a task due Friday in project `work`, estimated at two hours, with priority 1. Dates can be `fri`, `tomorrow`, `nov 20` or `+3d`. Estimates can be `~2h`, `~30m` or `~1h30m`. `!`, `!!` and `!!!` set the priority.
-- A task has notes, an estimate, a priority, a planned day, and a status of to do, in progress, done or dropped. A private task is never sent to the LLM. Log lines record work that isn't a task, such as "helped Sam debug the deploy".
-- Every change to a task is recorded. The weekly summary uses that history to say what you finished, what progressed, which deadlines moved and what you dropped.
-- Recommended tasks compare estimated work with your focus hours per day. Rust does all the counting; the model picks the order. They show as numbered badges in the Week tab and as a list under it.
-- The Week tab keeps both up to date on its own: when you open it, anything changed since the last update is sent once. You can copy, edit and export the summary. Both system prompts can be changed in Settings.
-- From Friday at 16:00 the summary is also kept up to date in the background, so it is ready when you need it. Fortnight checks at launch and every minute. A dot on the Week tab says when a background update is ready.
-- The endpoint can be any OpenAI-compatible server, such as Ollama at `http://localhost:11434/v1`, or the Anthropic Messages API at `https://api.anthropic.com`. Settings has a Test connection button and a model list.
-- The API key is stored encrypted under a password. Click the lock icon in the top bar to unlock it into memory; click again to lock, which wipes it and stops any request that holds it. The app works while locked; only the LLM features wait.
+- Three tabs show the same tasks around one selected date. `‹` and `›` move by a day, a week or a month, and Today jumps back.
+  - Today lists recommended tasks, the day's tasks, overdue tasks, notes, completed tasks, a collapsed No date inbox and a collapsed Deleted section. Drag a task card to reorder the Tasks section. Deleted holds every deleted task with Restore and Delete forever on each card, and Delete all in its header. A done task shows on the day it was planned for.
+  - Week has a column per working day. Each column title bar has a load bar: estimated tasks take their estimate, tasks without one share the rest of the day, and done tasks are drawn in the accent colour. Hover it for the figures. A warning sign shows when estimates exceed the day's capacity. Drag a task card to another day or to a new place in its day. The Work Summary is below the columns.
+  - Month is a calendar. A day with tasks due shows the share that is done, such as `67%`; click it to list those tasks. Click a day to open it, or a week label to open that week.
+- One quick-add bar is always visible. `Write Q4 report fri #work ~2h !` creates a task due Friday in project `work`, estimated at two hours, with priority 1. Dates can be `fri`, `tomorrow`, `nov 20` or `+3d`. Estimates can be `~2h`, `~30m` or `~1h30m`. `!`, `!!` and `!!!` set the priority, and cards show it as marks after the title.
+- A task has notes, an estimate, a priority, a planned day, and a status of to do, in progress, done or dropped. A private task is never sent to the LLM. While you type a title or notes in a task form, the app suggests a priority.
+- Today's Notes is a free-text box. Notes can be written on any day. Each day's notes are stored as one log line and go into the weekly summary.
+- Every change to a task is recorded. The weekly summary uses that history and your notes to say what you finished, what progressed, which deadlines moved and what you dropped. It is shown as Work Summary, with a copy icon in its header.
+- Recommended tasks are the top three open tasks, numbered, at the top of Today. Rust does the counting; the model picks the order. On today the list covers the day's tasks and all overdue tasks. On a later day it covers only the tasks planned for that day. Priority and lateness raise a task's rank. The list updates when tasks change.
+- The Work Summary updates on its own: when you open the Week tab, anything changed since the last update is sent once. After you edit on the Week tab, the summary reruns after 30 seconds. The previous result stays on screen until the new one is done. Both system prompts can be changed in Settings.
+- From Friday at 16:00 the summary is also kept up to date in the background. Fortnight checks at launch and every minute. A dot on the Week tab says when a background update is ready.
+- Settings has a Model block and a Recommendations block. Recommendations uses the Model block unless you tick Use a different model. Each block has a provider, a URL, a model and, except for Ollama, an API key. The provider is Ollama, OpenAI-compatible or Anthropic. Test checks the connection.
+- A local Ollama is detected at launch and when Settings opens, at `http://localhost:11434/v1` or the address in `OLLAMA_HOST`. Its models are listed with a thinking or decision tag. A decision model needs Ollama 0.35 or later and uses `/v1/systemone`. It answers with choices and probabilities, and is offered only for Recommendations. It also suggests task priorities. If it fails, Recommendations falls back to the Model endpoint.
+- An endpoint that needs no key, such as Ollama, has no key controls and never asks for a password.
+- Each API key is stored encrypted under one password. Click the lock icon in the top bar to unlock the keys into memory; click again to lock, which wipes them and stops any request that holds one. The app works while locked; only the LLM features wait.
+- Settings also sets work hours per day, 8 by default, and the working days. The load bars use both. Settings also holds the schedules, the prompts, the accent colour and the app icon, which follows the system or stays light or dark.
 - Cmd+Z or Ctrl+Z undoes the last add, status change, edit or delete.
-- Tasks, history and reports export to Markdown or JSON.
+- `fortnight-cli export` writes tasks, history and reports to Markdown or JSON.
 
 ### Keyboard
 
@@ -98,6 +121,7 @@ anywhere/
 └── fortnight-data/
     ├── fortnight.db     tasks, history, reports and settings, in a standard SQLite file
     ├── llm-key          your API key, encrypted, if you set one
+    ├── llm-key-decision the Recommendations key, encrypted, if you set one
     └── fortnight.lock   present while the app has the folder open
 ```
 
@@ -111,16 +135,18 @@ Fortnight writes nothing outside this folder. To move your data, copy the folder
 
 The app creates `fortnight.lock` while it runs and removes it on exit. If the folder is in a synced directory such as Dropbox or iCloud, open it on one machine at a time. The app warns if it finds a lock from another machine. The CLI never takes the lock, so it can run while the app is open.
 
-`llm-key` holds your API key, sealed with XChaCha20-Poly1305 under a key that Argon2id derives from your password. Someone who copies the data folder can't read the key. While the app is unlocked the key is in memory, where other software running as you could read it. `fortnight.db` is not encrypted. A forgotten password can't be recovered, so remove the key in Settings and enter it again. If your endpoint needs no key, as a local Ollama doesn't, Fortnight never creates the file and never asks for a password.
+`llm-key` and `llm-key-decision` hold your API keys, sealed with XChaCha20-Poly1305 under a key that Argon2id derives from your password. Someone who copies the data folder can't read the keys. While the app is unlocked the keys are in memory, where other software running as you could read it. `fortnight.db` is not encrypted. A forgotten password can't be recovered, so remove the keys in Settings and enter them again. If your endpoints need no key, as a local Ollama doesn't, Fortnight never creates the files and never asks for a password.
 
-Fortnight sends the key only to the endpoint you configured. It refuses to send it over plain `http` to another machine, and it doesn't follow redirects.
+Fortnight sends each key only to its configured endpoint. It refuses to send it over plain `http` to another machine, and it doesn't follow redirects.
 
 ## First run
 
 1. Start the app and open Settings with the gear or `Cmd+,`.
-2. Choose the protocol and enter the base URL and model. Load models lists what the endpoint offers.
-3. If the endpoint needs one, enter the API key and press Save key, then choose a password. The password encrypts the key on disk; unlock it with the lock icon.
-4. Press Test connection.
+2. In Model, choose the provider and enter the URL and model. Load lists what the endpoint offers. If Ollama is running, it is chosen with its first chat model.
+3. If the endpoint needs a key, paste it and press Save, then choose a password. The password encrypts the key on disk; unlock it with the lock icon.
+4. Press Test.
+5. To use another model for Recommendations, tick Use a different model in that block and repeat steps 2 to 4. A decision model from Ollama needs no key.
+6. Press Save at the top of Settings.
 
 ## Environment variables
 
@@ -131,10 +157,11 @@ Fortnight sends the key only to the endpoint you configured. It refuses to send 
 | `FORTNIGHT_LLM_BASE_URL` | The endpoint, such as `http://localhost:11434/v1`. |
 | `FORTNIGHT_LLM_MODEL` | The model name. |
 | `FORTNIGHT_LLM_API_KEY` | A key for this process only. Fortnight never writes it to disk. |
+| `FORTNIGHT_DECISION_API_KEY` | The same, for the Recommendations model. |
 
 The `FORTNIGHT_LLM_*` variables apply to the CLI. Its flags take precedence over them, and they take precedence over the saved settings. The app uses its saved settings only.
 
-The app also reads these for development: `FORTNIGHT_PAGE=today|week|month|settings` opens a tab, `FORTNIGHT_THEME=light|dark` overrides the system theme, and `FORTNIGHT_SCREENSHOT=<file>` saves a screenshot of the window as raw RGBA after two seconds, then exits.
+The app also reads these for development: `FORTNIGHT_PAGE=today|week|month|settings` opens a tab, `FORTNIGHT_THEME=light|dark` overrides the system theme, and `FORTNIGHT_SCREENSHOT=<file>` saves a screenshot of the window as raw RGBA after two seconds, then exits. `FORTNIGHT_SCREENSHOT_DELAY=<seconds>` changes that wait.
 
 ## Command line
 
@@ -154,7 +181,7 @@ fortnight-cli export [--format md|json] [--out <path>]           # everything, t
 - `summary` covers the latest week whose summary is due, and `plan` covers this week, unless you pass `--week`.
 - `--facts` prints the facts and never calls the LLM.
 - `summary`, `plan` and `run-due` take `--protocol openai|anthropic`, `--base-url`, `--model` and `--password-stdin`.
-- For the key, the CLI uses `FORTNIGHT_LLM_API_KEY` if it is set. Otherwise, if a key file exists, it reads the password from `--password-stdin` or asks for it.
+- For the key, the CLI uses `FORTNIGHT_LLM_API_KEY` if it is set. Otherwise, if a key file exists, it reads the password from `--password-stdin` or asks for it. `plan` and `run-due` use the saved Recommendations model, with `FORTNIGHT_DECISION_API_KEY` or `llm-key-decision` for its key.
 - The CLI stores each report it generates, so the app shows it too.
 - Exit code 0 means success. 1 means a report failed, a task wasn't found, or a file couldn't be read or written. 2 means bad arguments, or no endpoint configured for `summary` or `plan`. `run-due` with no endpoint generates nothing and exits 0.
 
@@ -170,4 +197,4 @@ cargo test
 
 - Registering with the OS scheduler, such as launchd, systemd or Task Scheduler. It would be the only thing Fortnight writes outside its folder, and a scheduled job can't type the password for an encrypted key. You can run `fortnight-cli run-due` from your own scheduler against an endpoint that needs no key. Otherwise reports are made the next time you open and unlock the app.
 - Code signing. A build you make yourself isn't flagged, but a downloaded archive shows a one-time Gatekeeper or SmartScreen warning on each machine.
-- Notifications (parked).
+- Notifications. The setting exists but is hidden, and nothing sends them yet.
