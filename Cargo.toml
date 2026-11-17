@@ -27,3 +27,9 @@ wiremock = "0.6"
 [profile.release]
 strip = true
 lto = "thin"
+
+# Argon2 is unusably slow unoptimised; keep debug builds and tests fast.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

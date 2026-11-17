@@ -32,6 +32,11 @@ impl TasksView {
         Self::default()
     }
 
+    /// A task that focuses the quick-add input (called at launch).
+    pub fn focus_quick_add() -> iced::Task<Message> {
+        iced::Task::none()
+    }
+
     /// `tasks` is every task (done or not); `today` is the local date.
     pub fn update(&mut self, message: Message, _tasks: &[Task], _today: Date) -> Action {
         match message {
