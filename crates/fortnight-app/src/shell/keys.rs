@@ -157,9 +157,7 @@ impl Ready {
     pub(crate) fn lock(&mut self) {
         self.keys.api_key = None; // dropping the SecretString zeroizes it
         self.keys.decision_key = None;
-        for (_, g) in self.generating.drain() {
-            g.abort.abort();
-        }
+        self.reports.abort_all();
         for handle in self.key_requests.drain(..) {
             handle.abort();
         }

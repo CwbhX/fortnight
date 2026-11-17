@@ -15,7 +15,7 @@ use jiff::Timestamp;
 use jiff::civil::Date;
 use std::collections::HashMap;
 
-use crate::backoff_active;
+use super::reports::backoff_active;
 
 /// Recommended tasks for later days.
 #[derive(Default)]
@@ -87,7 +87,7 @@ impl Ready {
                 .unwrap_or_default()
         };
         let recommending = if self.selected == today {
-            self.generating.contains_key(&ReportKey {
+            self.reports.is_generating(&ReportKey {
                 kind: ReportKind::Plan,
                 week_start: self.current_week().start,
             })
