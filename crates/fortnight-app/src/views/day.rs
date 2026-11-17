@@ -860,12 +860,12 @@ impl DayView {
 
         let recommended = section_tasks(data, Section::Recommended);
         if !recommended.is_empty() {
-            let heading = theme::section_heading("Recommended").into();
+            let heading = section_title(&recommended, "Recommended Task", text::default);
             content = content.push(self.group(heading, recommended, data));
         } else if data.recommending && data.day == data.today {
             content = content.push(
                 column![
-                    theme::section_heading("Recommended"),
+                    text("Recommended Tasks").size(theme::TEXT_HEADING),
                     text("Picking today's top tasks…")
                         .size(theme::TEXT_BODY)
                         .style(theme::muted),
@@ -876,13 +876,7 @@ impl DayView {
 
         let overdue = section_tasks(data, Section::Overdue);
         if !overdue.is_empty() {
-            let heading = heading_row(
-                text("Overdue")
-                    .size(theme::TEXT_SMALL)
-                    .style(theme::danger)
-                    .into(),
-                &overdue,
-            );
+            let heading = section_title(&overdue, "Overdue Task", theme::danger);
             content = content.push(self.group(heading, overdue, data));
         }
 
@@ -895,7 +889,7 @@ impl DayView {
             .padding([11, 14])
             .size(theme::TEXT_BODY)
             .style(theme::input);
-        let heading = heading_row(theme::section_heading("Tasks").into(), &day_tasks);
+        let heading = section_title(&day_tasks, "Task", text::default);
         let day_group = if day_tasks.is_empty() {
             column![heading]
         } else {
@@ -1002,20 +996,39 @@ impl DayView {
     }
 }
 
-/// A section heading with the task count and, if any task has an estimate,
-/// the total (`Today  3 · 4h30m`).
-fn heading_row<'a>(label: Element<'a, Message>, tasks: &[&Task]) -> Element<'a, Message> {
+/// A section title: the count and what they are (`5 Tasks`, `1 Overdue
+/// Task`) in the heading size, then the total estimate, if any, muted.
+fn section_title<'a>(
+    tasks: &[&Task],
+    noun: &str,
+    style: fn(&Theme) -> text::Style,
+) -> Element<'a, Message> {
+    let mut title = Row::new()
+        .spacing(theme::SPACING * 0.75)
+        .align_y(iced::alignment::Vertical::Bottom)
+        .push(
+            text(count_label(tasks.len(), noun))
+                .size(theme::TEXT_HEADING)
+                .style(style),
+        );
     let total: u32 = tasks.iter().filter_map(|t| t.estimate_minutes).sum();
-    let mut count = tasks.len().to_string();
     if total > 0 {
-        count.push_str(&format!("  ·  {}", parse::format_estimate(total)));
+        title = title.push(
+            text(parse::format_estimate(total))
+                .size(theme::TEXT_BODY)
+                .style(theme::muted),
+        );
     }
-    row![
-        label,
-        text(count).size(theme::TEXT_SMALL).style(theme::muted)
-    ]
-    .spacing(theme::SPACING / 2.0)
-    .into()
+    title.into()
+}
+
+/// `1 Task`, `5 Tasks`: a count and a noun, plural unless the count is 1.
+pub fn count_label(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
 }
 
 /// Side work for the shown day: free-standing log lines as ticked items,
@@ -1890,6 +1903,13 @@ mod tests {
         // Another day: no recommendations.
         data.day = date(2026, 11, 17);
         assert!(ids(&data, Section::Recommended).is_empty());
+    }
+
+    #[test]
+    fn count_labels_are_plural_unless_one() {
+        assert_eq!(count_label(0, "Task"), "0 Tasks");
+        assert_eq!(count_label(1, "Task"), "1 Task");
+        assert_eq!(count_label(3, "Recommended Task"), "3 Recommended Tasks");
     }
 
     #[test]
