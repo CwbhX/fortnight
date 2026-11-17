@@ -41,7 +41,7 @@ use fortnight_core::report::{self, Prepared};
 use fortnight_core::sqlite::SqliteStore;
 use fortnight_core::store::Store;
 use fortnight_core::vault::{self, VaultError};
-use fortnight_core::week::{due_reports, week_containing, week_label};
+use fortnight_core::week::{add_months, due_reports, week_containing, week_label};
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{
     button, center, column, container, mouse_area, opaque, operation, row, stack, text,
@@ -169,6 +169,8 @@ struct Ready {
     /// The one selected date all three tabs zoom around.
     selected: Date,
     quick_add: String,
+    /// The month the top bar's date calendar shows, while it is open.
+    date_picker: Option<Date>,
     settings_open: bool,
 
     day_view: DayView,
@@ -356,6 +358,7 @@ impl Ready {
             tab,
             selected: today,
             quick_add: String::new(),
+            date_picker: None,
             settings_open,
             day_view: DayView::new(),
             week_view: WeekView::new(),
@@ -1028,6 +1031,29 @@ impl Ready {
             }
             top_bar::Message::Today => {
                 self.selected = self.today();
+                self.date_picker = None;
+                self.update_week_reports()
+            }
+            top_bar::Message::ToggleCalendar => {
+                self.date_picker = match self.date_picker {
+                    Some(_) => None,
+                    None => Some(self.selected.first_of_month()),
+                };
+                Task::none()
+            }
+            top_bar::Message::CloseCalendar => {
+                self.date_picker = None;
+                Task::none()
+            }
+            top_bar::Message::CalendarMonth(step) => {
+                if let Some(month) = &mut self.date_picker {
+                    *month = add_months(*month, step).first_of_month();
+                }
+                Task::none()
+            }
+            top_bar::Message::PickDate(day) => {
+                self.selected = day;
+                self.date_picker = None;
                 self.update_week_reports()
             }
             top_bar::Message::Lock => {
@@ -1201,7 +1227,10 @@ impl Ready {
                 Task::none()
             }
             Shortcut::Escape => {
-                if self.tab == Tab::Today {
+                if self.date_picker.is_some() {
+                    self.date_picker = None;
+                    Task::none()
+                } else if self.tab == Tab::Today {
                     let action = self.day_view.on_key(NavKey::Close);
                     self.day_action(action)
                 } else {
@@ -1358,6 +1387,7 @@ impl Ready {
                 KeyState::Unlocked => Some(LockIcon::Unlocked),
             },
             week_badge: self.week_badge,
+            calendar: self.date_picker,
         })
         .map(Message::Top);
 

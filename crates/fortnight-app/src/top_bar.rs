@@ -1,18 +1,21 @@
 //! The top bar (PLAN.md section 4.2): the Today | Week | Month tabs, period
-//! navigation over the shared selected date, the Today button, Lock and the
+//! navigation over the shared selected date (centred), Lock and the
 //! Settings gear, and the always-visible quick-add bar under them.
+//! Clicking the date opens a calendar to pick a day (today is shaded);
+//! double-clicking it jumps back to today.
 //! Owner: orchestrator.
 //!
 //! ```text
-//! [ Today | Week | Month ]      Today  ‹ Mon 16 to Fri 20 Nov ›      lock  gear
+//! [ Today | Week | Month ]        ‹ Mon 16 to Fri 20 Nov ›          lock  gear
 //! [ Write Q4 report fri #work ~2h !                                              ]
 //! ```
 
+use crate::calendar::{Popup, month_picker};
 use crate::theme::{self, Icon};
 use fortnight_core::domain::{NewTask, Schedule};
 use fortnight_core::parse;
 use fortnight_core::week::{add_months, month_label, week_containing};
-use iced::widget::{button, column, container, row, space, text, text_input, tooltip};
+use iced::widget::{button, column, container, mouse_area, row, text, text_input, tooltip};
 use iced::{Center, Element, Fill};
 use jiff::ToSpan;
 use jiff::civil::Date;
@@ -48,8 +51,16 @@ pub enum Message {
     Prev,
     /// `›`: forward one day, week or month.
     Next,
-    /// Jump back to today.
+    /// Jump back to today (`T`, or a double click on the date).
     Today,
+    /// A click on the date: open or close the calendar.
+    ToggleCalendar,
+    /// A click outside the open calendar.
+    CloseCalendar,
+    /// Show the calendar month before (-1) or after (+1).
+    CalendarMonth(i32),
+    /// A day picked in the calendar.
+    PickDate(Date),
     /// The lock icon: lock when unlocked, unlock prompt when locked.
     Lock,
     /// The gear.
@@ -75,6 +86,8 @@ pub struct Bar<'a> {
     pub lock: Option<LockIcon>,
     /// A dot on the Week tab: a report became ready and hasn't been seen.
     pub week_badge: bool,
+    /// The month the date calendar shows, while it is open.
+    pub calendar: Option<Date>,
 }
 
 /// Moves `selected` by one step of `tab` (`dir` is -1 or +1).
@@ -183,27 +196,39 @@ pub fn view<'a>(bar: Bar<'a>) -> Element<'a, Message> {
         )
     };
 
-    // Today, then the arrows hugging the label. The label has a fixed width
-    // so the arrows don't jump as it changes.
-    let period = row![
-        button(text("Today").size(theme::TEXT_BODY))
-            .padding([5, 14])
-            .style(theme::secondary_button)
-            .on_press_maybe(
-                (bar.selected != bar.today || bar.tab == Tab::Month).then_some(Message::Today)
-            ),
-        space().width(theme::SPACING / 2.0),
-        icon_button(Icon::ChevronLeft, Message::Prev, "Previous (←)"),
-        container(
-            text(period_label(bar.tab, bar.selected, bar.today, bar.schedule))
-                .size(theme::TEXT_BODY)
-                .wrapping(iced::widget::text::Wrapping::None)
+    // The arrows hug the date. The date has a fixed width so the arrows
+    // don't jump as it changes. A click on it opens the calendar (the
+    // button); a double click jumps to today (the mouse area around it).
+    let width = match bar.tab {
+        Tab::Today => 160,
+        Tab::Week => 240,
+        Tab::Month => 190,
+    };
+    let date = button(
+        text(period_label(bar.tab, bar.selected, bar.today, bar.schedule))
+            .size(theme::TEXT_BODY)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .width(Fill)
+            .align_x(Center),
+    )
+    .width(width)
+    .padding([5, 10])
+    .style(date_button(bar.calendar.is_some()))
+    .on_press(Message::ToggleCalendar);
+    let date = mouse_area(date).on_double_click(Message::Today);
+    let picker = bar.calendar.map(|month| {
+        month_picker(
+            month,
+            Some(bar.selected),
+            bar.today,
+            Message::CalendarMonth,
+            Message::PickDate,
+            None,
         )
-        .center_x(match bar.tab {
-            Tab::Today => 140,
-            Tab::Week => 220,
-            Tab::Month => 170,
-        }),
+    });
+    let period = row![
+        icon_button(Icon::ChevronLeft, Message::Prev, "Previous (←)"),
+        Popup::new(date, picker, Message::CloseCalendar).centered(),
         icon_button(Icon::ChevronRight, Message::Next, "Next (→)"),
     ]
     .spacing(2)
@@ -221,12 +246,11 @@ pub fn view<'a>(bar: Bar<'a>) -> Element<'a, Message> {
     }
     right = right.push(icon_button(Icon::Gear, Message::Settings, "Settings (⌘,)"));
 
+    // Equal-width sides keep the date centred in the window.
     let first = row![
-        tabs,
-        space::horizontal(),
+        container(tabs).width(Fill),
         period,
-        space::horizontal(),
-        right
+        container(right).width(Fill).align_right(Fill),
     ]
     .spacing(theme::SPACING)
     .align_y(Center);
@@ -247,6 +271,21 @@ pub fn view<'a>(bar: Bar<'a>) -> Element<'a, Message> {
     .width(Fill)
     .style(theme::top_bar)
     .into()
+}
+
+/// The date: plain text that shows a soft fill on hover or while its
+/// calendar is open.
+fn date_button(open: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        let fill = (open || hovered).then(|| theme.palette().text.scale_alpha(0.07).into());
+        button::Style {
+            background: fill,
+            text_color: theme.palette().text,
+            border: iced::border::rounded(theme::RADIUS),
+            ..button::Style::default()
+        }
+    }
 }
 
 #[cfg(test)]
