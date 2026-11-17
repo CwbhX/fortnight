@@ -550,9 +550,9 @@ pub struct Settings {
 pub enum Accent {
     #[default]
     Orange,
-    Olive,
-    Sage,
-    Green,
+    /// Olive, Sage and Green were offered briefly; saved ones load as
+    /// Emerald, the one green kept.
+    #[serde(alias = "olive", alias = "sage", alias = "green")]
     Emerald,
     Teal,
     Blue,
@@ -563,11 +563,8 @@ pub enum Accent {
 
 impl Accent {
     /// Every choice, in the order Settings shows them.
-    pub const ALL: [Accent; 10] = [
+    pub const ALL: [Accent; 7] = [
         Accent::Orange,
-        Accent::Olive,
-        Accent::Sage,
-        Accent::Green,
         Accent::Emerald,
         Accent::Teal,
         Accent::Blue,
@@ -579,9 +576,6 @@ impl Accent {
     pub fn label(self) -> &'static str {
         match self {
             Accent::Orange => "Orange",
-            Accent::Olive => "Olive",
-            Accent::Sage => "Sage",
-            Accent::Green => "Green",
             Accent::Emerald => "Emerald",
             Accent::Teal => "Teal",
             Accent::Blue => "Blue",
@@ -653,6 +647,11 @@ mod tests {
         let json = serde_json::to_string(&teal).unwrap();
         assert!(json.contains(r#""accent":"teal""#));
         assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), teal);
+        // Greens no longer offered load as Emerald.
+        for old in ["olive", "sage", "green"] {
+            let s: Settings = serde_json::from_str(&format!(r#"{{"accent":"{old}"}}"#)).unwrap();
+            assert_eq!(s.accent, Accent::Emerald);
+        }
     }
 
     #[test]

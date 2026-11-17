@@ -88,9 +88,6 @@ static ACCENT_RGB: AtomicU32 = AtomicU32::new(0xea580c);
 fn accent_rgb(accent: Accent) -> u32 {
     match accent {
         Accent::Orange => 0xea580c,
-        Accent::Olive => 0x797758,
-        Accent::Sage => 0x647c6b,
-        Accent::Green => 0x4c8602,
         Accent::Emerald => 0x06885a,
         Accent::Teal => 0x308480,
         Accent::Blue => 0x0474e9,
