@@ -64,6 +64,8 @@ pub enum Message {
     SetPriority(Priority),
     /// Open or close the due-date calendar.
     ToggleCalendar,
+    /// A click outside the open calendar.
+    CloseCalendar,
     /// Show the calendar month before (-1) or after (+1).
     CalendarMonth(i32),
     PickDue(Date),
@@ -611,6 +613,7 @@ impl DayView {
                     }
                 })
             }
+            Message::CloseCalendar => self.edit(|f| f.calendar = None),
             Message::CalendarMonth(step) => self.edit(|f| {
                 if let Some(month) = &mut f.calendar {
                     *month = add_months(*month, step).first_of_month();
@@ -891,7 +894,7 @@ fn side_work<'a>(data: &'a DayData, input: &'a str) -> Option<Element<'a, Messag
     let mut group = column![theme::section_heading("Side work")].spacing(theme::SPACING / 2.0);
     let items = Column::with_children(lines.into_iter().map(|line| {
         row![
-            checkbox(true),
+            container(text("•").size(theme::TEXT_BODY).style(theme::muted)).center_x(20),
             text(&line.text).size(theme::TEXT_BODY).width(Fill),
             button(text("×").size(theme::TEXT_BODY))
                 .padding([0, 8])
@@ -1168,7 +1171,14 @@ fn calendar<'a>(month: Date, selected: Option<Date>, today: Date) -> Element<'a,
         .padding(theme::SPACING)
         .style(|theme: &Theme| container::Style {
             background: Some(theme.palette().background.into()),
-            border: border::rounded(theme::RADIUS),
+            border: border::rounded(theme::RADIUS)
+                .width(1)
+                .color(theme::muted_color(theme).scale_alpha(0.25)),
+            shadow: iced::Shadow {
+                color: Color::BLACK.scale_alpha(0.3),
+                offset: iced::Vector::new(0.0, 6.0),
+                blur_radius: 18.0,
+            },
             ..container::Style::default()
         })
         .into()
@@ -1253,7 +1263,14 @@ fn edit_card<'a>(task: &'a Task, form: &'a EditForm, today: Date) -> Element<'a,
         .align_y(Center),
         row![
             labelled("Project", field("", &form.project, Message::EditProject)),
-            labelled("Due", due_button(form.due, today)),
+            labelled(
+                "Due",
+                popup::Popup::new(
+                    due_button(form.due, today),
+                    form.calendar.map(|month| calendar(month, form.due, today)),
+                    Message::CloseCalendar,
+                )
+            ),
             labelled(
                 "Estimate",
                 field("1h30m", &form.estimate, Message::EditEstimate)
@@ -1263,18 +1280,14 @@ fn edit_card<'a>(task: &'a Task, form: &'a EditForm, today: Date) -> Element<'a,
     ]
     .spacing(theme::SPACING);
 
-    if let Some(month) = form.calendar {
-        body = body.push(calendar(month, form.due, today));
-    }
-
     body = body.push(labelled("Priority", priority_picker(form.priority)));
 
     if let Some(error) = &form.error {
         body = body.push(text(error).size(theme::TEXT_SMALL).style(theme::danger));
     }
 
-    body = body.push(labelled("Subtasks", subtasks_view(form)));
     body = body.push(labelled("Notes", notes));
+    body = body.push(labelled("Subtasks", subtasks_view(form)));
 
     body = body.push(
         row![
@@ -1306,6 +1319,273 @@ fn edit_card<'a>(task: &'a Task, form: &'a EditForm, today: Date) -> Element<'a,
     )
     .padding([theme::SPACING / 2.0, 0.0])
     .into()
+}
+
+/// A widget that shows a pop-up under its anchor, on the overlay layer, so
+/// it covers what is below instead of pushing it down. A click outside both
+/// the pop-up and the anchor sends `on_dismiss`.
+mod popup {
+    use iced::advanced::layout::{self, Layout};
+    use iced::advanced::overlay;
+    use iced::advanced::renderer;
+    use iced::advanced::widget::{self, Tree, Widget};
+    use iced::advanced::{Clipboard, Shell};
+    use iced::{Element, Event, Length, Point, Rectangle, Renderer, Size, Theme, Vector, mouse};
+
+    /// The space between the anchor and the pop-up.
+    const GAP: f32 = 6.0;
+
+    pub struct Popup<'a, Message> {
+        anchor: Element<'a, Message>,
+        /// The pop-up, or a placeholder while closed (so the tree keeps two
+        /// children).
+        content: Element<'a, Message>,
+        open: bool,
+        on_dismiss: Message,
+    }
+
+    impl<'a, Message: 'a> Popup<'a, Message> {
+        pub fn new(
+            anchor: impl Into<Element<'a, Message>>,
+            content: Option<Element<'a, Message>>,
+            on_dismiss: Message,
+        ) -> Self {
+            let open = content.is_some();
+            Popup {
+                anchor: anchor.into(),
+                content: content.unwrap_or_else(|| iced::widget::space().into()),
+                open,
+                on_dismiss,
+            }
+        }
+    }
+
+    impl<Message: Clone> Widget<Message, Theme, Renderer> for Popup<'_, Message> {
+        fn children(&self) -> Vec<Tree> {
+            vec![Tree::new(&self.anchor), Tree::new(&self.content)]
+        }
+
+        fn diff(&self, tree: &mut Tree) {
+            tree.diff_children(&[&self.anchor, &self.content]);
+        }
+
+        fn size(&self) -> Size<Length> {
+            self.anchor.as_widget().size()
+        }
+
+        fn layout(
+            &mut self,
+            tree: &mut Tree,
+            renderer: &Renderer,
+            limits: &layout::Limits,
+        ) -> layout::Node {
+            self.anchor
+                .as_widget_mut()
+                .layout(&mut tree.children[0], renderer, limits)
+        }
+
+        fn update(
+            &mut self,
+            tree: &mut Tree,
+            event: &Event,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            renderer: &Renderer,
+            clipboard: &mut dyn Clipboard,
+            shell: &mut Shell<'_, Message>,
+            viewport: &Rectangle,
+        ) {
+            self.anchor.as_widget_mut().update(
+                &mut tree.children[0],
+                event,
+                layout,
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+        }
+
+        fn draw(
+            &self,
+            tree: &Tree,
+            renderer: &mut Renderer,
+            theme: &Theme,
+            style: &renderer::Style,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            viewport: &Rectangle,
+        ) {
+            self.anchor.as_widget().draw(
+                &tree.children[0],
+                renderer,
+                theme,
+                style,
+                layout,
+                cursor,
+                viewport,
+            );
+        }
+
+        fn mouse_interaction(
+            &self,
+            tree: &Tree,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            viewport: &Rectangle,
+            renderer: &Renderer,
+        ) -> mouse::Interaction {
+            self.anchor.as_widget().mouse_interaction(
+                &tree.children[0],
+                layout,
+                cursor,
+                viewport,
+                renderer,
+            )
+        }
+
+        fn operate(
+            &mut self,
+            tree: &mut Tree,
+            layout: Layout<'_>,
+            renderer: &Renderer,
+            operation: &mut dyn widget::Operation,
+        ) {
+            self.anchor
+                .as_widget_mut()
+                .operate(&mut tree.children[0], layout, renderer, operation);
+        }
+
+        fn overlay<'b>(
+            &'b mut self,
+            tree: &'b mut Tree,
+            layout: Layout<'b>,
+            renderer: &Renderer,
+            viewport: &Rectangle,
+            translation: Vector,
+        ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+            let mut children = tree.children.iter_mut();
+            let anchor_tree = children.next()?;
+            let content_tree = children.next()?;
+            let base = self.anchor.as_widget_mut().overlay(
+                anchor_tree,
+                layout,
+                renderer,
+                viewport,
+                translation,
+            );
+            if !self.open {
+                return base;
+            }
+            let anchor = layout.bounds() + translation;
+            let popup = overlay::Element::new(Box::new(Overlay {
+                content: &mut self.content,
+                tree: content_tree,
+                anchor,
+                on_dismiss: self.on_dismiss.clone(),
+            }));
+            Some(overlay::Group::with_children(base.into_iter().chain([popup]).collect()).overlay())
+        }
+    }
+
+    struct Overlay<'a, 'b, Message> {
+        content: &'b mut Element<'a, Message>,
+        tree: &'b mut Tree,
+        /// The anchor's bounds, in window coordinates.
+        anchor: Rectangle,
+        on_dismiss: Message,
+    }
+
+    impl<Message: Clone> overlay::Overlay<Message, Theme, Renderer> for Overlay<'_, '_, Message> {
+        fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
+            let limits = layout::Limits::new(Size::ZERO, bounds);
+            let node = self
+                .content
+                .as_widget_mut()
+                .layout(self.tree, renderer, &limits);
+            let size = node.size();
+            // Below the anchor, kept inside the window; above it when there
+            // is no room below.
+            let x = self.anchor.x.min(bounds.width - size.width).max(0.0);
+            let below = self.anchor.y + self.anchor.height + GAP;
+            let y = if below + size.height <= bounds.height {
+                below
+            } else {
+                (self.anchor.y - GAP - size.height).max(0.0)
+            };
+            node.move_to(Point::new(x, y))
+        }
+
+        fn draw(
+            &self,
+            renderer: &mut Renderer,
+            theme: &Theme,
+            style: &renderer::Style,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+        ) {
+            self.content.as_widget().draw(
+                self.tree,
+                renderer,
+                theme,
+                style,
+                layout,
+                cursor,
+                &layout.bounds(),
+            );
+        }
+
+        fn update(
+            &mut self,
+            event: &Event,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            renderer: &Renderer,
+            clipboard: &mut dyn Clipboard,
+            shell: &mut Shell<'_, Message>,
+        ) {
+            self.content.as_widget_mut().update(
+                self.tree,
+                event,
+                layout,
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                &layout.bounds(),
+            );
+            if let Event::Mouse(mouse::Event::ButtonPressed(_)) = event {
+                if cursor.is_over(layout.bounds()) {
+                    // Nothing under the pop-up gets the click.
+                    shell.capture_event();
+                } else if !cursor.is_over(self.anchor) {
+                    shell.publish(self.on_dismiss.clone());
+                }
+            }
+        }
+
+        fn mouse_interaction(
+            &self,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            renderer: &Renderer,
+        ) -> mouse::Interaction {
+            self.content.as_widget().mouse_interaction(
+                self.tree,
+                layout,
+                cursor,
+                &layout.bounds(),
+                renderer,
+            )
+        }
+    }
+
+    impl<'a, Message: Clone + 'a> From<Popup<'a, Message>> for Element<'a, Message> {
+        fn from(popup: Popup<'a, Message>) -> Self {
+            Element::new(popup)
+        }
+    }
 }
 
 #[cfg(test)]
