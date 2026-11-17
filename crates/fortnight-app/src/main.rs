@@ -22,6 +22,7 @@ mod shell {
     pub(crate) mod dev;
     pub(crate) mod edits;
     pub(crate) mod keys;
+    pub(crate) mod recommend;
     pub(crate) mod shortcuts;
     pub(crate) mod suggest;
 }
@@ -42,7 +43,7 @@ use fortnight_core::domain::{
     Event, Priority, Protocol, Report, ReportKey, ReportKind, ReportStatus, Settings,
     Task as CoreTask, TaskId, TaskStatus, WeekRef,
 };
-use fortnight_core::fallback::{Endpoint, PlanRoute};
+use fortnight_core::fallback::PlanRoute;
 use fortnight_core::llm::{ChatEvent, ChatRequest, ChatResponse, LlmError};
 use fortnight_core::ollama::{self, ModelKind, OllamaModel};
 use fortnight_core::report::{self, Prepared};
@@ -62,6 +63,7 @@ use secrecy::SecretString;
 use shell::dev::{self, data_dir_flag, forced_theme, save_screenshot, shoot_after_delay};
 use shell::edits::UndoStack;
 use shell::keys::{Keys, SavedKey};
+use shell::recommend::LaterDays;
 use shell::shortcuts::{Shortcut, shortcut_for};
 use shell::suggest::Suggestions;
 use std::collections::HashMap;
@@ -219,15 +221,8 @@ struct Ready {
     undo: UndoStack,
     /// A report became ready while the Week tab wasn't showing.
     week_badge: bool,
-    /// Recommended tasks for later days (not stored as reports): each with
-    /// the facts it was worked out from, redone when those change.
-    day_recs: HashMap<Date, (String, Vec<day::Recommended>)>,
-    /// Later days whose recommendations are being worked out: from which
-    /// facts, and the request (aborted on Lock or when the day is left).
-    day_recs_pending: HashMap<Date, (String, iced::task::Handle)>,
-    /// Failures in a row per later day and when the last one was, for the
-    /// same retry backoff as reports.
-    day_recs_failures: HashMap<Date, (u32, Timestamp)>,
+    /// Recommended tasks for later days.
+    later_days: LaterDays,
     /// Today when the minute tick last looked: a new day moves the
     /// selection along if it was on the old one.
     last_today: Date,
@@ -463,9 +458,7 @@ impl Ready {
             notice,
             undo: UndoStack::default(),
             week_badge: false,
-            day_recs: HashMap::new(),
-            day_recs_pending: HashMap::new(),
-            day_recs_failures: HashMap::new(),
+            later_days: LaterDays::default(),
             last_today: today,
             derived: Derived::default(),
             week_data: None,
@@ -521,22 +514,7 @@ impl Ready {
         let today = self.today();
         match self.tab {
             Tab::Today => {
-                let recommended = if self.selected == today {
-                    self.recommended_today()
-                } else {
-                    self.day_recs
-                        .get(&self.selected)
-                        .map(|(_, list)| list.clone())
-                        .unwrap_or_default()
-                };
-                let recommending = if self.selected == today {
-                    self.generating.contains_key(&ReportKey {
-                        kind: ReportKind::Plan,
-                        week_start: self.current_week().start,
-                    })
-                } else {
-                    self.day_recs_pending.contains_key(&self.selected)
-                };
+                let (recommended, recommending) = self.day_recommendations(today);
                 let logs = self.logs();
                 self.day_view.load(DayData {
                     day: self.selected,
@@ -654,41 +632,6 @@ impl Ready {
         }
     }
 
-    /// Today's recommended tasks: the newest ready version of the current
-    /// week's Recommended tasks report that still names an open task on
-    /// the Today tab's list or overdue (as the tab shows them: a chat model
-    /// may not keep to that rule). An overdue task stays eligible until it
-    /// is done or deleted. Falling back to an older version keeps the last
-    /// good list on screen when the newest names none of them, e.g. while
-    /// a new one is worked out.
-    fn recommended_today(&mut self) -> Vec<day::Recommended> {
-        if let Some(list) = &self.derived.recommended_today {
-            return list.clone();
-        }
-        let today = self.today();
-        let versions = self.versions(ReportKey {
-            kind: ReportKind::Plan,
-            week_start: self.current_week().start,
-        });
-        let list = versions
-            .iter()
-            .filter(|r| r.status == ReportStatus::Ready)
-            .filter_map(|r| r.text().and_then(report::parse_recommendations))
-            .map(|rec| {
-                recommended(rec)
-                    .into_iter()
-                    .filter(|r| {
-                        self.task(r.id)
-                            .is_some_and(|t| t.on_today_list(today) || t.is_overdue(today))
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .find(|list| !list.is_empty())
-            .unwrap_or_default();
-        self.derived.recommended_today = Some(list.clone());
-        list
-    }
-
     /// Every version of a report, newest first (cached until `invalidate`).
     fn versions(&mut self, key: ReportKey) -> Vec<Report> {
         if let Some(v) = self.derived.versions.get(&key) {
@@ -802,15 +745,7 @@ impl Ready {
     fn new_day(&mut self, today: Date) {
         self.selected = follow_today(self.selected, self.last_today, today);
         self.last_today = today;
-        self.day_recs.retain(|day, _| *day > today);
-        self.day_recs_failures.retain(|day, _| *day > today);
-        self.day_recs_pending.retain(|day, (_, handle)| {
-            let keep = *day > today;
-            if !keep {
-                handle.abort();
-            }
-            keep
-        });
+        self.later_days.forget_past(today);
     }
 
     /// Shows `tab` (and `selected`, if given): clears the Week badge when
@@ -843,15 +778,9 @@ impl Ready {
             }
             keep
         });
-        let selected = self.selected;
-        self.day_recs_pending.retain(|day, (_, handle)| {
-            let keep = *day == selected;
-            if !keep {
-                handle.abort();
-                aborted = true;
-            }
-            keep
-        });
+        if self.later_days.abort_other_days(self.selected) {
+            aborted = true;
+        }
         if aborted {
             self.must_refresh = true;
         }
@@ -895,73 +824,6 @@ impl Ready {
         Task::batch(tasks)
     }
 
-    /// Works out the recommended tasks of the later day the Today tab
-    /// shows, unless they are known for its current facts or on their way.
-    /// Only the open tasks planned for that day take part: overdue ones are
-    /// today's business. Not stored; a failure keeps what was shown and is
-    /// retried with the reports' backoff.
-    fn update_day_recs(&mut self) -> Task<Message> {
-        let day = self.selected;
-        if self.tab != Tab::Today || day <= self.today() || self.blocked().is_some() {
-            return Task::none();
-        }
-        let tasks: Vec<CoreTask> = self
-            .tasks
-            .iter()
-            .filter(|t| t.status.is_open() && t.planned_for == Some(day))
-            .cloned()
-            .collect();
-        if tasks.is_empty() {
-            self.day_recs.remove(&day);
-            return Task::none();
-        }
-        let prepared =
-            report::prepare_plan(&tasks, &self.events, self.week_of(day), day, &self.settings);
-        let facts = prepared.digest_json;
-        if self.day_recs.get(&day).is_some_and(|(f, _)| *f == facts)
-            || self
-                .day_recs_pending
-                .get(&day)
-                .is_some_and(|(f, _)| *f == facts)
-        {
-            return Task::none();
-        }
-        let (failures, last) = self.day_recs_failures.get(&day).copied().unzip();
-        if backoff_active(failures.unwrap_or(0), last, Timestamp::now()) {
-            return Task::none();
-        }
-        let Ok(route) = self.plan_route(ReportKind::Plan) else {
-            return Task::none();
-        };
-        let sent = facts.clone();
-        let (task, handle) = Task::perform(route.client().chat(prepared.request), move |result| {
-            Message::DayRecs(day, sent, result)
-        })
-        .abortable();
-        if let Some((_, old)) = self.day_recs_pending.insert(day, (facts, handle)) {
-            old.abort();
-        }
-        self.must_refresh = true;
-        task
-    }
-
-    /// Where a report of `kind` goes: the main endpoint, and for
-    /// recommended tasks the decision model first when one is set (and can
-    /// be built).
-    fn plan_route(&self, kind: ReportKind) -> Result<PlanRoute, String> {
-        let (client, host) = self.keys.client_for(&self.settings.llm)?;
-        let decision = &self.settings.decision_llm;
-        let decision = (kind == ReportKind::Plan && decision.is_configured())
-            .then(|| {
-                self.keys
-                    .decision_client_for(decision, &self.settings.llm)
-                    .ok()
-            })
-            .flatten()
-            .map(|(client, host)| Endpoint { client, host });
-        Ok(PlanRoute::new(Endpoint { client, host }, decision))
-    }
-
     /// Whether the Work summary is still waiting after a Week-tab change.
     fn summary_waiting(&self) -> bool {
         self.summary_wait.is_some_and(|at| Timestamp::now() < at)
@@ -988,7 +850,7 @@ impl Ready {
     fn reset_backoff(&mut self) {
         self.failures.clear();
         self.last_attempt.clear();
-        self.day_recs_failures.clear();
+        self.later_days.clear_failures();
     }
 
     /// Starts streaming a report unless one is already in flight. A client
@@ -1243,34 +1105,11 @@ impl Ready {
                 Task::none()
             }
             Message::DayRecs(day, facts, result) => {
-                // Only the latest request for that day counts (one left
-                // behind or aborted doesn't).
-                if self
-                    .day_recs_pending
-                    .get(&day)
-                    .is_none_or(|(f, _)| *f != facts)
-                {
+                let Some(task) = self.day_recs_done(day, facts, result) else {
                     self.local = true;
                     return Task::none();
-                }
-                self.day_recs_pending.remove(&day);
-                match result
-                    .ok()
-                    .and_then(|r| report::parse_recommendations(&r.text))
-                {
-                    Some(rec) => {
-                        self.day_recs.insert(day, (facts, recommended(rec)));
-                        self.day_recs_failures.remove(&day);
-                    }
-                    // Keeps what was shown; retried after the backoff.
-                    None => {
-                        let failures = self.day_recs_failures.get(&day).map_or(0, |f| f.0);
-                        self.day_recs_failures
-                            .insert(day, (failures + 1, Timestamp::now()));
-                    }
-                }
-                // Tasks may have changed while it ran.
-                self.update_day_recs()
+                };
+                task
             }
             Message::SummaryWait => {
                 // Starting a generation asks for the refresh.
@@ -1787,14 +1626,6 @@ struct TaskDialog {
     form: task_form::EditForm,
     /// The task being edited; `None` for a new task.
     task: Option<TaskId>,
-}
-
-/// The tasks a recommendation names, in its order.
-fn recommended(rec: report::Recommendation) -> Vec<day::Recommended> {
-    rec.tasks
-        .into_iter()
-        .map(|t| day::Recommended { id: t.id })
-        .collect()
 }
 
 /// Model ids from an endpoint's model list, as chat models.

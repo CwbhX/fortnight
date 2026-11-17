@@ -163,9 +163,7 @@ impl Ready {
         for handle in self.key_requests.drain(..) {
             handle.abort();
         }
-        for (_, (_, handle)) in self.day_recs_pending.drain() {
-            handle.abort();
-        }
+        self.later_days.abort_all();
         self.suggest.cancel();
         self.testing = false;
         self.listing_models = false;
