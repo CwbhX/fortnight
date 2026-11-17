@@ -21,7 +21,8 @@
 //! - **Completed**, collapsed: done tasks whose day is the shown day (as on
 //!   the Week tab), whenever they were ticked; a done task with no day shows
 //!   on the day it was ticked.
-//! - **No date**, collapsed: open tasks with no planned day (the inbox).
+//! - **No date**, collapsed: open tasks with no planned day (the inbox),
+//!   except, on today, those whose deadline has passed (Overdue).
 //! - **Deleted**, collapsed: every deleted task, newest first, each a quiet
 //!   card with Restore and Delete forever, and Delete all in the header
 //!   when open. Delete moves a task here (status `Dropped`); only Delete
@@ -61,6 +62,7 @@ use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 
 use fortnight_core::domain::{NewTask, Priority, Task, TaskId, TaskStatus};
+use fortnight_core::notes::{Subtask, join_notes, split_notes, subtask_counts};
 use fortnight_core::parse;
 use fortnight_core::week::add_months;
 use iced::widget::overlay::menu;
@@ -75,6 +77,9 @@ use jiff::tz::TimeZone;
 use super::NavKey;
 use crate::calendar::{Popup, month_picker};
 use crate::theme;
+
+/// The id of the add-a-task input, for `operation::focus`.
+pub const QUICK_ADD_ID: &str = "quick-add";
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -235,6 +240,8 @@ pub struct DayData {
 #[derive(Debug, Default)]
 pub struct DayView {
     data: Option<DayData>,
+    /// Where `data`'s tasks are shown, worked out in `load`.
+    placement: Placement,
     show_done: bool,
     show_no_date: bool,
     show_deleted: bool,
@@ -302,16 +309,19 @@ fn section_of(task: &Task, day: Date, today: Date, tz: &TimeZone) -> Option<Sect
         }
         TaskStatus::Todo | TaskStatus::Doing => {}
     }
-    let shows_today = day == today;
-    let Some(task_day) = task.day() else {
-        return Some(Section::NoDate);
-    };
-    if shows_today && task.is_overdue(today) {
-        Some(Section::Overdue)
-    } else if task_day == day || (shows_today && task_day < today) {
-        Some(Section::Day)
-    } else {
-        None
+    if day == today {
+        // Overdue first, planned day or not (an inbox task too).
+        if task.is_overdue(today) {
+            return Some(Section::Overdue);
+        }
+        if task.on_today_list(today) {
+            return Some(Section::Day);
+        }
+    }
+    match task.day() {
+        None => Some(Section::NoDate),
+        Some(d) if d == day => Some(Section::Day),
+        Some(_) => None,
     }
 }
 
@@ -329,9 +339,10 @@ fn open_order(a: &Task, b: &Task) -> Ordering {
 const MAX_RECOMMENDED: usize = 3;
 
 /// The recommended tasks shown: on today and later days (not past ones),
-/// those still open, at most [`MAX_RECOMMENDED`], in the model's order.
-/// `main.rs` works them out for the shown day: on today from today's list
-/// and the overdue tasks, on a later day from the tasks planned for it.
+/// those still on the shown day's list (its Tasks or Overdue section), at
+/// most [`MAX_RECOMMENDED`], in the model's order. `main.rs` works them out
+/// for the shown day: on today from today's list and the overdue tasks, on
+/// a later day from the tasks planned for it.
 fn recommended_tasks(data: &DayData) -> Vec<&Task> {
     if data.day < data.today {
         return Vec::new();
@@ -339,61 +350,106 @@ fn recommended_tasks(data: &DayData) -> Vec<&Task> {
     data.recommended
         .iter()
         .filter_map(|r| data.tasks.iter().find(|t| t.id == r.id))
-        .filter(|t| t.status.is_open())
+        .filter(|t| {
+            matches!(
+                section_of(t, data.day, data.today, &data.tz),
+                Some(Section::Day | Section::Overdue)
+            )
+        })
         .take(MAX_RECOMMENDED)
         .collect()
 }
 
-/// The section `task` is shown in: Recommended if it is one of
-/// [`recommended_tasks`], otherwise [`section_of`].
-fn placed_section(data: &DayData, task: &Task) -> Option<Section> {
-    if recommended_tasks(data).iter().any(|t| t.id == task.id) {
-        Some(Section::Recommended)
-    } else {
-        section_of(task, data.day, data.today, &data.tz)
-    }
+/// Where every task is shown for one [`DayData`]: per section (in
+/// [`Section::ALL`] order), indices into `DayData::tasks`, sorted.
+/// Worked out once in [`DayView::load`], the only place the data changes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Placement {
+    sections: [Vec<usize>; Section::ALL.len()],
 }
 
-/// The tasks in `section`, sorted. Recommended: the model's order.
-/// Overdue: oldest deadline first, then [`open_order`]. The day: manual
-/// order (`position`). No date: [`open_order`]. Completed: most recently finished first. Deleted:
-/// most recently deleted first.
-fn section_tasks(data: &DayData, section: Section) -> Vec<&Task> {
-    if section == Section::Recommended {
-        return recommended_tasks(data);
+impl Placement {
+    /// Places every task. Recommended: [`recommended_tasks`], in the
+    /// model's order, and left out of the other sections; the rest by
+    /// [`section_of`]. Overdue: oldest deadline first, then [`open_order`].
+    /// The day: manual order (`position`). No date: [`open_order`].
+    /// Completed: most recently finished first. Deleted: most recently
+    /// deleted first.
+    fn new(data: &DayData) -> Self {
+        let recommended: Vec<TaskId> = recommended_tasks(data).iter().map(|t| t.id).collect();
+        let mut out = Self::default();
+        for (i, task) in data.tasks.iter().enumerate() {
+            // Recommended ones are pushed in task order, sorted by rank below.
+            let section = if recommended.contains(&task.id) {
+                Some(Section::Recommended)
+            } else {
+                section_of(task, data.day, data.today, &data.tz)
+            };
+            if let Some(section) = section {
+                out.sections[section as usize].push(i);
+            }
+        }
+        let t = |i: &usize| &data.tasks[*i];
+        for section in Section::ALL {
+            let list = &mut out.sections[section as usize];
+            match section {
+                Section::Recommended => list.sort_by_key(|i| {
+                    recommended
+                        .iter()
+                        .position(|&id| id == data.tasks[*i].id)
+                        .unwrap_or(usize::MAX)
+                }),
+                Section::Overdue => list.sort_by(|a, b| {
+                    let (a, b) = (t(a), t(b));
+                    a.due_on.cmp(&b.due_on).then(open_order(a, b))
+                }),
+                // The day's tasks are in manual order (drag to rearrange).
+                Section::Day => list.sort_by(|a, b| {
+                    let (a, b) = (t(a), t(b));
+                    a.position.total_cmp(&b.position).then(a.id.cmp(&b.id))
+                }),
+                Section::NoDate => list.sort_by(|a, b| open_order(t(a), t(b))),
+                Section::Done | Section::Deleted => list.sort_by(|a, b| {
+                    let (a, b) = (t(a), t(b));
+                    let when = |t: &Task| t.completed_at.unwrap_or(t.updated_at);
+                    when(b).cmp(&when(a)).then(a.id.cmp(&b.id))
+                }),
+            }
+        }
+        out
     }
-    let mut out: Vec<&Task> = data
-        .tasks
-        .iter()
-        .filter(|t| placed_section(data, t) == Some(section))
-        .collect();
-    match section {
-        Section::Recommended => {}
-        Section::Overdue => out.sort_by(|a, b| a.due_on.cmp(&b.due_on).then(open_order(a, b))),
-        // The day's tasks are in manual order (drag to rearrange).
-        Section::Day => out.sort_by(|a, b| a.position.total_cmp(&b.position).then(a.id.cmp(&b.id))),
-        Section::NoDate => out.sort_by(|a, b| open_order(a, b)),
-        Section::Done | Section::Deleted => out.sort_by(|a, b| {
-            let when = |t: &Task| t.completed_at.unwrap_or(t.updated_at);
-            when(b).cmp(&when(a)).then(a.id.cmp(&b.id))
-        }),
-    }
-    out
-}
 
-/// The rows the keyboard moves through, top to bottom, skipping collapsed
-/// sections and Deleted.
-fn visible_rows(data: &DayData, show_done: bool, show_no_date: bool) -> Vec<TaskId> {
-    Section::ALL
-        .into_iter()
-        .filter(|s| match s {
-            Section::Done => show_done,
-            Section::NoDate => show_no_date,
-            Section::Deleted => false,
-            _ => true,
+    /// The tasks in `section`, in display order.
+    fn tasks<'a>(&self, data: &'a DayData, section: Section) -> Vec<&'a Task> {
+        self.sections[section as usize]
+            .iter()
+            .map(|&i| &data.tasks[i])
+            .collect()
+    }
+
+    /// The section task `id` is shown in, if any.
+    fn section_of_id(&self, data: &DayData, id: TaskId) -> Option<Section> {
+        Section::ALL.into_iter().find(|&s| {
+            self.sections[s as usize]
+                .iter()
+                .any(|&i| data.tasks[i].id == id)
         })
-        .flat_map(|s| section_tasks(data, s).into_iter().map(|t| t.id))
-        .collect()
+    }
+
+    /// The rows the keyboard moves through, top to bottom, skipping
+    /// collapsed sections and Deleted.
+    fn visible_rows(&self, data: &DayData, show_done: bool, show_no_date: bool) -> Vec<TaskId> {
+        Section::ALL
+            .into_iter()
+            .filter(|s| match s {
+                Section::Done => show_done,
+                Section::NoDate => show_no_date,
+                Section::Deleted => false,
+                _ => true,
+            })
+            .flat_map(|s| self.sections[s as usize].iter().map(|&i| data.tasks[i].id))
+            .collect()
+    }
 }
 
 /// Days from `today` to `date` (negative in the past).
@@ -438,67 +494,6 @@ const PRIORITIES: [(&str, Priority); 3] = [("Low", 0), ("Medium", 1), ("High", 2
 /// The stored priority as Low (0), Medium (1) or High (2).
 fn priority_level(p: Priority) -> Priority {
     p.min(2)
-}
-
-// ---------------------------------------------------------------- subtasks
-
-/// A checklist item kept in the notes as `- [ ] text` or `- [x] text`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Subtask {
-    done: bool,
-    text: String,
-}
-
-/// One notes line as a subtask, if it is a checklist line.
-fn subtask_line(line: &str) -> Option<Subtask> {
-    let rest = line.trim_start().strip_prefix("- [")?;
-    let (mark, text) = rest.split_at_checked(1)?;
-    let text = text.strip_prefix("] ")?;
-    let done = match mark {
-        " " => false,
-        "x" | "X" => true,
-        _ => return None,
-    };
-    Some(Subtask {
-        done,
-        text: text.trim().to_string(),
-    })
-}
-
-/// Splits notes into their subtasks and the remaining text.
-fn split_notes(notes: &str) -> (Vec<Subtask>, String) {
-    let mut subtasks = Vec::new();
-    let mut rest = Vec::new();
-    for line in notes.lines() {
-        match subtask_line(line) {
-            Some(s) => subtasks.push(s),
-            None => rest.push(line),
-        }
-    }
-    (subtasks, rest.join("\n").trim().to_string())
-}
-
-/// Joins notes text and subtasks back into one notes string: the text, a
-/// blank line, then the checklist.
-fn join_notes(subtasks: &[Subtask], text: &str) -> String {
-    let list: Vec<String> = subtasks
-        .iter()
-        .map(|s| format!("- [{}] {}", if s.done { "x" } else { " " }, s.text))
-        .collect();
-    let text = text.trim();
-    match (text.is_empty(), list.is_empty()) {
-        (_, true) => text.to_string(),
-        (true, false) => list.join("\n"),
-        (false, false) => format!("{text}\n\n{}", list.join("\n")),
-    }
-}
-
-/// `(done, total)` subtasks in the notes.
-fn subtask_counts(notes: &str) -> (usize, usize) {
-    notes
-        .lines()
-        .filter_map(subtask_line)
-        .fold((0, 0), |(d, t), s| (d + usize::from(s.done), t + 1))
 }
 
 // ------------------------------------------------------------------- form
@@ -623,7 +618,14 @@ fn open_projects(tasks: &[Task]) -> Vec<String> {
         .filter(|t| t.status.is_open())
         .filter_map(|t| t.project.clone())
         .collect();
-    out.sort_by_key(|p| p.to_lowercase());
+    // Case-insensitive, without a lowercase copy per comparison; ties by
+    // exact spelling so that exact duplicates end up next to each other.
+    out.sort_unstable_by(|a, b| {
+        a.chars()
+            .flat_map(char::to_lowercase)
+            .cmp(b.chars().flat_map(char::to_lowercase))
+            .then_with(|| a.cmp(b))
+    });
     out.dedup();
     out
 }
@@ -747,13 +749,23 @@ impl DayView {
             self.notes = text_editor::Content::with_text(&day_notes(&data, data.day));
             self.notes_day = Some(data.day);
         } else if self.notes_edited.is_none() {
-            // Unsaved typing wins over what is stored.
+            // Unsaved typing wins over what is stored. Compared trimmed at
+            // both ends, as `main.rs` saves them, so an autosave of notes
+            // with leading blank space doesn't rewrite the editor.
             let stored = day_notes(&data, data.day);
-            if self.notes.text().trim_end() != stored {
+            if self.notes.text().trim() != stored.trim() {
                 self.notes = text_editor::Content::with_text(&stored);
             }
         }
+        self.placement = Placement::new(&data);
         self.data = Some(data);
+
+        // A card that left the Tasks section sends no exit event.
+        if let Some(id) = self.hovered
+            && self.section_of_id(id) != Some(Section::Day)
+        {
+            self.hovered = None;
+        }
 
         if let Some(form) = &self.editing {
             match self.section_of_id(form.id) {
@@ -812,7 +824,12 @@ impl DayView {
                 Action::None
             }
             NavKey::Close => {
-                if self.editing.is_some() {
+                if let Some(form) = self.editing.as_mut()
+                    && form.calendar.is_some()
+                {
+                    // Only the form's due calendar closes.
+                    form.calendar = None;
+                } else if self.editing.is_some() {
                     self.editing = None;
                 } else {
                     self.selected = None;
@@ -879,7 +896,9 @@ impl DayView {
                 let Some(drag) = self.drag.take().filter(|d| d.active) else {
                     return Action::None;
                 };
-                let order: Vec<&Task> = section_tasks(data, Section::Day);
+                // The cards move under the pointer without enter/exit events.
+                self.hovered = None;
+                let order: Vec<&Task> = self.placement.tasks(data, Section::Day);
                 reorder(&order, drag.id, spot)
                     .map(Action::Reorder)
                     .unwrap_or(Action::None)
@@ -891,6 +910,8 @@ impl DayView {
             },
             Message::Remove(id) => Action::SetStatus(id, TaskStatus::Dropped),
             Message::Expand(id) => {
+                // The card is replaced by the form (or back) with no exit event.
+                self.hovered = None;
                 if self.editing.as_ref().is_some_and(|f| f.id == id) {
                     self.editing = None;
                     self.selected = None;
@@ -905,13 +926,7 @@ impl DayView {
                 Action::None
             }
             Message::SubmitQuickAdd => {
-                let new = crate::top_bar::quick_add_task(
-                    &self.quick_add,
-                    crate::top_bar::Tab::Today,
-                    data.day,
-                    data.today,
-                );
-                match new {
+                match parse::quick_add_task(&self.quick_add, data.today, Some(data.day)) {
                     Some(new) => {
                         self.quick_add.clear();
                         Action::Add(new)
@@ -939,6 +954,7 @@ impl DayView {
                     Ok(updated) => {
                         self.editing = None;
                         self.selected = None;
+                        self.hovered = None;
                         if &updated == task {
                             Action::None
                         } else {
@@ -952,12 +968,17 @@ impl DayView {
                 }
             }
             Message::Delete => match self.editing.take() {
-                Some(form) => Action::SetStatus(form.id, TaskStatus::Dropped),
+                Some(form) => {
+                    self.selected = None;
+                    self.hovered = None;
+                    Action::SetStatus(form.id, TaskStatus::Dropped)
+                }
                 None => Action::None,
             },
             Message::Close => {
                 self.editing = None;
                 self.selected = None;
+                self.hovered = None;
                 Action::None
             }
             Message::Restore(id) => Action::SetStatus(id, TaskStatus::Todo),
@@ -984,14 +1005,16 @@ impl DayView {
     }
 
     fn section_of_id(&self, id: TaskId) -> Option<Section> {
-        let data = self.data.as_ref()?;
-        placed_section(data, self.task(id)?)
+        self.placement.section_of_id(self.data.as_ref()?, id)
     }
 
     fn visible(&self) -> Vec<TaskId> {
         self.data
             .as_ref()
-            .map(|d| visible_rows(d, self.show_done, self.show_no_date))
+            .map(|d| {
+                self.placement
+                    .visible_rows(d, self.show_done, self.show_no_date)
+            })
             .unwrap_or_default()
     }
 
@@ -1003,10 +1026,10 @@ impl DayView {
         };
         let mut content = Column::new().spacing(theme::SPACING * 2.0);
 
-        let recommended = section_tasks(data, Section::Recommended);
+        let recommended = self.placement.tasks(data, Section::Recommended);
         if !recommended.is_empty() {
             let heading = section_title(&recommended, "Recommended Task", text::default);
-            content = content.push(self.group(heading, recommended, data));
+            content = content.push(self.group(heading, recommended, data, true));
         } else if data.recommending && data.day >= data.today {
             content = content.push(
                 column![
@@ -1020,9 +1043,9 @@ impl DayView {
         }
 
         // The day's tasks, then the add-a-task input as the last card.
-        let day_tasks = section_tasks(data, Section::Day);
+        let day_tasks = self.placement.tasks(data, Section::Day);
         let quick_add = text_input("Add a task", &self.quick_add)
-            .id(crate::top_bar::QUICK_ADD_ID)
+            .id(QUICK_ADD_ID)
             .on_input(Message::EditQuickAdd)
             .on_submit(Message::SubmitQuickAdd)
             .padding([11, 14])
@@ -1036,10 +1059,10 @@ impl DayView {
         };
         content = content.push(day_group.push(quick_add).spacing(theme::SPACING / 2.0));
 
-        let overdue = section_tasks(data, Section::Overdue);
+        let overdue = self.placement.tasks(data, Section::Overdue);
         if !overdue.is_empty() {
             let heading = section_title(&overdue, "Overdue Task", theme::danger);
-            content = content.push(self.group(heading, overdue, data));
+            content = content.push(self.group(heading, overdue, data, false));
         }
 
         content = content.push(self.day_notes_view(data));
@@ -1065,7 +1088,7 @@ impl DayView {
             ),
         ];
         for (section, label, open, toggle) in collapsibles {
-            let tasks = section_tasks(data, section);
+            let tasks = self.placement.tasks(data, section);
             if !tasks.is_empty() {
                 content = content.push(self.collapsible(section, label, open, toggle, tasks, data));
             }
@@ -1223,8 +1246,9 @@ impl DayView {
         heading: Element<'a, Message>,
         tasks: Vec<&'a Task>,
         data: &'a DayData,
+        ranked: bool,
     ) -> Element<'a, Message> {
-        column![heading, self.rows(tasks, data)]
+        column![heading, self.rows(tasks, data, ranked)]
             .spacing(theme::SPACING / 2.0)
             .into()
     }
@@ -1261,25 +1285,32 @@ impl DayView {
                 group = group
                     .push(Column::with_children(tasks.into_iter().map(deleted_row)).spacing(6));
             } else {
-                group = group.push(self.rows(tasks, data));
+                group = group.push(self.rows(tasks, data, false));
             }
         }
         group.into()
     }
 
-    fn rows<'a>(&'a self, tasks: Vec<&'a Task>, data: &'a DayData) -> Element<'a, Message> {
-        Column::with_children(tasks.into_iter().map(|task| match &self.editing {
-            Some(form) if form.id == task.id => edit_card(task, form, data.today),
-            _ => {
-                let rec = data
-                    .recommended
-                    .iter()
-                    .filter(|_| data.day >= data.today)
-                    .position(|r| r.id == task.id)
-                    .map(|i| i + 1);
-                task_row(task, data.today, self.selected == Some(task.id), rec)
-            }
-        }))
+    /// The rows of a section. `ranked` (the Recommended section only)
+    /// numbers them 1, 2, 3 in the order shown.
+    fn rows<'a>(
+        &'a self,
+        tasks: Vec<&'a Task>,
+        data: &'a DayData,
+        ranked: bool,
+    ) -> Element<'a, Message> {
+        Column::with_children(
+            tasks
+                .into_iter()
+                .enumerate()
+                .map(|(i, task)| match &self.editing {
+                    Some(form) if form.id == task.id => edit_card(task, form, data.today),
+                    _ => {
+                        let rank = ranked.then_some(i + 1);
+                        task_row(task, data.today, self.selected == Some(task.id), rank)
+                    }
+                }),
+        )
         .spacing(6)
         .into()
     }
@@ -1480,13 +1511,16 @@ fn drop_line<'a>(show: bool) -> Element<'a, Message> {
 
 /// The new positions after moving `dragged` to `spot` in `order` (the
 /// Tasks section as shown): 1, 2, 3, … top to bottom, only for the tasks
-/// whose position changes. `None` if `dragged` isn't in the list or
-/// nothing moves.
+/// whose position changes. `None` if `dragged` isn't in the list, it is
+/// let go on itself or before a card not in the list, or nothing moves.
 fn reorder(order: &[&Task], dragged: TaskId, spot: Spot) -> Option<Vec<(TaskId, f64)>> {
     let moving = order.iter().find(|t| t.id == dragged)?;
     let mut ids: Vec<&Task> = order.iter().copied().filter(|t| t.id != dragged).collect();
     let at = match spot {
-        Spot::Before(id) => ids.iter().position(|t| t.id == id).unwrap_or(ids.len()),
+        // Let go on itself: nothing moves.
+        Spot::Before(id) if id == dragged => return None,
+        // A card that is no longer in the list: no place to land.
+        Spot::Before(id) => ids.iter().position(|t| t.id == id)?,
         Spot::End => ids.len(),
     };
     ids.insert(at, moving);
@@ -1933,6 +1967,14 @@ mod tests {
         view
     }
 
+    fn section_tasks(data: &DayData, section: Section) -> Vec<&Task> {
+        Placement::new(data).tasks(data, section)
+    }
+
+    fn visible_rows(data: &DayData, show_done: bool, show_no_date: bool) -> Vec<TaskId> {
+        Placement::new(data).visible_rows(data, show_done, show_no_date)
+    }
+
     fn ids(tasks: &[&Task]) -> Vec<TaskId> {
         tasks.iter().map(|t| t.id).collect()
     }
@@ -2004,6 +2046,10 @@ mod tests {
         // Dropped where it was: nothing to do.
         assert_eq!(reorder(&order, 2, Spot::Before(3)), None);
         assert_eq!(reorder(&order, 9, Spot::End), None);
+        // Let go on itself, or before a card that is gone: nothing moves
+        // (not to the end).
+        assert_eq!(reorder(&order, 1, Spot::Before(1)), None);
+        assert_eq!(reorder(&order, 1, Spot::Before(9)), None);
     }
 
     #[test]
@@ -2329,11 +2375,154 @@ mod tests {
         assert_eq!(visible_rows(&data, false, false), [4, 2, 1, 3, 5]);
 
         // A past day: no recommendations. A later one shows its own (as
-        // `main.rs` gives them).
+        // `main.rs` gives them), only those planned for it.
         data.day = date(2026, 11, 15);
         assert!(ids(&data, Section::Recommended).is_empty());
-        data.day = date(2026, 11, 17);
-        assert!(!ids(&data, Section::Recommended).is_empty());
+        let tue = date(2026, 11, 17);
+        data.day = tue;
+        assert!(ids(&data, Section::Recommended).is_empty());
+        for id in [2, 4] {
+            let t = data.tasks.iter_mut().find(|t| t.id == id).unwrap();
+            t.planned_for = Some(tue);
+        }
+        assert_eq!(ids(&data, Section::Recommended), [4, 2]);
+    }
+
+    /// A stale list: a recommended task ticked off or moved to another day
+    /// leaves Recommended, and the rest close up (they are numbered by
+    /// their place in this list).
+    #[test]
+    fn recommended_keeps_only_tasks_still_on_the_shown_day() {
+        let tue = date(2026, 11, 17);
+        let mut tasks: Vec<Task> = (1..=4)
+            .map(|i| planned(task(i, &format!("t{i}"), None), tue))
+            .collect();
+        tasks[0] = done_on(tasks[0].clone(), tue);
+        tasks[2].planned_for = Some(date(2026, 11, 19));
+        let mut data = data_for(tue, tasks);
+        data.recommended = [1, 2, 3, 4]
+            .into_iter()
+            .map(|id| Recommended { id })
+            .collect();
+        assert_eq!(ids(&section_tasks(&data, Section::Recommended)), [2, 4]);
+        assert_eq!(ids(&section_tasks(&data, Section::Done)), [1]);
+        // Today: an overdue inbox task can be recommended.
+        let mut inbox = task(5, "inbox", None);
+        inbox.due_on = Some(date(2026, 11, 13));
+        let mut data = data_for(today(), vec![inbox, task(6, "other day", Some(tue))]);
+        data.recommended = vec![Recommended { id: 6 }, Recommended { id: 5 }];
+        assert_eq!(ids(&section_tasks(&data, Section::Recommended)), [5]);
+    }
+
+    #[test]
+    fn an_inbox_task_past_its_deadline_is_overdue_on_today() {
+        let mut inbox = task(1, "inbox", None);
+        inbox.due_on = Some(date(2026, 11, 13));
+        assert_eq!(
+            section_of(&inbox, today(), today(), &TimeZone::UTC),
+            Some(Section::Overdue)
+        );
+        // On another day it stays in No date.
+        assert_eq!(
+            section_of(&inbox, date(2026, 11, 18), today(), &TimeZone::UTC),
+            Some(Section::NoDate)
+        );
+        let data = data_for(today(), vec![inbox]);
+        assert_eq!(ids(&section_tasks(&data, Section::Overdue)), [1]);
+        assert!(section_tasks(&data, Section::NoDate).is_empty());
+    }
+
+    #[test]
+    fn hover_is_cleared_where_the_card_goes_without_an_exit() {
+        let a = planned(task(1, "a", None), today());
+        let b = planned(task(2, "b", None), today());
+        let mut view = loaded(vec![a.clone(), b.clone()]);
+        // Opening the form, then closing it.
+        view.update(Message::Enter(Spot::Before(1)));
+        view.update(Message::Expand(1));
+        assert_eq!(view.hovered, None);
+        view.update(Message::Enter(Spot::Before(1)));
+        view.update(Message::Close);
+        assert_eq!(view.hovered, None);
+        // A drop.
+        view.update(Message::Press(2));
+        view.update(Message::Moved(Point::new(0.0, 0.0)));
+        view.update(Message::Moved(Point::new(0.0, 40.0)));
+        view.update(Message::Enter(Spot::Before(1)));
+        view.update(Message::DropOn(Spot::Before(1)));
+        assert_eq!(view.hovered, None);
+        // Save and Delete from the form.
+        view.update(Message::Expand(1));
+        view.update(Message::Enter(Spot::Before(2)));
+        view.update(Message::Save);
+        assert_eq!(view.hovered, None);
+        view.update(Message::Expand(1));
+        view.update(Message::Enter(Spot::Before(2)));
+        view.update(Message::Delete);
+        assert_eq!(view.hovered, None);
+        // A reload where the hovered card has left the Tasks section.
+        view.update(Message::Enter(Spot::Before(2)));
+        view.load(data_for(
+            today(),
+            vec![a.clone(), done_on(b.clone(), today())],
+        ));
+        assert_eq!(view.hovered, None);
+        // ...but not one where it stays.
+        view.update(Message::Enter(Spot::Before(1)));
+        view.load(data_for(today(), vec![a, b]));
+        assert_eq!(view.hovered, Some(1));
+    }
+
+    #[test]
+    fn deleting_from_the_form_clears_the_selection() {
+        let mut view = loaded(vec![
+            task(1, "a", Some(today())),
+            task(2, "b", Some(today())),
+        ]);
+        view.update(Message::Expand(1));
+        assert_eq!(view.selected, Some(1));
+        view.update(Message::Delete);
+        assert_eq!(view.selected, None);
+        let tasks = vec![
+            with_status(task(1, "a", Some(today())), TaskStatus::Dropped),
+            task(2, "b", Some(today())),
+        ];
+        view.load(data_for(today(), tasks));
+        assert_eq!(view.selected, None);
+    }
+
+    #[test]
+    fn escape_with_the_due_calendar_open_closes_only_the_calendar() {
+        let mut view = loaded(vec![task(1, "a", Some(today()))]);
+        view.update(Message::Expand(1));
+        view.update(Message::EditTitle("typed".into()));
+        view.update(Message::ToggleCalendar);
+        view.on_key(NavKey::Close);
+        let form = view.editing.as_ref().expect("the form stays open");
+        assert_eq!(form.calendar, None);
+        assert_eq!(form.title, "typed");
+        view.on_key(NavKey::Close);
+        assert!(view.editing.is_none());
+    }
+
+    /// `main.rs` saves notes trimmed at both ends; the reload after that
+    /// must not rewrite what is in the editor.
+    #[test]
+    fn an_autosave_does_not_rewrite_notes_with_leading_space() {
+        let mut view = loaded(vec![]);
+        view.update(Message::EditDayNotes(text_editor::Action::Edit(
+            text_editor::Edit::Paste(std::sync::Arc::new("  - item".to_string())),
+        )));
+        let (day, saved) = view
+            .notes_to_save(Instant::now() + NOTES_SAVE_DELAY)
+            .unwrap();
+        let mut data = data_for(today(), vec![]);
+        data.logs = vec![LogLine {
+            date: day,
+            text: saved.trim().to_string(),
+        }];
+        view.load(data);
+        assert_eq!(view.notes.text(), "  - item");
     }
 
     #[test]
@@ -2353,7 +2542,19 @@ mod tests {
         c.project = Some("old".into());
         let mut d = task(4, "d", None);
         d.project = Some("work".into());
-        assert_eq!(open_projects(&[a, b, c, d]), ["Home", "work"]);
+        assert_eq!(
+            open_projects(&[a.clone(), b.clone(), c, d.clone()]),
+            ["Home", "work"]
+        );
+        // Exact duplicates go even when another spelling sorts between them.
+        let mut e = task(5, "e", None);
+        e.project = Some("Work".into());
+        let mut f = task(6, "f", None);
+        f.project = Some("home".into());
+        assert_eq!(
+            open_projects(&[a, e, d, b, f]),
+            ["Home", "home", "Work", "work"]
+        );
     }
 
     #[test]
@@ -2371,28 +2572,6 @@ mod tests {
             panic!("expected Update");
         };
         assert_eq!(updated.due_on, None);
-    }
-
-    #[test]
-    fn notes_split_and_join() {
-        let (subs, text) = split_notes("intro\n- [ ] a\n  - [X] b\n- [y] not one\n");
-        assert_eq!(
-            subs,
-            vec![
-                Subtask {
-                    done: false,
-                    text: "a".into()
-                },
-                Subtask {
-                    done: true,
-                    text: "b".into()
-                },
-            ]
-        );
-        assert_eq!(text, "intro\n- [y] not one");
-        assert_eq!(join_notes(&subs, ""), "- [ ] a\n- [x] b");
-        assert_eq!(join_notes(&[], " x "), "x");
-        assert_eq!(subtask_counts("- [x] a\n- [ ] b\nc"), (1, 2));
     }
 
     #[test]

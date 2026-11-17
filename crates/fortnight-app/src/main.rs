@@ -288,7 +288,7 @@ impl App {
                 ready.refresh();
                 let tasks = Task::batch([
                     iced::system::theme().map(Message::ThemeMode),
-                    operation::focus(top_bar::QUICK_ADD_ID),
+                    operation::focus(day::QUICK_ADD_ID),
                     start,
                     detect_ollama(),
                     shoot_after_delay(),
@@ -1848,7 +1848,7 @@ impl Ready {
             Shortcut::FocusQuickAdd if self.tab == Tab::Week => self.open_new_task(self.selected),
             Shortcut::FocusQuickAdd => {
                 self.tab = Tab::Today;
-                operation::focus(top_bar::QUICK_ADD_ID)
+                operation::focus(day::QUICK_ADD_ID)
             }
             Shortcut::Settings => {
                 self.settings_open = true;

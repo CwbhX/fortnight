@@ -1,27 +1,22 @@
 //! The top bar (PLAN.md section 4.2): the Today | Week | Month tabs, period
-//! navigation over the shared selected date (centred), Lock and the
-//! Settings gear, and the always-visible quick-add bar under them.
-//! Clicking the date opens a calendar to pick a day (today is shaded);
-//! double-clicking it jumps back to today.
+//! navigation over the shared selected date (centred), and Lock and the
+//! Settings gear on the right. Clicking the date opens a calendar to pick
+//! a day (today is shaded); double-clicking it jumps back to today. (The
+//! add-a-task input is in the Today tab, `views/day.rs`.)
 //! Owner: orchestrator.
 //!
 //! ```text
 //! [ Today | Week | Month ]          ‹ Nov 16 to Nov 20 ›            lock  gear
-//! [ Write Q4 report fri #work ~2h !                                              ]
 //! ```
 
 use crate::calendar::{Popup, month_picker, year_picker};
 use crate::theme::{self, Icon};
-use fortnight_core::domain::{NewTask, Schedule};
-use fortnight_core::parse;
+use fortnight_core::domain::Schedule;
 use fortnight_core::week::{add_months, month_label, week_containing};
 use iced::widget::{button, container, mouse_area, row, text, tooltip};
 use iced::{Center, Element, Fill};
 use jiff::ToSpan;
 use jiff::civil::Date;
-
-/// The id of the Today tab's add-a-task input, for `operation::focus`.
-pub const QUICK_ADD_ID: &str = "quick-add";
 
 /// The three zoom levels over the same tasks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -136,29 +131,6 @@ pub fn period_label(tab: Tab, selected: Date, today: Date, schedule: &Schedule) 
         }
         Tab::Month => month_label(selected),
     }
-}
-
-/// The task a quick-add line creates, or `None` if it has no title.
-/// A date in the line is the day you plan to do it (where the task is
-/// shown), not a deadline. In the Today tab a line without a date is
-/// planned for the day shown.
-pub fn quick_add_task(input: &str, tab: Tab, selected: Date, today: Date) -> Option<NewTask> {
-    let parsed = parse::parse_quick_add(input, today);
-    if parsed.title.trim().is_empty() {
-        return None;
-    }
-    let planned_for = match tab {
-        Tab::Today => parsed.day.or(Some(selected)),
-        _ => parsed.day,
-    };
-    Some(NewTask {
-        title: parsed.title,
-        project: parsed.project,
-        planned_for,
-        estimate_minutes: parsed.estimate_minutes,
-        priority: parsed.priority,
-        ..NewTask::default()
-    })
 }
 
 pub fn view<'a>(bar: Bar<'a>) -> Element<'a, Message> {
@@ -341,24 +313,5 @@ mod tests {
             period_label(Tab::Month, today(), today(), &s),
             "November 2026"
         );
-    }
-
-    #[test]
-    fn quick_add_dates_undated_tasks_on_the_day_shown() {
-        let shown = date(2026, 11, 18);
-        let t = quick_add_task("Buy milk #home", Tab::Today, shown, today()).unwrap();
-        assert_eq!(t.planned_for, Some(shown));
-        assert_eq!(t.due_on, None);
-        assert_eq!(t.project.as_deref(), Some("home"));
-
-        let t = quick_add_task("Report fri", Tab::Today, shown, today()).unwrap();
-        assert_eq!(t.planned_for, Some(date(2026, 11, 20)));
-        assert_eq!(t.due_on, None);
-
-        let t = quick_add_task("Inbox item", Tab::Week, shown, today()).unwrap();
-        assert_eq!(t.planned_for, None);
-
-        assert_eq!(quick_add_task("   ", Tab::Today, shown, today()), None);
-        assert_eq!(quick_add_task("#work", Tab::Today, shown, today()), None);
     }
 }
