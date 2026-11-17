@@ -184,9 +184,11 @@ impl LlmClient for DecisionClient {
                     )),
                     Some(Ask::Answer(text)) => Ok(ChatResponse { text, model }),
                     Some(Ask::Question { body, candidates }) => {
-                        ask(builder, body, &model).await.map(|reply| ChatResponse {
-                            text: plan_reply(&reply.answers, &candidates),
-                            model: reply.model,
+                        ask(builder, body, &model).await.and_then(|reply| {
+                            Ok(ChatResponse {
+                                text: plan_reply(&reply.answers, &candidates)?,
+                                model: reply.model,
+                            })
                         })
                     }
                 }
@@ -427,7 +429,7 @@ fn candidate(id: i64, task: &Value, facts: &Value) -> Candidate {
 /// The recommended-tasks JSON from the `first` answer: the options by
 /// probability times priority weight, highest first (or just the chosen
 /// one).
-fn plan_reply(answers: &Value, candidates: &[Candidate]) -> String {
+fn plan_reply(answers: &Value, candidates: &[Candidate]) -> Result<String, LlmError> {
     let first = answers.get("first");
     let mut ranked: Vec<(&Candidate, f64)> = first
         .and_then(|a| a.get("probabilities"))
@@ -450,7 +452,14 @@ fn plan_reply(answers: &Value, candidates: &[Candidate]) -> String {
         picks.extend(candidates.iter().find(|c| c.key == choice));
     }
     picks.truncate(PICKS);
-    reply_json(&picks)
+    if picks.is_empty() {
+        // Not a usable answer: an error, so the fallback answers instead and
+        // the last good recommendations stay on screen meanwhile.
+        return Err(LlmError::Malformed(
+            "the decision model's answer named none of the tasks".into(),
+        ));
+    }
+    Ok(reply_json(&picks))
 }
 
 fn reply_json(picks: &[&Candidate]) -> String {
@@ -623,6 +632,25 @@ mod tests {
                 .unwrap()
                 .starts_with("Medium priority; ")
         );
+    }
+
+    #[tokio::test]
+    async fn an_answer_naming_no_task_is_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "nimble",
+                "answers": { "first": { "type": "choice", "choice": "0",
+                    "probabilities": { "0": 0.7, "1": 0.3 } } }
+            })))
+            .mount(&server)
+            .await;
+        let tasks = [task(1, "a", None), task(2, "b", None)];
+        assert!(matches!(
+            client(&server).chat(plan_request(&tasks)).await,
+            Err(LlmError::Malformed(_))
+        ));
     }
 
     #[tokio::test]

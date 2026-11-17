@@ -17,7 +17,9 @@
 //!
 //! `load` runs after every message and on every streamed piece, so it
 //! returns early on equal data and only reparses Markdown whose source
-//! changed; streamed text that grows is pushed incrementally.
+//! changed; streamed text that grows is pushed incrementally. While a new
+//! summary is generated, the previous one stays on screen until the new one
+//! is done; only a first summary streams in live.
 
 use fortnight_core::domain::{Report, ReportId, ReportKind, ReportStatus, WeekRef};
 use fortnight_core::export::ExportFormat;
@@ -132,15 +134,20 @@ impl ReportPanel {
         self.refresh();
     }
 
+    /// The summary shown: the newest ready version, kept while a new one
+    /// is generated (the status line says "Updating…"), so it never blanks
+    /// and pops back in. With no earlier version, the new one streams in
+    /// live.
     fn refresh(&mut self) {
+        let ready = self
+            .ready(ReportKind::Summary)
+            .and_then(Report::text)
+            .map(str::to_owned);
         let body_src = match self.slot(ReportKind::Summary) {
-            Some(slot) => match &slot.streaming {
-                Some(so_far) => so_far.clone(),
-                None => self
-                    .ready(ReportKind::Summary)
-                    .and_then(Report::text)
-                    .unwrap_or_default()
-                    .to_owned(),
+            Some(slot) => match (&slot.streaming, ready) {
+                (_, Some(ready)) => ready,
+                (Some(so_far), None) => so_far.clone(),
+                (None, None) => String::new(),
             },
             None => String::new(),
         };
@@ -609,6 +616,22 @@ mod tests {
         p.load(streaming("## Highlights\n- one"));
         assert_eq!(p.body_parses, start + 2);
         let _ = p.summary_view();
+    }
+
+    #[test]
+    fn the_previous_summary_stays_while_a_new_one_is_generated() {
+        let mut p = ReportPanel::new();
+        let mut s = slot(
+            ReportKind::Summary,
+            vec![report(1, ReportKind::Summary, "## Old summary")],
+        );
+        s.streaming = Some(String::new());
+        p.load(data(vec![s.clone()]));
+        assert_eq!(p.body_src, "## Old summary");
+        s.streaming = Some("## New".into());
+        p.load(data(vec![s]));
+        assert_eq!(p.body_src, "## Old summary");
+        assert_eq!(p.status(ReportKind::Summary).unwrap().text, "Updating…");
     }
 
     #[test]

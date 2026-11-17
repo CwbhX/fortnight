@@ -729,32 +729,35 @@ impl Ready {
     /// Today's recommended tasks: the current week's newest ready
     /// Recommended tasks report, parsed (empty if none or unreadable). A
     /// failed newer attempt doesn't hide the last good one.
-    /// The recommended tasks, limited to tasks planned for today (a chat
-    /// model may not keep to that rule).
+    /// The recommended tasks: the newest ready version that still names an
+    /// open task planned for today (a chat model may not keep to that rule).
+    /// Falling back to an older version keeps the last good list on screen
+    /// when the newest names none of today's open tasks, e.g. while a new
+    /// one is worked out.
     fn recommended_today(&self) -> Vec<day::Recommended> {
         let today = self.today();
         let reports = self
             .store
             .list_reports(ReportKind::Plan, self.current_week().start)
             .unwrap_or_default();
-        let Some(r) = reports
-            .into_iter()
-            .find(|r| r.status == fortnight_core::domain::ReportStatus::Ready)
-        else {
-            return Vec::new();
-        };
-        r.text()
-            .and_then(report::parse_recommendations)
+        reports
+            .iter()
+            .filter(|r| r.status == fortnight_core::domain::ReportStatus::Ready)
+            .filter_map(|r| r.text().and_then(report::parse_recommendations))
             .map(|rec| {
                 rec.tasks
                     .into_iter()
-                    .filter(|t| self.task(t.id).is_some_and(|x| x.day() == Some(today)))
+                    .filter(|t| {
+                        self.task(t.id)
+                            .is_some_and(|x| x.day() == Some(today) && x.status.is_open())
+                    })
                     .map(|t| day::Recommended {
                         id: t.id,
                         why: t.why,
                     })
-                    .collect()
+                    .collect::<Vec<_>>()
             })
+            .find(|list| !list.is_empty())
             .unwrap_or_default()
     }
 
