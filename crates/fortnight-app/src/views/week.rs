@@ -1,16 +1,15 @@
 //! The Week tab (PLAN.md 4.2 "Week"). Owner: agent K (round 2).
 //!
 //! One column per working day, in week order, all the same width and
-//! height. Each column has a heading (weekday and date; click to open the
-//! day in the Today tab), a load line once a task that day has an estimate
-//! ("3.5h of 8h · 1h done", a warning sign when over capacity, "+2
-//! unestimated"), then
+//! height. Each column has a title bar: the heading (weekday and date;
+//! click to open the day in the Today tab) and, once a task that day has an
+//! estimate, the load bar under it (no text: hovering it says "3.5h of 8h
+//! · 1h done · +2 unestimated"; a warning sign when over capacity). Then
 //! the day's tasks: open ones first, done ones dimmed after them. A task is
 //! placed by `Task::day()` (planned day, else deadline). Non-working days
 //! share one extra column ("Sat–Sun"), shown only when one of them has
-//! tasks. Today's column has the accent ring and, when tasks from before
-//! this week are overdue, a quiet "2 overdue, see Today" link. The whole tab
-//! scrolls.
+//! tasks. Today's column has the accent ring. Overdue tasks from before the
+//! week are on the Today tab only. The whole tab scrolls.
 //!
 //! The AI part comes from the report panel and is generated automatically
 //! (see `report_panel`): the Work summary card. (Recommended tasks moved to
@@ -47,7 +46,7 @@ const MIN_COLUMN_HEIGHT: f32 = 220.0;
 pub enum Message {
     /// A task's checkbox.
     Toggle(TaskId, bool),
-    /// A day's heading (or the overdue note) was clicked.
+    /// A day's heading was clicked.
     OpenDay(Date),
     Panel(report_panel::Message),
     /// The mouse went down on a task card.
@@ -228,7 +227,6 @@ impl WeekView {
             return text("Loading…").style(theme::muted).into();
         };
         let specs = columns(data);
-        let overdue = overdue_before_week(data);
         let ranks = self.ranks();
         let dragging = self.dragging();
 
@@ -255,8 +253,7 @@ impl WeekView {
                     .on_release(Message::DropOn(day, None));
             }
             backgrounds = backgrounds.push(free);
-            let note = if spec.is_today { overdue } else { 0 };
-            contents = contents.push(day_column(data, spec, note, &ranks, dragging));
+            contents = contents.push(day_column(data, spec, &ranks, dragging));
         }
         let base = row![
             space().width(0).height(MIN_COLUMN_HEIGHT),
@@ -555,18 +552,6 @@ pub fn tasks_on(tasks: &[Task], day: Date) -> Vec<&Task> {
     out
 }
 
-/// Open tasks overdue today that sit on a day before the week (they don't
-/// appear in any column). Zero unless the week contains today.
-fn overdue_before_week(data: &WeekData) -> usize {
-    if !data.week.contains(data.today) {
-        return 0;
-    }
-    data.tasks
-        .iter()
-        .filter(|t| t.is_overdue(data.today) && t.day().is_some_and(|d| d < data.week.start))
-        .count()
-}
-
 /// The load line under a column heading. The bar's track is the day's
 /// capacity; on it, the estimated tasks (open and done) take a lighter
 /// share, and the done part of that share is the accent.
@@ -692,7 +677,6 @@ fn due_corner(task: &Task, column_day: Date) -> Option<String> {
 fn day_column<'a>(
     data: &'a WeekData,
     spec: &ColumnSpec,
-    overdue: usize,
     ranks: &[(TaskId, usize)],
     drag: Option<&Drag>,
 ) -> Element<'a, Message> {
@@ -746,34 +730,27 @@ fn day_column<'a>(
     );
     // The heading sits in a title bar like the Work Summary's, inset by
     // today's ring so the ring stays visible around it.
-    let heading = container(row![heading, add].align_y(Center))
-        .padding([theme::SPACING * 0.6, theme::SPACING])
-        .width(Fill)
-        .style(title_bar(theme::RADIUS - COLUMN_RING));
-
-    let mut col = Column::new().spacing(8).width(Fill);
-
+    let mut bar = Column::new()
+        .spacing(6)
+        .push(row![heading, add].align_y(Center));
     let loads: Vec<&DayLoad> = data
         .loads
         .iter()
         .filter(|l| spec.days.contains(&l.date))
         .collect();
-    if let Some(line) = load_line(&loads, done_minutes(&data.tasks, &spec.days)) {
-        col = col.push(load_view(line));
+    if let Some(line) = load_line(&loads, done_minutes(&data.tasks, &spec.days)).and_then(load_view)
+    {
+        bar = bar.push(line);
+    } else {
+        // Same height as a bar, so every title bar lines up.
+        bar = bar.push(space().height(6));
     }
+    let heading = container(bar)
+        .padding([theme::SPACING * 0.6, theme::SPACING])
+        .width(Fill)
+        .style(title_bar(theme::RADIUS - COLUMN_RING));
 
-    if overdue > 0 {
-        col = col.push(
-            button(
-                text(format!("{overdue} overdue, see Today"))
-                    .size(theme::TEXT_SMALL)
-                    .style(theme::danger),
-            )
-            .padding(0)
-            .style(theme::text_button)
-            .on_press(Message::OpenDay(data.today)),
-        );
-    }
+    let mut col = Column::new().spacing(8).width(Fill);
 
     // Cards sit on fixed 8 px slots that double as the landing line, so
     // showing the line never moves anything (which would move the target
@@ -831,57 +808,44 @@ fn day_column<'a>(
 /// inside it.
 const COLUMN_RING: f32 = 1.5;
 
-fn load_view<'a>(line: LoadLine) -> Element<'a, Message> {
-    let mut col = Column::new().spacing(4);
-    if let Some(f) = line.fraction {
-        // The track with the whole share, then the done part on top.
-        col = col.push(stack![
-            progress_bar(0.0..=1.0, f).girth(6).style(theme::load_bar),
-            progress_bar(0.0..=1.0, line.done_fraction.unwrap_or(0.0))
-                .girth(6)
-                .style(theme::load_bar_done),
-        ]);
+/// The load bar in a column's title bar, with the figures in its tooltip
+/// and a warning sign after it when over capacity. `None` without capacity
+/// (a non-working day): there is no bar to show.
+fn load_view<'a>(line: LoadLine) -> Option<Element<'a, Message>> {
+    let f = line.fraction?;
+    // The track with the whole share, then the done part on top.
+    let bar = stack![
+        progress_bar(0.0..=1.0, f).girth(6).style(theme::load_bar),
+        progress_bar(0.0..=1.0, line.done_fraction.unwrap_or(0.0))
+            .girth(6)
+            .style(theme::load_bar_done),
+    ];
+    let mut figures = vec![line.label];
+    figures.extend(line.done);
+    figures.extend(line.unestimated);
+    if let Some(over) = line.over_by {
+        figures.push(format!("over by {}", duration(over)));
     }
-    let mut labels = row![
-        text(line.label)
-            .size(theme::TEXT_SMALL)
-            .style(theme::muted)
-            .wrapping(Wrapping::None)
-    ]
+    let mut row = row![tooltip(
+        bar,
+        container(text(figures.join(" · ")).size(theme::TEXT_SMALL))
+            .padding([4, 8])
+            .style(theme::card),
+        tooltip::Position::Bottom,
+    )]
     .spacing(6)
     .align_y(Center);
-    if let Some(over) = line.over_by {
-        labels = labels.push(tooltip(
+    if line.over_by.is_some() {
+        row = row.push(
             theme::icon(theme::Icon::Warning)
                 .width(14)
                 .height(14)
                 .style(|theme: &Theme, _| iced::widget::svg::Style {
                     color: Some(theme.palette().warning),
                 }),
-            container(text(format!("Over by {}", duration(over))).size(theme::TEXT_SMALL))
-                .padding([4, 8])
-                .style(theme::card),
-            tooltip::Position::Bottom,
-        ));
-    }
-    if let Some(d) = line.done {
-        labels = labels.push(
-            text(format!("· {d}"))
-                .size(theme::TEXT_SMALL)
-                .style(theme::muted)
-                .wrapping(Wrapping::None),
         );
     }
-    if let Some(u) = line.unestimated {
-        labels = labels.push(
-            text(u)
-                .size(theme::TEXT_SMALL)
-                .style(theme::muted)
-                .wrapping(Wrapping::None),
-        );
-    }
-    // In a narrow column "+2 unestimated" moves to its own line whole.
-    col.push(labels.wrap().vertical_spacing(2)).into()
+    Some(row.into())
 }
 
 /// A task card in a day column: draggable when open. `dragging` is `None`
@@ -1320,24 +1284,6 @@ mod tests {
         let plain = task(2, Some(d), TaskStatus::Todo);
         assert_eq!(meta_line(&plain), "");
         assert_eq!(due_corner(&plain, d), None);
-    }
-
-    #[test]
-    fn overdue_note_counts_only_tasks_before_the_week() {
-        let mut planned_here = task(3, Some(date(2026, 11, 2)), TaskStatus::Todo);
-        planned_here.planned_for = Some(date(2026, 11, 17));
-        let d = data(vec![
-            task(1, Some(date(2026, 11, 10)), TaskStatus::Todo),
-            task(2, Some(date(2026, 11, 12)), TaskStatus::Done),
-            planned_here,
-            // Overdue but in this week's Monday column already.
-            task(4, Some(date(2026, 11, 16)), TaskStatus::Todo),
-        ]);
-        assert_eq!(overdue_before_week(&d), 1);
-
-        let mut past = d.clone();
-        past.week = WeekRef::new(date(2026, 11, 23));
-        assert_eq!(overdue_before_week(&past), 0);
     }
 
     #[test]
