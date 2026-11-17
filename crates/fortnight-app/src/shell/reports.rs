@@ -391,7 +391,9 @@ impl Ready {
         if ready {
             self.reports.failures.remove(&key);
         } else {
-            *self.reports.failures.entry(key).or_insert(0) += 1;
+            // The wait before the next try counts from the failure, not
+            // from when a long attempt began.
+            self.reports.record_failure(key);
         }
         if stored.is_err() {
             return Task::none();

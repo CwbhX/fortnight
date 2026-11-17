@@ -209,7 +209,9 @@ impl Ready {
                 // What failed while locked out may work now.
                 self.reset_backoff();
             }
-            Err(e) => self.unlock_view.set_error(e.to_string()),
+            // A check that ends after the prompt was cancelled says nothing.
+            Err(e) if self.unlocking => self.unlock_view.set_error(e.to_string()),
+            Err(_) => {}
         }
         self.catch_up()
     }
