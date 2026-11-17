@@ -166,11 +166,7 @@ impl Ready {
         for (_, (_, handle)) in self.day_recs_pending.drain() {
             handle.abort();
         }
-        if let Some(handle) = self.suggest_request.take() {
-            handle.abort();
-        }
-        // A suggestion already on its way is ignored.
-        self.suggest_seq += 1;
+        self.suggest.cancel();
         self.testing = false;
         self.listing_models = false;
         self.key_message = None;

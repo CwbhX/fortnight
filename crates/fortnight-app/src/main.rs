@@ -23,6 +23,7 @@ mod shell {
     pub(crate) mod edits;
     pub(crate) mod keys;
     pub(crate) mod shortcuts;
+    pub(crate) mod suggest;
 }
 
 use fortnight_app::app_icon;
@@ -62,6 +63,7 @@ use shell::dev::{self, data_dir_flag, forced_theme, save_screenshot, shoot_after
 use shell::edits::UndoStack;
 use shell::keys::{Keys, SavedKey};
 use shell::shortcuts::{Shortcut, shortcut_for};
+use shell::suggest::Suggestions;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -194,12 +196,8 @@ struct Ready {
     /// Identifies a generation, so a late message from an earlier stream for
     /// the same report can't finish a newer one.
     next_generation: u64,
-    /// Bumped by each edit of a new task's title or notes, so only the
-    /// latest priority suggestion lands.
-    suggest_seq: u64,
-    /// The open task form and its title and notes when a suggestion was
-    /// last asked for: a change asks again.
-    suggest_for: Option<(FormKey, String, String)>,
+    /// Priority suggestions for the open task form.
+    suggest: Suggestions,
     /// Tasks were reloaded during this message (a change was made).
     tasks_changed: bool,
     /// The Work summary isn't redone before this: set by each change made
@@ -230,8 +228,6 @@ struct Ready {
     /// Failures in a row per later day and when the last one was, for the
     /// same retry backoff as reports.
     day_recs_failures: HashMap<Date, (u32, Timestamp)>,
-    /// The priority suggestion in flight (it holds the key: Lock aborts it).
-    suggest_request: Option<iced::task::Handle>,
     /// Today when the minute tick last looked: a new day moves the
     /// selection along if it was on the old one.
     last_today: Date,
@@ -454,8 +450,7 @@ impl Ready {
             failures: HashMap::new(),
             prompt_changed: HashMap::new(),
             next_generation: 0,
-            suggest_seq: 0,
-            suggest_for: None,
+            suggest: Suggestions::default(),
             tasks_changed: false,
             summary_wait: None,
             testing: false,
@@ -471,7 +466,6 @@ impl Ready {
             day_recs: HashMap::new(),
             day_recs_pending: HashMap::new(),
             day_recs_failures: HashMap::new(),
-            suggest_request: None,
             last_today: today,
             derived: Derived::default(),
             week_data: None,
@@ -497,42 +491,6 @@ impl Ready {
 
     fn current_week(&self) -> WeekRef {
         self.week_of(self.today())
-    }
-
-    /// The open task form, its title and its notes: the task dialog's, or
-    /// Today's inline form.
-    fn open_form_text(&self) -> Option<(FormKey, String, String)> {
-        if let Some(d) = &self.dialog {
-            return Some((FormKey::Dialog, d.form.title.clone(), d.form.notes.text()));
-        }
-        if self.tab != Tab::Today {
-            return None;
-        }
-        self.day_view
-            .form_text()
-            .map(|(id, title, notes)| (FormKey::Inline(id), title, notes))
-    }
-
-    /// With a decision model set up: when a task form opens or its title or
-    /// notes change, ask for a suggested priority once typing pauses.
-    fn maybe_suggest(&mut self) -> Task<Message> {
-        if !self.decision_active() {
-            return Task::none();
-        }
-        let now = self.open_form_text();
-        if now == self.suggest_for {
-            return Task::none();
-        }
-        let has_title = now.as_ref().is_some_and(|(_, t, _)| !t.trim().is_empty());
-        self.suggest_for = now;
-        self.suggest_seq += 1;
-        if !has_title {
-            return Task::none();
-        }
-        let seq = self.suggest_seq;
-        Task::perform(tokio::time::sleep(Duration::from_millis(500)), move |_| {
-            Message::SuggestPriority(seq)
-        })
     }
 
     // ---- data flow ----
@@ -1361,48 +1319,15 @@ impl Ready {
             }
             Message::SuggestPriority(seq) => {
                 self.local = true;
-                let Some((form, title, notes)) = self.suggest_for.clone() else {
+                let Some(task) = self.suggest_priority(seq) else {
                     return Task::none();
                 };
-                if seq != self.suggest_seq || title.trim().is_empty() {
-                    return Task::none();
-                }
-                // A private task's title and notes never leave the machine.
-                let task = match form {
-                    FormKey::Dialog => self.dialog.as_ref().and_then(|d| d.task),
-                    FormKey::Inline(id) => Some(id),
-                };
-                if task.and_then(|id| self.task(id)).is_some_and(|t| t.private) {
-                    return Task::none();
-                }
-                let Some(client) = self.decision_model() else {
-                    return Task::none();
-                };
-                let (task, handle) = Task::perform(
-                    async move { client.suggest_priority(&title, &notes).await.ok() },
-                    move |p| Message::PrioritySuggested(seq, p),
-                )
-                .abortable();
-                if let Some(old) = self.suggest_request.replace(handle) {
-                    old.abort();
-                }
                 task
             }
             Message::PrioritySuggested(seq, priority) => {
                 // The forms draw the suggestion themselves.
                 self.local = true;
-                if seq == self.suggest_seq {
-                    self.suggest_request = None;
-                    match self.suggest_for.as_ref().map(|(form, _, _)| *form) {
-                        Some(FormKey::Dialog) => {
-                            if let Some(dialog) = self.dialog.as_mut() {
-                                dialog.form.suggested = priority;
-                            }
-                        }
-                        Some(FormKey::Inline(id)) => self.day_view.set_suggested(id, priority),
-                        None => {}
-                    }
-                }
+                self.priority_suggested(seq, priority);
                 Task::none()
             }
             Message::OllamaDetected(result) => {
@@ -1967,15 +1892,6 @@ fn detect_ollama() -> Task<Message> {
         },
         Message::OllamaDetected,
     )
-}
-
-/// Which task form a priority suggestion is for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FormKey {
-    /// The task dialog (new or existing task).
-    Dialog,
-    /// Today's inline form for this task.
-    Inline(TaskId),
 }
 
 #[cfg(test)]
