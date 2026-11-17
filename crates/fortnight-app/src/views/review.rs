@@ -304,7 +304,7 @@ impl ReviewView {
 /// reported as `LinkClicked` and ignored.
 fn md(content: &markdown::Content) -> Element<'_, Message> {
     let style = markdown::Style {
-        font: Font::default(),
+        font: theme::FONT,
         inline_code_highlight: markdown::Highlight {
             background: color!(0x78716c, 0.2).into(),
             border: border::rounded(4),

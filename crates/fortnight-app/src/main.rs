@@ -38,6 +38,13 @@ const RETRY_AFTER_MINUTES: i64 = 10;
 pub fn main() -> iced::Result {
     iced::application(App::boot, App::update, App::view)
         .title("Fortnight")
+        // One bundled typeface (Inter, OFL), so bold and italic Markdown
+        // render the same on every machine.
+        .font(include_bytes!("../../../assets/fonts/Inter-Regular.ttf").as_slice())
+        .font(include_bytes!("../../../assets/fonts/Inter-Bold.ttf").as_slice())
+        .font(include_bytes!("../../../assets/fonts/Inter-Italic.ttf").as_slice())
+        .font(include_bytes!("../../../assets/fonts/Inter-BoldItalic.ttf").as_slice())
+        .default_font(theme::FONT)
         .theme(App::theme)
         .subscription(App::subscription)
         .window_size((1100.0, 760.0))

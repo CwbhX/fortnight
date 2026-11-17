@@ -66,6 +66,12 @@ pub const ACCENT: Color = Color::from_rgb(
     0x0c as f32 / 255.0,
 );
 
+/// The app's one typeface, Inter, bundled and loaded by `main.rs`. Use it
+/// wherever a widget sets a font explicitly (e.g. `markdown::Style::font`):
+/// `Font::default()` is the generic sans-serif family, whose bold falls
+/// back to a monospace face on macOS.
+pub const FONT: iced::Font = iced::Font::with_name("Inter");
+
 /// Standard spacing unit, in logical pixels.
 pub const SPACING: f32 = 12.0;
 
