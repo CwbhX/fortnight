@@ -517,6 +517,20 @@ pub struct Settings {
     /// The system prompt for recommended tasks. Empty means the built-in
     /// one (`report::DEFAULT_PLAN_PROMPT`).
     pub plan_prompt: String,
+    /// Which app icon to show.
+    pub app_icon: AppIcon,
+}
+
+/// The app icon: the Dock icon on macOS, the window and taskbar icon
+/// elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppIcon {
+    /// Light or dark, following the system appearance.
+    #[default]
+    System,
+    Light,
+    Dark,
 }
 
 impl Default for Settings {
@@ -530,6 +544,7 @@ impl Default for Settings {
             notifications: false,
             summary_prompt: String::new(),
             plan_prompt: String::new(),
+            app_icon: AppIcon::System,
         }
     }
 }
@@ -540,6 +555,20 @@ pub const DEFAULT_FOCUS_MINUTES: u32 = 6 * 60;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_icon_defaults_to_system_and_round_trips() {
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.app_icon, AppIcon::System);
+        let dark = Settings {
+            app_icon: AppIcon::Dark,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&dark).unwrap();
+        assert!(json.contains(r#""app_icon":"dark""#));
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.app_icon, AppIcon::Dark);
+    }
 
     #[test]
     fn settings_round_trip_through_json() {

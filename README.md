@@ -1,4 +1,7 @@
-<img src="assets/icon.svg" width="64" height="64" alt="">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/icon-dark.svg">
+  <img src="assets/icon-light.svg" width="96" height="96" alt="">
+</picture>
 
 # Fortnight
 
@@ -83,7 +86,7 @@ cargo xtask bundle              # for this Mac's architecture
 cargo xtask bundle --universal  # for Apple Silicon and Intel
 ```
 
-This builds the app and wraps it in `target/bundle/Fortnight.app`, so it starts without a terminal window. It replaces any existing bundle. `--universal` needs both Rust targets, which `rustup target add aarch64-apple-darwin x86_64-apple-darwin` installs. The icon is made from `assets/icon.svg` with tools that come with macOS. If that fails, the bundle has no icon. You can move `Fortnight.app` anywhere; keep the data folder beside it.
+This builds the app and wraps it in `target/bundle/Fortnight.app`, so it starts without a terminal window. It replaces any existing bundle. `--universal` needs both Rust targets, which `rustup target add aarch64-apple-darwin x86_64-apple-darwin` installs. The icon is made from `assets/icon-light.svg` with tools that come with macOS. If that fails, the bundle has no icon. You can move `Fortnight.app` anywhere; keep the data folder beside it.
 
 ## Where your data lives
 

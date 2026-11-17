@@ -69,7 +69,7 @@ fn bundle(args: &[String]) -> Result<()> {
         .map_err(|e| format!("copying the binary: {e}"))?;
 
     let icon = match make_icon(
-        &root.join("assets/icon.svg"),
+        &root.join("assets/icon-light.svg"),
         &resources.join("Fortnight.icns"),
     ) {
         Ok(()) => true,
@@ -166,7 +166,7 @@ fn run(command: &mut Command) -> Result<()> {
     }
 }
 
-/// Renders `icon.svg` to a PNG with Quick Look, then builds an .icns with
+/// Renders the icon SVG to a PNG with Quick Look, then builds an .icns with
 /// `sips` and `iconutil`, all of which ship with macOS. Any failure only means
 /// the bundle has no icon.
 fn make_icon(svg: &Path, icns: &Path) -> Result<()> {
@@ -187,7 +187,9 @@ fn make_icon_in(work: &Path, svg: &Path, icns: &Path) -> Result<()> {
     ql.args(["-t", "-s", "1024", "-o"]).arg(work).arg(svg);
     quiet(&mut ql);
     run(&mut ql).map_err(|e| format!("qlmanage: {e}"))?;
-    let rendered = work.join("icon.svg.png");
+    // Quick Look names its output after the input: `<file name>.png`.
+    let name = svg.file_name().ok_or("the icon path has no file name")?;
+    let rendered = work.join(format!("{}.png", name.to_string_lossy()));
     if !rendered.exists() {
         return Err("qlmanage did not render the SVG".into());
     }

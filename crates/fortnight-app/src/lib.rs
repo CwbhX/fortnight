@@ -6,6 +6,7 @@
 //! (the FROZEN contract with `main.rs`), `update` that
 //! returns an `Action`, and `view`.
 
+pub mod app_icon;
 pub mod calendar;
 pub mod theme;
 pub mod top_bar;

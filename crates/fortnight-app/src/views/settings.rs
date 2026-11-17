@@ -32,7 +32,7 @@
 //! and a confirmation before closing with unsaved changes. Notifications are
 //! parked: the setting is kept but not shown.
 
-use fortnight_core::domain::{LlmSettings, Protocol, Schedule, Settings};
+use fortnight_core::domain::{AppIcon, LlmSettings, Protocol, Schedule, Settings};
 use fortnight_core::report::{DEFAULT_PLAN_PROMPT, DEFAULT_SUMMARY_PROMPT};
 use fortnight_core::secure::is_local_endpoint;
 use fortnight_core::vault::MIN_PASSWORD_LEN;
@@ -125,6 +125,7 @@ pub enum Message {
     ConfirmRemove,
     /// Close whichever key form or confirmation is open.
     CancelKey,
+    AppIcon(AppIcon),
 }
 
 /// Which endpoint a field, button or request is for: the main LLM, or the
@@ -193,6 +194,26 @@ const WEEK: [Weekday; 7] = [
     Weekday::Saturday,
     Weekday::Sunday,
 ];
+
+/// An app icon choice with a `Display` impl, for `pick_list`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IconChoice(AppIcon);
+
+const ICON_CHOICES: [IconChoice; 3] = [
+    IconChoice(AppIcon::System),
+    IconChoice(AppIcon::Light),
+    IconChoice(AppIcon::Dark),
+];
+
+impl fmt::Display for IconChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self.0 {
+            AppIcon::System => "Match system",
+            AppIcon::Light => "Light",
+            AppIcon::Dark => "Dark",
+        })
+    }
+}
 
 /// A weekday with a `Display` impl, for `pick_list`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,6 +340,7 @@ struct Form {
     focus_hours: String,
     /// Parked: carried through unchanged.
     notifications: bool,
+    app_icon: AppIcon,
     /// The prompts as shown and edited.
     summary_prompt: String,
     plan_prompt: String,
@@ -357,6 +379,7 @@ impl Form {
             working_days: WEEK.map(|d| sched.working_days.contains(&d)),
             focus_hours: format_hours(s.focus_minutes_per_day),
             notifications: s.notifications,
+            app_icon: s.app_icon,
             summary_prompt: summary_shown.clone(),
             plan_prompt: match s.plan_prompt.trim() {
                 "" => DEFAULT_PLAN_PROMPT.to_string(),
@@ -397,6 +420,7 @@ impl Form {
             summary_instructions,
             focus_minutes_per_day: parse_hours(&self.focus_hours)?,
             notifications: self.notifications,
+            app_icon: self.app_icon,
             summary_prompt,
             plan_prompt: stored_prompt(&self.plan_prompt, DEFAULT_PLAN_PROMPT),
         })
@@ -635,6 +659,7 @@ impl SettingsView {
                 return Action::Close;
             }
             Message::WeekStart(d) => form.week_start = d,
+            Message::AppIcon(choice) => form.app_icon = choice,
             Message::SummaryDay(d) => form.summary_day = d,
             Message::SummaryTime(s) => form.summary_time = s,
             Message::PlanDay(d) => form.plan_day = d,
@@ -794,6 +819,7 @@ impl SettingsView {
             self.schedule_section(),
             self.capacity_section(),
             self.prompts_section(),
+            self.appearance_section(),
             self.data_section(),
         ]
         .spacing(theme::SPACING * 2.5)
@@ -1251,6 +1277,19 @@ impl SettingsView {
         )
     }
 
+    fn appearance_section(&self) -> Element<'_, Message> {
+        let icon = pick_list(
+            ICON_CHOICES,
+            Some(IconChoice(self.form.app_icon)),
+            |c: IconChoice| Message::AppIcon(c.0),
+        )
+        .padding([8, 12])
+        .text_size(theme::TEXT_BODY)
+        .width(180)
+        .style(picker);
+        section("Appearance", labelled("App icon", icon))
+    }
+
     fn data_section(&self) -> Element<'_, Message> {
         section(
             "Data folder",
@@ -1626,6 +1665,18 @@ mod tests {
         );
         assert_eq!(s.summary_instructions, "");
         assert_eq!(s.plan_prompt, "", "the built-in prompt is stored as empty");
+    }
+
+    #[test]
+    fn app_icon_choice_saves() {
+        let mut v = loaded(KeyState::NoKey);
+        assert_eq!(v.form.app_icon, AppIcon::System);
+        v.update(Message::AppIcon(AppIcon::Dark));
+        assert!(v.is_dirty());
+        let Action::Save(s) = v.update(Message::Save) else {
+            panic!("expected Save");
+        };
+        assert_eq!(s.app_icon, AppIcon::Dark);
     }
 
     #[test]

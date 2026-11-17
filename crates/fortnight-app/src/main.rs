@@ -18,6 +18,7 @@
 //! the background from its scheduled day and time. An edited summary is
 //! never regenerated.
 
+use fortnight_app::app_icon;
 use fortnight_app::theme;
 use fortnight_app::top_bar::{self, LockIcon, Tab};
 use fortnight_app::views::NavKey;
@@ -108,6 +109,8 @@ enum Message {
     DismissError,
     Shoot,
     Shot(iced::window::Screenshot),
+    /// The window opened: show the app icon on it.
+    WindowOpened,
 }
 
 /// A key pressed while no widget captured it (PLAN.md 4.4). Single keys
@@ -216,6 +219,8 @@ struct Ready {
     week_badge: bool,
     /// Test connection / Load models requests in flight, aborted on Lock.
     key_requests: Vec<iced::task::Handle>,
+    /// The app icon last shown (`Some(true)` = dark), `None` before any.
+    icon_dark: Option<bool>,
     /// Held for the app's lifetime; removes the lock file when dropped.
     _lock: Option<DataLock>,
 }
@@ -243,7 +248,9 @@ impl App {
                     start,
                     shoot_after_delay(),
                 ]);
-                (App::Ready(ready, forced_theme()), tasks)
+                let mut app = App::Ready(ready, forced_theme());
+                let icon = app.sync_icon();
+                (app, Task::batch([tasks, icon]))
             }
             Err(e) => (App::Fatal(e), shoot_after_delay()),
         }
@@ -260,6 +267,7 @@ impl App {
         Subscription::batch([
             iced::time::every(Duration::from_secs(60)).map(|_| Message::Tick),
             iced::system::theme_changes().map(Message::ThemeMode),
+            iced::window::open_events().map(|_| Message::WindowOpened),
             // Ends a Week-tab card drag even when the button is let go
             // outside the window.
             iced::event::listen_with(|event, _, _| match event {
@@ -278,11 +286,36 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // Any message may change the system appearance or the icon setting.
+        let task = self.handle(message);
+        Task::batch([task, self.sync_icon()])
+    }
+
+    /// Shows the app icon that the setting and the system appearance call
+    /// for, if it is not the one showing.
+    fn sync_icon(&mut self) -> Task<Message> {
+        let App::Ready(ready, mode) = self else {
+            return Task::none();
+        };
+        let dark = app_icon::is_dark(ready.settings.app_icon, *mode);
+        if ready.icon_dark == Some(dark) {
+            return Task::none();
+        }
+        ready.icon_dark = Some(dark);
+        app_icon::apply(dark)
+    }
+
+    fn handle(&mut self, message: Message) -> Task<Message> {
         match (&mut *self, message) {
             (_, Message::Shoot) => iced::window::latest()
                 .and_then(iced::window::screenshot)
                 .map(Message::Shot),
             (_, Message::Shot(shot)) => save_screenshot(shot),
+            (App::Ready(ready, _), Message::WindowOpened) => {
+                // A window icon set before the window existed went nowhere.
+                ready.icon_dark = None;
+                Task::none()
+            }
             (App::Ready(_, _), Message::ThemeMode(_)) if forced_theme().is_some() => Task::none(),
             (App::Ready(_, mode), Message::ThemeMode(m)) => {
                 *mode = match m {
@@ -392,6 +425,7 @@ impl Ready {
             undo: Vec::new(),
             week_badge: false,
             key_requests: Vec::new(),
+            icon_dark: None,
             _lock: lock,
         })
     }
@@ -1119,7 +1153,9 @@ impl Ready {
                 self.error = None;
                 Task::none()
             }
-            Message::ThemeMode(_) | Message::Shoot | Message::Shot(_) => Task::none(),
+            Message::ThemeMode(_) | Message::Shoot | Message::Shot(_) | Message::WindowOpened => {
+                Task::none()
+            }
         };
         self.refresh();
         task
