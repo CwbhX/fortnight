@@ -427,7 +427,7 @@ fn summary_card<'a>(
         weight: iced::font::Weight::Bold,
         ..theme::FONT
     };
-    let mut head = row![text("Work summary").size(theme::TEXT_HEADING).font(bold)]
+    let mut head = row![text("Work Summary").size(theme::TEXT_HEADING).font(bold)]
         .spacing(theme::SPACING / 2.0)
         .align_y(Center);
     if let Some(tools) = tools {
@@ -442,7 +442,7 @@ fn summary_card<'a>(
                 .right(theme::SPACING),
         )
         .width(Fill)
-        .style(summary_bar);
+        .style(title_bar(theme::RADIUS));
     container(column![
         bar,
         container(body).padding(theme::SPACING * 1.5).width(Fill)
@@ -452,9 +452,14 @@ fn summary_card<'a>(
     .into()
 }
 
-/// The Work summary's heading bar: a stronger fill than the card, rounded
-/// at the top only, with a hairline under it.
-fn summary_bar(theme: &Theme) -> container::Style {
+/// A title bar (the Work Summary's and each day column's): a stronger fill
+/// than the card, rounded at the top only (`radius`), with a hairline under
+/// it.
+fn title_bar(radius: f32) -> impl Fn(&Theme) -> container::Style {
+    move |theme| title_bar_style(theme, radius)
+}
+
+fn title_bar_style(theme: &Theme, radius: f32) -> container::Style {
     let p = theme.palette();
     let mix = |amount: f32| {
         Color::from_rgb(
@@ -465,7 +470,7 @@ fn summary_bar(theme: &Theme) -> container::Style {
     };
     container::Style {
         background: Some(mix(0.08).into()),
-        border: iced::border::rounded(iced::border::top(theme::RADIUS)),
+        border: iced::border::rounded(iced::border::top(radius)),
         shadow: iced::Shadow {
             color: mix(0.16),
             offset: iced::Vector::new(0.0, 1.0),
@@ -699,6 +704,10 @@ fn day_column<'a>(
     } else {
         text::default
     };
+    let bold = iced::Font {
+        weight: iced::font::Weight::Bold,
+        ..theme::FONT
+    };
     let open_day = spec
         .days
         .iter()
@@ -710,6 +719,7 @@ fn day_column<'a>(
             text(name)
                 .size(theme::TEXT_BODY)
                 .style(name_style)
+                .font(bold)
                 .wrapping(Wrapping::None),
             text(dates)
                 .size(theme::TEXT_SMALL)
@@ -734,9 +744,14 @@ fn day_column<'a>(
             .style(theme::card),
         tooltip::Position::Bottom,
     );
-    let heading = row![heading, add].align_y(Center);
+    // The heading sits in a title bar like the Work Summary's, inset by
+    // today's ring so the ring stays visible around it.
+    let heading = container(row![heading, add].align_y(Center))
+        .padding([theme::SPACING * 0.6, theme::SPACING])
+        .width(Fill)
+        .style(title_bar(theme::RADIUS - COLUMN_RING));
 
-    let mut col = Column::new().spacing(8).width(Fill).push(heading);
+    let mut col = Column::new().spacing(8).width(Fill);
 
     let loads: Vec<&DayLoad> = data
         .loads
@@ -806,8 +821,15 @@ fn day_column<'a>(
     }
     col = col.push(list);
 
-    container(col).padding(theme::SPACING).width(Fill).into()
+    container(column![heading, container(col).padding(theme::SPACING)])
+        .padding(COLUMN_RING)
+        .width(Fill)
+        .into()
 }
+
+/// Width of today's accent ring (`theme::day_column`); the title bar sits
+/// inside it.
+const COLUMN_RING: f32 = 1.5;
 
 fn load_view<'a>(line: LoadLine) -> Element<'a, Message> {
     let mut col = Column::new().spacing(4);
