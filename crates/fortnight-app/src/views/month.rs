@@ -28,8 +28,9 @@
 //! tooltips with full titles.
 
 use crate::theme;
-use fortnight_core::domain::{Task, TaskStatus, WeekRef};
-use fortnight_core::week::month_weeks;
+use fortnight_core::domain::{Priority, Task, TaskStatus, WeekRef};
+use fortnight_core::report::short_weekday;
+use fortnight_core::week::{month_abbr, month_weeks, week_number};
 use iced::border::{self, Border};
 use iced::widget::text::Wrapping;
 use iced::widget::{
@@ -37,8 +38,8 @@ use iced::widget::{
     space, stack, text, tooltip,
 };
 use iced::{Element, Fill, Font, Length, Point, Size, Theme};
-use jiff::ToSpan;
 use jiff::civil::{Date, Weekday};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -82,6 +83,9 @@ pub struct MonthData {
 #[derive(Debug, Default)]
 pub struct MonthView {
     data: Option<MonthData>,
+    /// `data`'s tasks by day, worked out by `load`: the grid is rebuilt on
+    /// every layout.
+    by_day: ByDay,
     /// The day whose due-tasks dropdown is open.
     open_due: Option<Date>,
 }
@@ -100,6 +104,7 @@ impl MonthView {
         if self.data.as_ref().map(|d| d.month) != Some(data.month) {
             self.open_due = None;
         }
+        self.by_day = ByDay::new(&data.tasks);
         self.data = Some(data);
     }
 
@@ -130,7 +135,8 @@ impl MonthView {
             return text("Loading…").style(theme::muted).into();
         };
         let open = self.open_due;
-        responsive(move |size| grid(data, open, size)).into()
+        let by_day = &self.by_day;
+        responsive(move |size| grid(data, by_day, open, size)).into()
     }
 }
 
@@ -192,7 +198,12 @@ const BADGE_SIZE: f32 = 11.0;
 
 /// The grid for `size` (the content area below the top bar), with the
 /// due-tasks dropdown of `open` over it.
-fn grid(data: &MonthData, open: Option<Date>, size: Size) -> Element<'_, Message> {
+fn grid<'a>(
+    data: &'a MonthData,
+    by_day: &ByDay,
+    open: Option<Date>,
+    size: Size,
+) -> Element<'a, Message> {
     let weeks = month_weeks(data.month, data.week_start);
     let rows = weeks.len().max(1) as f32;
 
@@ -215,7 +226,7 @@ fn grid(data: &MonthData, open: Option<Date>, size: Size) -> Element<'_, Message
         .push(Space::new().width(LABEL_WIDTH));
     for day in weekday_order(data.week_start) {
         header = header.push(
-            container(text(weekday_abbr(day)).size(DATE_SIZE).style(theme::muted))
+            container(text(short_weekday(day)).size(DATE_SIZE).style(theme::muted))
                 .padding([0.0, CELL_PAD_X])
                 .width(Fill),
         );
@@ -230,14 +241,19 @@ fn grid(data: &MonthData, open: Option<Date>, size: Size) -> Element<'_, Message
             .height(row_height)
             .push(week_label(*week, has_summary(data, *week)));
         for (c, day) in week.days().into_iter().enumerate() {
-            line = line.push(day_cell(data, day, lines, max_width));
-            if open == Some(day) {
-                let due = due_tasks(&data.tasks, day);
-                if !due.is_empty() {
-                    let right = LABEL_WIDTH + GAP + (c as f32 + 1.0) * (cell_width + GAP) - GAP;
-                    let top = r as f32 * (row_height + GAP) + CELL_PAD_Y + DATE_SIZE * LINE + 2.0;
-                    dropdown = Some((due, right, top));
-                }
+            let due = by_day.due(&data.tasks, day);
+            line = line.push(day_cell(
+                data,
+                &by_day.planned(&data.tasks, day),
+                &due,
+                day,
+                lines,
+                max_width,
+            ));
+            if open == Some(day) && !due.is_empty() {
+                let right = LABEL_WIDTH + GAP + (c as f32 + 1.0) * (cell_width + GAP) - GAP;
+                let top = r as f32 * (row_height + GAP) + CELL_PAD_Y + DATE_SIZE * LINE + 2.0;
+                dropdown = Some((due, right, top));
             }
         }
         body = body.push(line);
@@ -297,13 +313,22 @@ fn week_label<'a>(week: WeekRef, summary: bool) -> Element<'a, Message> {
 }
 
 /// One day of the grid.
-fn day_cell(data: &MonthData, day: Date, lines: usize, max_width: f32) -> Element<'_, Message> {
+/// `planned` and `due` are the tasks planned for and due on `day`, in
+/// `ByDay`'s orders.
+fn day_cell<'a>(
+    data: &MonthData,
+    planned: &[&Task],
+    due: &[&Task],
+    day: Date,
+    lines: usize,
+    max_width: f32,
+) -> Element<'a, Message> {
     let kind = theme::Cell {
         today: day == data.today,
         weekend: !data.working_days.contains(&day.weekday()),
         outside: day.month() != data.month.month() || day.year() != data.month.year(),
     };
-    let content = cell_content(&data.tasks, day, data.today, lines);
+    let content = cell_content(planned, data.today, lines);
 
     let date_label = if day.day() == 1 {
         format!("{} {}", day.day(), month_abbr(day))
@@ -318,7 +343,7 @@ fn day_cell(data: &MonthData, day: Date, lines: usize, max_width: f32) -> Elemen
         });
     }
     let mut top = row![date, space::horizontal()].align_y(iced::Alignment::Center);
-    if let Some(done) = due_done(&data.tasks, day) {
+    if let Some(done) = due_done(due) {
         top = top.push(completion_badge(day, done, data.today));
     }
 
@@ -362,10 +387,7 @@ fn task_pill<'a>(t: &TitleLine, max_width: f32) -> Element<'a, Message> {
     let (done, overdue) = (t.done, t.overdue);
     let priority = if done { 0 } else { t.priority };
     // The marks keep their own measured width; the title gets the rest.
-    let marks = match theme::priority_marks(priority) {
-        m if m.is_empty() => 0.0,
-        m => measure(&m),
-    };
+    let marks = marks_width(priority);
     let line = theme::title_with_marks(
         fit_cached(&t.title, max_width - marks),
         priority,
@@ -538,23 +560,10 @@ struct CellContent {
     more: usize,
 }
 
-/// The tasks on `day` (by `Task::day()`) as a cell lists them, given room
-/// for `lines` text lines under the date (a "+N more" line counts as one).
-/// Open tasks first (higher priority, then manual order), then done ones;
-/// at most [`MAX_TITLES`] titles. Deleted (`Dropped`) tasks are left out.
-fn cell_content(tasks: &[Task], day: Date, today: Date, lines: usize) -> CellContent {
-    let mut on_day: Vec<&Task> = tasks
-        .iter()
-        .filter(|t| t.day() == Some(day) && t.status != TaskStatus::Dropped)
-        .collect();
-    on_day.sort_by(|a, b| {
-        let open = |t: &Task| !t.status.is_open();
-        open(a)
-            .cmp(&open(b))
-            .then(b.priority.cmp(&a.priority))
-            .then(a.position.total_cmp(&b.position))
-            .then(a.id.cmp(&b.id))
-    });
+/// The tasks on a day as a cell lists them, given room for `lines` text
+/// lines under the date (a "+N more" line counts as one). `on_day` is the
+/// day's tasks in `ByDay::planned`'s order; at most [`MAX_TITLES`] titles.
+fn cell_content(on_day: &[&Task], today: Date, lines: usize) -> CellContent {
     let total = on_day.len();
     let cap = lines.min(MAX_TITLES);
     let shown = if total <= cap {
@@ -597,27 +606,75 @@ impl DueDone {
     }
 }
 
-/// The tasks due on `day` (deleted ones left out): open ones first (higher
-/// priority, then manual order), done ones at the bottom.
-fn due_tasks(tasks: &[Task], day: Date) -> Vec<&Task> {
-    let mut due: Vec<&Task> = tasks
-        .iter()
-        .filter(|t| t.due_on == Some(day) && t.status != TaskStatus::Dropped)
-        .collect();
-    due.sort_by(|a, b| {
-        let done = |t: &Task| t.status == TaskStatus::Done;
-        done(a)
-            .cmp(&done(b))
-            .then(b.priority.cmp(&a.priority))
-            .then(a.position.total_cmp(&b.position))
-            .then(a.id.cmp(&b.id))
-    });
-    due
+/// The tasks on each day, worked out once per `load` rather than for each
+/// of the 42 cells on every layout. Deleted (`Dropped`) tasks are left
+/// out. Indices into `MonthData::tasks`.
+#[derive(Debug, Default)]
+struct ByDay {
+    /// By `Task::day()`: open tasks first (higher priority, then manual
+    /// order), then done ones.
+    planned: HashMap<Date, Vec<usize>>,
+    /// By `Task::due_on`: open ones first (higher priority, then manual
+    /// order), done ones at the bottom.
+    due: HashMap<Date, Vec<usize>>,
 }
 
-/// The counts behind a day's badge; `None` when nothing is due that day.
-fn due_done(tasks: &[Task], day: Date) -> Option<DueDone> {
-    let due = due_tasks(tasks, day);
+impl ByDay {
+    fn new(tasks: &[Task]) -> Self {
+        let mut out = ByDay::default();
+        for (i, t) in tasks.iter().enumerate() {
+            if t.status == TaskStatus::Dropped {
+                continue;
+            }
+            if let Some(day) = t.day() {
+                out.planned.entry(day).or_default().push(i);
+            }
+            if let Some(day) = t.due_on {
+                out.due.entry(day).or_default().push(i);
+            }
+        }
+        for list in out.planned.values_mut() {
+            list.sort_by(|&a, &b| {
+                let (a, b) = (&tasks[a], &tasks[b]);
+                let open = |t: &Task| !t.status.is_open();
+                open(a)
+                    .cmp(&open(b))
+                    .then(b.priority.cmp(&a.priority))
+                    .then(a.position.total_cmp(&b.position))
+                    .then(a.id.cmp(&b.id))
+            });
+        }
+        for list in out.due.values_mut() {
+            list.sort_by(|&a, &b| {
+                let (a, b) = (&tasks[a], &tasks[b]);
+                let done = |t: &Task| t.status == TaskStatus::Done;
+                done(a)
+                    .cmp(&done(b))
+                    .then(b.priority.cmp(&a.priority))
+                    .then(a.position.total_cmp(&b.position))
+                    .then(a.id.cmp(&b.id))
+            });
+        }
+        out
+    }
+
+    fn planned<'a>(&self, tasks: &'a [Task], day: Date) -> Vec<&'a Task> {
+        Self::get(&self.planned, tasks, day)
+    }
+
+    fn due<'a>(&self, tasks: &'a [Task], day: Date) -> Vec<&'a Task> {
+        Self::get(&self.due, tasks, day)
+    }
+
+    fn get<'a>(map: &HashMap<Date, Vec<usize>>, tasks: &'a [Task], day: Date) -> Vec<&'a Task> {
+        map.get(&day)
+            .map_or_else(Vec::new, |l| l.iter().map(|&i| &tasks[i]).collect())
+    }
+}
+
+/// The counts behind a day's badge, from the tasks due that day; `None`
+/// when nothing is due.
+fn due_done(due: &[&Task]) -> Option<DueDone> {
     (!due.is_empty()).then(|| DueDone {
         due: due.len(),
         done: due.iter().filter(|t| t.status == TaskStatus::Done).count(),
@@ -643,23 +700,56 @@ fn measure(s: &str) -> f32 {
     .min_width()
 }
 
-/// [`fit`] with [`measure`], remembered per title and width: the grid is
-/// rebuilt often and shaping text is not free.
+/// The measured width of the priority marks after a title
+/// ([`theme::priority_marks`]); 0 without any. There are only two mark
+/// strings, so each is measured once.
+fn marks_width(priority: Priority) -> f32 {
+    use std::cell::Cell;
+    thread_local! {
+        static WIDTHS: Cell<[Option<f32>; 2]> = const { Cell::new([None; 2]) };
+    }
+    let level = usize::from(priority.min(2));
+    if level == 0 {
+        return 0.0;
+    }
+    WIDTHS.with(|cell| {
+        let mut widths = cell.get();
+        let width =
+            *widths[level - 1].get_or_insert_with(|| measure(&theme::priority_marks(priority)));
+        cell.set(widths);
+        width
+    })
+}
+
+/// [`fit`] with [`measure`], remembered per width and title: the grid is
+/// rebuilt often and shaping text is not free. A hit allocates nothing but
+/// the returned copy.
 fn fit_cached(s: &str, max_width: f32) -> String {
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    /// Titles kept before the cache starts over.
+    const LIMIT: usize = 4096;
+    /// Fitted titles by width, then title.
+    type ByWidth = HashMap<i32, HashMap<String, String>>;
     thread_local! {
-        static CACHE: RefCell<HashMap<(String, i32), String>> = RefCell::new(HashMap::new());
+        static CACHE: RefCell<(usize, ByWidth)> =
+            RefCell::new((0, HashMap::new()));
     }
-    let key = (s.to_string(), max_width.floor() as i32);
-    CACHE.with_borrow_mut(|cache| {
-        if cache.len() > 4096 {
-            cache.clear();
+    let width = max_width.floor() as i32;
+    CACHE.with_borrow_mut(|(len, cache)| {
+        if let Some(hit) = cache.get(&width).and_then(|titles| titles.get(s)) {
+            return hit.clone();
         }
+        if *len > LIMIT {
+            cache.clear();
+            *len = 0;
+        }
+        let fitted = fit(s, max_width, measure);
         cache
-            .entry(key)
-            .or_insert_with(|| fit(s, max_width, measure))
-            .clone()
+            .entry(width)
+            .or_default()
+            .insert(s.to_string(), fitted.clone());
+        *len += 1;
+        fitted
     })
 }
 
@@ -696,31 +786,6 @@ fn weekday_order(start: Weekday) -> [Weekday; 7] {
         *d = start.wrapping_add(i as i64);
     }
     days
-}
-
-fn weekday_abbr(day: Weekday) -> &'static str {
-    match day {
-        Weekday::Monday => "Mon",
-        Weekday::Tuesday => "Tue",
-        Weekday::Wednesday => "Wed",
-        Weekday::Thursday => "Thu",
-        Weekday::Friday => "Fri",
-        Weekday::Saturday => "Sat",
-        Weekday::Sunday => "Sun",
-    }
-}
-
-fn month_abbr(d: Date) -> &'static str {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    MONTHS[(d.month() - 1) as usize]
-}
-
-/// The week number shown on the label: the ISO week of `start + 3 days`,
-/// the same rule as `week::week_number`.
-fn week_number(week: WeekRef) -> i8 {
-    week.start.saturating_add(3.days()).iso_week_date().week()
 }
 
 /// Whether the week has a ready summary (the dot).
@@ -761,6 +826,11 @@ mod tests {
             tasks: Vec::new(),
             summary_weeks: vec![date(2026, 11, 9)],
         }
+    }
+
+    /// What the cell for `day` lists, from all the tasks.
+    fn cell_content(tasks: &[Task], day: Date, today: Date, lines: usize) -> CellContent {
+        super::cell_content(&ByDay::new(tasks).planned(tasks, day), today, lines)
     }
 
     fn titles(c: &CellContent) -> Vec<&str> {
@@ -860,18 +930,15 @@ mod tests {
                 Sunday, Monday, Tuesday, Wednesday, Thursday, Friday, Saturday
             ]
         );
-        let names: Vec<_> = weekday_order(Sunday).map(weekday_abbr).to_vec();
+        let names: Vec<_> = weekday_order(Sunday).map(short_weekday).to_vec();
         assert_eq!(names, ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]);
     }
 
     #[test]
-    fn summary_dot_and_week_number() {
+    fn summary_dot() {
         let d = data();
         assert!(has_summary(&d, WeekRef::new(date(2026, 11, 9))));
         assert!(!has_summary(&d, WeekRef::new(date(2026, 11, 16))));
-        assert_eq!(week_number(WeekRef::new(date(2026, 11, 16))), 47);
-        // A Sunday-start week uses the same rule (Sun 15 + 3 = Wed 18).
-        assert_eq!(week_number(WeekRef::new(date(2026, 11, 15))), 47);
     }
 
     #[test]
@@ -909,13 +976,15 @@ mod tests {
             task(4, "planned only", d, TaskStatus::Todo),
             due(task(5, "doing", d, TaskStatus::Doing)),
         ];
-        let ids: Vec<i64> = due_tasks(&tasks, d).iter().map(|t| t.id).collect();
+        let by_day = ByDay::new(&tasks);
+        let due = by_day.due(&tasks, d);
+        let ids: Vec<i64> = due.iter().map(|t| t.id).collect();
         assert_eq!(ids, [2, 5, 1]);
-        let counts = due_done(&tasks, d).unwrap();
+        let counts = due_done(&due).unwrap();
         assert_eq!(counts, DueDone { due: 3, done: 1 });
         assert_eq!(counts.percent(), 33);
         assert_eq!(counts.describe(), "3 due · 1 complete");
-        assert_eq!(due_done(&tasks, date(2026, 11, 19)), None);
+        assert_eq!(due_done(&by_day.due(&tasks, date(2026, 11, 19))), None);
         assert_eq!(DueDone { due: 3, done: 3 }.percent(), 100);
         assert_eq!(DueDone { due: 3, done: 2 }.percent(), 66);
     }
@@ -934,7 +1003,12 @@ mod tests {
         v.update(Message::ToggleDue(d));
         v.update(Message::CloseDue);
         assert_eq!(v.open_due, None);
-        let _ = grid(&data(), Some(d), Size::new(1000.0, 700.0));
+        let _ = grid(
+            &data(),
+            &ByDay::default(),
+            Some(d),
+            Size::new(1000.0, 700.0),
+        );
     }
 
     #[test]
