@@ -20,6 +20,7 @@
 
 mod shell {
     pub(crate) mod dev;
+    pub(crate) mod keys;
     pub(crate) mod shortcuts;
 }
 
@@ -35,21 +36,17 @@ use fortnight_app::views::settings::{
 use fortnight_app::views::task_form;
 use fortnight_app::views::week::{self, WeekData, WeekView};
 use fortnight_core::datadir::{self, DataLock};
-use fortnight_core::decision::DecisionClient;
 use fortnight_core::domain::{
-    DeletedTask, Event, EventId, LlmSettings, Priority, Protocol, Report, ReportKey, ReportKind,
-    ReportStatus, Settings, Task as CoreTask, TaskId, TaskStatus, WeekRef,
+    DeletedTask, Event, EventId, Priority, Protocol, Report, ReportKey, ReportKind, ReportStatus,
+    Settings, Task as CoreTask, TaskId, TaskStatus, WeekRef,
 };
-use fortnight_core::fallback::{self, Endpoint, PlanRoute};
-use fortnight_core::llm::{
-    self, ChatEvent, ChatRequest, ChatResponse, LlmClient, LlmConfig, LlmError,
-};
+use fortnight_core::fallback::{Endpoint, PlanRoute};
+use fortnight_core::llm::{ChatEvent, ChatRequest, ChatResponse, LlmError};
 use fortnight_core::ollama::{self, ModelKind, OllamaModel};
 use fortnight_core::report::{self, Prepared};
-use fortnight_core::secure;
 use fortnight_core::sqlite::SqliteStore;
 use fortnight_core::store::Store;
-use fortnight_core::vault::{self, VaultError};
+use fortnight_core::vault::VaultError;
 use fortnight_core::week::{add_months, due_reports, week_containing};
 use iced::keyboard;
 use iced::widget::{
@@ -61,10 +58,10 @@ use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp, ZonedDateTime};
 use secrecy::SecretString;
 use shell::dev::{self, data_dir_flag, forced_theme, save_screenshot, shoot_after_delay};
+use shell::keys::{Keys, SavedKey};
 use shell::shortcuts::{Shortcut, shortcut_for};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// A failed automatic generation is retried after this long, doubling after
@@ -206,12 +203,7 @@ struct Ready {
     /// The unlock prompt is showing (opened from the lock icon).
     unlocking: bool,
 
-    key_exists: bool,
-    api_key: Option<SecretString>,
-    /// The decision model's own key (`vault::decision_key_path`), under the
-    /// same password: unlocked and locked together with `api_key`.
-    decision_key_exists: bool,
-    decision_key: Option<SecretString>,
+    keys: Keys,
 
     generating: HashMap<ReportKey, Generation>,
     last_attempt: HashMap<ReportKey, Timestamp>,
@@ -434,8 +426,7 @@ impl Ready {
             .map_err(|e| e.to_string())?;
         let tz = TimeZone::system();
         let today = Timestamp::now().to_zoned_datetime(tz.clone()).date();
-        let key_exists = vault::key_path(&dir).exists();
-        let decision_key_exists = vault::decision_key_path(&dir).exists();
+        let keys = Keys::open(&dir);
         let (tab, settings_open) = dev::start_page();
         // One writer at a time (PLAN.md 3.5): warn, never refuse.
         let (lock, notice) = match datadir::acquire_lock(&dir) {
@@ -478,10 +469,7 @@ impl Ready {
             settings_view: SettingsView::new(),
             unlock_view: UnlockView::new(),
             unlocking: false,
-            key_exists,
-            api_key: None,
-            decision_key_exists,
-            decision_key: None,
+            keys,
             generating: HashMap::new(),
             last_attempt: HashMap::new(),
             failures: HashMap::new(),
@@ -532,47 +520,6 @@ impl Ready {
         self.week_of(self.today())
     }
 
-    /// Why the LLM can't be used right now, if it can't.
-    fn blocked(&self) -> Option<String> {
-        if !self.settings.llm.is_configured() {
-            Some("no endpoint is set up in Settings.".into())
-        } else if self.key_locked_for(&self.settings.llm) {
-            Some("the API key is locked.".into())
-        } else {
-            None
-        }
-    }
-
-    /// The saved key is locked and `llm` needs it. A keyless endpoint never
-    /// needs it; a local one (Ollama, LM Studio) works without it and gets
-    /// it only if it is unlocked.
-    fn key_locked_for(&self, llm: &LlmSettings) -> bool {
-        key_locked(self.key_exists, &self.api_key, llm)
-    }
-
-    /// The saved recommendations model is an Ollama decision model.
-    fn decision_active(&self) -> bool {
-        let d = &self.settings.decision_llm;
-        d.protocol == Protocol::OllamaDecision && d.is_configured()
-    }
-
-    /// The saved decision model's client, for priority suggestions.
-    fn decision_model(&self) -> Option<DecisionClient> {
-        if !self.decision_active() {
-            return None;
-        }
-        let config = fallback::decision_config(
-            &self.settings.decision_llm,
-            &self.settings.llm,
-            self.api_key.clone(),
-            self.decision_key.clone(),
-        );
-        // Suggestions are only worth having quickly.
-        DecisionClient::new(config)
-            .ok()
-            .map(|c| c.with_timeout(Duration::from_secs(15)))
-    }
-
     /// The open task form, its title and its notes: the task dialog's, or
     /// Today's inline form.
     fn open_form_text(&self) -> Option<(FormKey, String, String)> {
@@ -607,53 +554,6 @@ impl Ready {
         Task::perform(tokio::time::sleep(Duration::from_millis(500)), move |_| {
             Message::SuggestPriority(seq)
         })
-    }
-
-    /// The client for the decision model (`Settings::decision_llm`) with
-    /// these fields, and its host. It uses its own key if one is saved, and
-    /// otherwise the main key only on the main endpoint's host
-    /// (`fallback::decision_config`).
-    fn decision_client_for(
-        &self,
-        llm: &LlmSettings,
-    ) -> Result<(Arc<dyn LlmClient>, Option<String>), String> {
-        if key_locked(self.decision_key_exists, &self.decision_key, llm) {
-            return Err("The decision model's API key is locked. Unlock it first.".into());
-        }
-        let config = fallback::decision_config(
-            llm,
-            &self.settings.llm,
-            self.api_key.clone(),
-            self.decision_key.clone(),
-        );
-        let host = config.endpoint_host();
-        let client = llm::connect(llm.protocol, config).map_err(|e| e.to_string())?;
-        Ok((client, host))
-    }
-
-    /// The client a Settings Test or Load models button asks for.
-    fn settings_client(
-        &self,
-        llm: &LlmSettings,
-        which: settings::Which,
-    ) -> Result<(Arc<dyn LlmClient>, Option<String>), String> {
-        match which {
-            settings::Which::Main => self.client_for(llm),
-            settings::Which::Decision => self.decision_client_for(llm),
-        }
-    }
-
-    fn client_for(
-        &self,
-        llm: &LlmSettings,
-    ) -> Result<(Arc<dyn LlmClient>, Option<String>), String> {
-        if self.key_locked_for(llm) {
-            return Err("The API key is locked. Unlock it first.".into());
-        }
-        let config = LlmConfig::from_settings(llm, self.api_key.clone());
-        let host = config.endpoint_host();
-        let client = llm::connect(llm.protocol, config).map_err(|e| e.to_string())?;
-        Ok((client, host))
     }
 
     // ---- data flow ----
@@ -753,8 +653,8 @@ impl Ready {
             self.settings_view.load(SettingsData {
                 settings: self.settings.clone(),
                 data_dir: self.data_dir.clone(),
-                key_state: self.key_state(),
-                decision_key_state: self.decision_key_state(),
+                key_state: self.keys.key_state(),
+                decision_key_state: self.keys.decision_key_state(),
                 test_result: self.test_result.clone(),
                 testing: self.testing,
                 key_message: self.key_message.clone(),
@@ -1112,10 +1012,14 @@ impl Ready {
     /// recommended tasks the decision model first when one is set (and can
     /// be built).
     fn plan_route(&self, kind: ReportKind) -> Result<PlanRoute, String> {
-        let (client, host) = self.client_for(&self.settings.llm)?;
+        let (client, host) = self.keys.client_for(&self.settings.llm)?;
         let decision = &self.settings.decision_llm;
         let decision = (kind == ReportKind::Plan && decision.is_configured())
-            .then(|| self.decision_client_for(decision).ok())
+            .then(|| {
+                self.keys
+                    .decision_client_for(decision, &self.settings.llm)
+                    .ok()
+            })
             .flatten()
             .map(|(client, host)| Endpoint { client, host });
         Ok(PlanRoute::new(Endpoint { client, host }, decision))
@@ -1148,24 +1052,6 @@ impl Ready {
         self.failures.clear();
         self.last_attempt.clear();
         self.day_recs_failures.clear();
-    }
-
-    fn key_state(&self) -> KeyState {
-        key_state(self.key_exists, &self.api_key)
-    }
-
-    fn decision_key_state(&self) -> KeyState {
-        key_state(self.decision_key_exists, &self.decision_key)
-    }
-
-    /// Both keys together, for the top bar's lock: locked if either saved
-    /// key is.
-    fn any_key_state(&self) -> KeyState {
-        match (self.key_state(), self.decision_key_state()) {
-            (KeyState::NoKey, KeyState::NoKey) => KeyState::NoKey,
-            (KeyState::Locked, _) | (_, KeyState::Locked) => KeyState::Locked,
-            _ => KeyState::Unlocked,
-        }
     }
 
     /// Starts streaming a report unless one is already in flight. A client
@@ -1672,58 +1558,8 @@ impl Ready {
                 self.notice = None;
                 Task::none()
             }
-            Message::Unlocked(result) => {
-                match result {
-                    Ok((main, decision)) => {
-                        if main.is_some() {
-                            self.api_key = main;
-                        }
-                        if decision.is_some() {
-                            self.decision_key = decision;
-                        }
-                        self.close_unlock();
-                        self.key_message = None;
-                        // What failed while locked out may work now.
-                        self.reset_backoff();
-                    }
-                    Err(e) => self.unlock_view.set_error(e.to_string()),
-                }
-                self.catch_up()
-            }
-            Message::KeySaved(result) => {
-                match result {
-                    Ok(saved) => {
-                        let (mine, other) = match saved.which {
-                            settings::Which::Main => {
-                                self.key_exists = true;
-                                (&mut self.api_key, &mut self.decision_key)
-                            }
-                            settings::Which::Decision => {
-                                self.decision_key_exists = true;
-                                (&mut self.decision_key, &mut self.api_key)
-                            }
-                        };
-                        *mine = Some(saved.key);
-                        // The password opened the other key too.
-                        if saved.other.is_some() {
-                            *other = saved.other;
-                        }
-                        self.key_message = None;
-                        // A new key may fix what failed.
-                        self.reset_backoff();
-                    }
-                    // Only the check against the other key can say this.
-                    Err(VaultError::WrongPassword) => {
-                        self.key_message = Some(
-                            "That isn't the password of your other saved key. Use the same \
-                             one: it unlocks both."
-                                .into(),
-                        )
-                    }
-                    Err(e) => self.key_message = Some(e.to_string()),
-                }
-                self.catch_up()
-            }
+            Message::Unlocked(result) => self.unlocked(result),
+            Message::KeySaved(result) => self.key_saved(result),
             Message::DismissError => {
                 self.local = true;
                 self.error = None;
@@ -1796,7 +1632,7 @@ impl Ready {
                 self.update_week_reports()
             }
             top_bar::Message::Lock => {
-                if self.api_key.is_some() || self.decision_key.is_some() {
+                if self.keys.any_open() {
                     self.lock();
                     Task::none()
                 } else {
@@ -2041,34 +1877,7 @@ impl Ready {
         }
     }
 
-    /// Forgets the key and stops every request that holds a copy of it.
-    /// Reports being generated are dropped (not stored); the schedule
-    /// generates them again after the next unlock.
-    fn lock(&mut self) {
-        self.api_key = None; // dropping the SecretString zeroizes it
-        self.decision_key = None;
-        for (_, g) in self.generating.drain() {
-            g.abort.abort();
-        }
-        for handle in self.key_requests.drain(..) {
-            handle.abort();
-        }
-        for (_, (_, handle)) in self.day_recs_pending.drain() {
-            handle.abort();
-        }
-        if let Some(handle) = self.suggest_request.take() {
-            handle.abort();
-        }
-        // A suggestion already on its way is ignored.
-        self.suggest_seq += 1;
-        self.testing = false;
-        self.listing_models = false;
-        self.key_message = None;
-    }
-
     fn settings_action(&mut self, action: settings::Action) -> Task<Message> {
-        let main_path = vault::key_path(&self.data_dir);
-        let decision_path = vault::decision_key_path(&self.data_dir);
         match action {
             settings::Action::None => Task::none(),
             settings::Action::Close => {
@@ -2182,75 +1991,14 @@ impl Ready {
                 api_key,
                 password,
                 which,
-            } => {
-                self.key_message = None;
-                let (path, other) = match which {
-                    settings::Which::Main => {
-                        (main_path, self.decision_key_exists.then_some(decision_path))
-                    }
-                    settings::Which::Decision => {
-                        (decision_path, self.key_exists.then_some(main_path))
-                    }
-                };
-                blocking(
-                    move || {
-                        // One password for both keys: it must open the
-                        // other one, if there is one.
-                        let other = other.map(|p| vault::unlock(&p, &password)).transpose()?;
-                        vault::save(&path, &api_key, &password)?;
-                        Ok(SavedKey {
-                            which,
-                            key: api_key,
-                            other,
-                        })
-                    },
-                    Message::KeySaved,
-                )
-            }
-            settings::Action::RemoveKey(which) => {
-                let (path, exists, key) = match which {
-                    settings::Which::Main => (main_path, &mut self.key_exists, &mut self.api_key),
-                    settings::Which::Decision => (
-                        decision_path,
-                        &mut self.decision_key_exists,
-                        &mut self.decision_key,
-                    ),
-                };
-                match vault::remove(&path) {
-                    Ok(()) => {
-                        *exists = false;
-                        *key = None;
-                        self.key_message = None;
-                    }
-                    Err(e) => self.key_message = Some(e.to_string()),
-                }
-                Task::none()
-            }
+            } => self.set_key(api_key, password, which),
+            settings::Action::RemoveKey(which) => self.remove_key(which),
             settings::Action::ShowUnlock => {
                 self.unlocking = true;
                 UnlockView::focus().map(Message::Unlock)
             }
             settings::Action::FocusPassword => operation::focus(settings::PASSWORD_INPUT_ID),
         }
-    }
-
-    /// Opens both saved keys with `password`. Fails only if it opens
-    /// neither.
-    fn unlock(&mut self, password: SecretString) -> Task<Message> {
-        let main = self.key_exists.then(|| vault::key_path(&self.data_dir));
-        let decision = self
-            .decision_key_exists
-            .then(|| vault::decision_key_path(&self.data_dir));
-        blocking(
-            move || {
-                let open = |p: Option<PathBuf>| p.map(|p| vault::unlock(&p, &password)).transpose();
-                match (open(main), open(decision)) {
-                    (Err(e), Err(_) | Ok(None)) | (Ok(None), Err(e)) => Err(e),
-                    (main, decision) => Ok((main.ok().flatten(), decision.ok().flatten())),
-                }
-            },
-            Message::Unlocked,
-        )
     }
 
     // ---- view ----
@@ -2270,7 +2018,7 @@ impl Ready {
             selected: self.selected,
             today,
             schedule: &self.settings.schedule,
-            lock: match self.any_key_state() {
+            lock: match self.keys.any_key_state() {
                 KeyState::NoKey => None,
                 KeyState::Locked => Some(LockIcon::Locked),
                 KeyState::Unlocked => Some(LockIcon::Unlocked),
@@ -2368,12 +2116,6 @@ struct TaskDialog {
     form: task_form::EditForm,
     /// The task being edited; `None` for a new task.
     task: Option<TaskId>,
-}
-
-/// The saved key is locked (`exists` but not open) and `llm` needs it
-/// (`secure::needs_saved_key`).
-fn key_locked(exists: bool, key: &Option<SecretString>, llm: &LlmSettings) -> bool {
-    exists && key.is_none() && secure::needs_saved_key(llm)
 }
 
 /// The tasks a recommendation names, in its order.
@@ -2498,37 +2240,6 @@ enum FormKey {
     Dialog,
     /// Today's inline form for this task.
     Inline(TaskId),
-}
-
-/// A key `SetKey` saved, and the other key if the password opened it.
-#[derive(Debug, Clone)]
-struct SavedKey {
-    which: settings::Which,
-    key: SecretString,
-    other: Option<SecretString>,
-}
-
-fn key_state(exists: bool, key: &Option<SecretString>) -> KeyState {
-    match (exists, key.is_some()) {
-        (false, _) => KeyState::NoKey,
-        (true, false) => KeyState::Locked,
-        (true, true) => KeyState::Unlocked,
-    }
-}
-
-/// Runs blocking work (Argon2) off the UI thread.
-fn blocking<T: Send + 'static>(
-    work: impl FnOnce() -> Result<T, VaultError> + Send + 'static,
-    done: fn(Result<T, VaultError>) -> Message,
-) -> Task<Message> {
-    Task::perform(
-        async move {
-            tokio::task::spawn_blocking(work)
-                .await
-                .unwrap_or_else(|e| Err(VaultError::Io(e.to_string())))
-        },
-        done,
-    )
 }
 
 #[cfg(test)]
