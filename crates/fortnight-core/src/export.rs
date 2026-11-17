@@ -2,12 +2,15 @@
 //! (round 2). Pure functions: the caller gathers the data and writes the
 //! file.
 //!
-//! Moments are UTC everywhere in the core and an export has no time zone to
-//! consult, so the dates and times in the Markdown are UTC.
+//! Moments are UTC everywhere in the core. The Markdown shows them as the
+//! caller's local dates and times (the time zone the app files day notes
+//! under), so a note lands on the day it was written for. The JSON keeps
+//! the raw UTC timestamps.
 
 use crate::domain::{
     Event, MAX_PRIORITY, Report, ReportKind, ReportStatus, Task, TaskId, TaskStatus,
 };
+use crate::parse;
 use jiff::Timestamp;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
@@ -42,15 +45,18 @@ impl ExportFormat {
 
 /// Everything: every task (private ones included, marked), every event and
 /// every report version. `today` labels the export ("Exported 2026-11-16").
+/// `tz` is the local time zone the Markdown's dates and times are shown in;
+/// the JSON does not depend on it.
 pub fn export_all(
     format: ExportFormat,
     tasks: &[Task],
     events: &[Event],
     reports: &[Report],
     today: Date,
+    tz: &TimeZone,
 ) -> String {
     match format {
-        ExportFormat::Markdown => all_markdown(tasks, events, reports, today),
+        ExportFormat::Markdown => all_markdown(tasks, events, reports, today, tz),
         ExportFormat::Json => all_json(tasks, events, reports, today),
     }
 }
@@ -84,7 +90,13 @@ fn all_json(tasks: &[Task], events: &[Event], reports: &[Report], today: Date) -
 
 // --------------------------------------------------------------- Markdown
 
-fn all_markdown(tasks: &[Task], events: &[Event], reports: &[Report], today: Date) -> String {
+fn all_markdown(
+    tasks: &[Task],
+    events: &[Event],
+    reports: &[Report],
+    today: Date,
+    tz: &TimeZone,
+) -> String {
     let mut out = format!("# Fortnight export, {today}\n");
 
     // Log lines attached to a task that is in the export go under that task;
@@ -135,7 +147,7 @@ fn all_markdown(tasks: &[Task], events: &[Event], reports: &[Report], today: Dat
         }
         out.push_str(&format!("\n### {heading}\n\n"));
         for task in group {
-            push_task(&mut out, task, by_task.get(&task.id));
+            push_task(&mut out, task, by_task.get(&task.id), tz);
         }
     }
 
@@ -143,7 +155,7 @@ fn all_markdown(tasks: &[Task], events: &[Event], reports: &[Report], today: Dat
         out.push_str("\n## Log\n");
         let mut current: Option<Date> = None;
         for e in loose {
-            let day = utc_date(e.at);
+            let day = local_date(e.at, tz);
             if current != Some(day) {
                 out.push_str(&format!("\n### {day}\n\n"));
                 current = Some(day);
@@ -151,7 +163,7 @@ fn all_markdown(tasks: &[Task], events: &[Event], reports: &[Report], today: Dat
             let text = e.log_text().unwrap_or_default();
             out.push_str(&format!(
                 "- {} · {}\n",
-                utc_time(e.at),
+                local_time(e.at, tz),
                 indent_rest(text, 2)
             ));
         }
@@ -204,7 +216,7 @@ fn all_markdown(tasks: &[Task], events: &[Event], reports: &[Report], today: Dat
     out
 }
 
-fn push_task(out: &mut String, task: &Task, logs: Option<&Vec<&Event>>) {
+fn push_task(out: &mut String, task: &Task, logs: Option<&Vec<&Event>>, tz: &TimeZone) {
     let mark = match task.status {
         TaskStatus::Todo => "[ ]",
         TaskStatus::Doing => "[~]",
@@ -229,7 +241,7 @@ fn push_task(out: &mut String, task: &Task, logs: Option<&Vec<&Event>>) {
         parts.push(format!("planned: {d}"));
     }
     if let Some(m) = task.estimate_minutes {
-        parts.push(format!("estimate: {}", format_minutes(m)));
+        parts.push(format!("estimate: ~{}", parse::format_estimate(m)));
     }
     if task.priority > 0 {
         parts.push(format!(
@@ -238,7 +250,7 @@ fn push_task(out: &mut String, task: &Task, logs: Option<&Vec<&Event>>) {
         ));
     }
     if let (true, Some(at)) = (task.is_done(), task.completed_at) {
-        parts.push(format!("completed: {}", utc_date(at)));
+        parts.push(format!("completed: {}", local_date(at, tz)));
     }
     if !parts.is_empty() {
         line.push_str(" · ");
@@ -261,8 +273,8 @@ fn push_task(out: &mut String, task: &Task, logs: Option<&Vec<&Event>>) {
         let text = e.log_text().unwrap_or_default();
         out.push_str(&format!(
             "  - {} {} · {}\n",
-            utc_date(e.at),
-            utc_time(e.at),
+            local_date(e.at, tz),
+            local_time(e.at, tz),
             indent_rest(text, 4)
         ));
     }
@@ -297,15 +309,6 @@ fn push_report_body(out: &mut String, report: &Report) {
     }
 }
 
-/// 120 → "~2h", 90 → "~1h30m", 30 → "~30m".
-fn format_minutes(minutes: u32) -> String {
-    match (minutes / 60, minutes % 60) {
-        (0, m) => format!("~{m}m"),
-        (h, 0) => format!("~{h}h"),
-        (h, m) => format!("~{h}h{m}m"),
-    }
-}
-
 /// Indent every line after the first, so multi-line text stays inside its
 /// list item.
 fn indent_rest(text: &str, spaces: usize) -> String {
@@ -313,12 +316,12 @@ fn indent_rest(text: &str, spaces: usize) -> String {
     text.trim_end().replace('\n', &format!("\n{pad}"))
 }
 
-fn utc_date(at: Timestamp) -> Date {
-    TimeZone::UTC.to_datetime(at).date()
+fn local_date(at: Timestamp, tz: &TimeZone) -> Date {
+    tz.to_datetime(at).date()
 }
 
-fn utc_time(at: Timestamp) -> String {
-    let t = TimeZone::UTC.to_datetime(at).time();
+fn local_time(at: Timestamp, tz: &TimeZone) -> String {
+    let t = tz.to_datetime(at).time();
     format!("{:02}:{:02}", t.hour(), t.minute())
 }
 
@@ -450,7 +453,14 @@ mod tests {
             reports: Vec<Report>,
         }
         let (tasks, events, reports) = sample();
-        let json = export_all(ExportFormat::Json, &tasks, &events, &reports, TODAY);
+        let json = export_all(
+            ExportFormat::Json,
+            &tasks,
+            &events,
+            &reports,
+            TODAY,
+            &TimeZone::UTC,
+        );
         assert!(json.contains("\n  \"tasks\""), "pretty printed");
         assert!(pos(&json, "\"format\"") < pos(&json, "\"tasks\""));
         let back: Back = serde_json::from_str(&json).unwrap();
@@ -465,7 +475,14 @@ mod tests {
     #[test]
     fn markdown_has_sections_in_order() {
         let (tasks, events, reports) = sample();
-        let md = export_all(ExportFormat::Markdown, &tasks, &events, &reports, TODAY);
+        let md = export_all(
+            ExportFormat::Markdown,
+            &tasks,
+            &events,
+            &reports,
+            TODAY,
+            &TimeZone::UTC,
+        );
         assert!(md.starts_with("# Fortnight export, 2026-11-16\n"));
         let order = [
             "## Tasks",
@@ -486,7 +503,14 @@ mod tests {
     #[test]
     fn open_tasks_sort_by_due_date_undated_last() {
         let (tasks, events, reports) = sample();
-        let md = export_all(ExportFormat::Markdown, &tasks, &events, &reports, TODAY);
+        let md = export_all(
+            ExportFormat::Markdown,
+            &tasks,
+            &events,
+            &reports,
+            TODAY,
+            &TimeZone::UTC,
+        );
         let earlier = pos(&md, "Earlier deadline"); // due 18th
         let spec = pos(&md, "Write spec"); // due 20th
         let bank = pos(&md, "Call the bank"); // undated
@@ -498,7 +522,14 @@ mod tests {
     #[test]
     fn task_line_has_all_fields_and_private_marker() {
         let (tasks, events, reports) = sample();
-        let md = export_all(ExportFormat::Markdown, &tasks, &events, &reports, TODAY);
+        let md = export_all(
+            ExportFormat::Markdown,
+            &tasks,
+            &events,
+            &reports,
+            TODAY,
+            &TimeZone::UTC,
+        );
         assert!(md.contains(
             "- [ ] **Write spec** · project: Atlas · due: 2026-11-20 · estimate: ~1h30m · priority: !!\n"
         ));
@@ -511,7 +542,14 @@ mod tests {
     #[test]
     fn notes_and_task_logs_sit_under_their_task() {
         let (tasks, events, reports) = sample();
-        let md = export_all(ExportFormat::Markdown, &tasks, &events, &reports, TODAY);
+        let md = export_all(
+            ExportFormat::Markdown,
+            &tasks,
+            &events,
+            &reports,
+            TODAY,
+            &TimeZone::UTC,
+        );
         let spec = pos(&md, "**Write spec**");
         let notes = pos(&md, "  first line\n  second line\n");
         let logline = pos(&md, "  - 2026-11-12 14:30 · Drafted the outline");
@@ -524,16 +562,88 @@ mod tests {
     #[test]
     fn free_standing_log_lines_are_listed_by_date() {
         let (tasks, events, reports) = sample();
-        let md = export_all(ExportFormat::Markdown, &tasks, &events, &reports, TODAY);
+        let md = export_all(
+            ExportFormat::Markdown,
+            &tasks,
+            &events,
+            &reports,
+            TODAY,
+            &TimeZone::UTC,
+        );
         let log = &md[pos(&md, "## Log")..pos(&md, "## Reports")];
         assert!(log.contains("### 2026-11-13\n\n- 09:05 · Team offsite\n  second line\n"));
         assert!(!log.contains("Drafted the outline"));
     }
 
+    /// A note written at 18:00 on 16 Nov in Los Angeles is 02:00 UTC on the
+    /// 17th: the Markdown files it under the local day and time.
+    #[test]
+    fn markdown_uses_local_dates_and_times() {
+        let tz = TimeZone::get("America/Los_Angeles").unwrap();
+        let mut done = task(1, "Late finish");
+        done.status = TaskStatus::Done;
+        done.completed_at = Some(ts("2026-11-17T02:30:00Z"));
+        let events = vec![
+            log(1, None, "2026-11-17T02:00:00Z", "Evening note"),
+            log(2, Some(1), "2026-11-17T03:15:00Z", "Wrapped up"),
+        ];
+        let md = export_all(
+            ExportFormat::Markdown,
+            &[done.clone()],
+            &events,
+            &[],
+            TODAY,
+            &tz,
+        );
+        assert!(md.contains("completed: 2026-11-16"), "{md}");
+        assert!(md.contains("  - 2026-11-16 19:15 · Wrapped up"), "{md}");
+        assert!(
+            md.contains("### 2026-11-16\n\n- 18:00 · Evening note"),
+            "{md}"
+        );
+        assert!(!md.contains("2026-11-17"), "{md}");
+        // UTC would put them on the 17th.
+        let utc = export_all(
+            ExportFormat::Markdown,
+            &[done.clone()],
+            &events,
+            &[],
+            TODAY,
+            &TimeZone::UTC,
+        );
+        assert!(utc.contains("### 2026-11-17\n\n- 02:00 · Evening note"));
+        // The JSON does not depend on the time zone.
+        assert_eq!(
+            export_all(
+                ExportFormat::Json,
+                &[done.clone()],
+                &events,
+                &[],
+                TODAY,
+                &tz
+            ),
+            export_all(
+                ExportFormat::Json,
+                &[done],
+                &events,
+                &[],
+                TODAY,
+                &TimeZone::UTC
+            )
+        );
+    }
+
     #[test]
     fn reports_newest_week_first_latest_version_edit_preferred() {
         let (tasks, events, reports) = sample();
-        let md = export_all(ExportFormat::Markdown, &tasks, &events, &reports, TODAY);
+        let md = export_all(
+            ExportFormat::Markdown,
+            &tasks,
+            &events,
+            &reports,
+            TODAY,
+            &TimeZone::UTC,
+        );
         let reports_md = &md[pos(&md, "## Reports")..];
         let newer = pos(reports_md, "### Advice for the week of 2026-11-16");
         let older = pos(reports_md, "### Summary for the week of 2026-11-09");
@@ -547,12 +657,12 @@ mod tests {
 
     #[test]
     fn empty_inputs() {
-        let md = export_all(ExportFormat::Markdown, &[], &[], &[], TODAY);
+        let md = export_all(ExportFormat::Markdown, &[], &[], &[], TODAY, &TimeZone::UTC);
         assert!(md.contains("# Fortnight export, 2026-11-16"));
         assert!(md.contains("No tasks."));
         assert!(md.contains("No reports."));
         assert!(!md.contains("## Log"));
-        let json = export_all(ExportFormat::Json, &[], &[], &[], TODAY);
+        let json = export_all(ExportFormat::Json, &[], &[], &[], TODAY, &TimeZone::UTC);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["tasks"], serde_json::json!([]));
         assert_eq!(v["events"], serde_json::json!([]));

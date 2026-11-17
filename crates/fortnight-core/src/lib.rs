@@ -7,6 +7,7 @@ pub mod domain;
 pub mod export;
 pub mod fallback;
 pub mod llm;
+pub mod notes;
 pub mod ollama;
 pub mod openai;
 pub mod parse;

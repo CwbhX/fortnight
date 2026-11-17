@@ -53,7 +53,7 @@ pub fn add(store: &dyn Store, words: &[String], today: Date, out: &mut dyn Write
         title: parsed.title,
         project: parsed.project,
         // A quick-add date is the day you plan to do it.
-        planned_for: parsed.due_on,
+        planned_for: parsed.day,
         estimate_minutes: parsed.estimate_minutes,
         priority: parsed.priority,
         ..NewTask::default()
@@ -525,18 +525,26 @@ pub async fn run_due(
 
 // --------------------------------------------------------------- export
 
-/// `export`: everything, to `dest` or to `out`.
+/// `export`: everything, to `dest` or to `out`. `now` gives the export's
+/// date and the time zone of the Markdown's dates and times.
 pub fn export(
     store: &dyn Store,
     format: ExportFormat,
-    today: Date,
+    now: &ZonedDateTime,
     dest: Option<&Path>,
     out: &mut dyn Write,
 ) -> CliResult<()> {
     let tasks = store.list_tasks()?;
     let events = store.events_between(Timestamp::MIN, Timestamp::MAX)?;
     let reports = store.all_reports()?;
-    let text = export::export_all(format, &tasks, &events, &reports, today);
+    let text = export::export_all(
+        format,
+        &tasks,
+        &events,
+        &reports,
+        now.date(),
+        now.time_zone(),
+    );
     match dest {
         Some(path) => std::fs::write(path, text)
             .map_err(|e| CliError::failure(format!("cannot write {}: {e}", path.display()))),

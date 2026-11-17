@@ -1,7 +1,7 @@
 //! Quick-add parser. Owner: agent B.
 //!
-//! `Write Q4 report fri #work ~2h !` → title "Write Q4 report", due the
-//! coming Friday, project "work", estimate 120 minutes, priority 1.
+//! `Write Q4 report fri #work ~2h !` → title "Write Q4 report", planned for
+//! the coming Friday, project "work", estimate 120 minutes, priority 1.
 //! Tokens are separated by whitespace and may appear in any order:
 //!
 //! - **Dates**: `today`, `tomorrow` (`tmr`), weekday names and 3-letter
@@ -17,16 +17,21 @@
 //!
 //! Everything else, in order, is the title.
 //!
+//! [`quick_add_task`] turns a line into the `NewTask` to store (the app's
+//! quick-add bar and the CLI's `add`).
+//!
 //! [`parse_estimate`] and [`format_estimate`] read and write estimates on
-//! their own (the `~` is optional there) for the task edit form.
+//! their own (the `~` is optional there) for the task edit form;
+//! [`parse_time`]/[`format_time`] and [`parse_hours`]/[`format_hours`] do
+//! the same for the settings form's times and daily focus hours.
 //!
 //! Known limitation: a title word that is also a date token ("Call Monday
 //! Corp", "Buy 2 may ...") is read as a date. Prototype scope accepts this.
 
 use jiff::Span;
-use jiff::civil::{Date, Weekday};
+use jiff::civil::{Date, Time, Weekday};
 
-use crate::domain::MAX_PRIORITY;
+use crate::domain::{MAX_PRIORITY, NewTask};
 
 /// The largest estimate accepted: seven days, in minutes.
 const MAX_ESTIMATE_MINUTES: u32 = 7 * 24 * 60;
@@ -35,7 +40,9 @@ const MAX_ESTIMATE_MINUTES: u32 = 7 * 24 * 60;
 pub struct QuickAdd {
     pub title: String,
     pub project: Option<String>,
-    pub due_on: Option<Date>,
+    /// The date in the line: the day you plan to do it (`Task::planned_for`,
+    /// where the task is shown), never the deadline. The last date wins.
+    pub day: Option<Date>,
     /// `~2h`, `~30m`, `~1h30m`, `~1.5h` (round 2, agent B).
     pub estimate_minutes: Option<u32>,
     /// `!` = 1, `!!` = 2, `!!!` = 3 (round 2, agent B).
@@ -53,13 +60,13 @@ pub fn parse_quick_add(input: &str, today: Date) -> QuickAdd {
         if let Some(next) = tokens.get(i + 1)
             && let Some(d) = month_day(tokens[i], next, today)
         {
-            out.due_on = Some(d);
+            out.day = Some(d);
             i += 2;
             continue;
         }
         let tok = tokens[i];
         if let Some(d) = single_date(tok, today) {
-            out.due_on = Some(d);
+            out.day = Some(d);
         } else if let Some(p) = tok.strip_prefix('#').filter(|p| !p.is_empty()) {
             out.project = Some(p.to_string());
         } else if let Some(m) = tok.strip_prefix('~').and_then(estimate_body) {
@@ -74,6 +81,68 @@ pub fn parse_quick_add(input: &str, today: Date) -> QuickAdd {
 
     out.title = title.join(" ");
     out
+}
+
+/// The task a quick-add line creates, or `None` if it has no title (only
+/// a date, project, estimate or priority, or nothing). The date in the line
+/// is the planned day; without one the task is planned for `default_day`
+/// (the app's Today tab passes the day shown, the CLI and other tabs
+/// `None`, which leaves it undated).
+pub fn quick_add_task(input: &str, today: Date, default_day: Option<Date>) -> Option<NewTask> {
+    let parsed = parse_quick_add(input, today);
+    if parsed.title.trim().is_empty() {
+        return None;
+    }
+    Some(NewTask {
+        title: parsed.title,
+        project: parsed.project,
+        planned_for: parsed.day.or(default_day),
+        estimate_minutes: parsed.estimate_minutes,
+        priority: parsed.priority,
+        ..NewTask::default()
+    })
+}
+
+/// A time of day as `HH:MM` (or `H:MM`), 24-hour. Surrounding whitespace is
+/// ignored; anything else (seconds, signs, `24:00`) is `None`.
+pub fn parse_time(s: &str) -> Option<Time> {
+    let (h, m) = s.trim().split_once(':')?;
+    if h.is_empty() || h.len() > 2 || m.len() != 2 {
+        return None;
+    }
+    if !h.chars().chain(m.chars()).all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Time::new(h.parse().ok()?, m.parse().ok()?, 0, 0).ok()
+}
+
+/// `HH:MM`, which [`parse_time`] reads back (seconds are dropped).
+pub fn format_time(t: Time) -> String {
+    format!("{:02}:{:02}", t.hour(), t.minute())
+}
+
+/// Decimal hours per day (`6`, `5.5`, `7,25`) as whole minutes. More than 0
+/// and at most 24 hours.
+pub fn parse_hours(s: &str) -> Option<u32> {
+    let s = s.trim().replace(',', ".");
+    if s.is_empty() || !s.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    let hours: f64 = s.parse().ok()?;
+    let minutes = (hours * 60.0).round();
+    (1.0..=24.0 * 60.0)
+        .contains(&minutes)
+        .then_some(minutes as u32)
+}
+
+/// Minutes as decimal hours with at most two decimals: 360 → `6`,
+/// 330 → `5.5`. [`parse_hours`] reads it back to the same minutes.
+pub fn format_hours(minutes: u32) -> String {
+    if minutes.is_multiple_of(60) {
+        return (minutes / 60).to_string();
+    }
+    let s = format!("{:.2}", f64::from(minutes) / 60.0);
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// Parses an estimate such as `~2h`, `30m`, `1h30m` or `1.5h`. The leading
@@ -271,7 +340,7 @@ mod tests {
         QuickAdd {
             title: title.to_string(),
             project: project.map(str::to_string),
-            due_on: due,
+            day: due,
             ..QuickAdd::default()
         }
     }
@@ -577,6 +646,70 @@ mod tests {
         ];
         for (input, want) in cases {
             assert_eq!(parse_quick_add(input, TODAY), want, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn quick_add_task_plans_the_line_date_or_the_default_day() {
+        let other = date(2026, 11, 18);
+        let t = quick_add_task("Write report fri #work ~2h !", TODAY, Some(other)).unwrap();
+        assert_eq!(
+            t,
+            NewTask {
+                title: "Write report".into(),
+                project: Some("work".into()),
+                planned_for: Some(date(2026, 11, 20)),
+                estimate_minutes: Some(120),
+                priority: 1,
+                ..NewTask::default()
+            }
+        );
+        // The date is the planned day, never the deadline.
+        assert_eq!(t.due_on, None);
+        // No date: the default day, or undated.
+        let t = quick_add_task("Call Bob", TODAY, Some(other)).unwrap();
+        assert_eq!(t.planned_for, Some(other));
+        let t = quick_add_task("Call Bob", TODAY, None).unwrap();
+        assert_eq!(t.planned_for, None);
+        // No title: nothing to add.
+        for empty in ["", "   ", "fri #work ~1h !!"] {
+            assert_eq!(quick_add_task(empty, TODAY, Some(other)), None, "{empty:?}");
+        }
+    }
+
+    #[test]
+    fn parse_time_accepts_only_hh_mm() {
+        assert_eq!(parse_time("16:00"), Some(Time::constant(16, 0, 0, 0)));
+        assert_eq!(parse_time("8:05"), Some(Time::constant(8, 5, 0, 0)));
+        assert_eq!(parse_time(" 08:05 "), Some(Time::constant(8, 5, 0, 0)));
+        for bad in [
+            "", "16", "16:0", "24:00", "12:60", "1:2:3", "+1:00", "ab:cd",
+        ] {
+            assert_eq!(parse_time(bad), None, "{bad}");
+        }
+        assert_eq!(format_time(Time::constant(8, 5, 30, 0)), "08:05");
+        assert_eq!(
+            parse_time(&format_time(Time::constant(23, 59, 0, 0))),
+            Some(Time::constant(23, 59, 0, 0))
+        );
+    }
+
+    #[test]
+    fn hours_format_and_parse_round_trip() {
+        assert_eq!(format_hours(360), "6");
+        assert_eq!(format_hours(330), "5.5");
+        assert_eq!(format_hours(345), "5.75");
+        for minutes in 1..=24 * 60 {
+            assert_eq!(
+                parse_hours(&format_hours(minutes)),
+                Some(minutes),
+                "{minutes}"
+            );
+        }
+        assert_eq!(parse_hours("24"), Some(1440));
+        assert_eq!(parse_hours("7,25"), Some(435));
+        for bad in ["", "0", "24.5", "-1", "1e2", "six"] {
+            assert_eq!(parse_hours(bad), None, "{bad}");
         }
     }
 }
