@@ -28,6 +28,7 @@ use fortnight_app::views::report_panel::{self, ReportPanelData, ReportSlot};
 use fortnight_app::views::settings::{
     self, KeyState, SettingsData, SettingsView, UnlockAction, UnlockMessage, UnlockView,
 };
+use fortnight_app::views::task_form;
 use fortnight_app::views::week::{self, WeekData, WeekView};
 use fortnight_core::datadir::{self, DataLock};
 use fortnight_core::decision::DecisionClient;
@@ -1600,10 +1601,10 @@ impl Ready {
     fn open_new_task(&mut self, day: Date) -> Task<Message> {
         self.dialog = Some(TaskDialog {
             day: Some(day),
-            form: day::EditForm::blank(&self.tasks, self.settings.schedule.week_start),
+            form: task_form::EditForm::blank(&self.tasks, self.settings.schedule.week_start),
             task: None,
         });
-        operation::focus(day::DIALOG_TITLE_ID)
+        operation::focus(task_form::DIALOG_TITLE_ID)
     }
 
     /// Opens the task dialog to edit task `id`.
@@ -1611,7 +1612,7 @@ impl Ready {
         if let Some(task) = self.task(id) {
             self.dialog = Some(TaskDialog {
                 day: task.day(),
-                form: day::open_form(task, &self.tasks, self.settings.schedule.week_start),
+                form: task_form::open_form(task, &self.tasks, self.settings.schedule.week_start),
                 task: Some(id),
             });
         }
@@ -2129,7 +2130,7 @@ impl Ready {
 
         if let Some(dialog) = &self.dialog {
             let panel = container(
-                day::task_dialog(&dialog.form, dialog.day, dialog.task.is_some(), today)
+                task_form::task_dialog(&dialog.form, dialog.day, dialog.task.is_some(), today)
                     .map(Message::Dialog),
             )
             .max_width(640)
@@ -2178,7 +2179,7 @@ struct TaskDialog {
     /// The day a new task is planned for; an edited task's day, for the
     /// heading.
     day: Option<Date>,
-    form: day::EditForm,
+    form: task_form::EditForm,
     /// The task being edited; `None` for a new task.
     task: Option<TaskId>,
 }
