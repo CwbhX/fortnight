@@ -2,12 +2,13 @@
 
 use fortnight_cli::args::ListArgs;
 use fortnight_cli::commands::{self, now_for};
-use fortnight_cli::error::CliResult;
+use fortnight_cli::error::{CliError, CliResult};
 use fortnight_cli::llm_setup::LlmHandle;
 use fortnight_cli::run::lock_warning;
 use fortnight_core::datadir;
 use fortnight_core::domain::{NewTask, ReportKind, ReportStatus, Task, TaskStatus, WeekRef};
 use fortnight_core::export::{self, ExportFormat};
+use fortnight_core::fallback::Endpoint;
 use fortnight_core::llm::{LlmError, MockClient};
 use fortnight_core::sqlite::SqliteStore;
 use fortnight_core::store::Store;
@@ -46,8 +47,10 @@ fn text(out: Vec<u8>) -> String {
 
 fn handle(mock: &Arc<MockClient>) -> LlmHandle {
     LlmHandle {
-        client: mock.clone(),
-        endpoint_host: Some("mock.test".into()),
+        main: Endpoint {
+            client: mock.clone(),
+            host: Some("mock.test".into()),
+        },
         decision: None,
     }
 }
@@ -180,6 +183,22 @@ fn list_today_and_week_filters_keep_overdue() {
     add_task(&s, "friday", Some(date(2026, 11, 20)));
     add_task(&s, "next week", Some(date(2026, 11, 24)));
     add_task(&s, "undated", None);
+    // Planned for Monday, no deadline, still open: carried over to today.
+    s.add_task(NewTask {
+        title: "carried".into(),
+        planned_for: Some(date(2026, 11, 16)),
+        ..NewTask::default()
+    })
+    .unwrap();
+    // Undated with a passed deadline: overdue, so listed.
+    s.add_task(NewTask {
+        title: "late".into(),
+        due_on: Some(date(2026, 11, 17)),
+        ..NewTask::default()
+    })
+    .unwrap();
+    let closed = add_task(&s, "closed", Some(wednesday()));
+    s.set_status(closed.id, TaskStatus::Done).unwrap();
     let titles = |opts: ListArgs| -> Vec<String> {
         let mut out = Vec::new();
         commands::list(&s, &opts, wednesday(), &mut out).unwrap();
@@ -200,14 +219,23 @@ fn list_today_and_week_filters_keep_overdue() {
             today: true,
             ..ListArgs::default()
         }),
-        ["overdue", "today"]
+        ["overdue", "late", "carried", "today"]
+    );
+    // --all adds what was planned for today and is closed, nothing else.
+    assert_eq!(
+        titles(ListArgs {
+            today: true,
+            all: true,
+            ..ListArgs::default()
+        }),
+        ["overdue", "late", "carried", "today", "closed"]
     );
     assert_eq!(
         titles(ListArgs {
             week: true,
             ..ListArgs::default()
         }),
-        ["overdue", "today", "friday"]
+        ["overdue", "late", "carried", "today", "friday"]
     );
 }
 
@@ -338,10 +366,14 @@ fn default_weeks() {
 
 // ------------------------------------------------------------- reports
 
+/// A task for Wednesday with a log line on Tuesday: something to
+/// summarise for the week of the 16th and to recommend from Wednesday on.
 fn seeded() -> SqliteStore {
     let s = store();
-    let t = add_task(&s, "ship the thing", Some(date(2026, 11, 19)));
-    s.add_log(Some(t.id), "wrote the first half").unwrap();
+    let t = add_task(&s, "ship the thing", Some(wednesday()));
+    let tuesday: Timestamp = "2026-11-17T10:00:00Z".parse().unwrap();
+    s.add_log_at(Some(t.id), "wrote the first half", tuesday)
+        .unwrap();
     s
 }
 
@@ -356,7 +388,7 @@ async fn summary_streams_and_stores_a_ready_report() {
         Some("this"),
         false,
         &now(wednesday()),
-        &|| Ok(handle(&mock)),
+        &|_| Ok(handle(&mock)),
         &mut out,
     )
     .await
@@ -394,7 +426,7 @@ async fn plan_defaults_to_this_week_and_stores() {
         None,
         false,
         &now(wednesday()),
-        &|| Ok(handle(&mock)),
+        &|_| Ok(handle(&mock)),
         &mut out,
     )
     .await
@@ -410,7 +442,10 @@ async fn plan_defaults_to_this_week_and_stores() {
 /// `handle(main)` with `decision` as the decision model on `decision.test`.
 fn with_decision(main: &Arc<MockClient>, decision: &Arc<MockClient>) -> LlmHandle {
     LlmHandle {
-        decision: Some((decision.clone(), Some("decision.test".into()))),
+        decision: Some(Endpoint {
+            client: decision.clone(),
+            host: Some("decision.test".into()),
+        }),
         ..handle(main)
     }
 }
@@ -421,7 +456,7 @@ async fn plan_uses_the_decision_model_and_summary_does_not() {
     let main = Arc::new(MockClient::new("from main"));
     let decision = Arc::new(MockClient::new("from decision"));
     let mut out = Vec::new();
-    let make = || Ok(with_decision(&main, &decision));
+    let make = |_| Ok(with_decision(&main, &decision));
     commands::report_command(
         &s,
         ReportKind::Plan,
@@ -444,7 +479,7 @@ async fn plan_uses_the_decision_model_and_summary_does_not() {
     commands::report_command(
         &s,
         ReportKind::Summary,
-        None,
+        Some("this"),
         false,
         &now(wednesday()),
         &make,
@@ -468,7 +503,7 @@ async fn plan_falls_back_to_the_main_endpoint() {
         None,
         false,
         &now(wednesday()),
-        &|| Ok(with_decision(&main, &decision)),
+        &|_| Ok(with_decision(&main, &decision)),
         &mut Vec::new(),
     )
     .await
@@ -494,7 +529,7 @@ async fn failure_is_stored_as_failed_and_returns_an_error() {
         Some("this"),
         false,
         &now(wednesday()),
-        &|| Ok(handle(&mock)),
+        &|_| Ok(handle(&mock)),
         &mut out,
     )
     .await
@@ -524,7 +559,7 @@ async fn facts_never_call_the_client() {
             Some("this"),
             true,
             &now(wednesday()),
-            &|| panic!("--facts must not build a client"),
+            &|_| panic!("--facts must not build a client"),
             &mut out,
         )
         .await
@@ -549,7 +584,7 @@ async fn unconfigured_llm_is_exit_2_and_stores_nothing() {
         None,
         false,
         &now(wednesday()),
-        &|| -> CliResult<LlmHandle> {
+        &|_| -> CliResult<LlmHandle> {
             fortnight_cli::llm_setup::build_client(&Default::default(), None)
         },
         &mut Vec::new(),
@@ -569,7 +604,7 @@ async fn run_due_generates_what_is_due_once() {
     // End of Friday 20th: summary and plan for the week of the 16th are due.
     let when = now(date(2026, 11, 20));
     let mut out = Vec::new();
-    commands::run_due(&s, &when, &|| Ok(handle(&mock)), &mut out)
+    commands::run_due(&s, &when, &|_| Ok(handle(&mock)), &mut out)
         .await
         .unwrap();
     let out = text(out);
@@ -581,7 +616,7 @@ async fn run_due_generates_what_is_due_once() {
 
     // Nothing more to do: succeeds without building a client.
     let mut out = Vec::new();
-    commands::run_due(&s, &when, &|| panic!("nothing is due"), &mut out)
+    commands::run_due(&s, &when, &|_| panic!("nothing is due"), &mut out)
         .await
         .unwrap();
     assert_eq!(text(out), "Nothing is due.\n");
@@ -596,7 +631,7 @@ async fn run_due_fails_non_zero_when_a_report_fails() {
     let err = commands::run_due(
         &s,
         &now(date(2026, 11, 20)),
-        &|| Ok(handle(&mock)),
+        &|_| Ok(handle(&mock)),
         &mut out,
     )
     .await
@@ -679,4 +714,169 @@ fn lock_warning_only_for_other_hosts() {
     drop(_lock);
     assert_eq!(lock_warning(&dir, "some-other-machine"), None);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn lock_warning_ignores_local_suffix_on_the_same_mac() {
+    let dir = std::env::temp_dir().join(format!("fortnight-cli-lock-local-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lock = serde_json::json!({
+        "host": "Foo.local",
+        "pid": std::process::id(),
+        "since": "2026-11-16T09:00:00Z",
+    });
+    std::fs::write(datadir::lock_path(&dir), lock.to_string()).unwrap();
+    assert_eq!(lock_warning(&dir, "Foo"), None);
+    assert_eq!(lock_warning(&dir, "foo.local"), None);
+    assert!(lock_warning(&dir, "Bar").is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------- decision model, empties
+
+#[tokio::test]
+async fn only_recommendations_ask_for_the_decision_model() {
+    let s = seeded();
+    let mock = Arc::new(MockClient::new("text"));
+    let asked = std::cell::RefCell::new(Vec::new());
+    let make = |uses_decision| {
+        asked.borrow_mut().push(uses_decision);
+        Ok(handle(&mock))
+    };
+    for kind in [ReportKind::Summary, ReportKind::Plan] {
+        commands::report_command(
+            &s,
+            kind,
+            Some("this"),
+            false,
+            &now(wednesday()),
+            &make,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(*asked.borrow(), [false, true]);
+}
+
+#[tokio::test]
+async fn run_due_without_a_plan_does_not_ask_for_the_decision_model() {
+    // The task is done: the week has something to summarise (its log
+    // line) but nothing to recommend.
+    let s = seeded();
+    s.set_status(1, TaskStatus::Done).unwrap();
+    let mock = Arc::new(MockClient::new("generated"));
+    let asked = std::cell::RefCell::new(Vec::new());
+    let make = |uses_decision| {
+        asked.borrow_mut().push(uses_decision);
+        Ok(handle(&mock))
+    };
+    let mut out = Vec::new();
+    commands::run_due(&s, &now(date(2026, 11, 20)), &make, &mut out)
+        .await
+        .unwrap();
+    let out = text(out);
+    assert!(
+        out.contains("plan 2026-11-16: nothing to recommend"),
+        "{out}"
+    );
+    assert!(out.contains("summary 2026-11-16: ready"), "{out}");
+    assert_eq!(*asked.borrow(), [false]);
+    assert_eq!(mock.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn empty_facts_call_nothing_and_store_nothing() {
+    let s = store();
+    let mut out = Vec::new();
+    commands::report_command(
+        &s,
+        ReportKind::Summary,
+        Some("this"),
+        false,
+        &now(wednesday()),
+        &|_| panic!("nothing to summarise"),
+        &mut out,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        text(out),
+        "Nothing to summarise for the week of 2026-11-16.\n"
+    );
+    // A task planned for later is not on today's list.
+    add_task(&s, "later", Some(date(2026, 11, 25)));
+    let mut out = Vec::new();
+    commands::report_command(
+        &s,
+        ReportKind::Plan,
+        None,
+        false,
+        &now(wednesday()),
+        &|_| panic!("nothing to recommend"),
+        &mut out,
+    )
+    .await
+    .unwrap();
+    assert_eq!(text(out), "Nothing to recommend for today.\n");
+
+    let mut out = Vec::new();
+    commands::run_due(
+        &store(),
+        &now(date(2026, 11, 20)),
+        &|_| panic!("nothing to generate"),
+        &mut out,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        text(out),
+        "summary 2026-11-16: nothing to summarise\nplan 2026-11-16: nothing to recommend\n"
+    );
+    assert!(s.all_reports().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn run_due_reports_connect_errors_that_are_not_not_configured() {
+    let s = seeded();
+    let when = now(date(2026, 11, 20));
+    let mut out = Vec::new();
+    let err = commands::run_due(
+        &s,
+        &when,
+        &|_| -> CliResult<LlmHandle> {
+            Err(CliError::failure(
+                "could not connect: refusing to send the API key over plain http to 10.0.0.5",
+            ))
+        },
+        &mut out,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, 1);
+    assert!(err.message.contains("plain http"));
+    assert!(!text(out).contains("No LLM endpoint"));
+
+    // Other usage errors are not "not configured" either.
+    let err = commands::run_due(
+        &s,
+        &when,
+        &|_| -> CliResult<LlmHandle> { Err(CliError::usage("bad protocol")) },
+        &mut Vec::new(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, 2);
+
+    let mut out = Vec::new();
+    commands::run_due(
+        &s,
+        &when,
+        &|_| -> CliResult<LlmHandle> { Err(CliError::not_configured("no endpoint")) },
+        &mut out,
+    )
+    .await
+    .unwrap();
+    assert!(text(out).contains("2 due. No LLM endpoint is configured"));
+    assert!(s.all_reports().unwrap().is_empty());
 }

@@ -18,9 +18,9 @@ fn run(dir: &Path, args: &[&str]) -> Output {
     run_on(dir, "2026-11-16", args)
 }
 
-fn run_on(dir: &Path, today: &str, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_fortnight-cli"))
-        .arg("--data-dir")
+fn command(dir: &Path, today: &str, args: &[&str]) -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_fortnight-cli"));
+    c.arg("--data-dir")
         .arg(dir)
         .args(["--today", today])
         .args(args)
@@ -28,8 +28,15 @@ fn run_on(dir: &Path, today: &str, args: &[&str]) -> Output {
         .env_remove("FORTNIGHT_LLM_BASE_URL")
         .env_remove("FORTNIGHT_LLM_MODEL")
         .env_remove("FORTNIGHT_LLM_PROTOCOL")
+        .env_remove("FORTNIGHT_LLM_KEYLESS")
         .env_remove("FORTNIGHT_LLM_API_KEY")
-        .stdin(Stdio::null())
+        .env_remove("FORTNIGHT_DECISION_API_KEY")
+        .stdin(Stdio::null());
+    c
+}
+
+fn run_on(dir: &Path, today: &str, args: &[&str]) -> Output {
+    command(dir, today, args)
         .output()
         .expect("run fortnight-cli")
 }
@@ -82,7 +89,9 @@ fn facts_work_without_an_llm_and_llm_commands_exit_2_when_unconfigured() {
     assert!(facts.status.success(), "{}", stderr(&facts));
     assert!(stdout(&facts).contains("something"));
 
-    let plan = run(&dir, &["plan"]);
+    // Wednesday: the task is on today's list, so there is something to
+    // recommend and the model is needed.
+    let plan = run_on(&dir, "2026-11-18", &["plan"]);
     assert_eq!(plan.status.code(), Some(2));
     assert!(stderr(&plan).contains("no LLM endpoint is configured"));
     assert!(stdout(&plan).is_empty());
@@ -99,5 +108,60 @@ fn facts_work_without_an_llm_and_llm_commands_exit_2_when_unconfigured() {
     assert!(exported.status.success(), "{}", stderr(&exported));
     serde_json::from_str::<serde_json::Value>(&stdout(&exported)).expect("json");
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn only_add_creates_the_data_folder() {
+    let dir = temp_dir("missing");
+    for args in [
+        &["list"][..],
+        &["export"],
+        &["done", "1"],
+        &["log", "x"],
+        &["summary", "--facts"],
+        &["run-due"],
+    ] {
+        let o = run(&dir, args);
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {}", stderr(&o));
+        assert!(
+            stderr(&o).contains("no Fortnight data in"),
+            "{}",
+            stderr(&o)
+        );
+        assert!(stdout(&o).is_empty());
+        assert!(!dir.exists(), "{args:?} created the folder");
+    }
+    assert!(run(&dir, &["add", "first"]).status.success());
+    assert!(run(&dir, &["list"]).status.success());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_round_one_database_opens() {
+    let dir = temp_dir("round1");
+    std::fs::create_dir_all(&dir).unwrap();
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../fortnight-core/tests/fixtures/round1.db");
+    std::fs::copy(fixture, dir.join("fortnight.db")).unwrap();
+    let o = run(&dir, &["list", "--all"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_ne!(stdout(&o), "No tasks.\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_closed_pipe_is_a_quiet_success() {
+    let dir = temp_dir("pipe");
+    assert!(run(&dir, &["add", "something"]).status.success());
+    // A pipe whose reading end is already closed: the first write fails.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let o = command(&dir, "2026-11-16", &["export"])
+        .stdout(writer)
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(stderr(&o).is_empty(), "{}", stderr(&o));
     let _ = std::fs::remove_dir_all(&dir);
 }

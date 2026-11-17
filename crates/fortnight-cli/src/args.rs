@@ -42,9 +42,10 @@ pub enum Command {
         #[arg(long)]
         undo: bool,
     },
-    /// Add a log line, optionally attached to a task.
+    /// Add a note for today (the Today tab's Notes), or with --task a log
+    /// line on that task.
     Log {
-        /// Attach the line to this task.
+        /// Log the line on this task instead.
         #[arg(long, value_name = "ID")]
         task: Option<TaskId>,
         #[arg(required = true, num_args = 1.., allow_hyphen_values = true, value_name = "WORDS")]
@@ -53,8 +54,8 @@ pub enum Command {
     /// Write the weekly summary (default: the latest week whose summary is
     /// due).
     Summary(ReportArgs),
-    /// Write advice for the week ahead (default: this week).
-    Plan(ReportArgs),
+    /// Recommend the tasks to do first today.
+    Plan(PlanArgs),
     /// Generate whatever reports are due, then exit.
     RunDue(LlmArgs),
     /// Export all tasks, history and reports.
@@ -66,7 +67,9 @@ pub struct ListArgs {
     /// Include done and dropped tasks.
     #[arg(long)]
     pub all: bool,
-    /// Only overdue tasks and tasks for today.
+    /// Only the Today list (tasks planned for today or carried over from
+    /// earlier days) and overdue tasks. With --all, also today's closed
+    /// tasks.
     #[arg(long)]
     pub today: bool,
     /// Only overdue tasks and tasks for this week.
@@ -87,6 +90,16 @@ pub struct ReportArgs {
     pub llm: LlmArgs,
 }
 
+#[derive(Debug, Args)]
+pub struct PlanArgs {
+    /// Print the deterministic facts as Markdown instead; never calls the
+    /// LLM.
+    #[arg(long)]
+    pub facts: bool,
+    #[command(flatten)]
+    pub llm: LlmArgs,
+}
+
 /// Flags for commands that call the LLM; they win over the environment and
 /// the saved settings.
 #[derive(Debug, Args, Default, Clone)]
@@ -98,6 +111,10 @@ pub struct LlmArgs {
     pub base_url: Option<String>,
     #[arg(long)]
     pub model: Option<String>,
+    /// The endpoint needs no API key: send none. Overriding the base URL
+    /// otherwise assumes it needs one.
+    #[arg(long)]
+    pub keyless: bool,
     /// Read the key-file password from one line of standard input instead
     /// of prompting.
     #[arg(long)]
@@ -114,8 +131,13 @@ pub struct ExportArgs {
     pub out: Option<PathBuf>,
 }
 
-fn parse_protocol(s: &str) -> Result<Protocol, String> {
-    Protocol::parse(s).ok_or_else(|| format!("unknown protocol '{s}'. Use openai or anthropic."))
+/// A chat protocol for the main endpoint: `openai` or `anthropic`. The
+/// decision protocol only answers recommendations, so it is refused here.
+pub fn parse_protocol(s: &str) -> Result<Protocol, String> {
+    match Protocol::parse(s) {
+        Some(p @ (Protocol::OpenAi | Protocol::Anthropic)) => Ok(p),
+        _ => Err(format!("unknown protocol '{s}'. Use openai or anthropic.")),
+    }
 }
 
 fn parse_format(s: &str) -> Result<ExportFormat, String> {
@@ -168,6 +190,7 @@ mod tests {
             "--model",
             "m",
             "--password-stdin",
+            "--keyless",
         ]);
         match cli.command {
             Command::Summary(a) => {
@@ -175,6 +198,7 @@ mod tests {
                 assert_eq!(a.llm.protocol, Some(Protocol::Anthropic));
                 assert_eq!(a.llm.model.as_deref(), Some("m"));
                 assert!(a.llm.password_stdin);
+                assert!(a.llm.keyless);
                 assert!(!a.facts);
             }
             c => panic!("{c:?}"),
@@ -185,6 +209,10 @@ mod tests {
     fn bad_values_are_rejected() {
         assert!(Cli::try_parse_from(["f", "export", "--format", "xml"]).is_err());
         assert!(Cli::try_parse_from(["f", "plan", "--protocol", "grpc"]).is_err());
+        assert!(Cli::try_parse_from(["f", "summary", "--protocol", "decision"]).is_err());
+        assert!(Cli::try_parse_from(["f", "plan", "--protocol", "ollama_decision"]).is_err());
+        // Recommendations are about today: `plan` has no --week.
+        assert!(Cli::try_parse_from(["f", "plan", "--week", "last"]).is_err());
         assert!(Cli::try_parse_from(["f", "done"]).is_err());
         assert!(Cli::try_parse_from(["f", "add"]).is_err());
     }

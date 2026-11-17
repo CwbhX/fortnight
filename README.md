@@ -156,6 +156,7 @@ Fortnight sends each key only to its configured endpoint. It refuses to send it 
 | `FORTNIGHT_LLM_PROTOCOL` | `openai` or `anthropic`. |
 | `FORTNIGHT_LLM_BASE_URL` | The endpoint, such as `http://localhost:11434/v1`. |
 | `FORTNIGHT_LLM_MODEL` | The model name. |
+| `FORTNIGHT_LLM_KEYLESS` | `1` marks the endpoint as needing no API key. |
 | `FORTNIGHT_LLM_API_KEY` | A key for this process only. Fortnight never writes it to disk. |
 | `FORTNIGHT_DECISION_API_KEY` | The same, for the Recommendations model. |
 
@@ -165,25 +166,25 @@ The app also reads these for development: `FORTNIGHT_PAGE=today|week|month|setti
 
 ## Command line
 
-`fortnight-cli` works on the same data folder without a window. `--data-dir <path>` can go anywhere on the line.
+`fortnight-cli` works on the same data folder without a window. `--data-dir <path>` can go anywhere on the line. Only `add` creates a data folder; the other commands fail if there is no database there.
 
 ```
 fortnight-cli add <words...>                    # quick-add syntax: fri, nov 20, +3d, #project, ~2h, !
-fortnight-cli list [--all] [--today] [--week]   # open tasks; --all adds done and dropped ones
+fortnight-cli list [--all] [--today] [--week]   # open tasks; --today is the Today list plus overdue; --all adds done and dropped ones
 fortnight-cli done <id>... [--undo]             # mark tasks done, or reopen them
-fortnight-cli log [--task <id>] <words...>      # add a log line, on a task or on its own
+fortnight-cli log [--task <id>] <words...>      # add a note for today (the Today tab's Notes), or a log line on a task
 fortnight-cli summary [--week this|last|YYYY-MM-DD] [--facts]   # the weekly summary, streamed
-fortnight-cli plan [--week this|last|YYYY-MM-DD] [--facts]      # recommended tasks
+fortnight-cli plan [--facts]                    # recommended tasks for today
 fortnight-cli run-due                           # generate whatever is due, then exit
 fortnight-cli export [--format md|json] [--out <path>]           # everything, to stdout or a file
 ```
 
-- `summary` covers the latest week whose summary is due, and `plan` covers this week, unless you pass `--week`.
-- `--facts` prints the facts and never calls the LLM.
-- `summary`, `plan` and `run-due` take `--protocol openai|anthropic`, `--base-url`, `--model` and `--password-stdin`.
-- For the key, the CLI uses `FORTNIGHT_LLM_API_KEY` if it is set. Otherwise, if a key file exists, it reads the password from `--password-stdin` or asks for it. `plan` and `run-due` use the saved Recommendations model, with `FORTNIGHT_DECISION_API_KEY` or `llm-key-decision` for its key.
+- `summary` covers the latest week whose summary is due unless you pass `--week`.
+- `--facts` prints the facts and never calls the LLM. When there is nothing to summarise or recommend, the LLM isn't called and nothing is stored.
+- `summary`, `plan` and `run-due` take `--protocol openai|anthropic`, `--base-url`, `--model`, `--keyless` and `--password-stdin`. A different base URL is assumed to need a key unless you also pass `--keyless`.
+- For the key, the CLI uses `FORTNIGHT_LLM_API_KEY` if it is set. Otherwise, if a key file exists and the endpoint isn't local or keyless, it reads the password from `--password-stdin` or asks for it. `plan`, and `run-due` when recommendations are due, use the saved Recommendations model, with `FORTNIGHT_DECISION_API_KEY` or `llm-key-decision` for its key.
 - The CLI stores each report it generates, so the app shows it too.
-- Exit code 0 means success. 1 means a report failed, a task wasn't found, or a file couldn't be read or written. 2 means bad arguments, or no endpoint configured for `summary` or `plan`. `run-due` with no endpoint generates nothing and exits 0.
+- Exit code 0 means success. 1 means a report failed, a task wasn't found, the data folder has no database, the endpoint couldn't be used, or a file couldn't be read or written. 2 means bad arguments, or no endpoint configured for `summary` or `plan`. `run-due` with no endpoint generates nothing and exits 0.
 
 ## Development
 
@@ -195,6 +196,6 @@ cargo test
 
 ## Not included
 
-- Registering with the OS scheduler, such as launchd, systemd or Task Scheduler. It would be the only thing Fortnight writes outside its folder, and a scheduled job can't type the password for an encrypted key. You can run `fortnight-cli run-due` from your own scheduler against an endpoint that needs no key. Otherwise reports are made the next time you open and unlock the app.
+- Registering with the OS scheduler, such as launchd, systemd or Task Scheduler. It would be the only thing Fortnight writes outside its folder, and a scheduled job can't type the password for an encrypted key. You can run `fortnight-cli run-due` from your own scheduler against an endpoint that needs no key, or with `FORTNIGHT_LLM_API_KEY` and `FORTNIGHT_DECISION_API_KEY` set. A Recommendations model with a saved key needs the password only when recommendations are due. Otherwise reports are made the next time you open and unlock the app.
 - Code signing. A build you make yourself isn't flagged, but a downloaded archive shows a one-time Gatekeeper or SmartScreen warning on each machine.
 - Notifications. Fortnight doesn't send any.
