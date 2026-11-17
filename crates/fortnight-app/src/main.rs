@@ -24,6 +24,7 @@ mod shell {
     pub(crate) mod keys;
     pub(crate) mod recommend;
     pub(crate) mod reports;
+    pub(crate) mod settings_panel;
     pub(crate) mod shortcuts;
     pub(crate) mod suggest;
 }
@@ -40,11 +41,11 @@ use fortnight_app::views::task_form;
 use fortnight_app::views::week::{self, WeekData, WeekView};
 use fortnight_core::datadir::{self, DataLock};
 use fortnight_core::domain::{
-    Event, Priority, Protocol, Report, ReportKey, ReportKind, Settings, Task as CoreTask, TaskId,
-    TaskStatus, WeekRef,
+    Event, Priority, Report, ReportKey, ReportKind, Settings, Task as CoreTask, TaskId, TaskStatus,
+    WeekRef,
 };
-use fortnight_core::llm::{ChatEvent, ChatRequest, ChatResponse, LlmError};
-use fortnight_core::ollama::{self, ModelKind, OllamaModel};
+use fortnight_core::llm::{ChatEvent, ChatResponse, LlmError};
+use fortnight_core::ollama::OllamaModel;
 use fortnight_core::report;
 use fortnight_core::sqlite::SqliteStore;
 use fortnight_core::store::Store;
@@ -64,6 +65,7 @@ use shell::edits::UndoStack;
 use shell::keys::{Keys, SavedKey};
 use shell::recommend::LaterDays;
 use shell::reports::Reports;
+use shell::settings_panel::detect_ollama;
 use shell::shortcuts::{Shortcut, shortcut_for};
 use shell::suggest::Suggestions;
 use std::collections::HashMap;
@@ -735,14 +737,7 @@ impl Ready {
                 self.local = true;
                 self.stream_ended(key, id)
             }
-            Message::Tested(result) => {
-                self.testing = false;
-                if !self.listing_models {
-                    self.key_requests.clear();
-                }
-                self.test_result = Some(result);
-                Task::none()
-            }
+            Message::Tested(result) => self.tested(result),
             Message::SuggestPriority(seq) => {
                 self.local = true;
                 let Some(task) = self.suggest_priority(seq) else {
@@ -756,18 +751,8 @@ impl Ready {
                 self.priority_suggested(seq, priority);
                 Task::none()
             }
-            Message::OllamaDetected(result) => {
-                self.ollama = Some(result);
-                Task::none()
-            }
-            Message::Models(result) => {
-                self.listing_models = false;
-                if !self.testing {
-                    self.key_requests.clear();
-                }
-                self.models = Some(result);
-                Task::none()
-            }
+            Message::OllamaDetected(result) => self.ollama_detected(result),
+            Message::Models(result) => self.models_listed(result),
             Message::Key(shortcut) => self.shortcut(shortcut),
             Message::DismissNotice => {
                 self.local = true;
@@ -863,19 +848,6 @@ impl Ready {
         }
     }
 
-    /// Opens Settings and checks for a local Ollama.
-    fn open_settings(&mut self) -> Task<Message> {
-        self.settings_open = true;
-        detect_ollama()
-    }
-
-    /// Hides Settings, by any route: typed secrets are wiped
-    /// (`SettingsView::on_hidden`); form edits are kept.
-    fn hide_settings(&mut self) {
-        self.settings_open = false;
-        self.settings_view.on_hidden();
-    }
-
     /// Closes the unlock prompt, by any route, wiping what was typed.
     fn close_unlock(&mut self) {
         self.unlocking = false;
@@ -950,130 +922,6 @@ impl Ready {
             _ => {}
         }
         Task::none()
-    }
-
-    fn settings_action(&mut self, action: settings::Action) -> Task<Message> {
-        match action {
-            settings::Action::None => Task::none(),
-            settings::Action::Close => {
-                self.hide_settings();
-                Task::none()
-            }
-            settings::Action::Save(s) => {
-                let now = Timestamp::now();
-                if report::summary_prompt(&s) != report::summary_prompt(&self.settings)
-                    || s.summary_instructions != self.settings.summary_instructions
-                {
-                    self.reports.note_prompt_change(ReportKind::Summary, now);
-                }
-                if report::plan_prompt(&s) != report::plan_prompt(&self.settings) {
-                    self.reports.note_prompt_change(ReportKind::Plan, now);
-                }
-                match self.store.save_settings(&s) {
-                    Ok(()) => {
-                        theme::set_accent(s.accent);
-                        // A fixed endpoint is tried again at once.
-                        if s.llm != self.settings.llm
-                            || s.decision_llm != self.settings.decision_llm
-                        {
-                            self.reset_backoff();
-                        }
-                        self.settings = s;
-                        self.invalidate();
-                        self.hide_settings();
-                    }
-                    Err(e) => self.error = Some(e.to_string()),
-                }
-                self.catch_up()
-            }
-            settings::Action::Test(llm, which) => match self.settings_client(&llm, which) {
-                Ok((client, _)) => {
-                    self.testing = true;
-                    self.test_result = None;
-                    let (task, handle) = Task::perform(
-                        async move {
-                            client
-                                .chat(ChatRequest::test())
-                                .await
-                                .map(|r| format!("{} replied: {}", r.model, r.text.trim()))
-                                .map_err(|e| e.to_string())
-                        },
-                        Message::Tested,
-                    )
-                    .abortable();
-                    self.key_requests.push(handle);
-                    task
-                }
-                Err(e) => {
-                    self.test_result = Some(Err(e));
-                    Task::none()
-                }
-            },
-            // Ollama (keyless, or a decision model): ask it directly, which
-            // also says what each model can do.
-            // A keyless server that isn't Ollama (LM Studio) answers the
-            // endpoint's own model list instead.
-            settings::Action::ListModels(llm, which)
-                if llm.keyless || llm.protocol == Protocol::OllamaDecision =>
-            {
-                self.listing_models = true;
-                self.models = None;
-                let fallback = (llm.protocol != Protocol::OllamaDecision)
-                    .then(|| self.settings_client(&llm, which).ok())
-                    .flatten()
-                    .map(|(client, _)| client);
-                Task::perform(
-                    async move {
-                        match ollama::detect(&llm.base_url, Duration::from_secs(10)).await {
-                            Ok(models) => Ok(models),
-                            Err(e) => match fallback {
-                                Some(client) => client
-                                    .list_models()
-                                    .await
-                                    .map(chat_models)
-                                    .map_err(|e| e.to_string()),
-                                None => Err(e.to_string()),
-                            },
-                        }
-                    },
-                    Message::Models,
-                )
-            }
-            settings::Action::ListModels(llm, which) => match self.settings_client(&llm, which) {
-                Ok((client, _)) => {
-                    self.listing_models = true;
-                    self.models = None;
-                    let (task, handle) = Task::perform(
-                        async move {
-                            client
-                                .list_models()
-                                .await
-                                .map(chat_models)
-                                .map_err(|e| e.to_string())
-                        },
-                        Message::Models,
-                    )
-                    .abortable();
-                    self.key_requests.push(handle);
-                    task
-                }
-                Err(e) => {
-                    self.models = Some(Err(e));
-                    Task::none()
-                }
-            },
-            settings::Action::SetKey {
-                api_key,
-                password,
-                which,
-            } => self.set_key(api_key, password, which),
-            settings::Action::RemoveKey(which) => self.remove_key(which),
-            settings::Action::ShowUnlock => {
-                self.unlocking = true;
-                UnlockView::focus().map(Message::Unlock)
-            }
-            settings::Action::FocusPassword => operation::focus(settings::PASSWORD_INPUT_ID),
-        }
     }
 
     // ---- view ----
@@ -1193,16 +1041,6 @@ struct TaskDialog {
     task: Option<TaskId>,
 }
 
-/// Model ids from an endpoint's model list, as chat models.
-fn chat_models(ids: Vec<String>) -> Vec<OllamaModel> {
-    ids.into_iter()
-        .map(|name| OllamaModel {
-            name,
-            kind: ModelKind::Chat,
-        })
-        .collect()
-}
-
 /// Values worked out from the tasks, events, reports and settings, kept
 /// until `Ready::invalidate`.
 #[derive(Default)]
@@ -1224,18 +1062,6 @@ fn follow_today(selected: Date, last_today: Date, today: Date) -> Date {
     } else {
         selected
     }
-}
-
-/// Checks for Ollama on this machine (`Message::OllamaDetected`).
-fn detect_ollama() -> Task<Message> {
-    Task::perform(
-        async {
-            ollama::detect(&ollama::local_base_url(), Duration::from_secs(2))
-                .await
-                .map_err(|e| e.to_string())
-        },
-        Message::OllamaDetected,
-    )
 }
 
 #[cfg(test)]

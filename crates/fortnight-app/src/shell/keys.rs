@@ -140,7 +140,7 @@ impl Ready {
     }
 
     /// The client a Settings Test or Load models button asks for.
-    pub(crate) fn settings_client(
+    pub(super) fn settings_client(
         &self,
         llm: &LlmSettings,
         which: settings::Which,
