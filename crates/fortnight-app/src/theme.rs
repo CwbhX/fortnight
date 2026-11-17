@@ -64,7 +64,8 @@
 //! - [`day_column`]: a column of the Week tab; `is_today` adds the accent ring.
 //! - [`calendar_cell`]: a Month grid cell, by [`Cell`] (today, weekend,
 //!   outside the month).
-//! - [`load_bar`]: a `progress_bar` style; accent, or red when over capacity.
+//! - [`load_bar`] + [`load_bar_done`]: `progress_bar` styles for the Week
+//!   load bar: capacity track, gray task share (red when over), accent done.
 //! - [`backdrop`] + [`overlay_panel`]: the dimmed layer and the panel of an
 //!   overlay (Settings).
 //! - [`priority_color`]: the colour of a priority marker.
@@ -544,12 +545,28 @@ pub fn calendar_cell(cell: Cell) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
-/// A load bar (`progress_bar(0.0..=1.0, load).style(theme::load_bar(over))`):
-/// accent fill, red when the day is over capacity.
+/// A load bar's track (`progress_bar(0.0..=1.0, share).style(theme::load_bar(over))`):
+/// the gray track is the day's capacity, the fill the estimated tasks'
+/// share of it in a gray that stands out from the track (lighter in dark
+/// mode), red when the day is over capacity. [`load_bar_done`] goes on top.
 pub fn load_bar(over: bool) -> impl Fn(&Theme) -> progress_bar::Style {
     move |theme| progress_bar::Style {
-        background: Background::Color(field_fill(theme)),
-        bar: Background::Color(if over { danger_color(theme) } else { ACCENT }),
+        background: Background::Color(tint(theme, 0.10)),
+        bar: Background::Color(if over {
+            danger_color(theme)
+        } else {
+            tint(theme, 0.30)
+        }),
+        border: border::rounded(999),
+    }
+}
+
+/// The done part of a load bar, stacked over [`load_bar`]: accent on a
+/// clear track.
+pub fn load_bar_done(_theme: &Theme) -> progress_bar::Style {
+    progress_bar::Style {
+        background: Background::Color(Color::TRANSPARENT),
+        bar: Background::Color(ACCENT),
         border: border::rounded(999),
     }
 }

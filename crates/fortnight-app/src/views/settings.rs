@@ -2231,7 +2231,7 @@ mod tests {
     #[test]
     fn protocol_and_focus_hours_round_trip_through_save() {
         let mut v = loaded(KeyState::NoKey);
-        assert_eq!(v.form.focus_hours, "6");
+        assert_eq!(v.form.focus_hours, "8");
         v.update(Message::Provider(Which::Main, Provider::Anthropic));
         v.update(Message::Model(Which::Main, "claude-x".into()));
         v.update(Message::FocusHours(" 5.5 ".into()));
@@ -2262,9 +2262,9 @@ mod tests {
         v.load(data(round1.clone(), KeyState::NoKey));
         // On Ollama's port, so it shows as Ollama.
         assert_eq!(v.form.main.provider, Provider::Ollama);
-        assert_eq!(v.form.focus_hours, "6");
+        assert_eq!(v.form.focus_hours, "8");
         assert!(!v.is_dirty());
-        v.update(Message::FocusHours("6.5".into()));
+        v.update(Message::FocusHours("8.5".into()));
         let Action::Save(s) = v.update(Message::Save) else {
             panic!("expected Save");
         };

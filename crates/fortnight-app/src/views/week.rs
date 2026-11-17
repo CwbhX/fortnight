@@ -2,8 +2,8 @@
 //!
 //! One column per working day, in week order, all the same width and
 //! height. Each column has a heading (weekday and date; click to open the
-//! day in the Today tab), a load line once an open task that day has an
-//! estimate ("3.5h of 6h", red when over capacity, "+2 unestimated"), then
+//! day in the Today tab), a load line once a task that day has an estimate
+//! ("3.5h of 8h · 1h done", red when over capacity, "+2 unestimated"), then
 //! the day's tasks: open ones first, done ones dimmed after them. A task is
 //! placed by `Task::day()` (planned day, else deadline). Non-working days
 //! share one extra column ("Sat–Sun"), shown only when one of them has
@@ -500,42 +500,59 @@ fn overdue_before_week(data: &WeekData) -> usize {
         .count()
 }
 
-/// The load line under a column heading.
+/// The load line under a column heading. The bar's track is the day's
+/// capacity; on it, the estimated tasks (open and done) take a lighter
+/// share, and the done part of that share is the accent.
 #[derive(Debug, Clone, PartialEq)]
 struct LoadLine {
-    /// Load over capacity, 0–1, for the bar; `None` without capacity (a
-    /// non-working day), where only the hours are shown.
+    /// Done and open estimates over capacity, 0–1, for the bar; `None`
+    /// without capacity (a non-working day), where only the hours are shown.
     fraction: Option<f32>,
+    /// Done estimates over capacity, 0–1 (at most `fraction`).
+    done_fraction: Option<f32>,
     over: bool,
-    /// "3.5h of 6h", or "2h" without capacity.
+    /// "3.5h of 8h", or "2h" without capacity.
     label: String,
+    /// "1h done", when some done tasks have estimates.
+    done: Option<String>,
     /// "+2 unestimated", when some open tasks have no estimate.
     unestimated: Option<String>,
 }
 
-/// The load line for these days' loads added together; `None` until an
-/// open task on them has an estimate.
-fn load_line(loads: &[&DayLoad]) -> Option<LoadLine> {
-    let load: u32 = loads.iter().map(|l| l.load_minutes).sum();
+/// The load line for these days' loads added together, plus `done`, the
+/// estimates of the days' done tasks (`DayLoad` counts only open ones);
+/// `None` until a task on them has an estimate.
+fn load_line(loads: &[&DayLoad], done: u32) -> Option<LoadLine> {
+    let open: u32 = loads.iter().map(|l| l.load_minutes).sum();
     let capacity: u32 = loads.iter().map(|l| l.capacity_minutes).sum();
     let unestimated: usize = loads.iter().map(|l| l.unestimated).sum();
-    if load == 0 {
+    let total = open.saturating_add(done);
+    if total == 0 {
         return None;
     }
-    let (fraction, label) = if capacity == 0 {
-        (None, duration(load))
+    let share = |m: u32| (capacity > 0).then(|| (m as f32 / capacity as f32).min(1.0));
+    let label = if capacity == 0 {
+        duration(total)
     } else {
-        (
-            Some((load as f32 / capacity as f32).min(1.0)),
-            format!("{} of {}", duration(load), duration(capacity)),
-        )
+        format!("{} of {}", duration(total), duration(capacity))
     };
     Some(LoadLine {
-        fraction,
-        over: capacity > 0 && load > capacity,
+        fraction: share(total),
+        done_fraction: share(done),
+        over: capacity > 0 && total > capacity,
         label,
+        done: (done > 0).then(|| format!("{} done", duration(done))),
         unestimated: (unestimated > 0).then(|| format!("+{unestimated} unestimated")),
     })
+}
+
+/// Estimated minutes of the done tasks on `days`.
+fn done_minutes(tasks: &[Task], days: &[Date]) -> u32 {
+    days.iter()
+        .flat_map(|d| tasks_on(tasks, *d))
+        .filter(|t| t.status == TaskStatus::Done)
+        .filter_map(|t| t.estimate_minutes)
+        .sum()
 }
 
 /// Minutes as a short duration: 30 → "30m", 90 → "1.5h", 120 → "2h".
@@ -661,7 +678,7 @@ fn day_column<'a>(
         .iter()
         .filter(|l| spec.days.contains(&l.date))
         .collect();
-    if let Some(line) = load_line(&loads) {
+    if let Some(line) = load_line(&loads, done_minutes(&data.tasks, &spec.days)) {
         col = col.push(load_view(line));
     }
 
@@ -730,11 +747,15 @@ fn day_column<'a>(
 fn load_view<'a>(line: LoadLine) -> Element<'a, Message> {
     let mut col = Column::new().spacing(4);
     if let Some(f) = line.fraction {
-        col = col.push(
+        // The track with the whole share, then the done part on top.
+        col = col.push(stack![
             progress_bar(0.0..=1.0, f)
-                .girth(4)
+                .girth(6)
                 .style(theme::load_bar(line.over)),
-        );
+            progress_bar(0.0..=1.0, line.done_fraction.unwrap_or(0.0))
+                .girth(6)
+                .style(theme::load_bar_done),
+        ]);
     }
     let label_style: fn(&Theme) -> text::Style = if line.over {
         theme::danger
@@ -748,6 +769,14 @@ fn load_view<'a>(line: LoadLine) -> Element<'a, Message> {
             .wrapping(Wrapping::None)
     ]
     .spacing(6);
+    if let Some(d) = line.done {
+        labels = labels.push(
+            text(format!("· {d}"))
+                .size(theme::TEXT_SMALL)
+                .style(theme::muted)
+                .wrapping(Wrapping::None),
+        );
+    }
     if let Some(u) = line.unestimated {
         labels = labels.push(
             text(u)
@@ -1097,31 +1126,66 @@ mod tests {
     #[test]
     fn load_line_from_day_loads() {
         let d = date(2026, 11, 18);
-        assert_eq!(load_line(&[&load(d, 0, 360, 2)]), None);
+        assert_eq!(load_line(&[&load(d, 0, 480, 2)], 0), None);
 
-        let line = load_line(&[&load(d, 210, 360, 0)]).unwrap();
-        assert_eq!(line.label, "3.5h of 6h");
+        let line = load_line(&[&load(d, 210, 480, 0)], 0).unwrap();
+        assert_eq!(line.label, "3.5h of 8h");
         assert!(!line.over);
-        assert_eq!(line.fraction, Some(210.0 / 360.0));
+        assert_eq!(line.fraction, Some(210.0 / 480.0));
+        assert_eq!(line.done_fraction, Some(0.0));
+        assert_eq!(line.done, None);
         assert_eq!(line.unestimated, None);
 
-        let line = load_line(&[&load(d, 450, 360, 2)]).unwrap();
-        assert_eq!(line.label, "7.5h of 6h");
+        let line = load_line(&[&load(d, 540, 480, 2)], 0).unwrap();
+        assert_eq!(line.label, "9h of 8h");
         assert!(line.over);
         assert_eq!(line.fraction, Some(1.0));
         assert_eq!(line.unestimated.as_deref(), Some("+2 unestimated"));
 
         // Exactly at capacity is not over.
-        assert!(!load_line(&[&load(d, 360, 360, 0)]).unwrap().over);
+        assert!(!load_line(&[&load(d, 480, 480, 0)], 0).unwrap().over);
+
+        // Done tasks stay in the share, and their part is marked done.
+        let line = load_line(&[&load(d, 120, 480, 0)], 60).unwrap();
+        assert_eq!(line.label, "3h of 8h");
+        assert_eq!(line.fraction, Some(180.0 / 480.0));
+        assert_eq!(line.done_fraction, Some(60.0 / 480.0));
+        assert_eq!(line.done.as_deref(), Some("1h done"));
+        // All done: the line stays.
+        let line = load_line(&[&load(d, 0, 480, 0)], 90).unwrap();
+        assert_eq!(line.fraction, Some(90.0 / 480.0));
+        assert_eq!(line.done_fraction, Some(90.0 / 480.0));
+        // Done counts towards over capacity too.
+        assert!(load_line(&[&load(d, 420, 480, 0)], 120).unwrap().over);
 
         // Non-working days: no capacity, no bar, never "over".
         let sat = load(date(2026, 11, 21), 60, 0, 0);
         let sun = load(date(2026, 11, 22), 30, 0, 1);
-        let line = load_line(&[&sat, &sun]).unwrap();
+        let line = load_line(&[&sat, &sun], 0).unwrap();
         assert_eq!(line.label, "1.5h");
         assert_eq!(line.fraction, None);
         assert!(!line.over);
         assert_eq!(line.unestimated.as_deref(), Some("+1 unestimated"));
+    }
+
+    #[test]
+    fn done_minutes_count_done_estimates_on_the_days() {
+        let mon = date(2026, 11, 16);
+        let tue = date(2026, 11, 17);
+        let est = |id, day, status, m| {
+            let mut t = task(id, Some(day), status);
+            t.estimate_minutes = m;
+            t
+        };
+        let tasks = vec![
+            est(1, mon, TaskStatus::Done, Some(60)),
+            est(2, mon, TaskStatus::Done, None),
+            est(3, mon, TaskStatus::Todo, Some(120)),
+            est(4, mon, TaskStatus::Dropped, Some(30)),
+            est(5, tue, TaskStatus::Done, Some(45)),
+        ];
+        assert_eq!(done_minutes(&tasks, &[mon]), 60);
+        assert_eq!(done_minutes(&tasks, &[mon, tue]), 105);
     }
 
     #[test]

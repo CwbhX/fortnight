@@ -568,8 +568,8 @@ impl Default for Settings {
     }
 }
 
-/// Six focus hours per working day.
-pub const DEFAULT_FOCUS_MINUTES: u32 = 6 * 60;
+/// Eight focus hours per working day.
+pub const DEFAULT_FOCUS_MINUTES: u32 = 8 * 60;
 
 #[cfg(test)]
 mod tests {

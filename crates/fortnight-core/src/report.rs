@@ -2516,8 +2516,8 @@ mod tests {
                 undated: 2,
                 due_estimate_minutes: 420,
                 due_estimate_hours: 7.0,
-                available_minutes: 1080,
-                available_hours: 18.0,
+                available_minutes: 1440,
+                available_hours: 24.0,
                 due_without_estimate: 1,
                 without_estimate: 6,
                 overloaded: false,
@@ -2573,9 +2573,9 @@ mod tests {
         assert_eq!(
             days,
             vec![
-                ("Wednesday", 360, 120, 0, false),
-                ("Thursday", 360, 240, 0, false),
-                ("Friday", 360, 90, 0, false),
+                ("Wednesday", 480, 120, 0, false),
+                ("Thursday", 480, 240, 0, false),
+                ("Friday", 480, 90, 0, false),
             ]
         );
         assert_eq!(f.remaining_working_days[2].load_hours, 1.5);

@@ -14,8 +14,8 @@ Plan my week Monday 2026-11-16 to Sunday 2026-11-22. Today is Wednesday 2026-11-
     {
       "date": "2026-11-18",
       "weekday": "Wednesday",
-      "capacity_minutes": 360,
-      "capacity_hours": 6.0,
+      "capacity_minutes": 480,
+      "capacity_hours": 8.0,
       "load_minutes": 120,
       "load_hours": 2.0,
       "unestimated": 0,
@@ -24,8 +24,8 @@ Plan my week Monday 2026-11-16 to Sunday 2026-11-22. Today is Wednesday 2026-11-
     {
       "date": "2026-11-19",
       "weekday": "Thursday",
-      "capacity_minutes": 360,
-      "capacity_hours": 6.0,
+      "capacity_minutes": 480,
+      "capacity_hours": 8.0,
       "load_minutes": 240,
       "load_hours": 4.0,
       "unestimated": 0,
@@ -34,8 +34,8 @@ Plan my week Monday 2026-11-16 to Sunday 2026-11-22. Today is Wednesday 2026-11-
     {
       "date": "2026-11-20",
       "weekday": "Friday",
-      "capacity_minutes": 360,
-      "capacity_hours": 6.0,
+      "capacity_minutes": 480,
+      "capacity_hours": 8.0,
       "load_minutes": 90,
       "load_hours": 1.5,
       "unestimated": 0,
@@ -189,8 +189,8 @@ Plan my week Monday 2026-11-16 to Sunday 2026-11-22. Today is Wednesday 2026-11-
     "undated": 2,
     "due_estimate_minutes": 420,
     "due_estimate_hours": 7.0,
-    "available_minutes": 1080,
-    "available_hours": 18.0,
+    "available_minutes": 1440,
+    "available_hours": 24.0,
     "due_without_estimate": 1,
     "without_estimate": 6,
     "overloaded": false
