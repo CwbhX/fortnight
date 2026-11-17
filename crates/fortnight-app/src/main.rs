@@ -86,6 +86,8 @@ enum Message {
     Settings(settings::Message),
     Unlock(UnlockMessage),
     CloseSettings,
+    /// The new-task dialog (the Week tab's `+`).
+    NewTask(day::Message),
     Tick,
     ThemeMode(iced::theme::Mode),
     /// A piece of a streamed report.
@@ -168,7 +170,8 @@ struct Ready {
     tab: Tab,
     /// The one selected date all three tabs zoom around.
     selected: Date,
-    quick_add: String,
+    /// The new-task dialog, while open: the day it plans the task for.
+    new_task: Option<(Date, day::EditForm)>,
     /// The month the top bar's date calendar shows, while it is open.
     date_picker: Option<Date>,
     settings_open: bool,
@@ -357,7 +360,7 @@ impl Ready {
             tz,
             tab,
             selected: today,
-            quick_add: String::new(),
+            new_task: None,
             date_picker: None,
             settings_open,
             day_view: DayView::new(),
@@ -890,6 +893,7 @@ impl Ready {
                     self.set_status(id, status);
                     Task::none()
                 }
+                week::Action::NewTask(day) => self.open_new_task(day),
                 week::Action::OpenDay(day) => {
                     self.selected = day;
                     self.tab = Tab::Today;
@@ -918,6 +922,7 @@ impl Ready {
                 self.settings_open = false;
                 Task::none()
             }
+            Message::NewTask(m) => self.new_task_message(m),
             Message::Unlock(m) => match self.unlock_view.update(m) {
                 UnlockAction::None => Task::none(),
                 UnlockAction::Skip => {
@@ -1069,27 +1074,46 @@ impl Ready {
                 self.settings_open = !self.settings_open;
                 Task::none()
             }
-            top_bar::Message::QuickAdd(s) => {
-                self.quick_add = s;
-                Task::none()
-            }
-            top_bar::Message::QuickAddSubmit => {
-                let today = self.today();
-                if let Some(new) =
-                    top_bar::quick_add_task(&self.quick_add, self.tab, self.selected, today)
-                {
-                    match self.store.add_task(new) {
-                        Ok(task) => {
-                            self.quick_add.clear();
-                            self.remember(Undo::Added(task.id));
-                        }
-                        Err(e) => self.error = Some(e.to_string()),
-                    }
-                    self.reload_tasks();
-                }
-                Task::none()
-            }
         }
+    }
+
+    /// Opens the new-task dialog for `day` and focuses its title.
+    fn open_new_task(&mut self, day: Date) -> Task<Message> {
+        self.new_task = Some((day, day::EditForm::blank(&self.tasks)));
+        operation::focus(day::DIALOG_TITLE_ID)
+    }
+
+    /// A message from the new-task dialog: a form edit, `Save` (add the
+    /// task and close) or `Close` (cancel).
+    fn new_task_message(&mut self, message: day::Message) -> Task<Message> {
+        let today = self.today();
+        let Some((day, form)) = self.new_task.as_mut() else {
+            return Task::none();
+        };
+        if form.handle(&message, today) {
+            return Task::none();
+        }
+        match message {
+            day::Message::Save => match form.new_task(*day) {
+                Ok(new) => {
+                    self.new_task = None;
+                    self.add_task(new);
+                }
+                Err(e) => form.error = Some(e),
+            },
+            day::Message::Close => self.new_task = None,
+            _ => {}
+        }
+        Task::none()
+    }
+
+    /// Stores a new task, remembers it for undo, and reloads.
+    fn add_task(&mut self, new: fortnight_core::domain::NewTask) {
+        match self.store.add_task(new) {
+            Ok(task) => self.remember(Undo::Added(task.id)),
+            Err(e) => self.error = Some(e.to_string()),
+        }
+        self.reload_tasks();
     }
 
     fn set_status(&mut self, id: TaskId, status: TaskStatus) {
@@ -1130,6 +1154,10 @@ impl Ready {
             },
             day::Action::AddLog { task_id, text } => self.store.add_log(task_id, &text).map(|_| ()),
             day::Action::DeleteLog(id) => self.store.delete_log(id),
+            day::Action::Add(new) => {
+                self.add_task(new);
+                return Task::none();
+            }
         };
         if let Err(e) = result {
             self.error = Some(e.to_string());
@@ -1212,12 +1240,24 @@ impl Ready {
                 _ => Task::none(),
             };
         }
+        if self.new_task.is_some() {
+            if shortcut == Shortcut::Escape {
+                self.new_task = None;
+            }
+            return Task::none();
+        }
         match shortcut {
             Shortcut::Tab(tab) => self.top_bar(top_bar::Message::Tab(tab)),
             Shortcut::Prev => self.top_bar(top_bar::Message::Prev),
             Shortcut::Next => self.top_bar(top_bar::Message::Next),
             Shortcut::Today => self.top_bar(top_bar::Message::Today),
-            Shortcut::FocusQuickAdd => operation::focus(top_bar::QUICK_ADD_ID),
+            // In the Week tab, the new-task dialog for the selected day;
+            // elsewhere the Today tab's add-a-task input.
+            Shortcut::FocusQuickAdd if self.tab == Tab::Week => self.open_new_task(self.selected),
+            Shortcut::FocusQuickAdd => {
+                self.tab = Tab::Today;
+                operation::focus(top_bar::QUICK_ADD_ID)
+            }
             Shortcut::Settings => {
                 self.settings_open = true;
                 Task::none()
@@ -1380,7 +1420,6 @@ impl Ready {
             selected: self.selected,
             today,
             schedule: &self.settings.schedule,
-            quick_add: &self.quick_add,
             lock: match self.key_state() {
                 KeyState::NoKey => None,
                 KeyState::Locked => Some(LockIcon::Locked),
@@ -1425,6 +1464,24 @@ impl Ready {
         }
         let base: Element<'_, Message> = main.height(Fill).into();
 
+        if let Some((day, form)) = &self.new_task {
+            let panel = container(day::new_task_dialog(form, *day, today).map(Message::NewTask))
+                .max_width(640)
+                .style(theme::overlay_panel);
+            return stack![
+                base,
+                opaque(
+                    mouse_area(
+                        container(opaque(panel))
+                            .padding([32, 24])
+                            .center(Fill)
+                            .style(dialog_backdrop)
+                    )
+                    .on_press(Message::NewTask(day::Message::Close))
+                )
+            ]
+            .into();
+        }
         if !self.settings_open {
             return base;
         }
@@ -1446,6 +1503,15 @@ impl Ready {
             )
         ]
         .into()
+    }
+}
+
+/// The new-task dialog's backdrop: darker than Settings' so the page
+/// behind recedes. (iced 0.14 has no backdrop blur.)
+fn dialog_backdrop(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Color::BLACK.scale_alpha(0.55).into()),
+        ..container::Style::default()
     }
 }
 

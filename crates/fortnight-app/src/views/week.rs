@@ -35,7 +35,7 @@ use fortnight_core::report::DayLoad;
 use iced::widget::text::Wrapping;
 use iced::widget::{
     Column, Row, button, checkbox, column, container, mouse_area, pin, progress_bar, row,
-    scrollable, space, stack, text,
+    scrollable, space, stack, text, tooltip,
 };
 use iced::{Center, Color, Element, Fill, Point, Theme, mouse};
 use jiff::civil::{Date, Weekday};
@@ -61,6 +61,8 @@ pub enum Message {
     DropOn(Date, Option<TaskId>),
     /// The mouse button went up: the drag (if any) is over.
     EndDrag,
+    /// A day's `+`: add a task planned for that day.
+    AddTask(Date),
 }
 
 impl Message {
@@ -101,9 +103,11 @@ pub enum Action {
     OpenDay(Date),
     /// Something the embedded report panel asked for.
     Panel(report_panel::Action),
-    /// A card was dragged: make `Date` its due date (if it isn't already
-    /// its day) and set its position to the `f64`.
+    /// A card was dragged: plan it for `Date` (if it isn't already its
+    /// day) and set its position to the `f64`.
     Move(TaskId, Date, f64),
+    /// Open the new-task dialog for this day.
+    NewTask(Date),
 }
 
 /// Everything the tab shows, supplied by `main.rs`. FROZEN contract
@@ -157,6 +161,7 @@ impl WeekView {
                 },
             ),
             Message::OpenDay(day) => Action::OpenDay(day),
+            Message::AddTask(day) => Action::NewTask(day),
             Message::Panel(m) => match self.panel.update(m) {
                 report_panel::Action::None => Action::None,
                 action => Action::Panel(action),
@@ -614,8 +619,14 @@ fn day_column<'a>(
         .unwrap_or(spec.days[0]);
     let heading = button(
         row![
-            text(name).size(theme::TEXT_BODY).style(name_style),
-            text(dates).size(theme::TEXT_SMALL).style(theme::muted),
+            text(name)
+                .size(theme::TEXT_BODY)
+                .style(name_style)
+                .wrapping(Wrapping::None),
+            text(dates)
+                .size(theme::TEXT_SMALL)
+                .style(theme::muted)
+                .wrapping(Wrapping::None),
         ]
         .spacing(6)
         .align_y(Center),
@@ -624,6 +635,18 @@ fn day_column<'a>(
     .width(Fill)
     .style(theme::text_button)
     .on_press(Message::OpenDay(open_day));
+    // `+` in the top right: a new task for the column's (first) day.
+    let add = tooltip(
+        button(theme::icon(theme::Icon::Plus))
+            .padding(2)
+            .style(theme::icon_button)
+            .on_press(Message::AddTask(spec.days[0])),
+        container(text("Add a task").size(theme::TEXT_SMALL))
+            .padding([4, 8])
+            .style(theme::card),
+        tooltip::Position::Bottom,
+    );
+    let heading = row![heading, add].align_y(Center);
 
     let mut col = Column::new().spacing(8).width(Fill).push(heading);
 
@@ -1240,6 +1263,10 @@ mod tests {
         assert_eq!(
             v.update(Message::Toggle(4, false)),
             Action::SetStatus(4, TaskStatus::Todo)
+        );
+        assert_eq!(
+            v.update(Message::AddTask(date(2026, 11, 18))),
+            Action::NewTask(date(2026, 11, 18))
         );
         assert_eq!(
             v.update(Message::OpenDay(date(2026, 11, 17))),

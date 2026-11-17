@@ -15,12 +15,12 @@ use crate::theme::{self, Icon};
 use fortnight_core::domain::{NewTask, Schedule};
 use fortnight_core::parse;
 use fortnight_core::week::{add_months, month_label, week_containing};
-use iced::widget::{button, column, container, mouse_area, row, text, text_input, tooltip};
+use iced::widget::{button, container, mouse_area, row, text, tooltip};
 use iced::{Center, Element, Fill};
 use jiff::ToSpan;
 use jiff::civil::Date;
 
-/// The id of the quick-add input, for `operation::focus`.
+/// The id of the Today tab's add-a-task input, for `operation::focus`.
 pub const QUICK_ADD_ID: &str = "quick-add";
 
 /// The three zoom levels over the same tasks.
@@ -65,8 +65,6 @@ pub enum Message {
     Lock,
     /// The gear.
     Settings,
-    QuickAdd(String),
-    QuickAddSubmit,
 }
 
 /// The lock icon's state; `None` hides it (no key file).
@@ -82,7 +80,6 @@ pub struct Bar<'a> {
     pub selected: Date,
     pub today: Date,
     pub schedule: &'a Schedule,
-    pub quick_add: &'a str,
     pub lock: Option<LockIcon>,
     /// A dot on the Week tab: a report became ready and hasn't been seen.
     pub week_badge: bool,
@@ -255,22 +252,10 @@ pub fn view<'a>(bar: Bar<'a>) -> Element<'a, Message> {
     .spacing(theme::SPACING)
     .align_y(Center);
 
-    let quick_add = text_input("Write Q4 report fri #work ~2h !", bar.quick_add)
-        .id(QUICK_ADD_ID)
-        .on_input(Message::QuickAdd)
-        .on_submit(Message::QuickAddSubmit)
-        .padding([9, 14])
-        .size(theme::TEXT_BODY)
-        .style(theme::input);
-
-    container(
-        column![first, quick_add]
-            .spacing(theme::SPACING)
-            .padding([theme::SPACING, theme::SPACING * 1.5]),
-    )
-    .width(Fill)
-    .style(theme::top_bar)
-    .into()
+    container(first.padding([theme::SPACING, theme::SPACING * 1.5]))
+        .width(Fill)
+        .style(theme::top_bar)
+        .into()
 }
 
 /// The date: plain text that shows a soft fill on hover or while its

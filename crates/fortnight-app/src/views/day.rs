@@ -38,7 +38,7 @@
 
 use std::cmp::Ordering;
 
-use fortnight_core::domain::{EventId, Priority, Task, TaskId, TaskStatus};
+use fortnight_core::domain::{EventId, NewTask, Priority, Task, TaskId, TaskStatus};
 use fortnight_core::parse;
 use fortnight_core::week::add_months;
 use iced::widget::overlay::menu;
@@ -80,6 +80,9 @@ pub enum Message {
     RemoveSubtask(usize),
     EditNewSubtask(String),
     AddSubtask,
+    /// The add-a-task input under the day's tasks.
+    EditQuickAdd(String),
+    SubmitQuickAdd,
     /// The side work input.
     EditDayLog(String),
     AddDayLog,
@@ -115,6 +118,8 @@ pub enum Action {
         text: String,
     },
     DeleteLog(EventId),
+    /// Create a task (the add-a-task input). `main.rs` records it for undo.
+    Add(NewTask),
 }
 
 /// A log line, as the view needs it.
@@ -156,6 +161,8 @@ pub struct DayView {
     editing: Option<EditForm>,
     /// The side work input.
     day_log: String,
+    /// The add-a-task input.
+    quick_add: String,
 }
 
 /// Where a task is shown on the Today tab.
@@ -501,6 +508,86 @@ pub fn open_projects(tasks: &[Task]) -> Vec<String> {
     out
 }
 
+impl EditForm {
+    /// An empty form for a new task (the Week tab's dialog), with the
+    /// project list from `tasks`.
+    pub fn blank(tasks: &[Task]) -> Self {
+        open_form(&Task::default(), tasks)
+    }
+
+    /// The new task this form describes, planned for `day`, or an error
+    /// message.
+    pub fn new_task(&self, day: Date) -> Result<NewTask, String> {
+        let base = Task {
+            planned_for: Some(day),
+            ..Task::default()
+        };
+        let t = self.apply(&base)?;
+        Ok(NewTask {
+            title: t.title,
+            notes: t.notes,
+            project: t.project,
+            due_on: t.due_on,
+            planned_for: t.planned_for,
+            estimate_minutes: t.estimate_minutes,
+            priority: t.priority,
+            private: false,
+        })
+    }
+
+    /// Applies a message that only edits the form. Returns `false` (and
+    /// does nothing) for any other message. Any edit clears the error.
+    pub fn handle(&mut self, message: &Message, today: Date) -> bool {
+        match message {
+            Message::EditTitle(s) => self.title = s.clone(),
+            Message::EditProject(s) | Message::PickProject(s) => self.project = s.clone(),
+            Message::EditEstimate(s) => self.estimate = s.clone(),
+            Message::EditNotes(action) => self.notes.perform(action.clone()),
+            Message::SetPriority(p) => self.priority = priority_level(*p),
+            Message::ToggleCalendar => {
+                self.calendar = match self.calendar {
+                    Some(_) => None,
+                    None => Some(self.due.unwrap_or(today).first_of_month()),
+                }
+            }
+            Message::CloseCalendar => self.calendar = None,
+            Message::CalendarMonth(step) => {
+                if let Some(month) = &mut self.calendar {
+                    *month = add_months(*month, *step).first_of_month();
+                }
+            }
+            Message::PickDue(date) => {
+                self.due = Some(*date);
+                self.calendar = None;
+            }
+            Message::ClearDue => {
+                self.due = None;
+                self.calendar = None;
+            }
+            Message::ToggleSubtask(i, done) => {
+                if let Some(s) = self.subtasks.get_mut(*i) {
+                    s.done = *done;
+                }
+            }
+            Message::RemoveSubtask(i) => {
+                if *i < self.subtasks.len() {
+                    self.subtasks.remove(*i);
+                }
+            }
+            Message::EditNewSubtask(s) => self.new_subtask = s.clone(),
+            Message::AddSubtask => {
+                let text = std::mem::take(&mut self.new_subtask).trim().to_string();
+                if !text.is_empty() {
+                    self.subtasks.push(Subtask { done: false, text });
+                }
+            }
+            _ => return false,
+        }
+        self.error = None;
+        true
+    }
+}
+
 /// The edit form for `task`, with the project list from `tasks`.
 fn open_form(task: &Task, tasks: &[Task]) -> EditForm {
     EditForm {
@@ -602,6 +689,11 @@ impl DayView {
         let Some(data) = &self.data else {
             return Action::None;
         };
+        if let Some(form) = self.editing.as_mut()
+            && form.handle(&message, data.today)
+        {
+            return Action::None;
+        }
         match message {
             Message::Toggle(id, done) => Action::SetStatus(
                 id,
@@ -620,51 +712,25 @@ impl DayView {
                 }
                 Action::None
             }
-            Message::EditTitle(s) => self.edit(|f| f.title = s),
-            Message::EditProject(s) | Message::PickProject(s) => self.edit(|f| f.project = s),
-            Message::EditEstimate(s) => self.edit(|f| f.estimate = s),
-            Message::EditNotes(action) => self.edit(|f| f.notes.perform(action)),
-            Message::SetPriority(p) => self.edit(|f| f.priority = priority_level(p)),
-            Message::ToggleCalendar => {
-                let today = data.today;
-                self.edit(|f| {
-                    f.calendar = match f.calendar {
-                        Some(_) => None,
-                        None => Some(f.due.unwrap_or(today).first_of_month()),
-                    }
-                })
+            Message::EditQuickAdd(s) => {
+                self.quick_add = s;
+                Action::None
             }
-            Message::CloseCalendar => self.edit(|f| f.calendar = None),
-            Message::CalendarMonth(step) => self.edit(|f| {
-                if let Some(month) = &mut f.calendar {
-                    *month = add_months(*month, step).first_of_month();
+            Message::SubmitQuickAdd => {
+                let new = crate::top_bar::quick_add_task(
+                    &self.quick_add,
+                    crate::top_bar::Tab::Today,
+                    data.day,
+                    data.today,
+                );
+                match new {
+                    Some(new) => {
+                        self.quick_add.clear();
+                        Action::Add(new)
+                    }
+                    None => Action::None,
                 }
-            }),
-            Message::PickDue(date) => self.edit(|f| {
-                f.due = Some(date);
-                f.calendar = None;
-            }),
-            Message::ClearDue => self.edit(|f| {
-                f.due = None;
-                f.calendar = None;
-            }),
-            Message::ToggleSubtask(i, done) => self.edit(|f| {
-                if let Some(s) = f.subtasks.get_mut(i) {
-                    s.done = done;
-                }
-            }),
-            Message::RemoveSubtask(i) => self.edit(|f| {
-                if i < f.subtasks.len() {
-                    f.subtasks.remove(i);
-                }
-            }),
-            Message::EditNewSubtask(s) => self.edit(|f| f.new_subtask = s),
-            Message::AddSubtask => self.edit(|f| {
-                let text = std::mem::take(&mut f.new_subtask).trim().to_string();
-                if !text.is_empty() {
-                    f.subtasks.push(Subtask { done: false, text });
-                }
-            }),
+            }
             Message::EditDayLog(s) => {
                 self.day_log = s;
                 Action::None
@@ -725,16 +791,9 @@ impl DayView {
                 self.show_deleted = !self.show_deleted;
                 Action::None
             }
+            // Form edits with no form open.
+            _ => Action::None,
         }
-    }
-
-    /// Changes the open form; any edit clears its error.
-    fn edit(&mut self, f: impl FnOnce(&mut EditForm)) -> Action {
-        if let Some(form) = self.editing.as_mut() {
-            f(form);
-            form.error = None;
-        }
-        Action::None
     }
 
     fn task(&self, id: TaskId) -> Option<&Task> {
@@ -773,24 +832,30 @@ impl DayView {
             content = content.push(self.group(heading, overdue, data));
         }
 
+        // The day's tasks, then the add-a-task input as the last card.
         let day_tasks = section_tasks(data, Section::Day);
-        if day_tasks.is_empty() {
-            content = content.push(
-                column![
-                    theme::section_heading(day_heading(data.day, data.today)),
-                    text(empty_message(data.day, data.today))
-                        .size(theme::TEXT_BODY)
-                        .style(theme::muted),
-                ]
-                .spacing(theme::SPACING / 2.0),
-            );
+        let quick_add = text_input("Add a task", &self.quick_add)
+            .id(crate::top_bar::QUICK_ADD_ID)
+            .on_input(Message::EditQuickAdd)
+            .on_submit(Message::SubmitQuickAdd)
+            .padding([11, 14])
+            .size(theme::TEXT_BODY)
+            .style(theme::input);
+        let day_group = if day_tasks.is_empty() {
+            column![
+                theme::section_heading(day_heading(data.day, data.today)),
+                text(empty_message(data.day, data.today))
+                    .size(theme::TEXT_BODY)
+                    .style(theme::muted),
+            ]
         } else {
             let heading = heading_row(
                 theme::section_heading(day_heading(data.day, data.today)).into(),
                 &day_tasks,
             );
-            content = content.push(self.group(heading, day_tasks, data));
-        }
+            column![heading, self.rows(day_tasks, data)]
+        };
+        content = content.push(day_group.push(quick_add).spacing(theme::SPACING / 2.0));
 
         if let Some(side) = side_work(data, &self.day_log) {
             content = content.push(side);
@@ -1220,8 +1285,14 @@ fn project_menu(theme: &Theme) -> menu::Style {
     }
 }
 
-fn edit_card<'a>(task: &'a Task, form: &'a EditForm, today: Date) -> Element<'a, Message> {
-    let id = task.id;
+/// The form's fields, under `title_row` (the title field, with a checkbox
+/// for an existing task): project, due, estimate, priority, the error,
+/// notes and subtasks.
+fn form_fields<'a>(
+    form: &'a EditForm,
+    today: Date,
+    title_row: Element<'a, Message>,
+) -> Column<'a, Message> {
     let notes = text_editor(&form.notes)
         .placeholder("Notes")
         .on_action(Message::EditNotes)
@@ -1231,12 +1302,7 @@ fn edit_card<'a>(task: &'a Task, form: &'a EditForm, today: Date) -> Element<'a,
         .style(theme::editor);
 
     let mut body = column![
-        row![
-            checkbox(task.is_done()).on_toggle(move |b| Message::Toggle(id, b)),
-            field("Title", &form.title, Message::EditTitle),
-        ]
-        .spacing(theme::SPACING / 2.0)
-        .align_y(Center),
+        title_row,
         row![
             labelled("Project", project_field(form)),
             labelled(
@@ -1264,13 +1330,61 @@ fn edit_card<'a>(task: &'a Task, form: &'a EditForm, today: Date) -> Element<'a,
     .spacing(theme::SPACING);
 
     body = body.push(labelled("Priority", priority_picker(form.priority)));
-
     if let Some(error) = &form.error {
         body = body.push(text(error).size(theme::TEXT_SMALL).style(theme::danger));
     }
-
     body = body.push(labelled("Notes", notes));
-    body = body.push(labelled("Subtasks", subtasks_view(form)));
+    body.push(labelled("Subtasks", subtasks_view(form)))
+}
+
+/// The id of the new-task dialog's title field, for `operation::focus`.
+pub const DIALOG_TITLE_ID: &str = "new-task-title";
+
+/// The new-task dialog's panel (the Week tab's `+`): a heading naming the
+/// day, the form, then Cancel and Add task. `Save` adds, `Close` cancels.
+/// `main.rs` shows it over everything.
+pub fn new_task_dialog(form: &EditForm, day: Date, today: Date) -> Element<'_, Message> {
+    let heading = row![
+        text("New task").size(theme::TEXT_HEADING),
+        text(day.strftime("%A %-d %B").to_string())
+            .size(theme::TEXT_BODY)
+            .style(theme::muted),
+    ]
+    .spacing(theme::SPACING)
+    .align_y(iced::alignment::Vertical::Bottom);
+    let title = field("Title", &form.title, Message::EditTitle)
+        .id(DIALOG_TITLE_ID)
+        .into();
+    let body = column![heading, form_fields(form, today, title)]
+        .spacing(theme::SPACING * 1.5)
+        .push(
+            row![
+                Space::new().width(Fill),
+                button(text("Cancel").size(theme::TEXT_BODY))
+                    .padding([6, 12])
+                    .style(theme::text_button)
+                    .on_press(Message::Close),
+                button(text("Add task").size(theme::TEXT_BODY))
+                    .padding([6, 16])
+                    .style(theme::primary_button)
+                    .on_press(Message::Save),
+            ]
+            .spacing(theme::SPACING / 2.0)
+            .align_y(Center),
+        );
+    container(body).padding(theme::SPACING * 2.0).into()
+}
+
+fn edit_card<'a>(task: &'a Task, form: &'a EditForm, today: Date) -> Element<'a, Message> {
+    let id = task.id;
+    let title = row![
+        checkbox(task.is_done()).on_toggle(move |b| Message::Toggle(id, b)),
+        field("Title", &form.title, Message::EditTitle),
+    ]
+    .spacing(theme::SPACING / 2.0)
+    .align_y(Center)
+    .into();
+    let mut body = form_fields(form, today, title);
 
     body = body.push(
         row![
@@ -1609,6 +1723,34 @@ mod tests {
             section_of(&inbox, date(2026, 11, 18), today(), &TimeZone::UTC),
             Some(Section::NoDate)
         );
+    }
+
+    #[test]
+    fn add_a_task_plans_it_for_the_day_shown() {
+        let mut view = DayView::new();
+        view.load(data_for(date(2026, 11, 18), vec![]));
+        view.update(Message::EditQuickAdd("Call Sam #work".into()));
+        let Action::Add(new) = view.update(Message::SubmitQuickAdd) else {
+            panic!("expected Add");
+        };
+        assert_eq!(new.title, "Call Sam");
+        assert_eq!(new.planned_for, Some(date(2026, 11, 18)));
+        assert!(view.quick_add.is_empty());
+        assert_eq!(view.update(Message::SubmitQuickAdd), Action::None);
+    }
+
+    #[test]
+    fn blank_form_makes_a_new_task_for_the_day() {
+        let mut form = EditForm::blank(&[]);
+        assert!(form.new_task(today()).is_err());
+        form.handle(&Message::EditTitle("Draft plan".into()), today());
+        form.handle(&Message::PickDue(date(2026, 11, 20)), today());
+        form.handle(&Message::EditNewSubtask("outline".into()), today());
+        let new = form.new_task(date(2026, 11, 18)).unwrap();
+        assert_eq!(new.title, "Draft plan");
+        assert_eq!(new.planned_for, Some(date(2026, 11, 18)));
+        assert_eq!(new.due_on, Some(date(2026, 11, 20)));
+        assert_eq!(new.notes, "- [ ] outline");
     }
 
     #[test]

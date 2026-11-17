@@ -448,6 +448,7 @@ pub enum Icon {
     ChevronLeft,
     ChevronRight,
     Close,
+    Plus,
 }
 
 impl Icon {
@@ -459,6 +460,7 @@ impl Icon {
             Icon::ChevronLeft => include_bytes!("../../../assets/icons/chevron-left.svg"),
             Icon::ChevronRight => include_bytes!("../../../assets/icons/chevron-right.svg"),
             Icon::Close => include_bytes!("../../../assets/icons/close.svg"),
+            Icon::Plus => include_bytes!("../../../assets/icons/plus.svg"),
         }
     }
 }
