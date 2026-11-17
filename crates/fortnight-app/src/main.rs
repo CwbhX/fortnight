@@ -1010,7 +1010,9 @@ impl Ready {
             self.week_badge = true;
         }
         // Tasks may have changed while it ran: catch up straight away.
-        if key.kind == ReportKind::Plan && self.decision_active() {
+        if (key.kind == ReportKind::Summary && self.tab == Tab::Week)
+            || (key.kind == ReportKind::Plan && self.decision_active())
+        {
             return self.update_week_reports();
         }
         Task::none()
@@ -1384,7 +1386,10 @@ impl Ready {
         };
         self.refresh();
         // A decision model is quick: recommendations follow every change.
-        if std::mem::take(&mut self.tasks_changed) && self.decision_active() {
+        // On the Week tab the Work summary does too (when its facts change).
+        if std::mem::take(&mut self.tasks_changed)
+            && (self.decision_active() || self.tab == Tab::Week)
+        {
             return Task::batch([task, self.update_week_reports()]);
         }
         task
