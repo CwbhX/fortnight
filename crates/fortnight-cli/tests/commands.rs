@@ -418,7 +418,7 @@ async fn summary_streams_and_stores_a_ready_report() {
 #[tokio::test]
 async fn plan_defaults_to_this_week_and_stores() {
     let s = seeded();
-    let mock = Arc::new(MockClient::new("do the thing"));
+    let mock = Arc::new(MockClient::new(PLAN_REPLY));
     let mut out = Vec::new();
     commands::report_command(
         &s,
@@ -431,12 +431,45 @@ async fn plan_defaults_to_this_week_and_stores() {
     )
     .await
     .unwrap();
-    assert_eq!(text(out), "do the thing\n");
+    // Read back as a list of the named tasks.
+    assert_eq!(text(out), "1. ship the thing\n");
     let report = s
         .latest_report(ReportKind::Plan, date(2026, 11, 16))
         .unwrap()
         .unwrap();
     assert_eq!(report.status, ReportStatus::Ready);
+}
+
+/// Replies a plan can read (`report::parse_recommendations`); a summary
+/// takes any text, so these serve it too.
+const PLAN_REPLY: &str = r#"{"tasks":[{"id":1,"reason":"due soon"}]}"#;
+const FROM_MAIN: &str = r#"{"tasks":[{"id":1,"reason":"from main"}]}"#;
+const FROM_DECISION: &str = r#"{"tasks":[{"id":1,"reason":"from decision"}]}"#;
+
+/// A plan reply with no recommendations in it is stored `Failed`, so it is
+/// retried, and the command fails.
+#[tokio::test]
+async fn an_unreadable_plan_reply_fails() {
+    let s = seeded();
+    let mock = Arc::new(MockClient::new("do the thing"));
+    let err = commands::report_command(
+        &s,
+        ReportKind::Plan,
+        None,
+        false,
+        &now(wednesday()),
+        &|_| Ok(handle(&mock)),
+        &mut Vec::new(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, 1);
+    let report = s
+        .latest_report(ReportKind::Plan, date(2026, 11, 16))
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.status, ReportStatus::Failed);
+    assert!(s.ready_report_keys().unwrap().is_empty());
 }
 
 /// `handle(main)` with `decision` as the decision model on `decision.test`.
@@ -453,8 +486,8 @@ fn with_decision(main: &Arc<MockClient>, decision: &Arc<MockClient>) -> LlmHandl
 #[tokio::test]
 async fn plan_uses_the_decision_model_and_summary_does_not() {
     let s = seeded();
-    let main = Arc::new(MockClient::new("from main"));
-    let decision = Arc::new(MockClient::new("from decision"));
+    let main = Arc::new(MockClient::new(FROM_MAIN));
+    let decision = Arc::new(MockClient::new(FROM_DECISION));
     let mut out = Vec::new();
     let make = |_| Ok(with_decision(&main, &decision));
     commands::report_command(
@@ -472,7 +505,7 @@ async fn plan_uses_the_decision_model_and_summary_does_not() {
         .latest_report(ReportKind::Plan, date(2026, 11, 16))
         .unwrap()
         .unwrap();
-    assert_eq!(plan.content_md.as_deref(), Some("from decision"));
+    assert_eq!(plan.content_md.as_deref(), Some(FROM_DECISION));
     assert_eq!(plan.endpoint_host.as_deref(), Some("decision.test"));
     assert!(main.requests.lock().unwrap().is_empty());
 
@@ -494,7 +527,7 @@ async fn plan_uses_the_decision_model_and_summary_does_not() {
 #[tokio::test]
 async fn plan_falls_back_to_the_main_endpoint() {
     let s = seeded();
-    let main = Arc::new(MockClient::new("from main"));
+    let main = Arc::new(MockClient::new(FROM_MAIN));
     let decision = Arc::new(MockClient::new("unused"));
     decision.push_reply(Err(LlmError::Connection("connection refused".into())));
     commands::report_command(
@@ -513,7 +546,7 @@ async fn plan_falls_back_to_the_main_endpoint() {
         .unwrap()
         .unwrap();
     assert_eq!(plan.status, ReportStatus::Ready);
-    assert_eq!(plan.content_md.as_deref(), Some("from main"));
+    assert_eq!(plan.content_md.as_deref(), Some(FROM_MAIN));
     assert_eq!(plan.endpoint_host.as_deref(), Some("mock.test"));
 }
 
@@ -600,7 +633,7 @@ async fn unconfigured_llm_is_exit_2_and_stores_nothing() {
 #[tokio::test]
 async fn run_due_generates_what_is_due_once() {
     let s = seeded();
-    let mock = Arc::new(MockClient::new("generated"));
+    let mock = Arc::new(MockClient::new(PLAN_REPLY));
     // End of Friday 20th: summary and plan for the week of the 16th are due.
     let when = now(date(2026, 11, 20));
     let mut out = Vec::new();
@@ -625,7 +658,7 @@ async fn run_due_generates_what_is_due_once() {
 #[tokio::test]
 async fn run_due_fails_non_zero_when_a_report_fails() {
     let s = seeded();
-    let mock = Arc::new(MockClient::new("generated"));
+    let mock = Arc::new(MockClient::new(PLAN_REPLY));
     mock.push_reply(Err(LlmError::Timeout));
     let mut out = Vec::new();
     let err = commands::run_due(
@@ -737,7 +770,7 @@ fn lock_warning_ignores_local_suffix_on_the_same_mac() {
 #[tokio::test]
 async fn only_recommendations_ask_for_the_decision_model() {
     let s = seeded();
-    let mock = Arc::new(MockClient::new("text"));
+    let mock = Arc::new(MockClient::new(PLAN_REPLY));
     let asked = std::cell::RefCell::new(Vec::new());
     let make = |uses_decision| {
         asked.borrow_mut().push(uses_decision);
