@@ -11,12 +11,15 @@ use crate::theme;
 pub use popup::Popup;
 
 /// A month calendar, Monday first, as a raised panel. `selected` is filled
-/// with the accent; `today` is shaded and in the accent colour so it is easy
-/// to find. The arrows send `on_month(-1 | 1)`, a day sends `on_pick`, and
+/// with the accent; the days of `range` (first, last) get a soft accent
+/// band; `today` is shaded and in the accent colour so it is easy to find.
+/// The arrows send `on_month(-1 | 1)`, a day sends `on_pick`, and
 /// `on_clear` (if any, and a date is selected) adds a Clear button.
+#[allow(clippy::too_many_arguments)]
 pub fn month_picker<'a, Message: Clone + 'a>(
     month: Date,
     selected: Option<Date>,
+    range: Option<(Date, Date)>,
     today: Date,
     on_month: impl Fn(i32) -> Message,
     on_pick: impl Fn(Date) -> Message,
@@ -60,6 +63,7 @@ pub fn month_picker<'a, Message: Clone + 'a>(
             let in_month = date.month() == first.month();
             let is_selected = selected == Some(date);
             let is_today = date == today;
+            let in_range = range.is_some_and(|(a, b)| a <= date && date <= b);
             button(
                 text(date.day().to_string())
                     .size(theme::TEXT_SMALL)
@@ -69,7 +73,7 @@ pub fn month_picker<'a, Message: Clone + 'a>(
             .width(CELL)
             .padding([7, 0])
             .style(move |theme: &Theme, status| {
-                calendar_day(theme, status, in_month, is_selected, is_today)
+                calendar_day(theme, status, in_month, is_selected, in_range, is_today)
             })
             .on_press(on_pick(date))
             .into()
@@ -112,6 +116,7 @@ fn calendar_day(
     status: button::Status,
     in_month: bool,
     selected: bool,
+    in_range: bool,
     today: bool,
 ) -> button::Style {
     let p = theme.palette();
@@ -119,15 +124,24 @@ fn calendar_day(
     let (background, text_color) = if selected {
         (Some(theme::ACCENT.into()), Color::WHITE)
     } else if today {
-        let shade = if hovered { 0.28 } else { 0.18 };
+        let shade = if hovered || in_range { 0.32 } else { 0.18 };
         (Some(theme::ACCENT.scale_alpha(shade).into()), theme::ACCENT)
     } else {
-        let color = if in_month {
+        let color = if in_month || in_range {
             p.text
         } else {
             theme::muted_color(theme).scale_alpha(0.6)
         };
-        (hovered.then(|| p.text.scale_alpha(0.08).into()), color)
+        let fill = if in_range {
+            Some(
+                theme::ACCENT
+                    .scale_alpha(if hovered { 0.24 } else { 0.14 })
+                    .into(),
+            )
+        } else {
+            hovered.then(|| p.text.scale_alpha(0.08).into())
+        };
+        (fill, color)
     };
     button::Style {
         background,

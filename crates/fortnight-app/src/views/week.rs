@@ -63,6 +63,9 @@ pub enum Message {
     EndDrag,
     /// A day's `+`: add a task planned for that day.
     AddTask(Date),
+    /// A click on a done task's card (open cards report clicks through
+    /// `Press` then `EndDrag` without a drag).
+    Edit(TaskId),
 }
 
 impl Message {
@@ -108,6 +111,8 @@ pub enum Action {
     Move(TaskId, Date, f64),
     /// Open the new-task dialog for this day.
     NewTask(Date),
+    /// A card was clicked: open the task dialog to edit it.
+    Edit(TaskId),
 }
 
 /// Everything the tab shows, supplied by `main.rs`. FROZEN contract
@@ -162,6 +167,7 @@ impl WeekView {
             ),
             Message::OpenDay(day) => Action::OpenDay(day),
             Message::AddTask(day) => Action::NewTask(day),
+            Message::Edit(id) => Action::Edit(id),
             Message::Panel(m) => match self.panel.update(m) {
                 report_panel::Action::None => Action::None,
                 action => Action::Panel(action),
@@ -204,10 +210,11 @@ impl WeekView {
                     None => Action::None,
                 }
             }
-            Message::EndDrag => {
-                self.drag = None;
-                Action::None
-            }
+            // A press let go before it became a drag is a click.
+            Message::EndDrag => match self.drag.take() {
+                Some(drag) if !drag.active => Action::Edit(drag.id),
+                _ => Action::None,
+            },
         }
     }
 
@@ -771,7 +778,10 @@ fn task_row<'a>(
         task_card(task, day, today, rank, dragging == Some(true))
     ];
     if !task.status.is_open() {
-        return card.into();
+        return mouse_area(card)
+            .on_press(Message::Edit(task.id))
+            .interaction(mouse::Interaction::Pointer)
+            .into();
     }
     // The slot above belongs to the card: hovering the gap means "before
     // this card" too.
@@ -1179,6 +1189,12 @@ mod tests {
             Action::Move(1, wed, 1.0)
         );
         assert!(v.drag.is_none());
+
+        // A press let go without moving is a click: edit the task.
+        v.update(Message::Press(1));
+        v.update(Message::Moved(Point::new(5.0, 5.0)));
+        assert_eq!(v.update(Message::EndDrag), Action::Edit(1));
+        assert_eq!(v.update(Message::EndDrag), Action::None);
 
         // Let go outside a column: cancelled.
         v.update(Message::Press(1));

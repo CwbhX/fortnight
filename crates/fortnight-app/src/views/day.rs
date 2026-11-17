@@ -589,7 +589,7 @@ impl EditForm {
 }
 
 /// The edit form for `task`, with the project list from `tasks`.
-fn open_form(task: &Task, tasks: &[Task]) -> EditForm {
+pub fn open_form(task: &Task, tasks: &[Task]) -> EditForm {
     EditForm {
         projects: combo_box::State::new(open_projects(tasks)),
         ..EditForm::from_task(task)
@@ -1312,6 +1312,7 @@ fn form_fields<'a>(
                     form.calendar.map(|month| month_picker(
                         month,
                         form.due,
+                        None,
                         today,
                         Message::CalendarMonth,
                         Message::PickDue,
@@ -1340,15 +1341,24 @@ fn form_fields<'a>(
 /// The id of the new-task dialog's title field, for `operation::focus`.
 pub const DIALOG_TITLE_ID: &str = "new-task-title";
 
-/// The new-task dialog's panel (the Week tab's `+`): a heading naming the
-/// day, the form, then Cancel and Add task. `Save` adds, `Close` cancels.
+/// The task dialog's panel (the Week tab): a heading naming the day, the
+/// form, then the buttons. For a new task (`editing` false): Cancel and Add
+/// task. For an existing one: Delete on the left, Cancel and Save on the
+/// right. `Save` adds or saves, `Close` cancels, `Delete` deletes.
 /// `main.rs` shows it over everything.
-pub fn new_task_dialog(form: &EditForm, day: Date, today: Date) -> Element<'_, Message> {
+pub fn task_dialog(
+    form: &EditForm,
+    day: Option<Date>,
+    editing: bool,
+    today: Date,
+) -> Element<'_, Message> {
+    let day_label = day.map_or_else(
+        || "No date".to_string(),
+        |d| d.strftime("%A %-d %B").to_string(),
+    );
     let heading = row![
-        text("New task").size(theme::TEXT_HEADING),
-        text(day.strftime("%A %-d %B").to_string())
-            .size(theme::TEXT_BODY)
-            .style(theme::muted),
+        text(if editing { "Edit task" } else { "New task" }).size(theme::TEXT_HEADING),
+        text(day_label).size(theme::TEXT_BODY).style(theme::muted),
     ]
     .spacing(theme::SPACING)
     .align_y(iced::alignment::Vertical::Bottom);
@@ -1357,21 +1367,31 @@ pub fn new_task_dialog(form: &EditForm, day: Date, today: Date) -> Element<'_, M
         .into();
     let body = column![heading, form_fields(form, today, title)]
         .spacing(theme::SPACING * 1.5)
-        .push(
-            row![
-                Space::new().width(Fill),
-                button(text("Cancel").size(theme::TEXT_BODY))
-                    .padding([6, 12])
-                    .style(theme::text_button)
-                    .on_press(Message::Close),
-                button(text("Add task").size(theme::TEXT_BODY))
-                    .padding([6, 16])
-                    .style(theme::primary_button)
-                    .on_press(Message::Save),
-            ]
-            .spacing(theme::SPACING / 2.0)
-            .align_y(Center),
-        );
+        .push({
+            let mut buttons = Row::new().spacing(theme::SPACING / 2.0).align_y(Center);
+            if editing {
+                buttons = buttons.push(
+                    button(text("Delete").size(theme::TEXT_BODY))
+                        .padding([6, 12])
+                        .style(theme::danger_button)
+                        .on_press(Message::Delete),
+                );
+            }
+            buttons
+                .push(Space::new().width(Fill))
+                .push(
+                    button(text("Cancel").size(theme::TEXT_BODY))
+                        .padding([6, 12])
+                        .style(theme::text_button)
+                        .on_press(Message::Close),
+                )
+                .push(
+                    button(text(if editing { "Save" } else { "Add task" }).size(theme::TEXT_BODY))
+                        .padding([6, 16])
+                        .style(theme::primary_button)
+                        .on_press(Message::Save),
+                )
+        });
     container(body).padding(theme::SPACING * 2.0).into()
 }
 

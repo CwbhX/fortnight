@@ -6,7 +6,7 @@
 //! Owner: orchestrator.
 //!
 //! ```text
-//! [ Today | Week | Month ]        ‹ Mon 16 to Fri 20 Nov ›          lock  gear
+//! [ Today | Week | Month ]          ‹ Nov 16 to Nov 20 ›            lock  gear
 //! [ Write Q4 report fri #work ~2h !                                              ]
 //! ```
 
@@ -96,7 +96,7 @@ pub fn step(tab: Tab, selected: Date, dir: i32) -> Date {
     }
 }
 
-/// "Mon 16 Nov"; "Mon 16 to Fri 20 Nov" (the week's working days);
+/// "Mon 16 Nov"; "Nov 16 to Nov 20" (the week's working days);
 /// "November 2026". The year is added to day and week labels when it is not
 /// `today`'s year.
 pub fn period_label(tab: Tab, selected: Date, today: Date, schedule: &Schedule) -> String {
@@ -120,21 +120,12 @@ pub fn period_label(tab: Tab, selected: Date, today: Date, schedule: &Schedule) 
                 (Some(f), Some(l)) => (*f, *l),
                 _ => (week.start, week.end()),
             };
-            if first.month() == last.month() {
-                format!(
-                    "{} to {}{}",
-                    first.strftime("%a %-d"),
-                    last.strftime("%a %-d %b"),
-                    year(last)
-                )
-            } else {
-                format!(
-                    "{} to {}{}",
-                    first.strftime("%a %-d %b"),
-                    last.strftime("%a %-d %b"),
-                    year(last)
-                )
-            }
+            format!(
+                "{} to {}{}",
+                first.strftime("%b %-d"),
+                last.strftime("%b %-d"),
+                year(last)
+            )
         }
         Tab::Month => month_label(selected),
     }
@@ -193,30 +184,34 @@ pub fn view<'a>(bar: Bar<'a>) -> Element<'a, Message> {
         )
     };
 
-    // The arrows hug the date. The date has a fixed width so the arrows
-    // don't jump as it changes. A click on it opens the calendar (the
-    // button); a double click jumps to today (the mouse area around it).
-    let width = match bar.tab {
-        Tab::Today => 160,
-        Tab::Week => 240,
-        Tab::Month => 190,
-    };
-    let date = button(
+    // The arrows hug the date. A click on the date opens the calendar; a
+    // double click jumps to today. (A mouse area, not a button: a button
+    // would take the clicks and the double click would never be seen.)
+    let date = container(
         text(period_label(bar.tab, bar.selected, bar.today, bar.schedule))
             .size(theme::TEXT_BODY)
-            .wrapping(iced::widget::text::Wrapping::None)
-            .width(Fill)
-            .align_x(Center),
+            .wrapping(iced::widget::text::Wrapping::None),
     )
-    .width(width)
     .padding([5, 10])
-    .style(date_button(bar.calendar.is_some()))
-    .on_press(Message::ToggleCalendar);
-    let date = mouse_area(date).on_double_click(Message::Today);
+    .style(date_fill(bar.calendar.is_some()));
+    let date = mouse_area(date)
+        .on_press(Message::ToggleCalendar)
+        .on_double_click(Message::Today)
+        .interaction(iced::mouse::Interaction::Pointer);
+    // In the Week tab the calendar bands the week shown instead of marking
+    // one day.
+    let (selected, range) = match bar.tab {
+        Tab::Week => {
+            let week = week_containing(bar.selected, bar.schedule.week_start);
+            (None, Some((week.start, week.end())))
+        }
+        _ => (Some(bar.selected), None),
+    };
     let picker = bar.calendar.map(|month| {
         month_picker(
             month,
-            Some(bar.selected),
+            selected,
+            range,
             bar.today,
             Message::CalendarMonth,
             Message::PickDate,
@@ -258,18 +253,12 @@ pub fn view<'a>(bar: Bar<'a>) -> Element<'a, Message> {
         .into()
 }
 
-/// The date: plain text that shows a soft fill on hover or while its
-/// calendar is open.
-fn date_button(open: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
-    move |theme, status| {
-        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-        let fill = (open || hovered).then(|| theme.palette().text.scale_alpha(0.07).into());
-        button::Style {
-            background: fill,
-            text_color: theme.palette().text,
-            border: iced::border::rounded(theme::RADIUS),
-            ..button::Style::default()
-        }
+/// The date: plain text with a soft fill while its calendar is open.
+fn date_fill(open: bool) -> impl Fn(&iced::Theme) -> container::Style {
+    move |theme| container::Style {
+        background: open.then(|| theme.palette().text.scale_alpha(0.07).into()),
+        border: iced::border::rounded(theme::RADIUS),
+        ..container::Style::default()
     }
 }
 
@@ -297,11 +286,11 @@ mod tests {
         assert_eq!(period_label(Tab::Today, today(), today(), &s), "Mon 16 Nov");
         assert_eq!(
             period_label(Tab::Week, date(2026, 11, 19), today(), &s),
-            "Mon 16 to Fri 20 Nov"
+            "Nov 16 to Nov 20"
         );
         assert_eq!(
             period_label(Tab::Week, date(2026, 12, 1), today(), &s),
-            "Mon 30 Nov to Fri 4 Dec"
+            "Nov 30 to Dec 4"
         );
         assert_eq!(
             period_label(Tab::Today, date(2027, 1, 4), today(), &s),

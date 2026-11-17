@@ -86,8 +86,8 @@ enum Message {
     Settings(settings::Message),
     Unlock(UnlockMessage),
     CloseSettings,
-    /// The new-task dialog (the Week tab's `+`).
-    NewTask(day::Message),
+    /// The task dialog (the Week tab's `+`, or a click on a card).
+    Dialog(day::Message),
     Tick,
     ThemeMode(iced::theme::Mode),
     /// A piece of a streamed report.
@@ -170,8 +170,8 @@ struct Ready {
     tab: Tab,
     /// The one selected date all three tabs zoom around.
     selected: Date,
-    /// The new-task dialog, while open: the day it plans the task for.
-    new_task: Option<(Date, day::EditForm)>,
+    /// The task dialog, while open.
+    dialog: Option<TaskDialog>,
     /// The month the top bar's date calendar shows, while it is open.
     date_picker: Option<Date>,
     settings_open: bool,
@@ -360,7 +360,7 @@ impl Ready {
             tz,
             tab,
             selected: today,
-            new_task: None,
+            dialog: None,
             date_picker: None,
             settings_open,
             day_view: DayView::new(),
@@ -859,8 +859,11 @@ impl Ready {
             }
             Message::Week(m) if m.is_pointer_move() => {
                 // Drag bookkeeping only: no data changed, skip the refresh.
-                self.week_view.update(m);
-                return Task::none();
+                // A press let go without a drag is a click on the card.
+                return match self.week_view.update(m) {
+                    week::Action::Edit(id) => self.open_edit(id),
+                    _ => Task::none(),
+                };
             }
             Message::Week(m) => match self.week_view.update(m) {
                 week::Action::None => Task::none(),
@@ -894,6 +897,7 @@ impl Ready {
                     Task::none()
                 }
                 week::Action::NewTask(day) => self.open_new_task(day),
+                week::Action::Edit(id) => self.open_edit(id),
                 week::Action::OpenDay(day) => {
                     self.selected = day;
                     self.tab = Tab::Today;
@@ -922,7 +926,7 @@ impl Ready {
                 self.settings_open = false;
                 Task::none()
             }
-            Message::NewTask(m) => self.new_task_message(m),
+            Message::Dialog(m) => self.dialog_message(m),
             Message::Unlock(m) => match self.unlock_view.update(m) {
                 UnlockAction::None => Task::none(),
                 UnlockAction::Skip => {
@@ -1077,31 +1081,69 @@ impl Ready {
         }
     }
 
-    /// Opens the new-task dialog for `day` and focuses its title.
+    /// Opens the task dialog for a new task on `day` and focuses its title.
     fn open_new_task(&mut self, day: Date) -> Task<Message> {
-        self.new_task = Some((day, day::EditForm::blank(&self.tasks)));
+        self.dialog = Some(TaskDialog {
+            day: Some(day),
+            form: day::EditForm::blank(&self.tasks),
+            task: None,
+        });
         operation::focus(day::DIALOG_TITLE_ID)
     }
 
-    /// A message from the new-task dialog: a form edit, `Save` (add the
-    /// task and close) or `Close` (cancel).
-    fn new_task_message(&mut self, message: day::Message) -> Task<Message> {
+    /// Opens the task dialog to edit task `id`.
+    fn open_edit(&mut self, id: TaskId) -> Task<Message> {
+        if let Some(task) = self.task(id) {
+            self.dialog = Some(TaskDialog {
+                day: task.day(),
+                form: day::open_form(task, &self.tasks),
+                task: Some(id),
+            });
+        }
+        Task::none()
+    }
+
+    /// A message from the task dialog: a form edit, `Save` (add or save,
+    /// then close), `Delete` (move the task to Deleted) or `Close`.
+    fn dialog_message(&mut self, message: day::Message) -> Task<Message> {
         let today = self.today();
-        let Some((day, form)) = self.new_task.as_mut() else {
+        let Some(dialog) = self.dialog.as_mut() else {
             return Task::none();
         };
-        if form.handle(&message, today) {
+        if dialog.form.handle(&message, today) {
             return Task::none();
         }
-        match message {
-            day::Message::Save => match form.new_task(*day) {
-                Ok(new) => {
-                    self.new_task = None;
-                    self.add_task(new);
+        match (message, dialog.task) {
+            (day::Message::Save, None) => {
+                let day = dialog.day.unwrap_or(today);
+                match dialog.form.new_task(day) {
+                    Ok(new) => {
+                        self.dialog = None;
+                        self.add_task(new);
+                    }
+                    Err(e) => dialog.form.error = Some(e),
                 }
-                Err(e) => form.error = Some(e),
-            },
-            day::Message::Close => self.new_task = None,
+            }
+            (day::Message::Save, Some(id)) => {
+                let Some(task) = self.tasks.iter().find(|t| t.id == id).cloned() else {
+                    self.dialog = None;
+                    return Task::none();
+                };
+                match dialog.form.apply(&task) {
+                    Ok(updated) => {
+                        self.dialog = None;
+                        if updated != task {
+                            return self.day_action(day::Action::Update(updated));
+                        }
+                    }
+                    Err(e) => dialog.form.error = Some(e),
+                }
+            }
+            (day::Message::Delete, Some(id)) => {
+                self.dialog = None;
+                self.set_status(id, TaskStatus::Dropped);
+            }
+            (day::Message::Close, _) => self.dialog = None,
             _ => {}
         }
         Task::none()
@@ -1240,9 +1282,9 @@ impl Ready {
                 _ => Task::none(),
             };
         }
-        if self.new_task.is_some() {
+        if self.dialog.is_some() {
             if shortcut == Shortcut::Escape {
-                self.new_task = None;
+                self.dialog = None;
             }
             return Task::none();
         }
@@ -1464,10 +1506,13 @@ impl Ready {
         }
         let base: Element<'_, Message> = main.height(Fill).into();
 
-        if let Some((day, form)) = &self.new_task {
-            let panel = container(day::new_task_dialog(form, *day, today).map(Message::NewTask))
-                .max_width(640)
-                .style(theme::overlay_panel);
+        if let Some(dialog) = &self.dialog {
+            let panel = container(
+                day::task_dialog(&dialog.form, dialog.day, dialog.task.is_some(), today)
+                    .map(Message::Dialog),
+            )
+            .max_width(640)
+            .style(theme::overlay_panel);
             return stack![
                 base,
                 opaque(
@@ -1477,7 +1522,7 @@ impl Ready {
                             .center(Fill)
                             .style(dialog_backdrop)
                     )
-                    .on_press(Message::NewTask(day::Message::Close))
+                    .on_press(Message::Dialog(day::Message::Close))
                 )
             ]
             .into();
@@ -1506,7 +1551,18 @@ impl Ready {
     }
 }
 
-/// The new-task dialog's backdrop: darker than Settings' so the page
+/// The task dialog over everything: a new task for `day`, or an edit of
+/// `task`.
+struct TaskDialog {
+    /// The day a new task is planned for; an edited task's day, for the
+    /// heading.
+    day: Option<Date>,
+    form: day::EditForm,
+    /// The task being edited; `None` for a new task.
+    task: Option<TaskId>,
+}
+
+/// The task dialog's backdrop: darker than Settings' so the page
 /// behind recedes. (iced 0.14 has no backdrop blur.)
 fn dialog_backdrop(_theme: &iced::Theme) -> container::Style {
     container::Style {
