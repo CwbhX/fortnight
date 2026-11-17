@@ -649,15 +649,21 @@ fn day_column<'a>(
         );
     }
 
-    let mut list = Column::new().spacing(8).width(Fill);
+    // Cards sit on fixed 8 px slots that double as the landing line, so
+    // showing the line never moves anything (which would move the target
+    // under the pointer and make the line jump back and forth).
+    let mut list = Column::new().width(Fill);
     let mut any = false;
+    // The line shows only where a drop would change something, and only
+    // among other open tasks (not in an empty day).
+    let shows_line = |day: Date, before: Option<TaskId>| {
+        dragged.is_some_and(|id| {
+            over == Some((day, before)) && line_wanted(&data.tasks, id, day, before)
+        })
+    };
     for day in &spec.days {
         let tasks = tasks_on(&data.tasks, *day);
-        let append_here = over == Some((*day, None));
         if tasks.is_empty() {
-            if append_here {
-                list = list.push(insert_line());
-            }
             continue;
         }
         if spec.weekend && spec.days.len() > 1 {
@@ -666,9 +672,6 @@ fn day_column<'a>(
         let open = tasks.iter().filter(|t| t.status.is_open()).count();
         for (i, task) in tasks.into_iter().enumerate() {
             any = true;
-            if over == Some((*day, Some(task.id))) && dragged != Some(task.id) {
-                list = list.push(insert_line());
-            }
             let rank = ranks.iter().find(|(id, _)| *id == task.id).map(|r| r.1);
             list = list.push(task_row(
                 task,
@@ -676,13 +679,11 @@ fn day_column<'a>(
                 data.today,
                 rank,
                 dragged.is_some().then_some(dragged == Some(task.id)),
+                shows_line(*day, Some(task.id)),
             ));
-            if append_here && i + 1 == open {
-                list = list.push(insert_line());
+            if i + 1 == open {
+                list = list.push(slot(shows_line(*day, None)));
             }
-        }
-        if append_here && open == 0 {
-            list = list.push(insert_line());
         }
     }
     if !any {
@@ -692,7 +693,7 @@ fn day_column<'a>(
                 .style(theme::muted),
         );
     }
-    col = col.push(container(list).padding([4, 0]));
+    col = col.push(list);
 
     container(col).padding(theme::SPACING).width(Fill).into()
 }
@@ -740,11 +741,17 @@ fn task_row<'a>(
     today: Date,
     rank: Option<usize>,
     dragging: Option<bool>,
+    line_above: bool,
 ) -> Element<'a, Message> {
-    let card = task_card(task, day, today, rank, dragging == Some(true));
+    let card = column![
+        slot(line_above),
+        task_card(task, day, today, rank, dragging == Some(true))
+    ];
     if !task.status.is_open() {
-        return card;
+        return card.into();
     }
+    // The slot above belongs to the card: hovering the gap means "before
+    // this card" too.
     let mut area = mouse_area(card)
         .on_press(Message::Press(task.id))
         .interaction(if dragging.is_some() {
@@ -760,17 +767,33 @@ fn task_row<'a>(
     area.into()
 }
 
-/// The accent line that shows where a dragged card will land.
-fn insert_line<'a>() -> Element<'a, Message> {
-    container(space())
-        .width(Fill)
-        .height(3)
-        .style(|_: &Theme| container::Style {
-            background: Some(theme::ACCENT.into()),
-            border: iced::border::rounded(2),
-            ..container::Style::default()
-        })
-        .into()
+/// Whether dropping task `id` on `day` before `before` deserves the landing
+/// line: another open task is there to order against, and the drop would
+/// change something.
+fn line_wanted(tasks: &[Task], id: TaskId, day: Date, before: Option<TaskId>) -> bool {
+    tasks_on(tasks, day)
+        .iter()
+        .any(|t| t.status.is_open() && t.id != id)
+        && drop_position(tasks, id, day, before).is_some()
+}
+
+/// The 8 px gap above a card (and after a day's open cards): empty, or the
+/// accent line that shows where a dragged card will land.
+fn slot<'a>(line: bool) -> Element<'a, Message> {
+    let inner: Element<'a, Message> = if line {
+        container(space())
+            .width(Fill)
+            .height(3)
+            .style(|_: &Theme| container::Style {
+                background: Some(theme::ACCENT.into()),
+                border: iced::border::rounded(2),
+                ..container::Style::default()
+            })
+            .into()
+    } else {
+        space().into()
+    };
+    container(inner).width(Fill).height(8).center_y(8).into()
 }
 
 /// Where task `id` goes when dropped on `day`, before the open task
@@ -1174,6 +1197,20 @@ mod tests {
         );
         tasks.clear();
         assert_eq!(drop_position(&tasks, 1, tue, None), None);
+
+        // The landing line: not in an empty day, not for a day's only
+        // task, not where nothing would change.
+        let tasks = vec![
+            task(1, Some(tue), TaskStatus::Todo),
+            task(2, Some(tue), TaskStatus::Todo),
+            task(3, Some(wed), TaskStatus::Todo),
+        ];
+        assert!(!line_wanted(&tasks, 1, date(2026, 11, 19), None));
+        assert!(!line_wanted(&tasks, 3, wed, None));
+        assert!(!line_wanted(&tasks, 2, tue, None));
+        assert!(line_wanted(&tasks, 1, tue, None));
+        assert!(line_wanted(&tasks, 2, tue, Some(1)));
+        assert!(line_wanted(&tasks, 3, tue, Some(2)));
 
         let mut v = WeekView::new();
         v.load(data(vec![
