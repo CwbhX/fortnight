@@ -1,0 +1,228 @@
+# Plain, unsigned archives on tag push (PLAN.md section 10, M7). No installers.
+#   Windows: .zip, x86_64 and aarch64
+#   macOS:   .zip, one universal binary (+ Fortnight.app when `cargo xtask bundle` exists)
+#   Linux:   .tar.gz, x86_64 and aarch64, built with cargo-zigbuild against glibc 2.28
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Do NOT set RUSTFLAGS (it would replace +crt-static from .cargo/config.toml).
+
+jobs:
+  windows:
+    name: Windows ${{ matrix.target }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-pc-windows-msvc, aarch64-pc-windows-msvc]
+    env:
+      # aws-lc-sys needs NASM on x86_64 Windows; use its bundled objects if the
+      # runner image ever stops shipping NASM.
+      AWS_LC_SYS_PREBUILT_NASM: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain from rust-toolchain.toml
+        shell: bash
+        run: |
+          rustup toolchain install --profile minimal
+          rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Dependency check
+        shell: pwsh
+        run: |
+          ./ci/check-deps.ps1 target/${{ matrix.target }}/release/fortnight.exe
+          ./ci/check-deps.ps1 target/${{ matrix.target }}/release/fortnight-cli.exe
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "fortnight-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path "dist/$name" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/fortnight.exe" "dist/$name/"
+          Copy-Item "target/${{ matrix.target }}/release/fortnight-cli.exe" "dist/$name/"
+          foreach ($f in 'README.md', 'LICENSE') {
+            if (Test-Path $f) { Copy-Item $f "dist/$name/" }
+          }
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.target }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  macos:
+    name: macOS universal
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: |
+          rustup toolchain install --profile minimal
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build both architectures
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      # Check the thin binaries: otool -L prints per-architecture headers for fat files.
+      - name: Dependency check
+        run: |
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            ci/check-deps.sh target/$t/release/fortnight macos
+            ci/check-deps.sh target/$t/release/fortnight-cli macos
+          done
+
+      - name: Universal binaries
+        run: |
+          mkdir -p universal
+          for b in fortnight fortnight-cli; do
+            lipo -create -output universal/$b \
+              target/aarch64-apple-darwin/release/$b \
+              target/x86_64-apple-darwin/release/$b
+            lipo -info universal/$b
+          done
+
+      # `cargo xtask bundle` (written separately) wraps the macOS binary in
+      # Fortnight.app. We do not know in advance where it writes the bundle or
+      # whether it rebuilds the binary, so: run it, find the .app, and put the
+      # universal binary inside it. If the command is missing or fails, the
+      # archive simply ships without the .app.
+      - name: Fortnight.app
+        run: |
+          rm -rf bundle-out && mkdir -p bundle-out
+          mkdir -p target/release
+          cp universal/fortnight target/release/fortnight
+          if cargo xtask bundle; then
+            app=$(find target -maxdepth 4 -name Fortnight.app -type d | head -n 1)
+            if [ -n "$app" ]; then
+              for exe in "$app"/Contents/MacOS/*; do
+                cp universal/fortnight "$exe"
+                lipo -info "$exe"
+              done
+              ditto "$app" bundle-out/Fortnight.app
+            else
+              echo "::warning::cargo xtask bundle succeeded but no Fortnight.app was found; shipping without it"
+            fi
+          else
+            echo "::warning::cargo xtask bundle is not available or failed; shipping without Fortnight.app"
+          fi
+
+      - name: Package
+        run: |
+          name="fortnight-${{ github.ref_name }}-macos-universal"
+          mkdir -p "dist/$name"
+          cp universal/fortnight universal/fortnight-cli "dist/$name/"
+          for f in README.md LICENSE; do
+            if [ -f "$f" ]; then cp "$f" "dist/$name/"; fi
+          done
+          if [ -d bundle-out/Fortnight.app ]; then ditto bundle-out/Fortnight.app "dist/$name/Fortnight.app"; fi
+          (cd dist && zip -r -y -q "$name.zip" "$name")
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: dist/*.zip
+          if-no-files-found: error
+
+  linux:
+    name: Linux ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: |
+          rustup toolchain install --profile minimal
+          rustup target add ${{ matrix.target }}
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # The ".2.28" suffix makes zig link against glibc 2.28.
+      - name: Build (glibc 2.28)
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}.2.28
+
+      - name: Dependency check
+        env:
+          MAX_GLIBC: "2.28"
+        run: |
+          ci/check-deps.sh target/${{ matrix.target }}/release/fortnight linux
+          ci/check-deps.sh target/${{ matrix.target }}/release/fortnight-cli linux
+
+      - name: Package
+        run: |
+          name="fortnight-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp target/${{ matrix.target }}/release/fortnight target/${{ matrix.target }}/release/fortnight-cli "dist/$name/"
+          for f in README.md LICENSE; do
+            if [ -f "$f" ]; then cp "$f" "dist/$name/"; fi
+          done
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: GitHub release
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          gh release create "${{ github.ref_name }}" dist/* \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes

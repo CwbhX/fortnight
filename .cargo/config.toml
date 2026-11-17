@@ -1,2 +1,11 @@
 [alias]
 xtask = "run --package xtask --"
+
+# PLAN.md 3.1: link the C runtime statically on Windows so no Visual C++
+# redistributable is needed. Note: a RUSTFLAGS environment variable replaces
+# these flags, so CI and release builds must not set RUSTFLAGS.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
