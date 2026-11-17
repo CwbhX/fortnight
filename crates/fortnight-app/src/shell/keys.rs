@@ -53,7 +53,7 @@ impl Keys {
         key_locked(self.key_exists, &self.api_key, llm)
     }
 
-    pub(crate) fn client_for(
+    pub(super) fn client_for(
         &self,
         llm: &LlmSettings,
     ) -> Result<(Arc<dyn LlmClient>, Option<String>), String> {
@@ -70,7 +70,7 @@ impl Keys {
     /// these fields, and its host. It uses its own key if one is saved, and
     /// otherwise the main key only on the main endpoint's host
     /// (`fallback::decision_config`); `main` is the main endpoint's fields.
-    pub(crate) fn decision_client_for(
+    pub(super) fn decision_client_for(
         &self,
         llm: &LlmSettings,
         main: &LlmSettings,
@@ -85,11 +85,11 @@ impl Keys {
         Ok((client, host))
     }
 
-    pub(crate) fn key_state(&self) -> KeyState {
+    pub(super) fn key_state(&self) -> KeyState {
         key_state(self.key_exists, &self.api_key)
     }
 
-    pub(crate) fn decision_key_state(&self) -> KeyState {
+    pub(super) fn decision_key_state(&self) -> KeyState {
         key_state(self.decision_key_exists, &self.decision_key)
     }
 
@@ -106,7 +106,7 @@ impl Keys {
 
 impl Ready {
     /// Why the LLM can't be used right now, if it can't.
-    pub(crate) fn blocked(&self) -> Option<String> {
+    pub(super) fn blocked(&self) -> Option<String> {
         if !self.settings.llm.is_configured() {
             Some("no endpoint is set up in Settings.".into())
         } else if self.keys.locked_for(&self.settings.llm) {
@@ -123,7 +123,7 @@ impl Ready {
     }
 
     /// The saved decision model's client, for priority suggestions.
-    pub(crate) fn decision_model(&self) -> Option<DecisionClient> {
+    pub(super) fn decision_model(&self) -> Option<DecisionClient> {
         if !self.decision_active() {
             return None;
         }
@@ -251,7 +251,7 @@ impl Ready {
     }
 
     /// Saves `api_key` as the `which` key under `password` (Settings).
-    pub(crate) fn set_key(
+    pub(super) fn set_key(
         &mut self,
         api_key: SecretString,
         password: SecretString,
@@ -284,7 +284,7 @@ impl Ready {
     }
 
     /// Removes the `which` key file and forgets the key (Settings).
-    pub(crate) fn remove_key(&mut self, which: settings::Which) -> Task<Message> {
+    pub(super) fn remove_key(&mut self, which: settings::Which) -> Task<Message> {
         let main_path = vault::key_path(&self.data_dir);
         let decision_path = vault::decision_key_path(&self.data_dir);
         let (path, exists, key) = match which {

@@ -69,14 +69,14 @@ impl Reports {
     }
 
     /// Aborts every generation (Lock); they are dropped, not stored.
-    pub(crate) fn abort_all(&mut self) {
+    pub(super) fn abort_all(&mut self) {
         for (_, g) in self.generating.drain() {
             g.abort.abort();
         }
     }
 
     /// The prompt of `kind` was changed in Settings `at`.
-    pub(crate) fn note_prompt_change(&mut self, kind: ReportKind, at: Timestamp) {
+    pub(super) fn note_prompt_change(&mut self, kind: ReportKind, at: Timestamp) {
         self.prompt_changed.insert(kind, at);
     }
 
@@ -225,7 +225,7 @@ impl Ready {
         }
     }
 
-    pub(crate) fn panel_data(&mut self, week: WeekRef) -> ReportPanelData {
+    pub(super) fn panel_data(&mut self, week: WeekRef) -> ReportPanelData {
         let blocked = self.blocked();
         let mut slots = Vec::new();
         for kind in self.panel_kinds(week) {
@@ -315,7 +315,7 @@ impl Ready {
 
     /// Forgets every failure, so the next catch-up tries at once (the
     /// endpoint or key changed).
-    pub(crate) fn reset_backoff(&mut self) {
+    pub(super) fn reset_backoff(&mut self) {
         self.reports.failures.clear();
         self.reports.last_attempt.clear();
         self.later_days.clear_failures();

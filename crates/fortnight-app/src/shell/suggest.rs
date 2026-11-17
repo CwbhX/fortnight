@@ -24,7 +24,7 @@ pub(crate) struct Suggestions {
 impl Suggestions {
     /// Lock: aborts the suggestion in flight, and ignores one already on
     /// its way.
-    pub(crate) fn cancel(&mut self) {
+    pub(super) fn cancel(&mut self) {
         if let Some(handle) = self.request.take() {
             handle.abort();
         }

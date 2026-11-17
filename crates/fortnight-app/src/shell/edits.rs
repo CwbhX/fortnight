@@ -13,7 +13,7 @@ use jiff::civil::Date;
 
 /// One change that Ctrl/Cmd+Z can take back.
 #[derive(Debug, Clone)]
-pub(crate) enum Undo {
+pub(super) enum Undo {
     /// A task was added: delete it (only while it has no other history).
     Added(TaskId),
     /// A task's status or fields changed. Undo puts the task back exactly as
@@ -69,7 +69,7 @@ fn reverted(before: &CoreTask, current: Option<&CoreTask>, keep_position: bool) 
 
 impl Ready {
     /// Takes back the last change (Ctrl/Cmd+Z).
-    pub(crate) fn undo(&mut self) {
+    pub(super) fn undo(&mut self) {
         let Some(last) = self.undo.pop() else {
             return;
         };
@@ -153,7 +153,7 @@ impl Ready {
     }
 
     /// Stores a new task, remembers it for undo, and reloads.
-    pub(crate) fn add_task(&mut self, new: fortnight_core::domain::NewTask) {
+    pub(super) fn add_task(&mut self, new: fortnight_core::domain::NewTask) {
         match self.store.add_task(new) {
             Ok(task) => self.undo.remember(Undo::Added(task.id)),
             Err(e) => self.error = Some(e.to_string()),

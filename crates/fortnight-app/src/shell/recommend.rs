@@ -47,7 +47,7 @@ impl LaterDays {
     }
 
     /// Aborts the requests for days other than `selected`; whether any was.
-    pub(crate) fn abort_other_days(&mut self, selected: Date) -> bool {
+    pub(super) fn abort_other_days(&mut self, selected: Date) -> bool {
         let mut aborted = false;
         self.pending.retain(|day, (_, handle)| {
             let keep = *day == selected;
@@ -61,14 +61,14 @@ impl LaterDays {
     }
 
     /// Aborts every request (Lock).
-    pub(crate) fn abort_all(&mut self) {
+    pub(super) fn abort_all(&mut self) {
         for (_, (_, handle)) in self.pending.drain() {
             handle.abort();
         }
     }
 
     /// Forgets every failure (the endpoint or key changed).
-    pub(crate) fn clear_failures(&mut self) {
+    pub(super) fn clear_failures(&mut self) {
         self.failures.clear();
     }
 }
@@ -76,7 +76,7 @@ impl LaterDays {
 impl Ready {
     /// The recommended tasks the Today tab shows for the selected day, and
     /// whether they are being worked out.
-    pub(crate) fn day_recommendations(&mut self, today: Date) -> (Vec<day::Recommended>, bool) {
+    pub(super) fn day_recommendations(&mut self, today: Date) -> (Vec<day::Recommended>, bool) {
         let recommended = if self.selected == today {
             self.recommended_today()
         } else {
@@ -137,7 +137,7 @@ impl Ready {
     /// Only the open tasks planned for that day take part: overdue ones are
     /// today's business. Not stored; a failure keeps what was shown and is
     /// retried with the reports' backoff.
-    pub(crate) fn update_day_recs(&mut self) -> Task<Message> {
+    pub(super) fn update_day_recs(&mut self) -> Task<Message> {
         let day = self.selected;
         if self.tab != Tab::Today || day <= self.today() || self.blocked().is_some() {
             return Task::none();
@@ -190,7 +190,7 @@ impl Ready {
     /// Where a report of `kind` goes: the main endpoint, and for
     /// recommended tasks the decision model first when one is set (and can
     /// be built).
-    pub(crate) fn plan_route(&self, kind: ReportKind) -> Result<PlanRoute, String> {
+    pub(super) fn plan_route(&self, kind: ReportKind) -> Result<PlanRoute, String> {
         let (client, host) = self.keys.client_for(&self.settings.llm)?;
         let decision = &self.settings.decision_llm;
         let decision = (kind == ReportKind::Plan && decision.is_configured())
