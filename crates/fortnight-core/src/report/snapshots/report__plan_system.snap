@@ -1,5 +1,5 @@
 ---
-source: crates/fortnight-core/src/report.rs
+source: crates/fortnight-core/src/report/plan.rs
 expression: p.request.system
 ---
 You pick the three tasks the user should do first today (`today`), most important first, from the tasks on today's list (`on_today_list`: planned for today, or for an earlier day and carried over) and the overdue tasks (`overdue`: due on an earlier day and still not done). Be direct and practical.

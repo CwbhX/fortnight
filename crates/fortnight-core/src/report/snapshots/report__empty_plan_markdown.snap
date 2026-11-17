@@ -1,5 +1,5 @@
 ---
-source: crates/fortnight-core/src/report.rs
+source: crates/fortnight-core/src/report/plan.rs
 expression: plan_facts_markdown(&plan)
 ---
 **Today:** Wed 18 Nov · week Mon 16 Nov to Sun 22 Nov

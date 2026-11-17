@@ -1,7 +1,10 @@
 ---
-source: crates/fortnight-core/src/report.rs
-expression: facts
+source: crates/fortnight-core/src/report/plan.rs
+expression: p.request.user
 ---
+Pick the three tasks I should do first today, Wednesday 2026-11-18. This week runs from Monday 2026-11-16 to Sunday 2026-11-22.
+
+<facts>
 {
   "today": "2026-11-18",
   "today_weekday": "Wednesday",
@@ -202,3 +205,4 @@ expression: facts
     "overloaded": false
   }
 }
+</facts>

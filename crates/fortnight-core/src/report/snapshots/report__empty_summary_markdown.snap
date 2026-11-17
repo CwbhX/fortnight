@@ -1,5 +1,5 @@
 ---
-source: crates/fortnight-core/src/report.rs
+source: crates/fortnight-core/src/report/summary.rs
 expression: summary_facts_markdown(&summary)
 ---
 **Week:** Mon 9 Nov to Sun 15 Nov 2026
