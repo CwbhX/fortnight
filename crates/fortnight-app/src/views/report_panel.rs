@@ -12,9 +12,12 @@
 //!   `report::parse_recommendations`. The Week tab draws the list and the
 //!   rank badges in its day columns; this module only holds the parsed
 //!   result and the status line.
-//! - Work summary: the newest `Summary` version as Markdown, with Copy,
-//!   Edit, Export and, for an edited summary, Discard edit (an edited
-//!   summary is not regenerated, so the edit is never lost silently).
+//! - Work summary: the newest `Summary` version as Markdown. Its heading
+//!   carries a copy icon (`summary_tools`; the tooltip says "Copied" after a
+//!   click) and, for a summary edited earlier, Discard edit (an edited
+//!   summary is not regenerated, so the edit is never lost silently). The
+//!   Edit and Export buttons under the text were removed; the editor code
+//!   stays for summaries already being edited.
 //!
 //! `load` runs after every message and on every streamed piece, so it
 //! returns early on equal data and only reparses Markdown whose source
@@ -25,7 +28,9 @@
 use fortnight_core::domain::{Report, ReportId, ReportKind, ReportStatus, WeekRef};
 use fortnight_core::export::ExportFormat;
 use fortnight_core::report::{self, Recommendation};
-use iced::widget::{Column, button, column, markdown, row, space, text, text_editor};
+use iced::widget::{
+    Column, button, column, container, markdown, mouse_area, row, text, text_editor, tooltip,
+};
 use iced::{Center, Element, Font, Padding, Theme, border, color};
 
 use crate::theme;
@@ -40,6 +45,8 @@ pub enum Message {
     CancelEdit,
     DiscardEdit,
     Copy,
+    /// The pointer left the copy icon: its tooltip says "Copy" again.
+    CopyHoverEnd,
     Export,
     /// A Markdown link was clicked; ignored on purpose.
     LinkClicked(markdown::Uri),
@@ -99,6 +106,8 @@ pub struct ReportPanel {
     body_parses: u32,
     /// The open editor and the version it edits.
     editor: Option<(ReportId, text_editor::Content)>,
+    /// The copy icon was clicked and the pointer hasn't left it since.
+    copied: bool,
 }
 
 /// A status line under a heading, and whether it is an error.
@@ -159,6 +168,7 @@ impl ReportPanel {
             }
             self.body_src = body_src;
             self.body_parses += 1;
+            self.copied = false;
         }
     }
 
@@ -276,10 +286,21 @@ impl ReportPanel {
                 Some(r) if r.edited_md.is_some() => Action::SaveEdit(r.id, None),
                 _ => Action::None,
             },
-            Message::Copy => match self.ready(ReportKind::Summary).and_then(Report::text) {
-                Some(text) => Action::Copy(text.to_owned()),
+            Message::Copy => match self
+                .ready(ReportKind::Summary)
+                .and_then(Report::text)
+                .map(str::to_owned)
+            {
+                Some(text) => {
+                    self.copied = true;
+                    Action::Copy(text)
+                }
                 None => Action::None,
             },
+            Message::CopyHoverEnd => {
+                self.copied = false;
+                Action::None
+            }
             Message::Export => match self.ready(ReportKind::Summary) {
                 Some(r) => Action::Export(r.id, ExportFormat::Markdown),
                 None => Action::None,
@@ -288,12 +309,50 @@ impl ReportPanel {
         }
     }
 
-    /// The Work summary's body: the text and its buttons, or the editor.
-    /// Empty when there is no summary to show.
-    pub fn summary_view(&self) -> Element<'_, Message> {
-        let Some(slot) = self.slot(ReportKind::Summary) else {
-            return Column::new().into();
+    /// What sits beside the Work summary heading: the copy icon (with a
+    /// tooltip) and, for an edited summary, Discard edit. `None` without a
+    /// ready summary or while editing.
+    pub fn summary_tools(&self) -> Option<Element<'_, Message>> {
+        if self.editor.is_some() {
+            return None;
+        }
+        let ready = self.ready(ReportKind::Summary)?;
+        ready.text()?;
+        let (icon, tip) = if self.copied {
+            (theme::Icon::Check, "Copied")
+        } else {
+            (theme::Icon::Copy, "Copy as Markdown")
         };
+        let copy = button(theme::icon(icon).width(16).height(16))
+            .padding(theme::ICON_PADDING)
+            .style(theme::icon_button)
+            .on_press(Message::Copy);
+        let copy = mouse_area(tooltip(
+            copy,
+            container(text(tip).size(theme::TEXT_SMALL))
+                .padding([4, 8])
+                .style(theme::card),
+            tooltip::Position::Bottom,
+        ))
+        .on_exit(Message::CopyHoverEnd);
+        let mut tools = row![copy].spacing(theme::SPACING / 2.0).align_y(Center);
+        if ready.edited_md.is_some() {
+            tools = tools.push(
+                button(text("Discard edit").size(theme::TEXT_SMALL))
+                    .padding([2, 8])
+                    .style(theme::text_button)
+                    .on_press(Message::DiscardEdit),
+            );
+        }
+        Some(tools.into())
+    }
+
+    /// The Work summary's body: the text, or the editor. Empty when there
+    /// is no summary to show.
+    pub fn summary_view(&self) -> Element<'_, Message> {
+        if self.slot(ReportKind::Summary).is_none() {
+            return Column::new().into();
+        }
         if let Some((_, editor)) = &self.editor {
             let editor = text_editor(editor)
                 .on_action(Message::EditAction)
@@ -311,27 +370,7 @@ impl ReportPanel {
         if self.body_src.is_empty() {
             return Column::new().into();
         }
-        let mut col = column![md(&self.body, theme::TEXT_BODY)].spacing(theme::SPACING);
-        if slot.streaming.is_none()
-            && let Some(r) = self.ready(ReportKind::Summary)
-        {
-            let mut buttons = row![
-                small_button("Copy", Message::Copy, theme::secondary_button),
-                small_button("Edit", Message::StartEdit, theme::secondary_button),
-                small_button("Export", Message::Export, theme::secondary_button),
-            ]
-            .spacing(theme::SPACING / 2.0)
-            .align_y(Center);
-            if r.edited_md.is_some() {
-                buttons = buttons.push(space::horizontal()).push(small_button(
-                    "Discard edit",
-                    Message::DiscardEdit,
-                    theme::text_button,
-                ));
-            }
-            col = col.push(buttons);
-        }
-        col.into()
+        md(&self.body, theme::TEXT_BODY)
     }
 
     /// The status line for `kind` as an element (with Retry when offered).
@@ -571,6 +610,10 @@ mod tests {
         edited.edited_md = Some("mine".into());
         p.load(data(vec![slot(ReportKind::Summary, vec![edited])]));
         assert_eq!(p.update(Message::Copy), Action::Copy("mine".into()));
+        assert!(p.copied);
+        assert!(p.summary_tools().is_some());
+        p.update(Message::CopyHoverEnd);
+        assert!(!p.copied);
         assert_eq!(p.update(Message::DiscardEdit), Action::SaveEdit(7, None));
         assert_eq!(
             p.update(Message::Export),

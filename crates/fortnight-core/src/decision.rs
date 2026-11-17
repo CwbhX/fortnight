@@ -7,14 +7,16 @@
 //! chat model would (fallback, streaming, CLI), but it only understands
 //! the recommended-tasks request (`report::prepare_plan`): it reads the
 //! plan facts from between `<facts>` and `</facts>`, offers the open tasks
-//! planned for today (never other days' tasks) as one `choice` question
-//! ("which first?"), ranks them by probability
+//! planned for today and the overdue ones (due on an earlier day and not
+//! done, wherever they sit; never other days' tasks) as one `choice`
+//! question ("which first?"), ranks them by probability
 //! and replies with the same JSON a chat model would
 //! (`report::parse_recommendations`). The reasons are written here from
 //! the facts ("overdue 2 days", "high priority, due Thursday"); the model
 //! gives none. Priority counts twice: each option starts with it ("High
 //! priority; …"), and the ranking multiplies the probabilities by 1, 2 or
-//! 4 for low, medium and high (`priority_weight`).
+//! 4 for low, medium and high (`priority_weight`). Being overdue counts
+//! too: up to twice as much the longer it is late (`overdue_weight`).
 //!
 //! The Settings Test button's request (`ChatRequest::test`) sends one
 //! `noul` question and replies "OK". Any other request (a weekly summary)
@@ -287,6 +289,15 @@ fn priority_weight(priority: u64) -> f64 {
     }
 }
 
+/// An overdue task counts more the longer it is late: 1.25 at one day
+/// overdue, up to 2 at four days or more. Not overdue: 1.
+fn overdue_weight(days_until_due: Option<i64>) -> f64 {
+    match days_until_due {
+        Some(d) if d < 0 => 1.0 + 0.25 * (-d).min(4) as f64,
+        _ => 1.0,
+    }
+}
+
 /// The systemone request for the plan facts in `user`, or `None` if `user`
 /// isn't a recommended-tasks request.
 fn plan_question(user: &str, model: &str) -> Option<Ask> {
@@ -307,8 +318,11 @@ fn plan_question(user: &str, model: &str) -> Option<Ask> {
             let Some(id) = task.get("id").and_then(Value::as_i64) else {
                 continue;
             };
-            // Only the tasks on today's list.
-            if today.is_empty() || task.get("planned_for").and_then(Value::as_str) != Some(today) {
+            // Only the tasks on today's list, and overdue ones until done.
+            let planned_today =
+                !today.is_empty() && task.get("planned_for").and_then(Value::as_str) == Some(today);
+            let overdue = task.get("overdue").and_then(Value::as_bool) == Some(true);
+            if !planned_today && !overdue {
                 continue;
             }
             if candidates.len() < MAX_OPTIONS && candidates.iter().all(|c| c.id != id) {
@@ -351,7 +365,7 @@ fn plan_question(user: &str, model: &str) -> Option<Ask> {
         "questions": {
             "first": {
                 "type": "choice",
-                "instructions": "Which task should be done first today? Higher priority comes first: High before Medium before Low. Among tasks of the same priority, overdue tasks and the nearest deadlines come first, then what fits the free hours.",
+                "instructions": "Which task should be done first today? Weigh priority, deadlines and context together. Higher priority comes first: High before Medium before Low. Overdue tasks were not finished on the day they were due and should not slip again: the longer overdue, the sooner. Among tasks of the same priority, overdue tasks and the nearest deadlines come first, then what unblocks other work or fits the free hours.",
                 "criteria": criteria,
             }
         }
@@ -422,7 +436,7 @@ fn candidate(id: i64, task: &Value, facts: &Value) -> Candidate {
         key: format!("t{id}"),
         description: parts.join("; "),
         why,
-        weight: priority_weight(priority),
+        weight: priority_weight(priority) * overdue_weight(days),
     }
 }
 
@@ -632,6 +646,59 @@ mod tests {
                 .unwrap()
                 .starts_with("Medium priority; ")
         );
+    }
+
+    #[tokio::test]
+    async fn overdue_tasks_from_earlier_days_are_offered_and_count_more() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "nimble",
+                "answers": { "first": {
+                    "type": "choice",
+                    "choice": "t1",
+                    // 0.5 (x1); overdue 4 days: 0.3 (x2 = 0.6).
+                    "probabilities": { "t1": 0.5, "t2": 0.3 }
+                } }
+            })))
+            .mount(&server)
+            .await;
+        let todays = task(1, "Tidy desk", None);
+        // Planned for last Thursday, due then, still open.
+        let late = Task {
+            planned_for: Some(date(2026, 11, 12)),
+            ..task(2, "Send invoice", Some(date(2026, 11, 12)))
+        };
+        // Planned for an earlier day but not overdue: not offered.
+        let carried = Task {
+            planned_for: Some(date(2026, 11, 13)),
+            ..task(3, "Read paper", Some(date(2026, 11, 20)))
+        };
+        let reply = client(&server)
+            .chat(plan_request(&[todays, late, carried]))
+            .await
+            .unwrap();
+        let rec = parse_recommendations(&reply.text).unwrap();
+        let picked: Vec<(i64, &str)> = rec.tasks.iter().map(|t| (t.id, t.why.as_str())).collect();
+        assert_eq!(
+            picked,
+            vec![(2, "overdue 4 days"), (1, "planned for today")]
+        );
+        let sent: Value = server.received_requests().await.unwrap()[0]
+            .body_json()
+            .unwrap();
+        let criteria = sent["questions"]["first"]["criteria"].as_object().unwrap();
+        assert_eq!(criteria.len(), 2, "{criteria:?}");
+    }
+
+    #[test]
+    fn overdue_weight_grows_then_stops() {
+        assert_eq!(overdue_weight(None), 1.0);
+        assert_eq!(overdue_weight(Some(0)), 1.0);
+        assert_eq!(overdue_weight(Some(-1)), 1.25);
+        assert_eq!(overdue_weight(Some(-4)), 2.0);
+        assert_eq!(overdue_weight(Some(-30)), 2.0);
     }
 
     #[tokio::test]

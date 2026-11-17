@@ -3,13 +3,14 @@
 //! Sections, top to bottom:
 //!
 //! - **Recommended** (only when the shown day is today): the model's top
-//!   three open tasks, most important first, numbered, each with a few
-//!   words on why. They are left out of the sections below.
-//! - **Overdue** (only when the shown day is today, and only if any): open
-//!   tasks whose deadline has passed.
+//!   three open tasks (planned for today or overdue), most important
+//!   first, numbered, each with a few words on why. They are left out of
+//!   the sections below.
 //! - **Tasks**: open tasks whose [`Task::day`] (the planned day) is the
 //!   shown day, then the add-a-task input. On today this also carries over
 //!   open tasks planned for an earlier day whose deadline has not passed.
+//! - **Overdue** (only when the shown day is today, and only if any): open
+//!   tasks whose deadline has passed.
 //! - **Side work**: free-standing log lines dated the shown day, shown as
 //!   ticked items, with an input to add one (today only, see below).
 //! - **Completed**, collapsed: tasks completed on the shown day.
@@ -256,21 +257,21 @@ pub enum Section {
     /// Today only: the model's top three open tasks, most important first.
     /// They are left out of the sections below.
     Recommended,
-    Overdue,
     /// The shown day's open tasks.
     Day,
+    Overdue,
     Done,
     NoDate,
     Deleted,
 }
 
 impl Section {
-    /// Display order of the task sections (side work sits between Day and
-    /// Done).
+    /// Display order of the task sections (side work sits between Overdue
+    /// and Done).
     pub const ALL: [Section; 6] = [
         Section::Recommended,
-        Section::Overdue,
         Section::Day,
+        Section::Overdue,
         Section::Done,
         Section::NoDate,
         Section::Deleted,
@@ -997,12 +998,6 @@ impl DayView {
             );
         }
 
-        let overdue = section_tasks(data, Section::Overdue);
-        if !overdue.is_empty() {
-            let heading = section_title(&overdue, "Overdue Task", theme::danger);
-            content = content.push(self.group(heading, overdue, data));
-        }
-
         // The day's tasks, then the add-a-task input as the last card.
         let day_tasks = section_tasks(data, Section::Day);
         let quick_add = text_input("Add a task", &self.quick_add)
@@ -1019,6 +1014,12 @@ impl DayView {
             column![heading, self.sortable_rows(day_tasks, data)]
         };
         content = content.push(day_group.push(quick_add).spacing(theme::SPACING / 2.0));
+
+        let overdue = section_tasks(data, Section::Overdue);
+        if !overdue.is_empty() {
+            let heading = section_title(&overdue, "Overdue Task", theme::danger);
+            content = content.push(self.group(heading, overdue, data));
+        }
 
         if let Some(side) = side_work(data, &self.day_log) {
             content = content.push(side);
@@ -2050,7 +2051,8 @@ mod tests {
     #[test]
     fn visible_rows_skip_collapsed_sections_and_deleted() {
         let data = data_for(today(), mixed());
-        assert_eq!(visible_rows(&data, false, false), vec![4, 1, 2, 3, 12]);
+        // The day's tasks, then Overdue under them.
+        assert_eq!(visible_rows(&data, false, false), vec![2, 3, 12, 4, 1]);
         let all = visible_rows(&data, true, true);
         assert_eq!(all.len(), 8);
         assert_eq!(all.last(), Some(&7));
@@ -2078,15 +2080,15 @@ mod tests {
     fn keyboard_moves_toggles_and_closes() {
         let mut view = loaded(mixed());
         view.on_key(NavKey::Down);
-        assert_eq!(view.selected, Some(4));
+        assert_eq!(view.selected, Some(2));
         view.on_key(NavKey::Up);
-        assert_eq!(view.selected, Some(4), "stops at the top");
+        assert_eq!(view.selected, Some(2), "stops at the top");
         assert_eq!(
             view.on_key(NavKey::Toggle),
-            Action::SetStatus(4, TaskStatus::Done)
+            Action::SetStatus(2, TaskStatus::Done)
         );
         view.on_key(NavKey::Open);
-        assert_eq!(view.editing.as_ref().map(|f| f.id), Some(4));
+        assert_eq!(view.editing.as_ref().map(|f| f.id), Some(2));
         view.on_key(NavKey::Close);
         assert!(view.editing.is_none());
         view.on_key(NavKey::Close);

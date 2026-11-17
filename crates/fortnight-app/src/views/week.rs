@@ -284,8 +284,8 @@ impl WeekView {
             ));
         }
         if self.panel.slot(ReportKind::Summary).is_some() {
-            body = body.push(card(
-                "Work summary",
+            body = body.push(summary_card(
+                self.panel.summary_tools().map(|e| e.map(Message::Panel)),
                 self.panel
                     .status_view(ReportKind::Summary)
                     .map(|e| e.map(Message::Panel)),
@@ -413,6 +413,66 @@ fn card<'a>(
         .width(Fill)
         .style(theme::card)
         .into()
+}
+
+/// The Work summary card. Its heading sits in a tinted bar of its own, in
+/// bold with a copy icon beside it and the status at the right, so it
+/// doesn't read as one more heading of the Markdown below it.
+fn summary_card<'a>(
+    tools: Option<Element<'a, Message>>,
+    status: Option<Element<'a, Message>>,
+    body: Element<'a, Message>,
+) -> Element<'a, Message> {
+    let bold = iced::Font {
+        weight: iced::font::Weight::Bold,
+        ..theme::FONT
+    };
+    let mut head = row![text("Work summary").size(theme::TEXT_HEADING).font(bold)]
+        .spacing(theme::SPACING / 2.0)
+        .align_y(Center);
+    if let Some(tools) = tools {
+        head = head.push(tools);
+    }
+    if let Some(status) = status {
+        head = head.push(space::horizontal()).push(status);
+    }
+    let bar = container(head)
+        .padding(
+            iced::Padding::from([theme::SPACING * 0.75, theme::SPACING * 1.5])
+                .right(theme::SPACING),
+        )
+        .width(Fill)
+        .style(summary_bar);
+    container(column![
+        bar,
+        container(body).padding(theme::SPACING * 1.5).width(Fill)
+    ])
+    .width(Fill)
+    .style(theme::card)
+    .into()
+}
+
+/// The Work summary's heading bar: a stronger fill than the card, rounded
+/// at the top only, with a hairline under it.
+fn summary_bar(theme: &Theme) -> container::Style {
+    let p = theme.palette();
+    let mix = |amount: f32| {
+        Color::from_rgb(
+            p.background.r + (p.text.r - p.background.r) * amount,
+            p.background.g + (p.text.g - p.background.g) * amount,
+            p.background.b + (p.text.b - p.background.b) * amount,
+        )
+    };
+    container::Style {
+        background: Some(mix(0.08).into()),
+        border: iced::border::rounded(iced::border::top(theme::RADIUS)),
+        shadow: iced::Shadow {
+            color: mix(0.16),
+            offset: iced::Vector::new(0.0, 1.0),
+            blur_radius: 0.0,
+        },
+        ..container::Style::default()
+    }
 }
 
 /// A small round number in the accent colour: a recommended task's rank.
@@ -604,9 +664,8 @@ fn date_label(d: Date) -> String {
     d.strftime("%-d %b").to_string()
 }
 
-/// The small grey line under a task title: estimate, project, and the
-/// deadline when the task is planned for another day.
-fn meta_line(task: &Task, column_day: Date) -> String {
+/// The small grey line under a task title: estimate and project.
+fn meta_line(task: &Task) -> String {
     let mut parts = Vec::new();
     if let Some(m) = task.estimate_minutes {
         parts.push(duration(m));
@@ -614,12 +673,15 @@ fn meta_line(task: &Task, column_day: Date) -> String {
     if let Some(p) = &task.project {
         parts.push(format!("#{p}"));
     }
-    if let Some(due) = task.due_on
-        && due != column_day
-    {
-        parts.push(format!("due {}", due.strftime("%a %-d")));
-    }
     parts.join(" · ")
+}
+
+/// The deadline at a card's bottom right ("Wed 18"), when the task is
+/// planned for another day than its deadline.
+fn due_corner(task: &Task, column_day: Date) -> Option<String> {
+    task.due_on
+        .filter(|due| *due != column_day)
+        .map(|due| due.strftime("%a %-d").to_string())
 }
 
 fn day_column<'a>(
@@ -938,14 +1000,28 @@ fn task_card<'a>(
 
     let mut body = Column::new().spacing(2).width(Fill).push(title);
     if !done {
-        let meta = meta_line(task, day);
-        if !meta.is_empty() {
-            body = body.push(
+        let meta = meta_line(task);
+        let due = due_corner(task, day);
+        if !meta.is_empty() || due.is_some() {
+            // Estimate and project on the left, the deadline bottom right.
+            let mut line = row![
                 text(meta)
                     .size(11)
                     .style(theme::muted)
-                    .wrapping(Wrapping::WordOrGlyph),
-            );
+                    .wrapping(Wrapping::WordOrGlyph)
+                    .width(Fill)
+            ]
+            .spacing(6)
+            .align_y(iced::Bottom);
+            if let Some(due) = due {
+                line = line.push(
+                    text(due)
+                        .size(11)
+                        .style(theme::due_style(overdue))
+                        .wrapping(Wrapping::None),
+                );
+            }
+            body = body.push(line);
         }
     }
 
@@ -1211,15 +1287,17 @@ mod tests {
     }
 
     #[test]
-    fn meta_line_shows_estimate_project_and_other_deadline() {
+    fn meta_line_shows_estimate_and_project_and_the_corner_another_deadline() {
         let d = date(2026, 11, 18);
         let mut t = task(1, Some(date(2026, 11, 20)), TaskStatus::Doing);
         t.planned_for = Some(d);
         t.estimate_minutes = Some(120);
         t.project = Some("work".into());
-        assert_eq!(meta_line(&t, d), "2h · #work · due Fri 20");
+        assert_eq!(meta_line(&t), "2h · #work");
+        assert_eq!(due_corner(&t, d).as_deref(), Some("Fri 20"));
         let plain = task(2, Some(d), TaskStatus::Todo);
-        assert_eq!(meta_line(&plain, d), "");
+        assert_eq!(meta_line(&plain), "");
+        assert_eq!(due_corner(&plain, d), None);
     }
 
     #[test]

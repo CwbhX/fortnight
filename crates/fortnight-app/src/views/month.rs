@@ -10,6 +10,12 @@
 //! left out, as in the Week tab.
 //! Clicking a cell opens the day in the Today tab.
 //!
+//! A day with tasks due on it (`Task::due_on`, deleted ones left out) shows
+//! at its top right the share of them that are done ("67%"); hovering says
+//! how many are due and done. Clicking it opens a small dropdown under it
+//! listing the tasks due that day as tiny cards, open ones first and done
+//! ones at the bottom; clicking anywhere else closes it.
+//!
 //! The grid fills the content area with equal cells. When the rows get too
 //! short for three titles it shows fewer (the "+N more" grows); below one
 //! title per cell it keeps a minimum height and scrolls.
@@ -24,9 +30,10 @@ use fortnight_core::week::month_weeks;
 use iced::border::{self, Border};
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Column, Row, Space, button, column, container, responsive, row, scrollable, text,
+    Column, Row, Space, button, column, container, mouse_area, pin, responsive, row, scrollable,
+    space, stack, text, tooltip,
 };
-use iced::{Color, Element, Fill, Font, Length, Size, Theme};
+use iced::{Color, Element, Fill, Font, Length, Point, Size, Theme};
 use jiff::ToSpan;
 use jiff::civil::{Date, Weekday};
 
@@ -34,6 +41,12 @@ use jiff::civil::{Date, Weekday};
 pub enum Message {
     DayClicked(Date),
     WeekClicked(WeekRef),
+    /// A day's completion badge: open its dropdown (or close it if open).
+    ToggleDue(Date),
+    /// A click outside the open dropdown.
+    CloseDue,
+    /// A click inside the open dropdown: keeps it open.
+    Ignore,
 }
 
 /// What `main.rs` must do. FROZEN contract (round 2).
@@ -66,6 +79,8 @@ pub struct MonthData {
 #[derive(Debug, Default)]
 pub struct MonthView {
     data: Option<MonthData>,
+    /// The day whose due-tasks dropdown is open.
+    open_due: Option<Date>,
 }
 
 impl MonthView {
@@ -79,13 +94,31 @@ impl MonthView {
         if self.data.as_ref() == Some(&data) {
             return;
         }
+        if self.data.as_ref().map(|d| d.month) != Some(data.month) {
+            self.open_due = None;
+        }
         self.data = Some(data);
     }
 
     pub fn update(&mut self, message: Message) -> Action {
         match message {
-            Message::DayClicked(d) => Action::OpenDay(d),
-            Message::WeekClicked(w) => Action::OpenWeek(w),
+            Message::DayClicked(d) => {
+                self.open_due = None;
+                Action::OpenDay(d)
+            }
+            Message::WeekClicked(w) => {
+                self.open_due = None;
+                Action::OpenWeek(w)
+            }
+            Message::ToggleDue(d) => {
+                self.open_due = (self.open_due != Some(d)).then_some(d);
+                Action::None
+            }
+            Message::CloseDue => {
+                self.open_due = None;
+                Action::None
+            }
+            Message::Ignore => Action::None,
         }
     }
 
@@ -93,7 +126,8 @@ impl MonthView {
         let Some(data) = &self.data else {
             return text("Loading…").style(theme::muted).into();
         };
-        responsive(move |size| grid(data, size)).into()
+        let open = self.open_due;
+        responsive(move |size| grid(data, open, size)).into()
     }
 }
 
@@ -149,8 +183,14 @@ fn lines_that_fit(height: f32) -> usize {
     }
 }
 
-/// The grid for `size` (the content area below the top bar).
-fn grid(data: &MonthData, size: Size) -> Element<'_, Message> {
+/// Width of the due-tasks dropdown.
+const DROPDOWN_WIDTH: f32 = 230.0;
+/// Text size of the completion badge.
+const BADGE_SIZE: f32 = 11.0;
+
+/// The grid for `size` (the content area below the top bar), with the
+/// due-tasks dropdown of `open` over it.
+fn grid(data: &MonthData, open: Option<Date>, size: Size) -> Element<'_, Message> {
     let weeks = month_weeks(data.month, data.week_start);
     let rows = weeks.len().max(1) as f32;
 
@@ -180,21 +220,49 @@ fn grid(data: &MonthData, size: Size) -> Element<'_, Message> {
     }
 
     let mut body = Column::new().spacing(GAP);
-    for week in weeks {
+    // Where the open dropdown goes, in the body's coordinates.
+    let mut dropdown = None;
+    for (r, week) in weeks.iter().enumerate() {
         let mut line = Row::new()
             .spacing(GAP)
             .height(row_height)
-            .push(week_label(week, has_summary(data, week)));
-        for day in week.days() {
+            .push(week_label(*week, has_summary(data, *week)));
+        for (c, day) in week.days().into_iter().enumerate() {
             line = line.push(day_cell(data, day, lines, max_chars));
+            if open == Some(day) {
+                let due = due_tasks(&data.tasks, day);
+                if !due.is_empty() {
+                    let right = LABEL_WIDTH + GAP + (c as f32 + 1.0) * (cell_width + GAP) - GAP;
+                    let top = r as f32 * (row_height + GAP) + CELL_PAD_Y + DATE_SIZE * LINE + 2.0;
+                    dropdown = Some((due, right, top));
+                }
+            }
         }
         body = body.push(line);
     }
 
+    let body: Element<'_, Message> = match dropdown {
+        None => body.into(),
+        Some((due, right, top)) => {
+            let height = rows * row_height + GAP * (rows - 1.0);
+            let estimate = dropdown_height(due.len());
+            let x = (right - DROPDOWN_WIDTH).max(0.0);
+            // Under the badge; moved up when it would run off the bottom.
+            let y = top.min(height - estimate).max(0.0);
+            let panel = mouse_area(due_dropdown(due, data.today)).on_press(Message::Ignore);
+            stack![
+                body,
+                mouse_area(space().width(Fill).height(Fill)).on_press(Message::CloseDue),
+                pin(panel).position(Point::new(x, y)),
+            ]
+            .into()
+        }
+    };
+
     let body: Element<'_, Message> = if scrolls {
         scrollable(body).height(Fill).into()
     } else {
-        body.into()
+        body
     };
 
     column![container(header).height(HEADER_HEIGHT), body]
@@ -247,6 +315,10 @@ fn day_cell(data: &MonthData, day: Date, lines: usize, max_chars: usize) -> Elem
             ..theme::FONT
         });
     }
+    let mut top = row![date, space::horizontal()].align_y(iced::Alignment::Center);
+    if let Some(done) = due_done(&data.tasks, day) {
+        top = top.push(completion_badge(day, done, data.today));
+    }
 
     let mut cards = Column::new().spacing(LINE_GAP);
     for t in &content.titles {
@@ -264,7 +336,7 @@ fn day_cell(data: &MonthData, day: Date, lines: usize, max_chars: usize) -> Elem
             .padding([PILL_PAD_Y, PILL_PAD_X]),
         );
     }
-    let col = column![date, cards].spacing(DATE_GAP);
+    let col = column![top, cards].spacing(DATE_GAP);
 
     button(
         container(col)
@@ -326,6 +398,94 @@ fn task_pill<'a>(t: &TitleLine, max_chars: usize) -> Element<'a, Message> {
                 ..container::Style::default()
             }
         })
+        .into()
+}
+
+/// The "67%" at a day's top right: how much of what is due that day is
+/// done. Hover for the counts; click for the dropdown. Green when all is
+/// done, red when the day has passed with some still open.
+fn completion_badge<'a>(day: Date, done: DueDone, today: Date) -> Element<'a, Message> {
+    let tone = if done.done == done.due {
+        Tone::Done
+    } else if day < today {
+        Tone::Late
+    } else {
+        Tone::Open
+    };
+    let badge = button(
+        text(format!("{}%", done.percent()))
+            .size(BADGE_SIZE)
+            .line_height(LINE)
+            .wrapping(Wrapping::None),
+    )
+    .padding([0.0, 5.0])
+    .style(badge_style(tone))
+    .on_press(Message::ToggleDue(day));
+    tooltip(
+        badge,
+        container(text(done.describe()).size(theme::TEXT_SMALL))
+            .padding([4, 8])
+            .style(theme::card),
+        tooltip::Position::Bottom,
+    )
+    .into()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Tone {
+    Open,
+    Done,
+    Late,
+}
+
+fn badge_style(tone: Tone) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let p = theme.palette();
+        let color = match tone {
+            Tone::Open => theme::muted_color(theme),
+            Tone::Done => p.success,
+            Tone::Late => theme::danger_color(theme),
+        };
+        let amount = match status {
+            button::Status::Hovered | button::Status::Pressed => 0.22,
+            _ => 0.12,
+        };
+        button::Style {
+            background: Some(color.scale_alpha(amount).into()),
+            text_color: color,
+            border: border::rounded(999),
+            ..button::Style::default()
+        }
+    }
+}
+
+/// Rough height of the dropdown for `n` tasks, to keep it on screen.
+fn dropdown_height(n: usize) -> f32 {
+    let card = TITLE_SIZE * LINE + PILL_PAD_Y * 2.0 + 4.0;
+    20.0 + DATE_SIZE * LINE + 8.0 + n as f32 * (card + 4.0)
+}
+
+/// The dropdown listing the tasks due on a day: open ones first, done ones
+/// at the bottom.
+fn due_dropdown<'a>(due: Vec<&Task>, today: Date) -> Element<'a, Message> {
+    let done = due.iter().filter(|t| t.status == TaskStatus::Done).count();
+    let heading = text(format!("{done} of {} done", due.len()))
+        .size(TITLE_SIZE)
+        .style(theme::muted);
+    let mut list = Column::new().spacing(4).push(heading);
+    for t in due {
+        let line = TitleLine {
+            title: t.title.clone(),
+            done: t.status == TaskStatus::Done,
+            overdue: t.is_overdue(today),
+            priority: t.priority,
+        };
+        list = list.push(task_pill(&line, 34));
+    }
+    container(list.width(Fill))
+        .padding(10)
+        .width(DROPDOWN_WIDTH)
+        .style(theme::overlay_panel)
         .into()
 }
 
@@ -423,6 +583,52 @@ fn cell_content(tasks: &[Task], day: Date, today: Date, lines: usize) -> CellCon
             .collect(),
         more: total - shown,
     }
+}
+
+/// How many tasks are due on a day and how many of those are done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DueDone {
+    due: usize,
+    done: usize,
+}
+
+impl DueDone {
+    /// Rounded down, so "100%" only when all are done.
+    fn percent(self) -> usize {
+        self.done * 100 / self.due.max(1)
+    }
+
+    /// The badge's tooltip: "3 due · 2 complete".
+    fn describe(self) -> String {
+        format!("{} due · {} complete", self.due, self.done)
+    }
+}
+
+/// The tasks due on `day` (deleted ones left out): open ones first (higher
+/// priority, then manual order), done ones at the bottom.
+fn due_tasks(tasks: &[Task], day: Date) -> Vec<&Task> {
+    let mut due: Vec<&Task> = tasks
+        .iter()
+        .filter(|t| t.due_on == Some(day) && t.status != TaskStatus::Dropped)
+        .collect();
+    due.sort_by(|a, b| {
+        let done = |t: &Task| t.status == TaskStatus::Done;
+        done(a)
+            .cmp(&done(b))
+            .then(b.priority.cmp(&a.priority))
+            .then(a.position.total_cmp(&b.position))
+            .then(a.id.cmp(&b.id))
+    });
+    due
+}
+
+/// The counts behind a day's badge; `None` when nothing is due that day.
+fn due_done(tasks: &[Task], day: Date) -> Option<DueDone> {
+    let due = due_tasks(tasks, day);
+    (!due.is_empty()).then(|| DueDone {
+        due: due.len(),
+        done: due.iter().filter(|t| t.status == TaskStatus::Done).count(),
+    })
 }
 
 /// `s` cut to at most `max` characters, ending in "…" when cut.
@@ -635,6 +841,49 @@ mod tests {
         assert_eq!(lines_that_fit(cell_height(4)), 4);
         assert_eq!(lines_that_fit(cell_height(2) + 1.0), 2);
         assert_eq!(lines_that_fit(cell_height(0) - 5.0), 0);
+    }
+
+    #[test]
+    fn due_tasks_count_done_and_sort_done_last() {
+        let d = date(2026, 11, 18);
+        let due = |mut t: Task| {
+            t.due_on = Some(d);
+            t
+        };
+        let tasks = vec![
+            due(task(1, "done", d, TaskStatus::Done)),
+            due(task(2, "open", date(2026, 11, 17), TaskStatus::Todo)),
+            due(task(3, "deleted", d, TaskStatus::Dropped)),
+            // On the 18th but due another day: not counted.
+            task(4, "planned only", d, TaskStatus::Todo),
+            due(task(5, "doing", d, TaskStatus::Doing)),
+        ];
+        let ids: Vec<i64> = due_tasks(&tasks, d).iter().map(|t| t.id).collect();
+        assert_eq!(ids, [2, 5, 1]);
+        let counts = due_done(&tasks, d).unwrap();
+        assert_eq!(counts, DueDone { due: 3, done: 1 });
+        assert_eq!(counts.percent(), 33);
+        assert_eq!(counts.describe(), "3 due · 1 complete");
+        assert_eq!(due_done(&tasks, date(2026, 11, 19)), None);
+        assert_eq!(DueDone { due: 3, done: 3 }.percent(), 100);
+        assert_eq!(DueDone { due: 3, done: 2 }.percent(), 66);
+    }
+
+    #[test]
+    fn the_badge_toggles_its_dropdown() {
+        let mut v = MonthView::new();
+        v.load(data());
+        let d = date(2026, 11, 18);
+        assert_eq!(v.update(Message::ToggleDue(d)), Action::None);
+        assert_eq!(v.open_due, Some(d));
+        v.update(Message::Ignore);
+        assert_eq!(v.open_due, Some(d));
+        v.update(Message::ToggleDue(d));
+        assert_eq!(v.open_due, None);
+        v.update(Message::ToggleDue(d));
+        v.update(Message::CloseDue);
+        assert_eq!(v.open_due, None);
+        let _ = grid(&data(), Some(d), Size::new(1000.0, 700.0));
     }
 
     #[test]

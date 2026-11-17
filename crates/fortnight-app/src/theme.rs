@@ -453,6 +453,8 @@ pub enum Icon {
     Close,
     Plus,
     Warning,
+    Copy,
+    Check,
 }
 
 impl Icon {
@@ -466,6 +468,8 @@ impl Icon {
             Icon::Close => include_bytes!("../../../assets/icons/close.svg"),
             Icon::Plus => include_bytes!("../../../assets/icons/plus.svg"),
             Icon::Warning => include_bytes!("../../../assets/icons/warning.svg"),
+            Icon::Copy => include_bytes!("../../../assets/icons/copy.svg"),
+            Icon::Check => include_bytes!("../../../assets/icons/check.svg"),
         }
     }
 }

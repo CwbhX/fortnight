@@ -748,10 +748,11 @@ impl Ready {
     /// Recommended tasks report, parsed (empty if none or unreadable). A
     /// failed newer attempt doesn't hide the last good one.
     /// The recommended tasks: the newest ready version that still names an
-    /// open task planned for today (a chat model may not keep to that rule).
-    /// Falling back to an older version keeps the last good list on screen
-    /// when the newest names none of today's open tasks, e.g. while a new
-    /// one is worked out.
+    /// open task planned for today or overdue (a chat model may not keep to
+    /// that rule). An overdue task stays eligible until it is done or
+    /// deleted. Falling back to an older version keeps the last good list
+    /// on screen when the newest names none of them, e.g. while a new one
+    /// is worked out.
     fn recommended_today(&self) -> Vec<day::Recommended> {
         let today = self.today();
         let reports = self
@@ -766,8 +767,9 @@ impl Ready {
                 rec.tasks
                     .into_iter()
                     .filter(|t| {
-                        self.task(t.id)
-                            .is_some_and(|x| x.day() == Some(today) && x.status.is_open())
+                        self.task(t.id).is_some_and(|x| {
+                            x.status.is_open() && (x.day() == Some(today) || x.is_overdue(today))
+                        })
                     })
                     .map(|t| day::Recommended {
                         id: t.id,
