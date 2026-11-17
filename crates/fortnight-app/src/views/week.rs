@@ -11,11 +11,10 @@
 //! this week are overdue, a quiet "2 overdue, see Today" link. The whole tab
 //! scrolls.
 //!
-//! The AI parts come from the report panel and are generated automatically
-//! (see `report_panel`): the week's focus sentence above the columns, a
-//! numbered badge on each recommended task in its column, then a
-//! Recommended tasks card (the order to work in, with a few words on why)
-//! and the Work summary card.
+//! The AI part comes from the report panel and is generated automatically
+//! (see `report_panel`): the Work summary card. (Recommended tasks moved to
+//! the Today tab; `main.rs` no longer gives this tab a Plan slot, so the
+//! focus sentence, rank badges and Recommended card below stay hidden.)
 //!
 //! Tasks are small cards. An open task's card can be dragged: a copy follows
 //! the pointer, the day under it is highlighted, and an accent line shows

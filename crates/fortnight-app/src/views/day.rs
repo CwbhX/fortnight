@@ -2,11 +2,14 @@
 //!
 //! Sections, top to bottom:
 //!
+//! - **Recommended** (only when the shown day is today): the model's top
+//!   three open tasks, most important first, numbered, each with a few
+//!   words on why. They are left out of the sections below.
 //! - **Overdue** (only when the shown day is today, and only if any): open
 //!   tasks whose deadline has passed.
-//! - **The day**: open tasks whose [`Task::day`] (the planned day) is the
-//!   shown day. On today this also carries over open tasks planned for an
-//!   earlier day whose deadline has not passed.
+//! - **Tasks**: open tasks whose [`Task::day`] (the planned day) is the
+//!   shown day, then the add-a-task input. On today this also carries over
+//!   open tasks planned for an earlier day whose deadline has not passed.
 //! - **Side work**: free-standing log lines dated the shown day, shown as
 //!   ticked items, with an input to add one (today only, see below).
 //! - **Completed**, collapsed: tasks completed on the shown day.
@@ -122,6 +125,14 @@ pub enum Action {
     Add(NewTask),
 }
 
+/// A task the model recommends doing today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recommended {
+    pub id: TaskId,
+    /// A few words on why.
+    pub why: String,
+}
+
 /// A log line, as the view needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogLine {
@@ -147,6 +158,11 @@ pub struct DayData {
     pub tasks: Vec<Task>,
     /// The first day of the week (Settings), for the due-date calendar.
     pub week_start: Weekday,
+    /// The model's recommended tasks for today, most important first (from
+    /// this week's Recommended tasks report). Shown only on today.
+    pub recommended: Vec<Recommended>,
+    /// Recommendations are being worked out.
+    pub recommending: bool,
     /// Every log line, oldest first. Only free-standing ones are shown.
     pub logs: Vec<LogLine>,
 }
@@ -170,6 +186,9 @@ pub struct DayView {
 /// Where a task is shown on the Today tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Section {
+    /// Today only: the model's top three open tasks, most important first.
+    /// They are left out of the sections below.
+    Recommended,
     Overdue,
     /// The shown day's open tasks.
     Day,
@@ -181,7 +200,8 @@ pub enum Section {
 impl Section {
     /// Display order of the task sections (side work sits between Day and
     /// Done).
-    pub const ALL: [Section; 5] = [
+    pub const ALL: [Section; 6] = [
+        Section::Recommended,
         Section::Overdue,
         Section::Day,
         Section::Done,
@@ -230,16 +250,48 @@ fn open_order(a: &Task, b: &Task) -> Ordering {
         .then(a.id.cmp(&b.id))
 }
 
-/// The tasks in `section`, sorted. Overdue: oldest deadline first, then
-/// [`open_order`]. The day and No date: [`open_order`]. Completed: most
-/// recently finished first. Deleted: most recently deleted first.
+/// How many recommended tasks the Today tab shows.
+pub const MAX_RECOMMENDED: usize = 3;
+
+/// The recommended tasks shown: only when the shown day is today, those
+/// still open, at most [`MAX_RECOMMENDED`], in the model's order.
+fn recommended_tasks(data: &DayData) -> Vec<&Task> {
+    if data.day != data.today {
+        return Vec::new();
+    }
+    data.recommended
+        .iter()
+        .filter_map(|r| data.tasks.iter().find(|t| t.id == r.id))
+        .filter(|t| t.status.is_open())
+        .take(MAX_RECOMMENDED)
+        .collect()
+}
+
+/// The section `task` is shown in: Recommended if it is one of
+/// [`recommended_tasks`], otherwise [`section_of`].
+fn placed_section(data: &DayData, task: &Task) -> Option<Section> {
+    if recommended_tasks(data).iter().any(|t| t.id == task.id) {
+        Some(Section::Recommended)
+    } else {
+        section_of(task, data.day, data.today, &data.tz)
+    }
+}
+
+/// The tasks in `section`, sorted. Recommended: the model's order.
+/// Overdue: oldest deadline first, then [`open_order`]. The day and No
+/// date: [`open_order`]. Completed: most recently finished first. Deleted:
+/// most recently deleted first.
 pub fn section_tasks(data: &DayData, section: Section) -> Vec<&Task> {
+    if section == Section::Recommended {
+        return recommended_tasks(data);
+    }
     let mut out: Vec<&Task> = data
         .tasks
         .iter()
-        .filter(|t| section_of(t, data.day, data.today, &data.tz) == Some(section))
+        .filter(|t| placed_section(data, t) == Some(section))
         .collect();
     match section {
+        Section::Recommended => {}
         Section::Overdue => out.sort_by(|a, b| a.due_on.cmp(&b.due_on).then(open_order(a, b))),
         Section::Day | Section::NoDate => out.sort_by(|a, b| open_order(a, b)),
         Section::Done | Section::Deleted => out.sort_by(|a, b| {
@@ -286,26 +338,6 @@ pub fn due_label(due: Date, today: Date) -> String {
         d @ 7..=13 => format!("in {d}d"),
         _ if due.year() == today.year() => due.strftime("%b %-d").to_string(),
         _ => due.strftime("%b %-d, %Y").to_string(),
-    }
-}
-
-/// The heading of the day section: `Today`, `Tomorrow`, `Yesterday`, or
-/// `Wed 18 Nov`.
-pub fn day_heading(day: Date, today: Date) -> String {
-    match days_between(today, day) {
-        0 => "Today".to_string(),
-        1 => "Tomorrow".to_string(),
-        -1 => "Yesterday".to_string(),
-        _ => day.strftime("%a %-d %b").to_string(),
-    }
-}
-
-/// The text shown when the shown day has no open tasks.
-pub fn empty_message(day: Date, today: Date) -> String {
-    if day == today {
-        "Nothing planned for today.".to_string()
-    } else {
-        format!("Nothing planned for {}", day.strftime("%a %-d %b"))
     }
 }
 
@@ -808,7 +840,7 @@ impl DayView {
 
     fn section_of_id(&self, id: TaskId) -> Option<Section> {
         let data = self.data.as_ref()?;
-        section_of(self.task(id)?, data.day, data.today, &data.tz)
+        placed_section(data, self.task(id)?)
     }
 
     fn visible(&self) -> Vec<TaskId> {
@@ -825,6 +857,22 @@ impl DayView {
             return text("Loading…").style(theme::muted).into();
         };
         let mut content = Column::new().spacing(theme::SPACING * 2.0);
+
+        let recommended = section_tasks(data, Section::Recommended);
+        if !recommended.is_empty() {
+            let heading = theme::section_heading("Recommended").into();
+            content = content.push(self.group(heading, recommended, data));
+        } else if data.recommending && data.day == data.today {
+            content = content.push(
+                column![
+                    theme::section_heading("Recommended"),
+                    text("Picking today's top tasks…")
+                        .size(theme::TEXT_BODY)
+                        .style(theme::muted),
+                ]
+                .spacing(theme::SPACING / 2.0),
+            );
+        }
 
         let overdue = section_tasks(data, Section::Overdue);
         if !overdue.is_empty() {
@@ -847,18 +895,10 @@ impl DayView {
             .padding([11, 14])
             .size(theme::TEXT_BODY)
             .style(theme::input);
+        let heading = heading_row(theme::section_heading("Tasks").into(), &day_tasks);
         let day_group = if day_tasks.is_empty() {
-            column![
-                theme::section_heading(day_heading(data.day, data.today)),
-                text(empty_message(data.day, data.today))
-                    .size(theme::TEXT_BODY)
-                    .style(theme::muted),
-            ]
+            column![heading]
         } else {
-            let heading = heading_row(
-                theme::section_heading(day_heading(data.day, data.today)).into(),
-                &day_tasks,
-            );
             column![heading, self.rows(day_tasks, data)]
         };
         content = content.push(day_group.push(quick_add).spacing(theme::SPACING / 2.0));
@@ -947,7 +987,15 @@ impl DayView {
     fn rows<'a>(&'a self, tasks: Vec<&'a Task>, data: &'a DayData) -> Element<'a, Message> {
         Column::with_children(tasks.into_iter().map(|task| match &self.editing {
             Some(form) if form.id == task.id => edit_card(task, form, data.today),
-            _ => task_row(task, data.today, self.selected == Some(task.id)),
+            _ => {
+                let rec = data
+                    .recommended
+                    .iter()
+                    .filter(|_| data.day == data.today)
+                    .position(|r| r.id == task.id)
+                    .map(|i| (i + 1, data.recommended[i].why.as_str()));
+                task_row(task, data.today, self.selected == Some(task.id), rec)
+            }
         }))
         .spacing(6)
         .into()
@@ -1059,11 +1107,21 @@ fn priority_marker<'a>(priority: Priority) -> Option<Element<'a, Message>> {
     })
 }
 
-fn task_row<'a>(task: &'a Task, today: Date, selected: bool) -> Element<'a, Message> {
+/// A task card. `rec` is its rank and reason when it is recommended: a
+/// numbered badge before the title and the reason after it.
+fn task_row<'a>(
+    task: &'a Task,
+    today: Date,
+    selected: bool,
+    rec: Option<(usize, &'a str)>,
+) -> Element<'a, Message> {
     let id = task.id;
     let open = task.status.is_open();
 
     let mut line = Row::new().spacing(theme::SPACING * 0.75).align_y(Center);
+    if let Some((rank, _)) = rec {
+        line = line.push(rank_badge(rank));
+    }
     if open && let Some(marker) = priority_marker(task.priority) {
         line = line.push(marker);
     }
@@ -1074,6 +1132,9 @@ fn task_row<'a>(task: &'a Task, today: Date, selected: bool) -> Element<'a, Mess
     line = line.push(title);
     if let Some(project) = &task.project {
         line = line.push(project_chip(project));
+    }
+    if let Some((_, why)) = rec.filter(|(_, why)| !why.is_empty()) {
+        line = line.push(text(why).size(theme::TEXT_SMALL).style(theme::muted));
     }
     line = line.push(Space::new().width(Fill));
     let (done, total) = subtask_counts(&task.notes);
@@ -1113,6 +1174,24 @@ fn task_row<'a>(task: &'a Task, today: Date, selected: bool) -> Element<'a, Mess
     .padding([11, 14])
     .style(task_card_style(!open, selected))
     .on_press(Message::Expand(id))
+    .into()
+}
+
+/// A small round number in the accent colour: a recommended task's rank.
+fn rank_badge<'a>(rank: usize) -> Element<'a, Message> {
+    container(
+        text(rank.to_string())
+            .size(12)
+            .color(Color::WHITE)
+            .align_x(Center),
+    )
+    .center_x(20)
+    .center_y(20)
+    .style(|_: &Theme| container::Style {
+        background: Some(theme::ACCENT.into()),
+        border: border::rounded(999),
+        ..container::Style::default()
+    })
     .into()
 }
 
@@ -1491,6 +1570,8 @@ mod tests {
             tz: TimeZone::UTC,
             tasks,
             week_start: Weekday::Monday,
+            recommended: Vec::new(),
+            recommending: false,
             logs: Vec::new(),
         }
     }
@@ -1779,6 +1860,36 @@ mod tests {
         assert_eq!(new.planned_for, Some(date(2026, 11, 18)));
         assert_eq!(new.due_on, Some(date(2026, 11, 20)));
         assert_eq!(new.notes, "- [ ] outline");
+    }
+
+    #[test]
+    fn recommended_tasks_lead_today_and_leave_the_other_sections() {
+        let tasks: Vec<Task> = (1..=5)
+            .map(|i| task(i, &format!("t{i}"), Some(today())))
+            .chain([with_status(
+                task(6, "done", Some(today())),
+                TaskStatus::Done,
+            )])
+            .collect();
+        let mut data = data_for(today(), tasks);
+        data.recommended = [6, 4, 2, 9, 1, 3]
+            .into_iter()
+            .map(|id| Recommended {
+                id,
+                why: String::new(),
+            })
+            .collect();
+        // Done and missing ids are skipped; at most three.
+        fn ids(data: &DayData, s: Section) -> Vec<TaskId> {
+            section_tasks(data, s).iter().map(|t| t.id).collect()
+        }
+        assert_eq!(ids(&data, Section::Recommended), [4, 2, 1]);
+        assert_eq!(ids(&data, Section::Day), [3, 5]);
+        assert_eq!(visible_rows(&data, false, false), [4, 2, 1, 3, 5]);
+
+        // Another day: no recommendations.
+        data.day = date(2026, 11, 17);
+        assert!(ids(&data, Section::Recommended).is_empty());
     }
 
     #[test]

@@ -472,6 +472,11 @@ impl Ready {
                     tz: self.tz.clone(),
                     tasks: self.tasks.clone(),
                     week_start: self.settings.schedule.week_start,
+                    recommended: self.recommended_today(),
+                    recommending: self.generating.contains_key(&ReportKey {
+                        kind: ReportKind::Plan,
+                        week_start: self.current_week().start,
+                    }),
                     logs,
                 });
             }
@@ -524,18 +529,42 @@ impl Ready {
         }
     }
 
-    /// Which reports the Week tab shows for `week`: a past week its
-    /// Summary; the current week Recommended tasks and the Summary; a future
-    /// week Recommended tasks.
+    /// Which reports the Week tab shows for `week`: the Summary, for the
+    /// current and past weeks. (Recommended tasks moved to the Today tab.)
     fn panel_kinds(&self, week: WeekRef) -> Vec<ReportKind> {
-        let current = self.current_week();
-        if week < current {
-            vec![ReportKind::Summary]
-        } else if week > current {
-            vec![ReportKind::Plan]
+        if week > self.current_week() {
+            Vec::new()
         } else {
-            vec![ReportKind::Plan, ReportKind::Summary]
+            vec![ReportKind::Summary]
         }
+    }
+
+    /// Today's recommended tasks: the current week's newest ready
+    /// Recommended tasks report, parsed (empty if none or unreadable). A
+    /// failed newer attempt doesn't hide the last good one.
+    fn recommended_today(&self) -> Vec<day::Recommended> {
+        let reports = self
+            .store
+            .list_reports(ReportKind::Plan, self.current_week().start)
+            .unwrap_or_default();
+        let Some(r) = reports
+            .into_iter()
+            .find(|r| r.status == fortnight_core::domain::ReportStatus::Ready)
+        else {
+            return Vec::new();
+        };
+        r.text()
+            .and_then(report::parse_recommendations)
+            .map(|rec| {
+                rec.tasks
+                    .into_iter()
+                    .map(|t| day::Recommended {
+                        id: t.id,
+                        why: t.why,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Whether `kind` for `week` has nothing to work from, and whether it
@@ -567,7 +596,10 @@ impl Ready {
         let stale = match ready {
             Some(r) if r.edited_md.is_some() => false,
             Some(r) => {
-                r.digest_json != self.prepare(kind, week).digest_json
+                // Recommendations made with an older prompt (the weekly list
+                // before it became today's top three) are redone.
+                (kind == ReportKind::Plan && r.prompt_version < report::PROMPT_VERSION)
+                    || r.digest_json != self.prepare(kind, week).digest_json
                     || self
                         .prompt_changed
                         .get(&kind)
@@ -627,15 +659,26 @@ impl Ready {
         }
     }
 
-    /// Generates the Week tab's reports that are out of date, once each
-    /// (none while one is in flight, and failures back off).
+    /// Generates the reports the shown tab needs that are out of date, once
+    /// each (none while one is in flight, and failures back off): the Week
+    /// tab's Summary, and the Today tab's recommended tasks (when it shows
+    /// today).
     fn update_week_reports(&mut self) -> Task<Message> {
-        if self.tab != Tab::Week || self.blocked().is_some() {
+        if self.blocked().is_some() {
             return Task::none();
         }
-        let week = self.week_of(self.selected);
+        let (week, kinds) = match self.tab {
+            Tab::Week => {
+                let week = self.week_of(self.selected);
+                (week, self.panel_kinds(week))
+            }
+            Tab::Today if self.selected == self.today() => {
+                (self.current_week(), vec![ReportKind::Plan])
+            }
+            _ => return Task::none(),
+        };
         let mut tasks = Vec::new();
-        for kind in self.panel_kinds(week) {
+        for kind in kinds {
             let key = ReportKey {
                 kind,
                 week_start: week.start,
