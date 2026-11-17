@@ -28,7 +28,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 /// Bump when a prompt changes.
-pub const PROMPT_VERSION: i64 = 5;
+pub const PROMPT_VERSION: i64 = 6;
 
 /// Notes and log lines longer than this (in characters) are cut and end
 /// in "…".
@@ -1182,7 +1182,7 @@ If a section has no facts, write \"- Nothing to report.\" under it.";
 /// in Settings (`Settings::plan_prompt`); `DATA_RULE` and `PLAN_FORMAT` are
 /// always added, so a custom prompt can't break the reply format.
 pub const DEFAULT_PLAN_PROMPT: &str = "\
-You pick the three tasks the user should do first today (`today`), most important first. Be direct and practical.
+You pick the three tasks the user should do first today (`today`), most important first, from the tasks planned for today. Be direct and practical.
 
 - Use only the facts provided. Do not invent tasks, deadlines or estimates.
 - Do no arithmetic: every date, day count and hour figure is already computed.
@@ -1194,7 +1194,8 @@ You pick the three tasks the user should do first today (`today`), most importan
 const PLAN_FORMAT: &str = "\
 Reply with one JSON object and nothing else (no code fences, no prose):
 {\"tasks\": [{\"id\": <a task id from the facts>, \"why\": \"<a few words>\"}]}
-List at most 3 tasks, the most important first. Use only ids that appear in the facts.";
+List at most 3 tasks, the most important first. Use only ids that appear in the facts.
+Pick only tasks whose `planned_for` is `today`: never a task planned for another day or with no planned day. If fewer than 3 are, list only those.";
 
 /// The summary prompt in use: the user's, or the built-in one.
 pub fn summary_prompt(settings: &Settings) -> &str {
@@ -1467,11 +1468,16 @@ pub fn summary_is_empty(facts: &SummaryFacts) -> bool {
 }
 
 /// True when there is nothing to recommend (no open tasks to plan).
+/// True when no open task is planned for today: recommendations only ever
+/// come from today's tasks.
 pub fn plan_is_empty(facts: &PlanFacts) -> bool {
-    facts.overdue.is_empty()
-        && facts.due_this_week.is_empty()
-        && facts.due_soon.is_empty()
-        && facts.undated.is_empty()
+    !facts
+        .overdue
+        .iter()
+        .chain(&facts.due_this_week)
+        .chain(&facts.due_soon)
+        .chain(&facts.undated)
+        .any(|t| t.planned_for == Some(facts.today))
 }
 
 // ---------------------------------------------------------------------------
@@ -2459,6 +2465,23 @@ mod tests {
     // --- plan facts --------------------------------------------------------
 
     #[test]
+    fn plan_is_empty_unless_a_task_is_planned_for_today() {
+        let monday = date(2026, 11, 16);
+        let week = WeekRef::new(monday);
+        let settings = Settings::default();
+        let elsewhere = vec![
+            due(task(1, "Wednesday's"), date(2026, 11, 18)),
+            task(2, "No day"),
+        ];
+        let facts = plan_facts(&elsewhere, &[], week, monday, &settings);
+        assert!(plan_is_empty(&facts));
+        let mut today = elsewhere;
+        today.push(due(task(3, "Today's"), monday));
+        let facts = plan_facts(&today, &[], week, monday, &settings);
+        assert!(!plan_is_empty(&facts));
+    }
+
+    #[test]
     fn plan_buckets_overdue_this_week_and_soon() {
         let f = plan_facts(
             &plan_fixture(),
@@ -2942,7 +2965,7 @@ mod tests {
         assert_eq!(r.model.as_deref(), Some("mock"));
         assert_eq!(r.endpoint_host.as_deref(), Some("localhost:11434"));
         assert_eq!(r.prompt_version, PROMPT_VERSION);
-        assert_eq!(r.prompt_version, 5);
+        assert_eq!(r.prompt_version, 6);
         assert_eq!(r.error, None);
         assert_eq!(r.digest_json, digest);
 

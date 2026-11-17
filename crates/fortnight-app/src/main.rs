@@ -258,7 +258,9 @@ impl App {
         match Ready::open() {
             Ok(ready) => {
                 let mut ready = Box::new(ready);
-                let start = ready.run_due();
+                // Due reports, then anything the open tab shows that is out
+                // of date (e.g. recommendations from an older prompt).
+                let start = Task::batch([ready.run_due(), ready.update_week_reports()]);
                 ready.refresh();
                 let tasks = Task::batch([
                     iced::system::theme().map(Message::ThemeMode),
@@ -682,7 +684,10 @@ impl Ready {
     /// Today's recommended tasks: the current week's newest ready
     /// Recommended tasks report, parsed (empty if none or unreadable). A
     /// failed newer attempt doesn't hide the last good one.
+    /// The recommended tasks, limited to tasks planned for today (a chat
+    /// model may not keep to that rule).
     fn recommended_today(&self) -> Vec<day::Recommended> {
+        let today = self.today();
         let reports = self
             .store
             .list_reports(ReportKind::Plan, self.current_week().start)
@@ -698,6 +703,7 @@ impl Ready {
             .map(|rec| {
                 rec.tasks
                     .into_iter()
+                    .filter(|t| self.task(t.id).is_some_and(|x| x.day() == Some(today)))
                     .map(|t| day::Recommended {
                         id: t.id,
                         why: t.why,

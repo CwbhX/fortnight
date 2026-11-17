@@ -7,7 +7,8 @@
 //! chat model would (fallback, streaming, CLI), but it only understands
 //! the recommended-tasks request (`report::prepare_plan`): it reads the
 //! plan facts from between `<facts>` and `</facts>`, offers the open tasks
-//! as one `choice` question ("which first?"), ranks them by probability
+//! planned for today (never other days' tasks) as one `choice` question
+//! ("which first?"), ranks them by probability
 //! and replies with the same JSON a chat model would
 //! (`report::parse_recommendations`). The reasons are written here from
 //! the facts ("overdue 2 days", "due Thursday"); the model gives none.
@@ -278,6 +279,7 @@ fn plan_question(user: &str, model: &str) -> Option<Ask> {
     let facts: Value = serde_json::from_str(user.get(start..end)?.trim()).ok()?;
     facts.get("due_this_week")?;
 
+    let today = facts.get("today").and_then(Value::as_str).unwrap_or("");
     let mut candidates: Vec<Candidate> = Vec::new();
     for list in ["overdue", "due_this_week", "due_soon", "undated"] {
         for task in facts
@@ -289,6 +291,10 @@ fn plan_question(user: &str, model: &str) -> Option<Ask> {
             let Some(id) = task.get("id").and_then(Value::as_i64) else {
                 continue;
             };
+            // Only the tasks on today's list.
+            if today.is_empty() || task.get("planned_for").and_then(Value::as_str) != Some(today) {
+                continue;
+            }
             if candidates.len() < MAX_OPTIONS && candidates.iter().all(|c| c.id != id) {
                 candidates.push(candidate(id, task, &facts));
             }
@@ -300,7 +306,6 @@ fn plan_question(user: &str, model: &str) -> Option<Ask> {
         )));
     }
 
-    let today = facts.get("today").and_then(Value::as_str).unwrap_or("");
     let weekday = facts
         .get("today_weekday")
         .and_then(Value::as_str)
@@ -450,13 +455,14 @@ mod tests {
         .with_timeout(Duration::from_secs(5))
     }
 
+    /// An open task planned for today (Monday 16 Nov 2026).
     fn task(id: i64, title: &str, due: Option<jiff::civil::Date>) -> Task {
         Task {
             id,
             title: title.into(),
             status: TaskStatus::Todo,
             due_on: due,
-            planned_for: due,
+            planned_for: Some(date(2026, 11, 16)),
             position: id as f64,
             ..Task::default()
         }
@@ -497,6 +503,11 @@ mod tests {
             task(2, "Fix the build", Some(date(2026, 11, 13))),
             task(3, "Tidy inbox", None),
             task(4, "Book flights", Some(date(2026, 11, 16))),
+            // Planned for Wednesday: never offered.
+            Task {
+                planned_for: Some(date(2026, 11, 18)),
+                ..task(5, "Migrate analytics", Some(date(2026, 11, 18)))
+            },
         ];
         let reply = collect_stream(client(&server).chat_stream(plan_request(&tasks)))
             .await
@@ -515,6 +526,7 @@ mod tests {
             .unwrap();
         let criteria = &sent["questions"]["first"]["criteria"];
         assert_eq!(criteria.as_object().unwrap().len(), 4);
+        assert!(criteria.get("t5").is_none(), "{criteria}");
         assert!(
             criteria["t1"]
                 .as_str()
