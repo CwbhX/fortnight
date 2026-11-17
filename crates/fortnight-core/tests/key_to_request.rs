@@ -9,11 +9,32 @@ use serde_json::json;
 use wiremock::matchers::{bearer_token, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// A unique temp folder, removed on drop (also when the test panics).
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("fortnight-e2e-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        TempDir(dir)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[tokio::test]
 async fn unlocked_key_is_sent_as_bearer_token() {
-    let dir = std::env::temp_dir().join(format!("fortnight-e2e-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let file = vault::key_path(&dir);
+    let dir = TempDir::new();
+    let file = vault::key_path(&dir.0);
     vault::save(
         &file,
         &SecretString::from("sk-test-key".to_string()),
@@ -22,7 +43,7 @@ async fn unlocked_key_is_sent_as_bearer_token() {
     .unwrap();
     assert!(vault::unlock(&file, &SecretString::from("wrong pass".to_string())).is_err());
     let key = vault::unlock(&file, &SecretString::from("correct horse".to_string())).unwrap();
-    std::fs::remove_dir_all(&dir).unwrap();
+    drop(dir);
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
