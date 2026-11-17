@@ -13,15 +13,33 @@ Plan my week Monday 2026-11-16 to Sunday 2026-11-22. Today is Wednesday 2026-11-
   "remaining_working_days": [
     {
       "date": "2026-11-18",
-      "weekday": "Wednesday"
+      "weekday": "Wednesday",
+      "capacity_minutes": 360,
+      "capacity_hours": 6.0,
+      "load_minutes": 120,
+      "load_hours": 2.0,
+      "unestimated": 0,
+      "over_capacity": false
     },
     {
       "date": "2026-11-19",
-      "weekday": "Thursday"
+      "weekday": "Thursday",
+      "capacity_minutes": 360,
+      "capacity_hours": 6.0,
+      "load_minutes": 240,
+      "load_hours": 4.0,
+      "unestimated": 0,
+      "over_capacity": false
     },
     {
       "date": "2026-11-20",
-      "weekday": "Friday"
+      "weekday": "Friday",
+      "capacity_minutes": 360,
+      "capacity_hours": 6.0,
+      "load_minutes": 90,
+      "load_hours": 1.5,
+      "unestimated": 0,
+      "over_capacity": false
     }
   ],
   "overdue": [
@@ -32,7 +50,13 @@ Plan my week Monday 2026-11-16 to Sunday 2026-11-22. Today is Wednesday 2026-11-
       "due_on": "2026-11-12",
       "due_weekday": "Thursday",
       "days_until_due": -6,
-      "overdue": true
+      "overdue": true,
+      "planned_for": null,
+      "planned_weekday": null,
+      "estimate_minutes": 60,
+      "estimate_hours": 1.0,
+      "priority": 0,
+      "deadline_moves": 1
     }
   ],
   "due_this_week": [
@@ -43,7 +67,13 @@ Plan my week Monday 2026-11-16 to Sunday 2026-11-22. Today is Wednesday 2026-11-
       "due_on": "2026-11-18",
       "due_weekday": "Wednesday",
       "days_until_due": 0,
-      "overdue": false
+      "overdue": false,
+      "planned_for": null,
+      "planned_weekday": null,
+      "estimate_minutes": 120,
+      "estimate_hours": 2.0,
+      "priority": 0,
+      "deadline_moves": 0
     },
     {
       "id": 3,
@@ -53,6 +83,12 @@ Plan my week Monday 2026-11-16 to Sunday 2026-11-22. Today is Wednesday 2026-11-
       "due_weekday": "Friday",
       "days_until_due": 2,
       "overdue": false,
+      "planned_for": "2026-11-19",
+      "planned_weekday": "Thursday",
+      "estimate_minutes": 240,
+      "estimate_hours": 4.0,
+      "priority": 2,
+      "deadline_moves": 2,
       "notes": "Needs Q3 actuals from Sam."
     },
     {
@@ -62,7 +98,12 @@ Plan my week Monday 2026-11-16 to Sunday 2026-11-22. Today is Wednesday 2026-11-
       "due_on": "2026-11-22",
       "due_weekday": "Sunday",
       "days_until_due": 4,
-      "overdue": false
+      "overdue": false,
+      "planned_for": null,
+      "planned_weekday": null,
+      "estimate_minutes": null,
+      "priority": 0,
+      "deadline_moves": 0
     }
   ],
   "due_soon": [
@@ -73,7 +114,12 @@ Plan my week Monday 2026-11-16 to Sunday 2026-11-22. Today is Wednesday 2026-11-
       "due_on": "2026-11-25",
       "due_weekday": "Wednesday",
       "days_until_due": 7,
-      "overdue": false
+      "overdue": false,
+      "planned_for": null,
+      "planned_weekday": null,
+      "estimate_minutes": null,
+      "priority": 0,
+      "deadline_moves": 0
     },
     {
       "id": 6,
@@ -82,7 +128,27 @@ Plan my week Monday 2026-11-16 to Sunday 2026-11-22. Today is Wednesday 2026-11-
       "due_on": "2026-12-02",
       "due_weekday": "Wednesday",
       "days_until_due": 14,
-      "overdue": false
+      "overdue": false,
+      "planned_for": null,
+      "planned_weekday": null,
+      "estimate_minutes": null,
+      "priority": 0,
+      "deadline_moves": 0
+    },
+    {
+      "id": 11,
+      "title": "Draft 2027 roadmap",
+      "project": null,
+      "due_on": "2026-12-15",
+      "due_weekday": "Tuesday",
+      "days_until_due": 27,
+      "overdue": false,
+      "planned_for": "2026-11-20",
+      "planned_weekday": "Friday",
+      "estimate_minutes": 90,
+      "estimate_hours": 1.5,
+      "priority": 0,
+      "deadline_moves": 0
     }
   ],
   "undated": [
@@ -93,7 +159,12 @@ Plan my week Monday 2026-11-16 to Sunday 2026-11-22. Today is Wednesday 2026-11-
       "due_on": null,
       "due_weekday": null,
       "days_until_due": null,
-      "overdue": false
+      "overdue": false,
+      "planned_for": null,
+      "planned_weekday": null,
+      "estimate_minutes": null,
+      "priority": 0,
+      "deadline_moves": 0
     },
     {
       "id": 9,
@@ -102,15 +173,27 @@ Plan my week Monday 2026-11-16 to Sunday 2026-11-22. Today is Wednesday 2026-11-
       "due_on": null,
       "due_weekday": null,
       "days_until_due": null,
-      "overdue": false
+      "overdue": false,
+      "planned_for": null,
+      "planned_weekday": null,
+      "estimate_minutes": null,
+      "priority": 0,
+      "deadline_moves": 0
     }
   ],
   "totals": {
-    "open": 9,
+    "open": 10,
     "overdue": 1,
     "due_this_week": 3,
-    "due_soon": 2,
-    "undated": 2
+    "due_soon": 3,
+    "undated": 2,
+    "due_estimate_minutes": 420,
+    "due_estimate_hours": 7.0,
+    "available_minutes": 1080,
+    "available_hours": 18.0,
+    "due_without_estimate": 1,
+    "without_estimate": 6,
+    "overloaded": false
   }
 }
 </facts>

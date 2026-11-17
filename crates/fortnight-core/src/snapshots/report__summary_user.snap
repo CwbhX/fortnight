@@ -16,7 +16,14 @@ Write my weekly update for the week Monday 2026-11-09 to Sunday 2026-11-15.
       "project": "Website",
       "completed_on": "2026-11-11",
       "completed_weekday": "Wednesday",
-      "notes": "Released behind the `new-login` flag; 5% of users so far."
+      "notes": "Released behind the `new-login` flag; 5% of users so far.",
+      "log_lines": [
+        {
+          "date": "2026-11-11",
+          "weekday": "Wednesday",
+          "text": "Rolled out to 5% of users"
+        }
+      ]
     },
     {
       "id": 10,
@@ -33,15 +40,58 @@ Write my weekly update for the week Monday 2026-11-09 to Sunday 2026-11-15.
       "completed_weekday": "Friday"
     }
   ],
-  "in_progress": [
+  "progressed": [
+    {
+      "id": 5,
+      "title": "Migrate analytics",
+      "project": "Website",
+      "status": "doing",
+      "started_this_week": true,
+      "due_on": "2026-11-20",
+      "due_weekday": "Friday",
+      "notes": "Reopened: the dashboard numbers were off.",
+      "log_lines": [
+        {
+          "date": "2026-11-12",
+          "weekday": "Thursday",
+          "text": "Found the double-counting bug"
+        }
+      ]
+    },
     {
       "id": 9,
       "title": "Hiring rubric",
       "project": "Hiring",
+      "status": "todo",
+      "started_this_week": false,
       "due_on": null,
-      "due_weekday": null
+      "due_weekday": null,
+      "log_lines": [
+        {
+          "date": "2026-11-11",
+          "weekday": "Wednesday",
+          "text": "Drafted the scoring scale"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "title": "Q3 retro write-up",
+      "project": "Team",
+      "status": "todo",
+      "started_this_week": false,
+      "due_on": null,
+      "due_weekday": null,
+      "log_lines": [
+        {
+          "date": "2026-11-13",
+          "weekday": "Friday",
+          "text": "Wrote the first half"
+        }
+      ]
     }
   ],
+  "in_progress": [],
   "missed": [
     {
       "id": 6,
@@ -59,6 +109,29 @@ Write my weekly update for the week Monday 2026-11-09 to Sunday 2026-11-15.
       "due_on": "2026-11-15",
       "due_weekday": "Sunday",
       "days_overdue": 0
+    }
+  ],
+  "slipped": [
+    {
+      "id": 6,
+      "title": "Vendor contract review",
+      "project": "Finance",
+      "from": "2026-11-10",
+      "from_weekday": "Tuesday",
+      "to": "2026-11-12",
+      "to_weekday": "Thursday",
+      "days_later": 2,
+      "times": 2
+    }
+  ],
+  "dropped": [
+    {
+      "id": 13,
+      "title": "Old migration plan",
+      "project": "Website",
+      "dropped_on": "2026-11-12",
+      "dropped_weekday": "Thursday",
+      "notes": "Superseded by the analytics migration."
     }
   ],
   "next_week": [
@@ -91,6 +164,18 @@ Write my weekly update for the week Monday 2026-11-09 to Sunday 2026-11-15.
       "project": "Hiring",
       "created_on": "2026-11-10",
       "status": "done"
+    }
+  ],
+  "log_lines": [
+    {
+      "date": "2026-11-10",
+      "weekday": "Tuesday",
+      "text": "Helped Sam debug the deploy"
+    },
+    {
+      "date": "2026-11-14",
+      "weekday": "Saturday",
+      "text": "Ran the team retro"
     }
   ],
   "completed_by_project": [
