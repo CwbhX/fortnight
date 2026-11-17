@@ -1663,10 +1663,6 @@ impl Ready {
                 }
                 Task::none()
             }
-            settings::Action::Lock => {
-                self.lock();
-                Task::none()
-            }
             settings::Action::ShowUnlock => {
                 self.unlocking = true;
                 UnlockView::focus().map(Message::Unlock)

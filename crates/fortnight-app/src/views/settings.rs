@@ -7,10 +7,17 @@
 //! changes is allowed: the header says "Unsaved changes", and the edits stay
 //! in the form until the saved settings change.
 //!
-//! The API key controls act immediately and are not part of Save. There is
-//! one API key field; Save key (or Enter) asks for a password in a small
-//! pop-up, which encrypts the key. Unlocking is done from the lock icon in
-//! the top bar (the Unlock button here opens the same prompt).
+//! Models: two blocks of label/field rows, Model (everything) and
+//! Recommendations (off unless "Use a different model" is ticked; then it
+//! is `Settings::decision_llm`). Each block has Provider (Ollama, which is
+//! keyless; OpenAI-compatible; Anthropic), URL, Model with a Load/Choose
+//! list, API key (not for Ollama) and Test. No help text, by request.
+//!
+//! The API key controls act immediately and are not part of Save. Each
+//! block has its own key; Save (or Enter) asks for a password in a small
+//! pop-up, which encrypts the key, and both keys share that password.
+//! Unlocking is done from the lock icon in the top bar (the Unlock button
+//! here opens the same prompt); so is locking.
 //!
 //! The prompts: the system prompts for the Work summary and Recommended
 //! tasks, shown in full (the built-in one until changed) with Reset. A
@@ -18,10 +25,9 @@
 //! built-in changes. Round 2's "summary instructions" are shown folded into
 //! the summary prompt and are folded in for good once that prompt is saved.
 //!
-//! "Use local Ollama" fills in Ollama's OpenAI-compatible endpoint and
-//! loads its model list; a local endpoint needs no API key. Reasoning
-//! models (DeepSeek-R1, Qwen3, gpt-oss) work like any other: the client
-//! drops their thinking.
+//! Picking a provider fills in its default URL (unless one was typed);
+//! Ollama also loads its model list. Reasoning models (DeepSeek-R1, Qwen3,
+//! gpt-oss) work like any other: the client drops their thinking.
 //!
 //! Secrets (API key, password) live in the form as `String` only while
 //! typed. They are moved into a `SecretString` when an action is emitted,
@@ -34,13 +40,12 @@
 
 use fortnight_core::domain::{AppIcon, LlmSettings, Protocol, Schedule, Settings};
 use fortnight_core::report::{DEFAULT_PLAN_PROMPT, DEFAULT_SUMMARY_PROMPT};
-use fortnight_core::secure::is_local_endpoint;
 use fortnight_core::vault::MIN_PASSWORD_LEN;
 use iced::widget::{
     Space, button, checkbox, column, container, opaque, operation, pick_list, row, rule,
     scrollable, stack, text, text_editor, text_input,
 };
-use iced::{Background, Border, Center, Color, Element, Fill, Length, Theme};
+use iced::{Background, Border, Center, Color, Element, Fill, Theme};
 use jiff::civil::{Time, Weekday};
 use secrecy::SecretString;
 use std::fmt;
@@ -86,19 +91,15 @@ pub enum PromptKind {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Protocol(Which, Protocol),
+    Provider(Which, Provider),
     BaseUrl(Which, String),
     Model(Which, String),
     /// Ask the endpoint for its model list.
     LoadModels(Which),
     /// A model picked from the listed ones.
     PickModel(Which, String),
-    /// Fill in a local Ollama server's endpoint and load its models.
-    UseOllama(Which),
-    /// The endpoint needs no API key.
-    Keyless(Which, bool),
-    /// Empty the decision model fields (recommendations use the main LLM).
-    ClearDecision,
+    /// "Use a different model" for recommendations: off empties it.
+    Separate(bool),
     FocusHours(String),
     Close,
     Save,
@@ -121,7 +122,6 @@ pub enum Message {
     CancelPassword,
     /// Open the unlock prompt.
     Unlock,
-    Lock,
     /// Open the replace-key form.
     ShowReplace(Which),
     /// First click on Remove key: ask for confirmation.
@@ -164,7 +164,6 @@ pub enum Action {
         which: Which,
     },
     RemoveKey(Which),
-    Lock,
     /// Show the unlock prompt.
     ShowUnlock,
     /// The password pop-up opened: focus its field (`PASSWORD_INPUT_ID`).
@@ -308,32 +307,83 @@ enum ModelsState<'a> {
     List(&'a [String]),
 }
 
+/// What the Provider picker offers. Ollama is the OpenAI-compatible
+/// protocol with no API key (`LlmSettings::keyless`); it suits LM Studio
+/// and other keyless servers too.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Provider {
+    Ollama,
+    #[default]
+    OpenAi,
+    Anthropic,
+}
+
+impl Provider {
+    const ALL: [Provider; 3] = [Provider::Ollama, Provider::OpenAi, Provider::Anthropic];
+
+    fn default_url(self) -> &'static str {
+        match self {
+            Provider::Ollama => OLLAMA_BASE_URL,
+            Provider::OpenAi => "https://api.openai.com/v1",
+            Provider::Anthropic => "https://api.anthropic.com",
+        }
+    }
+}
+
+impl fmt::Display for Provider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Provider::Ollama => "Ollama",
+            Provider::OpenAi => "OpenAI-compatible",
+            Provider::Anthropic => "Anthropic",
+        })
+    }
+}
+
 /// One endpoint's fields as typed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Endpoint {
-    protocol: Protocol,
+    provider: Provider,
     base_url: String,
     model: String,
-    keyless: bool,
 }
 
 impl Endpoint {
+    /// Keyless endpoints, and older settings on Ollama's port, show as
+    /// Ollama.
     fn from_llm(llm: &LlmSettings) -> Self {
+        let provider = match llm.protocol {
+            Protocol::Anthropic => Provider::Anthropic,
+            Protocol::OpenAi if llm.keyless || llm.base_url.contains(":11434") => Provider::Ollama,
+            Protocol::OpenAi => Provider::OpenAi,
+        };
         Endpoint {
-            protocol: llm.protocol,
+            provider,
             base_url: llm.base_url.clone(),
             model: llm.model.clone(),
-            keyless: llm.keyless,
         }
     }
 
     fn llm(&self) -> LlmSettings {
         LlmSettings {
-            protocol: self.protocol,
+            protocol: match self.provider {
+                Provider::Anthropic => Protocol::Anthropic,
+                Provider::Ollama | Provider::OpenAi => Protocol::OpenAi,
+            },
             base_url: self.base_url.trim().to_string(),
             model: self.model.trim().to_string(),
-            keyless: self.keyless,
+            keyless: self.provider == Provider::Ollama,
         }
+    }
+
+    /// Switches provider; an empty URL or another provider's default URL
+    /// becomes the new provider's default.
+    fn set_provider(&mut self, provider: Provider) {
+        let url = self.base_url.trim();
+        if url.is_empty() || Provider::ALL.iter().any(|p| p.default_url() == url) {
+            self.base_url = provider.default_url().into();
+        }
+        self.provider = provider;
     }
 }
 
@@ -547,7 +597,9 @@ pub struct SettingsView {
     listing_models: bool,
     /// The endpoint of the last "Load models" request, to hide a list that
     /// belongs to an endpoint the form no longer names.
-    listed_for: Option<(Which, Protocol, String)>,
+    listed_for: Option<(Which, Provider, String)>,
+    /// "Use a different model" for recommendations is ticked.
+    decision_on: bool,
     /// The section whose Test button was pressed last; its result shows there.
     tested: Which,
     /// The password pop-up is open (after Save key).
@@ -574,6 +626,7 @@ impl Default for SettingsView {
             models: None,
             listing_models: false,
             listed_for: None,
+            decision_on: false,
             tested: Which::Main,
             password_prompt: false,
             summary_editor: text_editor::Content::new(),
@@ -594,6 +647,7 @@ impl SettingsView {
     pub fn load(&mut self, data: SettingsData) {
         if self.loaded.as_ref() != Some(&data.settings) {
             self.form = Form::from_settings(&data.settings);
+            self.decision_on = self.form.decision != Endpoint::default();
             self.summary_editor = text_editor::Content::with_text(&self.form.summary_prompt);
             self.plan_editor = text_editor::Content::with_text(&self.form.plan_prompt);
             self.loaded = Some(data.settings);
@@ -616,6 +670,9 @@ impl SettingsView {
     /// The settings the form would save, if they differ from the loaded
     /// ones and every field is valid.
     fn savable(&self) -> Option<Settings> {
+        if !self.is_dirty() {
+            return None;
+        }
         let settings = self.form.to_settings()?;
         let loaded = self.loaded.clone().unwrap_or_default();
         (settings != loaded).then_some(settings)
@@ -637,8 +694,8 @@ impl SettingsView {
     fn models_state(&self, which: Which) -> ModelsState<'_> {
         let e = self.form.endpoint(which);
         match &self.listed_for {
-            Some((w, protocol, base_url))
-                if *w == which && *protocol == e.protocol && *base_url == e.base_url.trim() => {}
+            Some((w, provider, base_url))
+                if *w == which && *provider == e.provider && *base_url == e.base_url.trim() => {}
             // The list belongs to the other section or an endpoint the form
             // no longer names.
             Some(_) => return ModelsState::Hidden,
@@ -658,23 +715,28 @@ impl SettingsView {
     pub fn update(&mut self, message: Message) -> Action {
         let form = &mut self.form;
         match message {
-            Message::Protocol(w, p) => form.endpoint_mut(w).protocol = p,
+            Message::Provider(w, p) => {
+                form.endpoint_mut(w).set_provider(p);
+                if p == Provider::Ollama {
+                    return self.update(Message::LoadModels(w));
+                }
+            }
+            Message::Separate(on) => {
+                self.decision_on = on;
+                if !on {
+                    form.decision = Endpoint::default();
+                } else if form.decision == Endpoint::default() {
+                    return self.update(Message::Provider(Which::Decision, Provider::Ollama));
+                }
+            }
             Message::BaseUrl(w, s) => form.endpoint_mut(w).base_url = s,
             Message::Model(w, s) | Message::PickModel(w, s) => form.endpoint_mut(w).model = s,
-            Message::Keyless(w, on) => form.endpoint_mut(w).keyless = on,
-            Message::ClearDecision => form.decision = Endpoint::default(),
             Message::FocusHours(s) => form.focus_hours = s,
-            Message::UseOllama(w) => {
-                let e = form.endpoint_mut(w);
-                e.protocol = Protocol::OpenAi;
-                e.base_url = OLLAMA_BASE_URL.into();
-                e.keyless = true;
-                return self.update(Message::LoadModels(w));
-            }
             Message::LoadModels(w) => {
                 if self.can_list_models(w) {
                     let llm = self.form.endpoint(w).llm();
-                    self.listed_for = Some((w, llm.protocol, llm.base_url.clone()));
+                    let provider = self.form.endpoint(w).provider;
+                    self.listed_for = Some((w, provider, llm.base_url.clone()));
                     return Action::ListModels(llm, w);
                 }
             }
@@ -755,10 +817,6 @@ impl SettingsView {
                 wipe(&mut self.secrets.password);
             }
             Message::Unlock => return Action::ShowUnlock,
-            Message::Lock => {
-                self.close_key_form();
-                return Action::Lock;
-            }
             Message::ShowReplace(which) => self.open_key_form(which, KeyMode::Replace),
             Message::AskRemove(which) => self.open_key_form(which, KeyMode::ConfirmRemove),
             Message::ConfirmRemove => {
@@ -866,9 +924,8 @@ impl SettingsView {
         .width(Fill);
 
         let content = column![
-            self.endpoint_section(),
-            self.key_section(),
-            self.decision_section(),
+            self.model_section(),
+            self.recommendations_section(),
             self.schedule_section(),
             self.capacity_section(),
             self.prompts_section(),
@@ -916,23 +973,13 @@ impl SettingsView {
             Which::Main => Which::Decision,
             Which::Decision => Which::Main,
         };
-        let (title, hint) = if self.key_state_of(other) == KeyState::NoKey {
-            (
-                "Choose a password",
-                "It encrypts the key. It can't be recovered if you forget it.",
-            )
+        let title = if self.key_state_of(other) == KeyState::NoKey {
+            "Set a password"
         } else {
-            (
-                "Enter your key password",
-                "Use the password of your other saved key: one password unlocks both.",
-            )
+            "Your key password"
         };
-        let mut card = column![
-            text(title).size(theme::TEXT_HEADING),
-            small_muted(hint),
-            field,
-        ]
-        .spacing(theme::SPACING);
+        let mut card =
+            column![text(title).size(theme::TEXT_HEADING), field].spacing(theme::SPACING);
         if let Some(e) = &self.key_error {
             card = card.push(text(e).size(theme::TEXT_SMALL).style(theme::danger));
         }
@@ -957,322 +1004,176 @@ impl SettingsView {
         .into()
     }
 
-    fn endpoint_section(&self) -> Element<'_, Message> {
-        section("LLM", self.endpoint_fields(Which::Main))
+    fn model_section(&self) -> Element<'_, Message> {
+        section("Model", self.endpoint_grid(Which::Main))
     }
 
-    fn decision_section(&self) -> Element<'_, Message> {
-        let d = &self.form.decision;
-        let blank = d.base_url.trim().is_empty() && d.model.trim().is_empty();
-        let clear = button(text("Clear").size(theme::TEXT_SMALL))
-            .padding([4, 10])
-            .style(theme::secondary_button)
-            .on_press_maybe((!blank).then_some(Message::ClearDecision));
-        let about = row![
-            container(small_muted(
-                "Optional. Used for Recommended tasks instead of the LLM above, such as a \
-                 reasoning model on a local Ollama. When it isn't set, or can't be reached, the \
-                 LLM above is used."
-            ))
-            .width(Fill),
-            clear
-        ]
-        .spacing(theme::SPACING)
-        .align_y(Center);
-        let key_hint = small_muted(if d.keyless {
-            "Not used: this endpoint needs no API key."
-        } else if self.decision_key_state == KeyState::NoKey {
-            "Its API key, if it needs one. Without it, the key above is used only when the \
-             decision model is on the same host."
-        } else {
-            "Its API key. It locks and unlocks with the key above, under the same password."
-        });
-        section(
-            "Decision model",
-            column![
-                about,
-                self.endpoint_fields(Which::Decision),
-                labelled(
-                    "API key",
-                    column![key_hint, self.key_controls(Which::Decision)]
-                        .spacing(theme::SPACING / 2.0)
-                ),
-            ]
-            .spacing(theme::SPACING),
-        )
-    }
-
-    /// Protocol, base URL, model (with its list) and Test for one endpoint.
-    fn endpoint_fields(&self, which: Which) -> Element<'_, Message> {
-        let f = self.form.endpoint(which);
-        let protocol = labelled(
-            "Protocol",
-            pick_list(Protocol::ALL, Some(f.protocol), move |p| {
-                Message::Protocol(which, p)
-            })
-            .padding([8, 12])
+    fn recommendations_section(&self) -> Element<'_, Message> {
+        let toggle = checkbox(self.decision_on)
+            .label("Use a different model")
             .text_size(theme::TEXT_BODY)
-            .width(Fill)
-            .style(picker),
-        );
-        let base_url = labelled(
-            "Base URL",
-            input(f.protocol.example_base_url(), &f.base_url)
-                .on_input(move |s| Message::BaseUrl(which, s)),
-        );
-        let model_placeholder = match (which, f.protocol) {
-            (Which::Decision, Protocol::OpenAi) => "Model name, such as deepseek-r1 or qwen3",
-            (Which::Main, Protocol::OpenAi) => "Model name, such as llama3.2",
-            (_, Protocol::Anthropic) => "Model name, such as claude-opus-5-5",
-        };
-        let listing_here = self.listing_models
-            && self
-                .listed_for
-                .as_ref()
-                .is_some_and(|(w, _, _)| *w == which);
-        let load_label = if listing_here {
-            "Loading…"
-        } else {
-            "Load models"
-        };
-        let load = button(text(load_label).size(theme::TEXT_BODY))
-            .padding([8, 14])
-            .style(theme::secondary_button)
-            .on_press_maybe(
-                self.can_list_models(which)
-                    .then_some(Message::LoadModels(which)),
-            );
-        let model = labelled(
-            "Model",
-            row![
-                input(model_placeholder, &f.model).on_input(move |s| Message::Model(which, s)),
-                load
-            ]
-            .spacing(theme::SPACING / 2.0)
-            .align_y(Center),
-        );
-        let models: Element<'_, Message> = match self.models_state(which) {
-            ModelsState::Hidden => Space::new().into(),
-            ModelsState::Busy => small_muted("Asking the endpoint for its models…"),
-            ModelsState::Empty => {
-                small_muted("The endpoint didn't list any models. Type the model name above.")
-            }
-            ModelsState::Error(e) => text(format!("Couldn't load models: {}", shorten(e, 160)))
-                .size(theme::TEXT_SMALL)
-                .style(theme::danger)
-                .into(),
+            .on_toggle(Message::Separate);
+        let mut body = column![toggle].spacing(theme::SPACING);
+        if self.decision_on {
+            body = body.push(self.endpoint_grid(Which::Decision));
+        }
+        section("Recommendations", body)
+    }
+
+    /// Provider, URL, model, API key (when the provider takes one) and Test
+    /// for one endpoint, as label/field rows.
+    fn endpoint_grid(&self, which: Which) -> Element<'_, Message> {
+        let f = self.form.endpoint(which);
+        let provider = pick_list(Provider::ALL, Some(f.provider), move |p| {
+            Message::Provider(which, p)
+        })
+        .padding([8, 12])
+        .text_size(theme::TEXT_BODY)
+        .width(240)
+        .style(picker);
+        let url = input(f.provider.default_url(), &f.base_url)
+            .on_input(move |s| Message::BaseUrl(which, s));
+
+        let model_input = input("Model name", &f.model).on_input(move |s| Message::Model(which, s));
+        let state = self.models_state(which);
+        let pick: Element<'_, Message> = match state {
             ModelsState::List(ids) => {
                 let selected = ids.iter().find(|id| **id == f.model.trim()).cloned();
-                row![
-                    text(format!(
-                        "{} model{} listed",
-                        ids.len(),
-                        if ids.len() == 1 { "" } else { "s" }
-                    ))
-                    .size(theme::TEXT_SMALL)
-                    .style(theme::muted),
-                    pick_list(ids, selected, move |m| Message::PickModel(which, m))
-                        .placeholder("Choose a model")
-                        .padding([6, 12])
-                        .text_size(theme::TEXT_BODY)
-                        .width(Fill)
-                        .style(picker),
-                ]
-                .spacing(theme::SPACING)
+                pick_list(ids, selected, move |m| Message::PickModel(which, m))
+                    .placeholder("Choose")
+                    .padding([8, 12])
+                    .text_size(theme::TEXT_BODY)
+                    .width(200)
+                    .style(picker)
+                    .into()
+            }
+            ModelsState::Busy => button(text("Loading…").size(theme::TEXT_BODY))
+                .padding([8, 14])
+                .style(theme::secondary_button)
+                .into(),
+            _ => button(text("Load").size(theme::TEXT_BODY))
+                .padding([8, 14])
+                .style(theme::secondary_button)
+                .on_press_maybe(
+                    self.can_list_models(which)
+                        .then_some(Message::LoadModels(which)),
+                )
+                .into(),
+        };
+        let mut model = column![
+            row![model_input, pick]
+                .spacing(theme::SPACING / 2.0)
                 .align_y(Center)
-                .into()
-            }
-        };
-        let local = is_local_endpoint(&f.base_url);
-        let hint_text = match f.protocol {
-            _ if f.keyless => "No API key is sent to this endpoint.",
-            _ if local => {
-                "A local endpoint: it works without a key. Reasoning models work; their thinking is hidden."
-            }
-            Protocol::OpenAi => {
-                "Any OpenAI-compatible endpoint works, such as Ollama at http://localhost:11434/v1."
-            }
-            Protocol::Anthropic => {
-                "Anthropic's Messages API, usually at https://api.anthropic.com."
-            }
-        };
-        let use_ollama = button(text("Use local Ollama").size(theme::TEXT_SMALL))
-            .padding([4, 10])
-            .style(theme::secondary_button)
-            .on_press_maybe(
-                (f.protocol != Protocol::OpenAi
-                    || f.base_url.trim() != OLLAMA_BASE_URL
-                    || !f.keyless)
-                    .then_some(Message::UseOllama(which)),
-            );
-        let keyless = checkbox(f.keyless)
-            .label("No API key needed")
-            .text_size(theme::TEXT_SMALL)
-            .on_toggle(move |on| Message::Keyless(which, on));
-        let hint = row![
-            container(small_muted(hint_text)).width(Fill),
-            keyless,
-            use_ollama
         ]
-        .spacing(theme::SPACING)
-        .align_y(Center);
+        .spacing(theme::SPACING / 3.0);
+        if let ModelsState::Error(e) = state {
+            model = model.push(error_text(shorten(e, 120)));
+        }
 
         let testing_here = self.testing && self.tested == which;
-        let test_label = if testing_here {
-            "Testing…"
-        } else {
-            "Test connection"
-        };
-        let test = button(text(test_label).size(theme::TEXT_BODY))
-            .padding([8, 18])
-            .style(theme::secondary_button)
-            .on_press_maybe(self.can_test(which).then_some(Message::Test(which)));
+        let test =
+            button(text(if testing_here { "Testing…" } else { "Test" }).size(theme::TEXT_BODY))
+                .padding([8, 14])
+                .style(theme::secondary_button)
+                .on_press_maybe(self.can_test(which).then_some(Message::Test(which)));
         let mut test_row = row![test].spacing(theme::SPACING).align_y(Center);
-        let result = if self.tested == which && !self.testing {
-            self.test_result.as_ref()
-        } else {
-            None
-        };
-        match result {
-            Some(Ok(reply)) => {
-                test_row = test_row.push(
-                    text(format!("Connected. {}", shorten(reply, 80)))
-                        .size(theme::TEXT_SMALL)
-                        .style(success)
-                        .width(Fill),
-                )
-            }
-            Some(Err(e)) => {
-                test_row = test_row.push(
-                    text(shorten(e, 160))
-                        .size(theme::TEXT_SMALL)
-                        .style(theme::danger)
-                        .width(Fill),
-                )
-            }
-            None if !self.testing
-                && self.key_state_of(which) == KeyState::Locked
-                && !local
-                && !f.keyless =>
-            {
-                test_row = test_row.push(small_muted("The key is locked. Unlock it first."))
-            }
-            None => {}
-        }
-
-        column![
-            row![
-                container(protocol).width(Length::FillPortion(2)),
-                container(base_url).width(Length::FillPortion(3))
-            ]
-            .spacing(theme::SPACING),
-            hint,
-            model,
-            models,
-            test_row
-        ]
-        .spacing(theme::SPACING)
-        .into()
-    }
-
-    fn key_section(&self) -> Element<'_, Message> {
-        let controls = self.key_controls(Which::Main);
-        if !self.form.main.keyless {
-            return section("API key", controls);
-        }
-        section(
-            "API key",
-            column![
-                small_muted("Not used: the LLM above needs no API key."),
-                controls
-            ]
-            .spacing(theme::SPACING / 2.0),
-        )
-    }
-
-    /// The saved-key state and its buttons, or the key field, for one key,
-    /// with the last key message if it is about this key.
-    fn key_controls(&self, which: Which) -> Element<'_, Message> {
-        let mut body = column![].spacing(theme::SPACING);
-        let state = |label: &'static str| {
-            container(text(label).size(theme::TEXT_SMALL))
-                .padding(theme::chip_padding())
-                .style(theme::chip)
-        };
-        let here = self.key_target == which;
-        let mode = if here { self.key_mode } else { KeyMode::Idle };
-
-        match (self.key_state_of(which), mode) {
-            (_, KeyMode::ConfirmRemove) => {
-                body = body.push(
-                    row![
-                        text("Remove the key?").size(theme::TEXT_BODY),
-                        button(text("Remove").size(theme::TEXT_BODY))
-                            .padding([8, 14])
-                            .style(theme::danger_button)
-                            .on_press(Message::ConfirmRemove),
-                        cancel_button(),
-                    ]
-                    .spacing(theme::SPACING)
-                    .align_y(Center),
-                );
-            }
-            (KeyState::NoKey, _) => body = body.push(self.key_input(which, false)),
-            (_, KeyMode::Replace) => body = body.push(self.key_input(which, true)),
-            (KeyState::Locked, KeyMode::Idle) => {
-                body = body.push(
-                    row![
-                        state("Saved, locked"),
-                        secondary("Unlock", Message::Unlock),
-                        secondary("Replace", Message::ShowReplace(which)),
-                        Space::new().width(Fill),
-                        remove_button(which),
-                    ]
-                    .spacing(theme::SPACING)
-                    .align_y(Center),
-                );
-            }
-            (KeyState::Unlocked, KeyMode::Idle) => {
-                body = body.push(
-                    row![
-                        state("Saved, unlocked"),
-                        secondary("Lock", Message::Lock),
-                        secondary("Replace", Message::ShowReplace(which)),
-                        Space::new().width(Fill),
-                        remove_button(which),
-                    ]
-                    .spacing(theme::SPACING)
-                    .align_y(Center),
-                );
-            }
-        }
-
-        if !here || self.password_prompt {
-            // Another key's message, or the pop-up shows the error.
-        } else if let Some(e) = &self.key_error {
-            body = body.push(text(e).size(theme::TEXT_SMALL).style(theme::danger));
-        } else {
-            match &self.key_message {
-                Some(Ok(m)) => body = body.push(text(m).size(theme::TEXT_SMALL).style(success)),
-                Some(Err(e)) => {
-                    body = body.push(text(e).size(theme::TEXT_SMALL).style(theme::danger))
+        if self.tested == which && !self.testing {
+            match &self.test_result {
+                Some(Ok(reply)) => {
+                    test_row = test_row.push(
+                        text(shorten(reply, 80))
+                            .size(theme::TEXT_SMALL)
+                            .style(success)
+                            .width(Fill),
+                    )
                 }
+                Some(Err(e)) => test_row = test_row.push(error_text(shorten(e, 160))),
                 None => {}
             }
         }
-        body.into()
+
+        let mut grid = column![
+            field_row("Provider", provider),
+            field_row("URL", url),
+            field_row("Model", model),
+        ]
+        .spacing(theme::SPACING);
+        if f.provider != Provider::Ollama {
+            grid = grid.push(field_row("API key", self.key_controls(which)));
+        }
+        grid.push(field_row("", test_row)).into()
     }
 
-    /// A key field and Save key (Enter works too).
+    /// One key: its field and Save, or its state with Unlock, Replace and
+    /// Remove. Errors about it show underneath.
+    fn key_controls(&self, which: Which) -> Element<'_, Message> {
+        let here = self.key_target == which;
+        let mode = if here { self.key_mode } else { KeyMode::Idle };
+        let status = |label: &'static str| {
+            text(label)
+                .size(theme::TEXT_BODY)
+                .style(theme::muted)
+                .width(Fill)
+        };
+        let line: Element<'_, Message> = match (self.key_state_of(which), mode) {
+            (_, KeyMode::ConfirmRemove) => row![
+                status("Remove this key?"),
+                button(text("Remove").size(theme::TEXT_BODY))
+                    .padding([8, 14])
+                    .style(theme::danger_button)
+                    .on_press(Message::ConfirmRemove),
+                cancel_button(),
+            ]
+            .spacing(theme::SPACING / 2.0)
+            .align_y(Center)
+            .into(),
+            (KeyState::NoKey, _) => self.key_input(which, false),
+            (_, KeyMode::Replace) => self.key_input(which, true),
+            (KeyState::Locked, KeyMode::Idle) => row![
+                status("Locked"),
+                secondary("Unlock", Message::Unlock),
+                secondary("Replace", Message::ShowReplace(which)),
+                remove_button(which),
+            ]
+            .spacing(theme::SPACING / 2.0)
+            .align_y(Center)
+            .into(),
+            (KeyState::Unlocked, KeyMode::Idle) => row![
+                status("Saved"),
+                secondary("Replace", Message::ShowReplace(which)),
+                remove_button(which),
+            ]
+            .spacing(theme::SPACING / 2.0)
+            .align_y(Center)
+            .into(),
+        };
+        let error = if !here || self.password_prompt {
+            None
+        } else if let Some(e) = &self.key_error {
+            Some(e.clone())
+        } else if let Some(Err(e)) = &self.key_message {
+            Some(e.clone())
+        } else {
+            None
+        };
+        match error {
+            Some(e) => column![line, error_text(e)]
+                .spacing(theme::SPACING / 3.0)
+                .into(),
+            None => line,
+        }
+    }
+
+    /// A key field and Save (Enter works too).
     fn key_input(&self, which: Which, cancellable: bool) -> Element<'_, Message> {
-        let (placeholder, field) = match which {
-            Which::Main => ("sk-…", SecretField::ApiKey),
-            Which::Decision => ("Its own API key, if it needs one", SecretField::DecisionKey),
+        let field = match which {
+            Which::Main => SecretField::ApiKey,
+            Which::Decision => SecretField::DecisionKey,
         };
         let mut line = row![
-            secret_input(placeholder, self.typed_key(which), field)
+            secret_input("Paste API key", self.typed_key(which), field)
                 .on_submit(Message::SaveKey(which)),
-            primary("Save key", Message::SaveKey(which)),
+            secondary("Save", Message::SaveKey(which)),
         ]
         .spacing(theme::SPACING / 2.0)
         .align_y(Center);
@@ -1423,6 +1324,24 @@ impl SettingsView {
 fn section<'a>(heading: &'a str, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     column![theme::section_heading(heading), body.into()]
         .spacing(theme::SPACING)
+        .into()
+}
+
+/// A fixed-width label and its field, for the model settings.
+fn field_row<'a>(label: &'a str, field: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    row![
+        text(label).size(theme::TEXT_BODY).width(90),
+        container(field).width(Fill)
+    ]
+    .spacing(theme::SPACING)
+    .align_y(Center)
+    .into()
+}
+
+fn error_text<'a>(message: String) -> Element<'a, Message> {
+    text(message)
+        .size(theme::TEXT_SMALL)
+        .style(theme::danger)
         .into()
 }
 
@@ -1929,37 +1848,43 @@ mod tests {
     }
 
     #[test]
-    fn use_ollama_fills_the_endpoint_and_lists_models() {
+    fn provider_fills_its_url_and_ollama_lists_models() {
         let mut v = loaded(KeyState::Locked);
-        v.update(Message::Protocol(Which::Main, Protocol::Anthropic));
-        let Action::ListModels(llm, Which::Main) = v.update(Message::UseOllama(Which::Main)) else {
+        v.update(Message::Provider(Which::Main, Provider::Anthropic));
+        assert_eq!(v.form.main.base_url, "https://api.anthropic.com");
+        let Action::ListModels(llm, Which::Main) =
+            v.update(Message::Provider(Which::Main, Provider::Ollama))
+        else {
             panic!("expected ListModels");
         };
         assert_eq!(llm.protocol, Protocol::OpenAi);
+        assert!(llm.keyless);
         assert_eq!(llm.base_url, OLLAMA_BASE_URL);
-        assert_eq!(v.form.main.base_url, OLLAMA_BASE_URL);
-        assert_eq!(v.form.main.protocol, Protocol::OpenAi);
+        // A typed URL is kept.
+        v.update(Message::BaseUrl(
+            Which::Main,
+            "http://192.168.1.20:11434/v1".into(),
+        ));
+        v.update(Message::Provider(Which::Main, Provider::OpenAi));
+        assert_eq!(v.form.main.base_url, "http://192.168.1.20:11434/v1");
+        assert!(!v.form.main.llm().keyless);
     }
 
     #[test]
-    fn decision_model_saves_tests_and_clears_on_its_own() {
+    fn recommendations_model_saves_tests_and_turns_off() {
         let mut v = loaded(KeyState::NoKey);
-        v.update(Message::BaseUrl(
-            Which::Main,
-            "https://api.openai.com/v1".into(),
-        ));
+        v.update(Message::Provider(Which::Main, Provider::OpenAi));
         v.update(Message::Model(Which::Main, "gpt-4o".into()));
-        let Action::ListModels(llm, Which::Decision) =
-            v.update(Message::UseOllama(Which::Decision))
-        else {
-            panic!("expected ListModels for the decision model");
+        let Action::ListModels(llm, Which::Decision) = v.update(Message::Separate(true)) else {
+            panic!("expected ListModels for the recommendations model");
         };
+        assert!(v.decision_on);
         assert_eq!(llm.base_url, OLLAMA_BASE_URL);
-        // The list belongs to the decision section only.
+        // The list belongs to the recommendations block only.
         assert_eq!(v.models_state(Which::Main), ModelsState::Hidden);
         v.update(Message::PickModel(Which::Decision, "deepseek-r1:8b".into()));
         let Action::Test(llm, Which::Decision) = v.update(Message::Test(Which::Decision)) else {
-            panic!("expected Test for the decision model");
+            panic!("expected Test for the recommendations model");
         };
         assert_eq!(llm.model, "deepseek-r1:8b");
 
@@ -1969,14 +1894,18 @@ mod tests {
         assert_eq!(saved.llm.model, "gpt-4o");
         assert_eq!(saved.decision_llm.base_url, OLLAMA_BASE_URL);
         assert_eq!(saved.decision_llm.model, "deepseek-r1:8b");
+        assert!(saved.decision_llm.keyless);
 
         v.load(data(saved, KeyState::NoKey));
-        v.update(Message::ClearDecision);
+        assert!(v.decision_on);
+        v.update(Message::Separate(false));
         let Action::Save(cleared) = v.update(Message::Save) else {
             panic!("expected Save");
         };
         assert!(!cleared.decision_llm.is_configured());
         assert_eq!(cleared.llm.model, "gpt-4o");
+        v.load(data(cleared, KeyState::NoKey));
+        assert!(!v.decision_on);
     }
 
     #[test]
@@ -2009,30 +1938,6 @@ mod tests {
             v.update(Message::ConfirmRemove),
             Action::RemoveKey(Which::Decision)
         ));
-    }
-
-    #[test]
-    fn keyless_is_per_endpoint_and_saved() {
-        let mut v = loaded(KeyState::Locked);
-        v.update(Message::BaseUrl(
-            Which::Main,
-            "http://192.168.1.20:11434/v1".into(),
-        ));
-        v.update(Message::Model(Which::Main, "llama3.2".into()));
-        v.update(Message::Keyless(Which::Main, true));
-        v.update(Message::UseOllama(Which::Decision));
-        let Action::Save(saved) = v.update(Message::Save) else {
-            panic!("expected Save");
-        };
-        assert!(saved.llm.keyless);
-        assert!(saved.decision_llm.keyless, "Use local Ollama ticks it");
-        v.load(data(saved, KeyState::Locked));
-        v.update(Message::Keyless(Which::Main, false));
-        let Action::Save(saved) = v.update(Message::Save) else {
-            panic!("expected Save");
-        };
-        assert!(!saved.llm.keyless);
-        assert!(saved.decision_llm.keyless);
     }
 
     #[test]
@@ -2073,11 +1978,9 @@ mod tests {
     }
 
     #[test]
-    fn settings_unlock_and_lock() {
+    fn settings_unlock() {
         let mut v = loaded(KeyState::Locked);
         assert!(matches!(v.update(Message::Unlock), Action::ShowUnlock));
-        v.load(data(Settings::default(), KeyState::Unlocked));
-        assert!(matches!(v.update(Message::Lock), Action::Lock));
     }
 
     #[test]
@@ -2124,11 +2027,7 @@ mod tests {
     fn protocol_and_focus_hours_round_trip_through_save() {
         let mut v = loaded(KeyState::NoKey);
         assert_eq!(v.form.focus_hours, "6");
-        v.update(Message::Protocol(Which::Main, Protocol::Anthropic));
-        v.update(Message::BaseUrl(
-            Which::Main,
-            "https://api.anthropic.com".into(),
-        ));
+        v.update(Message::Provider(Which::Main, Provider::Anthropic));
         v.update(Message::Model(Which::Main, "claude-x".into()));
         v.update(Message::FocusHours(" 5.5 ".into()));
         let Action::Save(s) = v.update(Message::Save) else {
@@ -2139,7 +2038,7 @@ mod tests {
         // Saved settings come back from main.rs: the form matches them and
         // there is nothing left to save.
         v.load(data(s.clone(), KeyState::NoKey));
-        assert_eq!(v.form.main.protocol, Protocol::Anthropic);
+        assert_eq!(v.form.main.provider, Provider::Anthropic);
         assert_eq!(v.form.focus_hours, "5.5");
         assert!(!v.is_dirty());
         assert!(matches!(v.update(Message::Save), Action::None));
@@ -2156,14 +2055,19 @@ mod tests {
         round1.summary_instructions = "Short.".into();
         let mut v = SettingsView::new();
         v.load(data(round1.clone(), KeyState::NoKey));
-        assert_eq!(v.form.main.protocol, Protocol::OpenAi);
+        // On Ollama's port, so it shows as Ollama.
+        assert_eq!(v.form.main.provider, Provider::Ollama);
         assert_eq!(v.form.focus_hours, "6");
         assert!(!v.is_dirty());
         v.update(Message::FocusHours("6.5".into()));
         let Action::Save(s) = v.update(Message::Save) else {
             panic!("expected Save");
         };
-        assert_eq!(s.llm, round1.llm);
+        // Saved as Ollama: the same endpoint, now marked keyless.
+        assert_eq!(s.llm.base_url, round1.llm.base_url);
+        assert_eq!(s.llm.model, round1.llm.model);
+        assert_eq!(s.llm.protocol, round1.llm.protocol);
+        assert!(s.llm.keyless);
         assert_eq!(s.schedule, round1.schedule);
         assert_eq!(s.focus_minutes_per_day, DEFAULT_FOCUS_MINUTES + 30);
         assert!(!s.notifications);
@@ -2209,7 +2113,7 @@ mod tests {
             v.update(Message::LoadModels(Which::Main)),
             Action::None
         ));
-        v.update(Message::Protocol(Which::Main, Protocol::Anthropic));
+        v.update(Message::Provider(Which::Main, Provider::Anthropic));
         v.update(Message::BaseUrl(
             Which::Main,
             " https://api.anthropic.com ".into(),
@@ -2236,9 +2140,10 @@ mod tests {
     #[test]
     fn models_result_handling() {
         let mut v = loaded(KeyState::NoKey);
+        // Not a provider's default URL, so switching provider keeps it.
         v.update(Message::BaseUrl(
             Which::Main,
-            "http://localhost:11434/v1".into(),
+            "http://localhost:8080/v1".into(),
         ));
         assert_eq!(v.models_state(Which::Main), ModelsState::Hidden);
         v.update(Message::LoadModels(Which::Main));
@@ -2271,9 +2176,9 @@ mod tests {
         assert_eq!(s.llm.model, "qwen3:8b");
 
         // A list for another endpoint is hidden.
-        v.update(Message::Protocol(Which::Main, Protocol::Anthropic));
+        v.update(Message::Provider(Which::Main, Provider::Anthropic));
         assert_eq!(v.models_state(Which::Main), ModelsState::Hidden);
-        v.update(Message::Protocol(Which::Main, Protocol::OpenAi));
+        v.update(Message::Provider(Which::Main, Provider::OpenAi));
         assert_eq!(v.models_state(Which::Main), ModelsState::List(&ids));
     }
 
