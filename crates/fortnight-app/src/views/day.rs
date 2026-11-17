@@ -12,8 +12,11 @@
 //!   open tasks planned for an earlier day whose deadline has not passed.
 //! - **Overdue** (only when the shown day is today, and only if any): open
 //!   tasks whose deadline has passed.
-//! - **Side work**: free-standing log lines dated the shown day, shown as
-//!   ticked items, with an input to add one (today only, see below).
+//! - **Today's Notes** (today): a free-text box to jot down anything from
+//!   the day. Saved a moment after typing stops, as one free-standing log
+//!   line dated today (replacing that day's others), so it reaches the
+//!   weekly summary as `log_lines`. Older side work lines show up as lines
+//!   of the notes. Other days show their notes read only, if any.
 //! - **Completed**, collapsed: tasks completed on the shown day.
 //! - **No date**, collapsed: open tasks with no planned day (the inbox).
 //! - **Deleted**, collapsed: every deleted task, newest first, each a quiet
@@ -49,10 +52,12 @@
 //! The other sections keep their own order and don't drag.
 //!
 //! Skipped for the prototype: undo for a drag, strikethrough on done tasks
-//! (iced text has none), and adding side work to a day other than today
-//! (`Action::AddLog` has no date; main.rs stamps it now).
+//! (iced text has none), editing the notes of a day other than today (the
+//! store stamps log lines now), undo for the notes, and saving notes typed
+//! in the last moment before quitting.
 
 use std::cmp::Ordering;
+use std::time::{Duration, Instant};
 
 use fortnight_core::domain::{EventId, NewTask, Priority, Task, TaskId, TaskStatus};
 use fortnight_core::parse;
@@ -99,10 +104,9 @@ pub enum Message {
     /// The add-a-task input under the day's tasks.
     EditQuickAdd(String),
     SubmitQuickAdd,
-    /// The side work input.
-    EditDayLog(String),
-    AddDayLog,
-    DeleteLog(EventId),
+    /// Typing in Today's Notes. Saved by `main.rs` once typing pauses
+    /// ([`DayView::notes_to_save`]).
+    EditDayNotes(text_editor::Action),
     Save,
     /// Move the open task to Deleted.
     Delete,
@@ -250,8 +254,10 @@ pub struct DayView {
     selected: Option<TaskId>,
     /// The expanded row's form.
     editing: Option<EditForm>,
-    /// The side work input.
-    day_log: String,
+    /// Today's Notes: always today's, whatever day is shown.
+    notes: text_editor::Content,
+    /// When the notes were last typed in, while not yet saved.
+    notes_edited: Option<Instant>,
     /// The add-a-task input.
     quick_add: String,
     /// A held Tasks card.
@@ -737,6 +743,13 @@ impl DayView {
             return;
         }
         let before = self.visible();
+        // Unsaved typing wins over what is stored.
+        if self.notes_edited.is_none() {
+            let stored = day_notes(&data, data.today);
+            if self.notes.text().trim_end() != stored {
+                self.notes = text_editor::Content::with_text(&stored);
+            }
+        }
         self.data = Some(data);
 
         if let Some(form) = &self.editing {
@@ -903,21 +916,14 @@ impl DayView {
                     None => Action::None,
                 }
             }
-            Message::EditDayLog(s) => {
-                self.day_log = s;
+            Message::EditDayNotes(action) => {
+                let edit = action.is_edit();
+                self.notes.perform(action);
+                if edit {
+                    self.notes_edited = Some(Instant::now());
+                }
                 Action::None
             }
-            Message::AddDayLog => {
-                let text = std::mem::take(&mut self.day_log).trim().to_string();
-                if text.is_empty() {
-                    return Action::None;
-                }
-                Action::AddLog {
-                    task_id: None,
-                    text,
-                }
-            }
-            Message::DeleteLog(id) => Action::DeleteLog(id),
             Message::Save => {
                 let Some(form) = self.editing.as_mut() else {
                     return Action::None;
@@ -1033,8 +1039,8 @@ impl DayView {
             content = content.push(self.group(heading, overdue, data));
         }
 
-        if let Some(side) = side_work(data, &self.day_log) {
-            content = content.push(side);
+        if let Some(notes) = self.day_notes_view(data) {
+            content = content.push(notes);
         }
 
         let collapsibles = [
@@ -1101,6 +1107,75 @@ impl DayView {
         self.editing
             .as_ref()
             .map(|f| (f.id, f.title.clone(), f.notes.text()))
+    }
+
+    /// Whether Today's Notes have unsaved typing (`main.rs` then checks
+    /// [`Self::notes_to_save`] every so often).
+    pub fn notes_pending(&self) -> bool {
+        self.notes_edited.is_some()
+    }
+
+    /// Today's Notes to save, once typing has paused for
+    /// [`NOTES_SAVE_DELAY`] (then they count as saved).
+    pub fn notes_to_save(&mut self, now: Instant) -> Option<String> {
+        let edited = self.notes_edited?;
+        if now.saturating_duration_since(edited) < NOTES_SAVE_DELAY {
+            return None;
+        }
+        self.notes_edited = None;
+        Some(self.notes.text().trim_end().to_string())
+    }
+
+    /// Today's Notes on today (an editor, saved as you type), or the
+    /// shown day's notes, read only, on another day that has some.
+    fn day_notes_view<'a>(&'a self, data: &'a DayData) -> Option<Element<'a, Message>> {
+        if data.day == data.today {
+            let heading = row![
+                text("Today's Notes").size(theme::TEXT_HEADING),
+                text("Goes into the weekly summary")
+                    .size(theme::TEXT_SMALL)
+                    .style(theme::muted),
+            ]
+            .spacing(theme::SPACING * 0.75)
+            .align_y(iced::alignment::Vertical::Bottom);
+            let editor = text_editor(&self.notes)
+                .placeholder(
+                    "Jot down anything from today: side work, meetings, decisions, blockers…",
+                )
+                .on_action(Message::EditDayNotes)
+                // Grows with the text, then scrolls.
+                .min_height(120)
+                .max_height(480)
+                .padding([11, 14])
+                .size(theme::TEXT_BODY)
+                .style(theme::editor);
+            return Some(
+                column![heading, editor]
+                    .spacing(theme::SPACING / 2.0)
+                    .into(),
+            );
+        }
+        let notes = day_notes(data, data.day);
+        if notes.is_empty() {
+            return None;
+        }
+        let body = container(text(notes).size(theme::TEXT_BODY))
+            .width(Fill)
+            .padding([11, 14])
+            .style(|t: &Theme| {
+                let b = task_card_style(false, false)(t, button::Status::Active);
+                container::Style {
+                    background: b.background,
+                    text_color: Some(b.text_color),
+                    border: b.border,
+                    ..container::Style::default()
+                }
+            });
+        Some(
+            column![text("Notes").size(theme::TEXT_HEADING), body]
+                .spacing(theme::SPACING / 2.0)
+                .into(),
+        )
     }
 
     /// Shows a suggested priority on the inline form of task `id`.
@@ -1248,56 +1323,30 @@ fn section_title<'a>(
         .into()
 }
 
-/// `1 Task`, `5 Tasks`: a count and a noun, plural unless the count is 1.
+/// `No Tasks`, `1 Task`, `5 Tasks`: a count and a noun, plural unless the
+/// count is 1.
 pub fn count_label(n: usize, noun: &str) -> String {
-    if n == 1 {
-        format!("1 {noun}")
-    } else {
-        format!("{n} {noun}s")
+    match n {
+        0 => format!("No {noun}s"),
+        1 => format!("1 {noun}"),
+        _ => format!("{n} {noun}s"),
     }
 }
 
-/// Side work for the shown day: free-standing log lines as ticked items,
-/// or `None` when there is nothing to show (a day other than today with
-/// none).
-fn side_work<'a>(data: &'a DayData, input: &'a str) -> Option<Element<'a, Message>> {
-    let lines: Vec<&LogLine> = data
-        .logs
+/// A day's notes: the free-standing log lines dated `day`, oldest first,
+/// one per line. (Side work logged before the notes existed shows up as
+/// lines of them.)
+pub fn day_notes(data: &DayData, day: Date) -> String {
+    data.logs
         .iter()
-        .filter(|l| l.task_id.is_none() && l.date == data.day)
-        .collect();
-    let can_add = data.day == data.today;
-    if lines.is_empty() && !can_add {
-        return None;
-    }
-    let mut group = column![theme::section_heading("Side work")].spacing(theme::SPACING / 2.0);
-    let items = Column::with_children(lines.into_iter().map(|line| {
-        row![
-            container(text("•").size(theme::TEXT_BODY).style(theme::muted)).center_x(20),
-            text(&line.text).size(theme::TEXT_BODY).width(Fill),
-            button(text("×").size(theme::TEXT_BODY))
-                .padding([0, 8])
-                .style(theme::text_button)
-                .on_press(Message::DeleteLog(line.id)),
-        ]
-        .spacing(theme::SPACING)
-        .padding([6, 0])
-        .align_y(Center)
-        .into()
-    }));
-    group = group.push(items);
-    if can_add {
-        group = group.push(
-            text_input("Log side work", input)
-                .on_input(Message::EditDayLog)
-                .on_submit(Message::AddDayLog)
-                .padding([8, 10])
-                .size(theme::TEXT_BODY)
-                .style(theme::input),
-        );
-    }
-    Some(group.into())
+        .filter(|l| l.task_id.is_none() && l.date == day)
+        .map(|l| l.text.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
+
+/// How long typing must pause before Today's Notes are saved.
+pub const NOTES_SAVE_DELAY: Duration = Duration::from_millis(1200);
 
 /// The background moved `amount` (0–1) towards the text colour.
 fn tinted(theme: &Theme, amount: f32) -> Color {
@@ -2298,9 +2347,9 @@ mod tests {
 
     #[test]
     fn count_labels_are_plural_unless_one() {
-        assert_eq!(count_label(0, "Task"), "0 Tasks");
         assert_eq!(count_label(1, "Task"), "1 Task");
         assert_eq!(count_label(3, "Recommended Task"), "3 Recommended Tasks");
+        assert_eq!(count_label(0, "Task"), "No Tasks");
     }
 
     #[test]
@@ -2356,19 +2405,45 @@ mod tests {
     }
 
     #[test]
-    fn side_work_add_and_delete() {
-        let mut view = loaded(vec![]);
-        assert_eq!(view.update(Message::AddDayLog), Action::None, "empty");
-        view.update(Message::EditDayLog("  helped Sam debug the deploy ".into()));
+    fn todays_notes_load_and_save_after_a_pause() {
+        let mut data = data_for(today(), vec![]);
+        let line = |id, date, text: &str| LogLine {
+            id,
+            task_id: None,
+            at: Timestamp::UNIX_EPOCH,
+            date,
+            text: text.into(),
+        };
+        // Old side work lines become lines of the notes; other days' don't.
+        data.logs = vec![
+            line(1, today(), "helped Sam"),
+            line(2, date(2026, 11, 15), "Sunday"),
+            line(3, today(), "standup ran long"),
+        ];
+        let mut view = DayView::new();
+        view.load(data.clone());
+        assert_eq!(view.notes.text(), "helped Sam\nstandup ran long");
+        assert!(!view.notes_pending());
+
+        view.update(Message::EditDayNotes(text_editor::Action::Move(
+            text_editor::Motion::DocumentEnd,
+        )));
+        assert!(!view.notes_pending(), "moving the cursor is no edit");
+        view.update(Message::EditDayNotes(text_editor::Action::Edit(
+            text_editor::Edit::Insert('!'),
+        )));
+        assert!(view.notes_pending());
+        let typed = view.notes_edited.unwrap();
+        assert_eq!(view.notes_to_save(typed), None, "still typing");
+        // A reload while typing keeps the typing.
+        view.load(data_for(today(), vec![]));
+        assert_eq!(view.notes.text(), "helped Sam\nstandup ran long!");
         assert_eq!(
-            view.update(Message::AddDayLog),
-            Action::AddLog {
-                task_id: None,
-                text: "helped Sam debug the deploy".into()
-            }
+            view.notes_to_save(typed + NOTES_SAVE_DELAY).as_deref(),
+            Some("helped Sam\nstandup ran long!")
         );
-        assert!(view.day_log.is_empty());
-        assert_eq!(view.update(Message::DeleteLog(42)), Action::DeleteLog(42));
+        assert!(!view.notes_pending());
+        assert_eq!(view.notes_to_save(typed + NOTES_SAVE_DELAY * 2), None);
     }
 
     #[test]

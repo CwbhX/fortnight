@@ -100,6 +100,8 @@ enum Message {
     Tick,
     /// Checks whether the Work summary's wait after an edit is over.
     SummaryWait,
+    /// While Today's Notes have unsaved typing: save them once it pauses.
+    NotesTick,
     ThemeMode(iced::theme::Mode),
     /// A piece of a streamed report.
     Stream(ReportKey, u64, Result<ChatEvent, LlmError>),
@@ -311,9 +313,16 @@ impl App {
             }
             _ => Subscription::none(),
         };
+        let notes = match self {
+            App::Ready(ready, _) if ready.day_view.notes_pending() => {
+                iced::time::every(Duration::from_millis(300)).map(|_| Message::NotesTick)
+            }
+            _ => Subscription::none(),
+        };
         Subscription::batch([
             iced::time::every(Duration::from_secs(60)).map(|_| Message::Tick),
             summary_wait,
+            notes,
             iced::system::theme_changes().map(Message::ThemeMode),
             iced::window::open_events().map(|_| Message::WindowOpened),
             // Ends a card drag (Week or Today) even when the button is let
@@ -1296,6 +1305,12 @@ impl Ready {
                 UnlockAction::Unlock(password) => self.unlock(password),
             },
             Message::Tick => Task::batch([self.run_due(), self.update_week_reports()]),
+            Message::NotesTick => {
+                if let Some(notes) = self.day_view.notes_to_save(std::time::Instant::now()) {
+                    self.save_todays_notes(&notes);
+                }
+                Task::none()
+            }
             Message::SummaryWait => {
                 if self.summary_waiting() {
                     Task::none()
@@ -1613,6 +1628,39 @@ impl Ready {
                 }
             }
             Err(e) => self.error = Some(e.to_string()),
+        }
+        self.reload_tasks();
+    }
+
+    /// Saves Today's Notes: today's free-standing log lines are replaced by
+    /// one holding `notes` (none if it is empty). Nothing is written when
+    /// they already say the same.
+    fn save_todays_notes(&mut self, notes: &str) {
+        let today = self.today();
+        let old: Vec<(EventId, &str)> = self
+            .events
+            .iter()
+            .filter(|e| e.task_id.is_none() && self.tz.to_datetime(e.at).date() == today)
+            .filter_map(|e| Some((e.id, e.log_text()?.trim_end())))
+            .collect();
+        let notes = notes.trim();
+        let same = old.iter().map(|(_, t)| *t).collect::<Vec<_>>().join("\n");
+        if same == notes {
+            return;
+        }
+        let ids: Vec<EventId> = old.iter().map(|(id, _)| *id).collect();
+        let result = ids
+            .into_iter()
+            .try_for_each(|id| self.store.delete_log(id))
+            .and_then(|()| {
+                if notes.is_empty() {
+                    Ok(())
+                } else {
+                    self.store.add_log(None, notes).map(|_| ())
+                }
+            });
+        if let Err(e) = result {
+            self.error = Some(format!("Could not save today's notes: {e}"));
         }
         self.reload_tasks();
     }

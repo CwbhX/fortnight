@@ -276,8 +276,9 @@ pub struct SummaryFacts {
     pub next_week: Vec<DueTask>,
     /// Tasks created during the week, in any status.
     pub added: Vec<AddedTask>,
-    /// Free-standing log lines written during the week: work that isn't a
-    /// task. Oldest first.
+    /// Free-standing log lines written during the week: the Today tab's
+    /// day notes (side work, meetings, blockers, anything not a task).
+    /// Oldest first.
     pub log_lines: Vec<LogEntry>,
     /// Completed counts per project; `project: null` is the no-project
     /// bucket. Named projects first, alphabetically.
@@ -1166,7 +1167,7 @@ Rules:
 - Write in the first person (\"I shipped...\") for a manager who knows the projects but not the details.
 - Lead with outcomes, not activity. Group items by project; tasks with no project and free-standing log lines go under \"Other\".
 - Do no arithmetic. Dates, weekdays and day counts are already computed in the facts; use them as given.
-- `log_lines` are the user's own short notes on side work done that day. Use them to say what moved forward, in your own words; do not list every one or copy them verbatim.
+- `log_lines` are the user's own notes from each day: side work, meetings, decisions, blockers, ideas. Use them to say what moved forward or got in the way, in your own words; do not list every one or copy them verbatim. Leave out what is only personal or has no bearing on the work.
 - Keep it short and scannable: one line per item, no filler.
 - Plain Markdown. Use exactly these five headings, as \"## Heading\", in this order, with bullet points under each. No title, preamble, sign-off, tables or code blocks.
 

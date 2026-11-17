@@ -417,15 +417,16 @@ pub fn top_tab_bar(theme: &Theme) -> container::Style {
     }
 }
 
-/// A tab inside [`tab_bar`]: the active one is a raised background-coloured
-/// pill with accent text; the others are muted text.
+/// A tab inside [`tab_bar`]: the active one is filled with the accent and
+/// has white text, like every other selected thing (a calendar day, a ticked
+/// checkbox, the primary button); the others are muted text.
 pub fn tab_button(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
         let p = theme.palette();
         if active {
             button::Style {
-                background: Some(p.background.into()),
-                text_color: ACCENT,
+                background: Some(ACCENT.into()),
+                text_color: Color::WHITE,
                 border: border::rounded(RADIUS - 2.0),
                 shadow: iced::Shadow {
                     color: Color::BLACK.scale_alpha(0.12),
