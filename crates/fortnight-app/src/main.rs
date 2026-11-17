@@ -177,8 +177,9 @@ enum Undo {
         last_event: EventId,
         what: &'static str,
     },
-    /// A task was deleted; put it back with its history.
-    Deleted(Box<DeletedTask>),
+    /// Tasks were deleted for good (one, or all of Deleted at once); put
+    /// them back with their history.
+    Deleted(Vec<DeletedTask>),
 }
 
 /// How many changes undo remembers.
@@ -748,7 +749,8 @@ impl Ready {
     /// Recommended tasks report, parsed (empty if none or unreadable). A
     /// failed newer attempt doesn't hide the last good one.
     /// The recommended tasks: the newest ready version that still names an
-    /// open task planned for today or overdue (a chat model may not keep to
+    /// open task on the Today list (planned for today or carried over from
+    /// an earlier day) or overdue (a chat model may not keep to
     /// that rule). An overdue task stays eligible until it is done or
     /// deleted. Falling back to an older version keeps the last good list
     /// on screen when the newest names none of them, e.g. while a new one
@@ -768,7 +770,8 @@ impl Ready {
                     .into_iter()
                     .filter(|t| {
                         self.task(t.id).is_some_and(|x| {
-                            x.status.is_open() && (x.day() == Some(today) || x.is_overdue(today))
+                            x.status.is_open()
+                                && (x.day().is_some_and(|d| d <= today) || x.is_overdue(today))
                         })
                     })
                     .map(|t| day::Recommended {
@@ -1066,11 +1069,30 @@ impl Ready {
                 last_event,
                 what,
             } => self.undo_change(before, *last_event).map(|()| *what),
-            Undo::Deleted(deleted) => self
-                .store
-                .restore_task(deleted)
-                .map(|()| "Task restored.")
-                .map_err(|e| e.to_string()),
+            Undo::Deleted(deleted) => {
+                // Put back what can be; keep the rest for another try.
+                let mut left = Vec::new();
+                let mut failed = None;
+                for d in deleted {
+                    if failed.is_none()
+                        && let Err(e) = self.store.restore_task(d)
+                    {
+                        failed = Some(e.to_string());
+                    }
+                    if failed.is_some() {
+                        left.push(d.clone());
+                    }
+                }
+                match failed {
+                    None => Ok("Task restored."),
+                    Some(e) => {
+                        self.undo.push(Undo::Deleted(left));
+                        self.error = Some(format!("Could not undo: {e}"));
+                        self.reload_tasks();
+                        return;
+                    }
+                }
+            }
         };
         match result {
             Ok(_) => {}
@@ -1177,6 +1199,10 @@ impl Ready {
                 // itself; no data changed, so skip the refresh.
                 let action = self.day_view.update(m);
                 return self.day_action(action);
+            }
+            Message::Day(day::Message::DeleteAll) => {
+                self.delete_all_deleted();
+                Task::none()
             }
             Message::Day(m) => {
                 let action = self.day_view.update(m);
@@ -1591,6 +1617,31 @@ impl Ready {
         self.reload_tasks();
     }
 
+    /// Removes every deleted task for good (Delete all on the Today tab's
+    /// Deleted section). One undo puts them all back.
+    fn delete_all_deleted(&mut self) {
+        let ids: Vec<TaskId> = self
+            .tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Dropped)
+            .map(|t| t.id)
+            .collect();
+        let mut removed = Vec::new();
+        for id in ids {
+            match self.store.delete_task(id) {
+                Ok(deleted) => removed.push(deleted),
+                Err(e) => {
+                    self.error = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        if !removed.is_empty() {
+            self.remember(Undo::Deleted(removed));
+        }
+        self.reload_tasks();
+    }
+
     fn day_action(&mut self, action: day::Action) -> Task<Message> {
         let result = match action {
             day::Action::None => return Task::none(),
@@ -1608,7 +1659,7 @@ impl Ready {
             }
             day::Action::Delete(id) => match self.store.delete_task(id) {
                 Ok(deleted) => {
-                    self.remember(Undo::Deleted(Box::new(deleted)));
+                    self.remember(Undo::Deleted(vec![deleted]));
                     Ok(())
                 }
                 Err(e) => Err(e),

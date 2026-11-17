@@ -7,7 +7,8 @@
 //! chat model would (fallback, streaming, CLI), but it only understands
 //! the recommended-tasks request (`report::prepare_plan`): it reads the
 //! plan facts from between `<facts>` and `</facts>`, offers the open tasks
-//! planned for today and the overdue ones (due on an earlier day and not
+//! on the Today list (planned for today, or carried over from an earlier
+//! day) and the overdue ones (due on an earlier day and not
 //! done, wherever they sit; never other days' tasks) as one `choice`
 //! question ("which first?"), ranks them by probability
 //! and replies with the same JSON a chat model would
@@ -318,11 +319,10 @@ fn plan_question(user: &str, model: &str) -> Option<Ask> {
             let Some(id) = task.get("id").and_then(Value::as_i64) else {
                 continue;
             };
-            // Only the tasks on today's list, and overdue ones until done.
-            let planned_today =
-                !today.is_empty() && task.get("planned_for").and_then(Value::as_str) == Some(today);
+            // Only the tasks on today's list (carried-over ones too), and
+            // overdue ones until done.
             let overdue = task.get("overdue").and_then(Value::as_bool) == Some(true);
-            if !planned_today && !overdue {
+            if !on_today_list(task, today) && !overdue {
                 continue;
             }
             if candidates.len() < MAX_OPTIONS && candidates.iter().all(|c| c.id != id) {
@@ -373,6 +373,16 @@ fn plan_question(user: &str, model: &str) -> Option<Ask> {
     Some(Ask::Question { body, candidates })
 }
 
+/// Whether `task` is on the Today list: planned for today, or for an
+/// earlier day and carried over (`on_today_list` in the facts; older facts
+/// without it fall back to `planned_for == today`).
+fn on_today_list(task: &Value, today: &str) -> bool {
+    match task.get("on_today_list").and_then(Value::as_bool) {
+        Some(on) => on,
+        None => !today.is_empty() && task.get("planned_for").and_then(Value::as_str) == Some(today),
+    }
+}
+
 fn candidate(id: i64, task: &Value, facts: &Value) -> Candidate {
     let text = |k: &str| {
         task.get(k)
@@ -383,7 +393,7 @@ fn candidate(id: i64, task: &Value, facts: &Value) -> Candidate {
     let today = facts.get("today").and_then(Value::as_str).unwrap_or("");
     let days = task.get("days_until_due").and_then(Value::as_i64);
     let priority = task.get("priority").and_then(Value::as_u64).unwrap_or(0);
-    let planned_today = !today.is_empty() && text("planned_for") == today;
+    let planned_today = on_today_list(task, today);
 
     let due = days.map(|d| match d {
         d if d < -1 => format!("overdue {} days", -d),
@@ -649,7 +659,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overdue_tasks_from_earlier_days_are_offered_and_count_more() {
+    async fn overdue_and_carried_over_tasks_are_offered_and_overdue_counts_more() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/systemone"))
@@ -658,8 +668,8 @@ mod tests {
                 "answers": { "first": {
                     "type": "choice",
                     "choice": "t1",
-                    // 0.5 (x1); overdue 4 days: 0.3 (x2 = 0.6).
-                    "probabilities": { "t1": 0.5, "t2": 0.3 }
+                    // 0.5 (x1); overdue 4 days: 0.3 (x2 = 0.6); 0.2 (x1).
+                    "probabilities": { "t1": 0.5, "t2": 0.3, "t3": 0.2 }
                 } }
             })))
             .mount(&server)
@@ -670,7 +680,8 @@ mod tests {
             planned_for: Some(date(2026, 11, 12)),
             ..task(2, "Send invoice", Some(date(2026, 11, 12)))
         };
-        // Planned for an earlier day but not overdue: not offered.
+        // Planned for an earlier day, not overdue: carried over to today's
+        // list, so offered too.
         let carried = Task {
             planned_for: Some(date(2026, 11, 13)),
             ..task(3, "Read paper", Some(date(2026, 11, 20)))
@@ -683,13 +694,17 @@ mod tests {
         let picked: Vec<(i64, &str)> = rec.tasks.iter().map(|t| (t.id, t.why.as_str())).collect();
         assert_eq!(
             picked,
-            vec![(2, "overdue 4 days"), (1, "planned for today")]
+            vec![
+                (2, "overdue 4 days"),
+                (1, "planned for today"),
+                (3, "due Friday")
+            ]
         );
         let sent: Value = server.received_requests().await.unwrap()[0]
             .body_json()
             .unwrap();
         let criteria = sent["questions"]["first"]["criteria"].as_object().unwrap();
-        assert_eq!(criteria.len(), 2, "{criteria:?}");
+        assert_eq!(criteria.len(), 3, "{criteria:?}");
     }
 
     #[test]

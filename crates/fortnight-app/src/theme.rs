@@ -380,16 +380,18 @@ pub fn editor(theme: &Theme, status: text_editor::Status) -> text_editor::Style 
 
 // ------------------------------------------------------- round 2: navigation
 
-/// The slim bar across the top: the background, a hairline below.
+/// The slim bar across the top, in the scheme of the Week tab's title
+/// bars (the Work Summary's and each day column's): a stronger fill than
+/// the page, a hairline below.
 pub fn top_bar(theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(theme.palette().background.into()),
+        background: Some(tint(theme, 0.08).into()),
         border: Border {
             width: 0.0,
             ..Border::default()
         },
         shadow: iced::Shadow {
-            color: tint(theme, 0.12),
+            color: tint(theme, 0.16),
             offset: iced::Vector::new(0.0, 1.0),
             blur_radius: 0.0,
         },
@@ -403,6 +405,15 @@ pub fn tab_bar(theme: &Theme) -> container::Style {
         background: Some(field_fill(theme).into()),
         border: border::rounded(RADIUS),
         ..container::Style::default()
+    }
+}
+
+/// [`tab_bar`] on the [`top_bar`]: a step lighter than the bar so the pill
+/// still shows on its stronger fill.
+pub fn top_tab_bar(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(tint(theme, 0.14).into()),
+        ..tab_bar(theme)
     }
 }
 

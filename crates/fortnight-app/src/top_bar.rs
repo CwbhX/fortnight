@@ -176,7 +176,7 @@ pub fn view<'a>(bar: Bar<'a>) -> Element<'a, Message> {
                 .on_press(Message::Tab(tab)),
         );
     }
-    let tabs = container(tabs).padding(3).style(theme::tab_bar);
+    let tabs = container(tabs).padding(3).style(theme::top_tab_bar);
 
     let icon_button = |icon: Icon, message: Message, tip: &'a str| {
         tooltip(
@@ -197,6 +197,10 @@ pub fn view<'a>(bar: Bar<'a>) -> Element<'a, Message> {
     let date = container(
         text(period_label(bar.tab, bar.selected, bar.today, bar.schedule))
             .size(theme::TEXT_BODY)
+            .font(iced::Font {
+                weight: iced::font::Weight::Bold,
+                ..theme::FONT
+            })
             .wrapping(iced::widget::text::Wrapping::None),
     )
     .padding([5, 10])

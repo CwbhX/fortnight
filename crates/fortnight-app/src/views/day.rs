@@ -3,7 +3,8 @@
 //! Sections, top to bottom:
 //!
 //! - **Recommended** (only when the shown day is today): the model's top
-//!   three open tasks (planned for today or overdue), most important
+//!   three open tasks (on the Tasks list, carried-over ones included, or
+//!   overdue), most important
 //!   first, numbered, each with a few words on why. They are left out of
 //!   the sections below.
 //! - **Tasks**: open tasks whose [`Task::day`] (the planned day) is the
@@ -15,9 +16,12 @@
 //!   ticked items, with an input to add one (today only, see below).
 //! - **Completed**, collapsed: tasks completed on the shown day.
 //! - **No date**, collapsed: open tasks with no planned day (the inbox).
-//! - **Deleted**, collapsed: every deleted task, newest first, each with
-//!   Restore and Delete forever. Delete moves a task here (status
-//!   `Dropped`); only Delete forever removes it.
+//! - **Deleted**, collapsed: every deleted task, newest first, each a quiet
+//!   card with Restore and Delete forever, and Delete all in the header
+//!   when open. Delete moves a task here (status `Dropped`); only Delete
+//!   forever (or Delete all) removes it.
+//!
+//! Section titles show the count only (no estimate totals).
 //!
 //! The quick-add bar and the date navigation live in the top bar.
 //!
@@ -31,7 +35,9 @@
 //! they need no schema change and reach the summary with the notes.
 //! `↑` `↓` move a selection highlight through the visible rows (stopping at
 //! the ends), `Space` toggles done and `Escape` collapses the form, then
-//! clears the selection.
+//! clears the selection. Closing a form with the mouse (Save, Close, or a
+//! click on its row) clears the selection too, so no accent ring is left
+//! behind.
 //!
 //! The statuses `Doing` (in progress) are shown as plain open tasks; the app
 //! no longer sets it.
@@ -107,6 +113,9 @@ pub enum Message {
     Remove(TaskId),
     /// Remove a deleted task for good.
     DeleteForever(TaskId),
+    /// Remove every deleted task for good. `main.rs` handles it (one undo
+    /// for all); `update` ignores it.
+    DeleteAll,
     ToggleShowDone,
     ToggleShowNoDate,
     ToggleShowDeleted,
@@ -868,6 +877,7 @@ impl DayView {
             Message::Expand(id) => {
                 if self.editing.as_ref().is_some_and(|f| f.id == id) {
                     self.editing = None;
+                    self.selected = None;
                 } else if let Some(task) = data.tasks.iter().find(|t| t.id == id) {
                     self.editing = Some(open_form(task, &data.tasks, data.week_start));
                     self.selected = Some(id);
@@ -919,6 +929,7 @@ impl DayView {
                 match form.apply(task) {
                     Ok(updated) => {
                         self.editing = None;
+                        self.selected = None;
                         if &updated == task {
                             Action::None
                         } else {
@@ -937,6 +948,7 @@ impl DayView {
             },
             Message::Close => {
                 self.editing = None;
+                self.selected = None;
                 Action::None
             }
             Message::Restore(id) => Action::SetStatus(id, TaskStatus::Todo),
@@ -1177,16 +1189,27 @@ impl DayView {
         data: &'a DayData,
     ) -> Element<'a, Message> {
         let arrow = if open { "▾" } else { "▸" };
-        let header =
+        let toggle =
             button(text(format!("{arrow}  {label}  {}", tasks.len())).size(theme::TEXT_SMALL))
                 .padding([4, 0])
                 .style(theme::text_button)
                 .on_press(toggle);
+        let mut header = row![toggle].align_y(Center);
+        if open && section == Section::Deleted {
+            header = header.push(Space::new().width(Fill)).push(
+                button(text("Delete all").size(theme::TEXT_SMALL))
+                    .padding([4, 10])
+                    .style(theme::danger_button)
+                    .on_press(Message::DeleteAll),
+            );
+            // Lines Delete all up with the cards' Delete forever.
+            header = header.padding(iced::Padding::ZERO.right(14));
+        }
         let mut group = column![header].spacing(theme::SPACING / 2.0);
         if open {
             if section == Section::Deleted {
                 group = group
-                    .push(Column::with_children(tasks.into_iter().map(deleted_row)).spacing(2));
+                    .push(Column::with_children(tasks.into_iter().map(deleted_row)).spacing(6));
             } else {
                 group = group.push(self.rows(tasks, data));
             }
@@ -1213,29 +1236,16 @@ impl DayView {
 }
 
 /// A section title: the count and what they are (`5 Tasks`, `1 Overdue
-/// Task`) in the heading size, then the total estimate, if any, muted.
+/// Task`) in the heading size.
 fn section_title<'a>(
     tasks: &[&Task],
     noun: &str,
     style: fn(&Theme) -> text::Style,
 ) -> Element<'a, Message> {
-    let mut title = Row::new()
-        .spacing(theme::SPACING * 0.75)
-        .align_y(iced::alignment::Vertical::Bottom)
-        .push(
-            text(count_label(tasks.len(), noun))
-                .size(theme::TEXT_HEADING)
-                .style(style),
-        );
-    let total: u32 = tasks.iter().filter_map(|t| t.estimate_minutes).sum();
-    if total > 0 {
-        title = title.push(
-            text(parse::format_estimate(total))
-                .size(theme::TEXT_BODY)
-                .style(theme::muted),
-        );
-    }
-    title.into()
+    text(count_label(tasks.len(), noun))
+        .size(theme::TEXT_HEADING)
+        .style(style)
+        .into()
 }
 
 /// `1 Task`, `5 Tasks`: a count and a noun, plural unless the count is 1.
@@ -1487,9 +1497,10 @@ fn rank_badge<'a>(rank: usize) -> Element<'a, Message> {
     .into()
 }
 
-/// A deleted task: its title, dimmed, with Restore and Delete forever.
+/// A deleted task: a quiet card (as a completed one) with its title,
+/// dimmed, and Restore and Delete forever.
 fn deleted_row(task: &Task) -> Element<'_, Message> {
-    row![
+    let line = row![
         text(&task.title)
             .size(theme::TEXT_BODY)
             .style(theme::muted)
@@ -1504,9 +1515,20 @@ fn deleted_row(task: &Task) -> Element<'_, Message> {
             .on_press(Message::DeleteForever(task.id)),
     ]
     .spacing(theme::SPACING / 2.0)
-    .padding([4, 10])
-    .align_y(Center)
-    .into()
+    .align_y(Center);
+    container(line)
+        .width(Fill)
+        .padding([7, 14])
+        .style(|t: &Theme| {
+            let b = task_card_style(true, false)(t, button::Status::Active);
+            container::Style {
+                background: b.background,
+                text_color: Some(b.text_color),
+                border: b.border,
+                ..container::Style::default()
+            }
+        })
+        .into()
 }
 
 fn project_chip(project: &str) -> Element<'_, Message> {
