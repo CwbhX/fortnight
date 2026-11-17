@@ -5,7 +5,7 @@
 //! - **Recommended** (only when the shown day is today): the model's top
 //!   three open tasks (on the Tasks list, carried-over ones included, or
 //!   overdue), most important
-//!   first, numbered, each with a few words on why. They are left out of
+//!   first, numbered (the model's reasons aren't shown). They are left out of
 //!   the sections below.
 //! - **Tasks**: open tasks whose [`Task::day`] (the planned day) is the
 //!   shown day, then the add-a-task input. On today this also carries over
@@ -1301,7 +1301,7 @@ impl DayView {
                     .iter()
                     .filter(|_| data.day == data.today)
                     .position(|r| r.id == task.id)
-                    .map(|i| (i + 1, data.recommended[i].why.as_str()));
+                    .map(|i| i + 1);
                 task_row(task, data.today, self.selected == Some(task.id), rec)
             }
         }))
@@ -1382,19 +1382,17 @@ fn task_card_style(done: bool, selected: bool) -> impl Fn(&Theme, button::Status
     }
 }
 
-/// What a task card shows: checkbox, title and details. `rec` is its rank
-/// and reason when it is recommended: a numbered badge before the title and
-/// the reason after it.
-fn card_content<'a>(
-    task: &'a Task,
-    today: Date,
-    rec: Option<(usize, &'a str)>,
-) -> Row<'a, Message> {
+/// What a task card shows: checkbox, title and details. `rank` is its place
+/// when it is recommended: a numbered badge before the title. (The model's
+/// reason isn't shown: the priority marks and the list it is on say it.)
+/// The details on the right (subtasks, estimate, due day) are separated by
+/// muted dots.
+fn card_content(task: &Task, today: Date, rank: Option<usize>) -> Row<'_, Message> {
     let id = task.id;
     let open = task.status.is_open();
 
     let mut line = Row::new().spacing(theme::SPACING * 0.75).align_y(Center);
-    if let Some((rank, _)) = rec {
+    if let Some(rank) = rank {
         line = line.push(rank_badge(rank));
     }
     // The title, then `!` for Medium or `!!` for High (open tasks only).
@@ -1412,31 +1410,42 @@ fn card_content<'a>(
     if let Some(project) = &task.project {
         line = line.push(project_chip(project));
     }
-    if let Some((_, why)) = rec.filter(|(_, why)| !why.is_empty()) {
-        line = line.push(text(why).size(theme::TEXT_SMALL).style(theme::muted));
-    }
     line = line.push(Space::new().width(Fill));
+    let mut details: Vec<Element<'_, Message>> = Vec::new();
     let (done, total) = subtask_counts(&task.notes);
     if total > 0 {
-        line = line.push(
+        details.push(
             text(format!("{done}/{total}"))
                 .size(theme::TEXT_SMALL)
-                .style(theme::muted),
+                .style(theme::muted)
+                .into(),
         );
     }
     if let Some(minutes) = task.estimate_minutes {
-        line = line.push(
+        details.push(
             text(parse::format_estimate(minutes))
                 .size(theme::TEXT_SMALL)
-                .style(theme::muted),
+                .style(theme::muted)
+                .into(),
         );
     }
     if open && let Some(due) = task.due_on {
-        line = line.push(
+        details.push(
             text(due_label(due, today))
                 .size(theme::TEXT_SMALL)
-                .style(theme::due_style(task.is_overdue(today))),
+                .style(theme::due_style(task.is_overdue(today)))
+                .into(),
         );
+    }
+    if !details.is_empty() {
+        let mut meta = Row::new().spacing(theme::SPACING / 2.0).align_y(Center);
+        for (i, detail) in details.into_iter().enumerate() {
+            if i > 0 {
+                meta = meta.push(text("·").size(theme::TEXT_SMALL).style(theme::muted));
+            }
+            meta = meta.push(detail);
+        }
+        line = line.push(meta);
     }
 
     // A completed task gets a quiet × to delete it. Like the checkbox, it
@@ -1463,9 +1472,9 @@ fn task_row<'a>(
     task: &'a Task,
     today: Date,
     selected: bool,
-    rec: Option<(usize, &'a str)>,
+    rank: Option<usize>,
 ) -> Element<'a, Message> {
-    button(card_content(task, today, rec))
+    button(card_content(task, today, rank))
         .width(Fill)
         .padding([11, 14])
         .style(task_card_style(!task.status.is_open(), selected))
