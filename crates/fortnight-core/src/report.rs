@@ -1,9 +1,10 @@
-//! Week facts, the two prompts, and `generate`. Owners: agent D (round 1),
-//! agent E (round 2: history, capacity, private tasks).
+//! Week facts, the two prompts, and the report row for a reply. Owners:
+//! agent D (round 1), agent E (round 2: history, capacity, private tasks).
 //!
-//! Flow: tasks + events → facts (pure, deterministic) → prompt → client →
-//! NewReport. The app stores the NewReport; this module never touches the
-//! store, so `generate` is a `Send` future the app can run as an async task.
+//! Flow: tasks + events → facts (pure, deterministic) → prompt
+//! (`prepare_summary`, `prepare_plan`) → the caller streams it to a client →
+//! `finish` → NewReport. The app and the CLI store the NewReport; this
+//! module never touches the store or the network.
 //! The LLM never does arithmetic: days until due, weekdays, overdue flags,
 //! hours, loads and capacities are computed here and handed over as facts.
 //! PLAN.md 4.1, 7.3, 7.4 and 7.5.
@@ -22,12 +23,12 @@ use jiff::Timestamp;
 use jiff::ToSpan;
 use jiff::civil::{Date, Weekday};
 use jiff::tz::TimeZone;
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 /// Bump when a prompt changes.
-pub const PROMPT_VERSION: i64 = 8;
+pub const PROMPT_VERSION: i64 = 9;
 
 /// Notes and log lines longer than this (in characters) are cut and end
 /// in "…".
@@ -314,6 +315,7 @@ pub struct ProgressedTask {
     pub status: TaskStatus,
     /// The status changed to doing during the week.
     pub started_this_week: bool,
+    /// The deadline at the end of the week.
     pub due_on: Option<Date>,
     pub due_weekday: Option<&'static str>,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -379,6 +381,7 @@ pub struct AddedTask {
     pub title: String,
     pub project: Option<String>,
     pub created_on: Date,
+    /// Status at the end of the week.
     pub status: TaskStatus,
 }
 
@@ -456,14 +459,15 @@ pub fn summary_facts(
                 || in_week
                     .iter()
                     .any(|e| matches!(e.kind, EventKind::Log { .. } | EventKind::Edited { .. }));
+            let due_on = lw.due_at_end(t, all);
             worked.then(|| ProgressedTask {
                 id: t.id,
                 title: clean_title(&t.title),
                 project: t.project.clone(),
                 status,
                 started_this_week: started,
-                due_on: t.due_on,
-                due_weekday: t.due_on.map(|d| weekday_name(d.weekday())),
+                due_on,
+                due_weekday: due_on.map(|d| weekday_name(d.weekday())),
                 notes: trim_notes(&t.notes),
                 log_lines: lw.logs(all),
             })
@@ -584,7 +588,7 @@ pub fn summary_facts(
             title: clean_title(&t.title),
             project: t.project.clone(),
             created_on: *d,
-            status: t.status,
+            status: lw.status_at_end(t, history.of(t.id)),
         })
         .collect();
 
@@ -624,10 +628,16 @@ pub fn summary_facts(
 
 /// Facts for advice on `week` (the week ahead), as seen on `today`.
 /// Private tasks are left out of every list, total and load.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+///
+/// They also deserialise, so a client that reads them back from the
+/// request (`decision.rs`) uses these field names rather than its own copy.
+/// Weekday names deserialise to the same static names; anything else is
+/// an error.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanFacts {
     pub today: Date,
-    pub today_weekday: &'static str,
+    #[serde(deserialize_with = "static_weekday")]
+    pub today_weekday: WeekdayName,
     pub week_start: Date,
     pub week_end: Date,
     /// Working days from today (inclusive) to the week's end, each with its
@@ -640,16 +650,17 @@ pub struct PlanFacts {
     /// Open tasks due after the week but within 14 days of today, or due
     /// later but planned for this week (or carried over to today).
     pub due_soon: Vec<PlanTask>,
-    /// Up to 10 open tasks without a due date: those planned for this week
-    /// (or carried over to today) first, then list order.
+    /// Open tasks without a due date: every one on the Today list, then up
+    /// to 10 more, those planned for this week first, then list order.
     pub undated: Vec<PlanTask>,
     pub totals: PlanTotals,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanDay {
     pub date: Date,
-    pub weekday: &'static str,
+    #[serde(deserialize_with = "static_weekday")]
+    pub weekday: WeekdayName,
     /// Focus time available (`Settings::focus_minutes_per_day`).
     pub capacity_minutes: u32,
     pub capacity_hours: f64,
@@ -663,13 +674,14 @@ pub struct PlanDay {
     pub over_capacity: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanTask {
     pub id: i64,
     pub title: String,
     pub project: Option<String>,
     pub due_on: Option<Date>,
-    pub due_weekday: Option<&'static str>,
+    #[serde(default, deserialize_with = "static_weekday_opt")]
+    pub due_weekday: Option<WeekdayName>,
     /// Negative when overdue; 0 = due today.
     pub days_until_due: Option<i32>,
     pub overdue: bool,
@@ -678,7 +690,8 @@ pub struct PlanTask {
     /// On the Today list: planned for today, or for an earlier day and
     /// carried over because it is still open.
     pub on_today_list: bool,
-    pub planned_weekday: Option<&'static str>,
+    #[serde(default, deserialize_with = "static_weekday_opt")]
+    pub planned_weekday: Option<WeekdayName>,
     /// `null` when there is no estimate.
     pub estimate_minutes: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -687,11 +700,11 @@ pub struct PlanTask {
     pub priority: Priority,
     /// How many times the deadline has moved later, all time.
     pub deadline_moves: usize,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub notes: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanTotals {
     pub open: usize,
     pub overdue: usize,
@@ -787,11 +800,15 @@ pub fn plan_facts(
             None => undated_tasks.push(t),
         }
     }
-    // Stable: planned-this-week first, list order otherwise.
-    undated_tasks.sort_by_key(|t| !planned_this_week(t));
+    // Tasks on today's list are always listed, so they can be recommended;
+    // the cap applies to the rest. Stable: today's list first, then planned
+    // this week, list order otherwise.
+    let on_today_list = |t: &Task| t.planned_for.is_some_and(|d| d <= today);
+    undated_tasks.sort_by_key(|t| (!on_today_list(t), !planned_this_week(t)));
+    let on_today = undated_tasks.iter().filter(|t| on_today_list(t)).count();
     let undated: Vec<PlanTask> = undated_tasks
         .iter()
-        .take(MAX_UNDATED)
+        .take(on_today + MAX_UNDATED)
         .map(|t| to_plan(t))
         .collect();
 
@@ -1283,10 +1300,10 @@ pub fn prepare_plan(
     let facts = plan_facts(tasks, events, week, today, settings);
     let digest_json = facts_json(&facts);
     let user = format!(
-        "Plan my week {} to {}. Today is {}.\n\n<facts>\n{digest_json}\n</facts>",
+        "Pick the three tasks I should do first today, {}. This week runs from {} to {}.\n\n<facts>\n{digest_json}\n</facts>",
+        long_date(facts.today),
         long_date(facts.week_start),
         long_date(facts.week_end),
-        long_date(facts.today),
     );
     Prepared {
         kind: ReportKind::Plan,
@@ -1303,6 +1320,11 @@ pub fn prepare_plan(
 /// with the error message. `requested_model` is recorded when the call
 /// failed (there is no reported model then). The app and the CLI stream the
 /// reply (`chat_stream`) and call this with the result.
+///
+/// A `Plan` reply that `parse_recommendations` can't read is still `Ready`:
+/// the app counts failures from the call's result, not the row, so a
+/// `Failed` row there would be retried without backoff once failed rows
+/// count as stale.
 pub fn finish(
     prepared: Prepared,
     result: Result<ChatResponse, LlmError>,
@@ -1356,10 +1378,10 @@ pub struct RecommendedTask {
 }
 
 /// Unknown keys (such as `focus` and `day`, which older prompt versions
-/// asked for) are ignored.
+/// asked for) are ignored. `tasks` is required, so an object with other
+/// keys is not mistaken for "nothing to recommend".
 #[derive(serde::Deserialize)]
 struct RawRecommendation {
-    #[serde(default)]
     tasks: Vec<RawTask>,
 }
 
@@ -1370,16 +1392,18 @@ struct RawTask {
     why: String,
 }
 
-/// Parses a `Plan` report's text: one JSON object, possibly wrapped in a
-/// code fence or a sentence. Task ids may be numbers or numeric strings;
-/// duplicates are dropped. `None` when there is no such object.
+/// Parses a `Plan` report's text: one JSON object with a `tasks` list,
+/// possibly wrapped in a code fence or prose (which may contain braces of
+/// its own): the first `{` where such an object starts is used, and
+/// anything after it is ignored. Task ids may be numbers or numeric
+/// strings; duplicates are dropped. `None` when there is no such object.
 pub fn parse_recommendations(text: &str) -> Option<Recommendation> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    if end < start {
-        return None;
-    }
-    let raw: RawRecommendation = serde_json::from_str(&text[start..=end]).ok()?;
+    let raw = text.match_indices('{').find_map(|(i, _)| {
+        serde_json::Deserializer::from_str(&text[i..])
+            .into_iter::<RawRecommendation>()
+            .next()?
+            .ok()
+    })?;
     let mut seen = BTreeSet::new();
     let tasks = raw
         .tasks
@@ -1507,21 +1531,138 @@ fn loads<'a>(
     out
 }
 
+/// The working-day capacity a column without one borrows, when the week
+/// has no working day with focus time.
+const FALLBACK_CAPACITY: u32 = 8 * 60;
+
+/// One Week-tab column's load bar: its tasks against its capacity. Tasks
+/// with an estimate take their estimate; tasks without one share what the
+/// estimates leave of the capacity evenly (nothing left: they take
+/// nothing). Open and done tasks both count; deleted ones don't.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnLoad {
+    /// The column's capacity, at least 1 (see `column_load`).
+    pub capacity_minutes: u32,
+    /// Sum of the estimates of the column's tasks.
+    pub estimated_minutes: u32,
+    /// Tasks with no estimate.
+    pub untimed: usize,
+    /// Each untimed task's share: what the estimates leave free, split
+    /// evenly. 0 with no untimed task or no time left.
+    pub untimed_share: f32,
+    /// Everything planned: the estimates plus the untimed shares.
+    pub planned_minutes: f32,
+    /// The part of `planned_minutes` that is done.
+    pub done_minutes: f32,
+    /// Estimates booked beyond capacity, when there are any.
+    pub over_by: Option<u32>,
+}
+
+impl ColumnLoad {
+    /// Everything planned over capacity, 0–1.
+    pub fn fraction(&self) -> f32 {
+        (self.planned_minutes / self.capacity_minutes as f32).min(1.0)
+    }
+
+    /// The done part over capacity, 0–1 (at most `fraction`).
+    pub fn done_fraction(&self) -> f32 {
+        (self.done_minutes / self.capacity_minutes as f32).min(1.0)
+    }
+}
+
+/// The load of a Week-tab column listing `days`, from the week's
+/// `day_loads`. Its tasks are those whose `Task::day()` is one of `days`,
+/// open or done (not dropped); private tasks count, as in `day_loads`.
+///
+/// Capacity: the sum of the days' `capacity_minutes`. A column with none
+/// (the shared non-working-days column) borrows a working day's capacity
+/// (the largest in `loads`, else 8h) for each of its days that has tasks,
+/// at least one.
+pub fn column_load(tasks: &[Task], days: &[Date], loads: &[DayLoad]) -> ColumnLoad {
+    let on = |d: &Date| {
+        let d = *d;
+        tasks
+            .iter()
+            .filter(move |t| t.day() == Some(d) && t.status != TaskStatus::Dropped)
+    };
+    let own: u32 = loads
+        .iter()
+        .filter(|l| days.contains(&l.date))
+        .map(|l| l.capacity_minutes)
+        .fold(0, u32::saturating_add);
+    let capacity = if own > 0 {
+        own
+    } else {
+        let nominal = loads
+            .iter()
+            .map(|l| l.capacity_minutes)
+            .max()
+            .filter(|m| *m > 0)
+            .unwrap_or(FALLBACK_CAPACITY);
+        let busy = days
+            .iter()
+            .filter(|d| on(d).next().is_some())
+            .count()
+            .max(1);
+        nominal.saturating_mul(u32::try_from(busy).unwrap_or(u32::MAX))
+    }
+    .max(1);
+
+    let column: Vec<&Task> = days.iter().flat_map(on).collect();
+    let estimated: u32 = column
+        .iter()
+        .filter_map(|t| t.estimate_minutes)
+        .fold(0, u32::saturating_add);
+    let untimed = column
+        .iter()
+        .filter(|t| t.estimate_minutes.is_none())
+        .count();
+    let untimed_share = match untimed {
+        0 => 0.0,
+        n => capacity.saturating_sub(estimated) as f32 / n as f32,
+    };
+    let minutes = |t: &Task| t.estimate_minutes.map_or(untimed_share, |m| m as f32);
+    ColumnLoad {
+        capacity_minutes: capacity,
+        estimated_minutes: estimated,
+        untimed,
+        untimed_share,
+        planned_minutes: column.iter().map(|t| minutes(t)).sum(),
+        done_minutes: column
+            .iter()
+            .filter(|t| t.status == TaskStatus::Done)
+            .map(|t| minutes(t))
+            .sum(),
+        over_by: (estimated > capacity).then(|| estimated - capacity),
+    }
+}
+
 /// Minutes as hours, rounded to one decimal (90 → 1.5).
 fn hours(minutes: u32) -> f64 {
     (f64::from(minutes) / 6.0).round() / 10.0
 }
 
-/// "1.5h", "6h".
-fn fmt_hours(minutes: u32) -> String {
-    format!("{}h", hours(minutes))
+/// Minutes as a short duration, for figures (not for editing): under an
+/// hour in minutes, otherwise hours to one decimal. 30 → "30m",
+/// 60 → "1h", 90 → "1.5h", 100 → "1.7h", 480 → "8h".
+pub fn fmt_hours(minutes: u32) -> String {
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let tenths = (u64::from(minutes) * 10 + 30) / 60;
+    if tenths % 10 == 0 {
+        format!("{}h", tenths / 10)
+    } else {
+        format!("{}.{}h", tenths / 10, tenths % 10)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn weekday_name(day: Weekday) -> &'static str {
+/// "Monday".
+pub fn weekday_name(day: Weekday) -> &'static str {
     match day {
         Weekday::Monday => "Monday",
         Weekday::Tuesday => "Tuesday",
@@ -1533,7 +1674,41 @@ fn weekday_name(day: Weekday) -> &'static str {
     }
 }
 
-fn short_weekday(day: Weekday) -> &'static str {
+/// A weekday name from `weekday_name`. An alias, not `&'static str`
+/// written out, because serde's derive borrows any field spelled `&str`
+/// from the input, which would only accept `'static` input.
+pub type WeekdayName = &'static str;
+
+/// Reads a weekday name as written by `weekday_name`, back into the same
+/// static string.
+fn static_weekday<'de, D: Deserializer<'de>>(d: D) -> Result<WeekdayName, D::Error> {
+    let name = String::deserialize(d)?;
+    WEEKDAYS
+        .into_iter()
+        .map(weekday_name)
+        .find(|w| *w == name)
+        .ok_or_else(|| serde::de::Error::custom(format!("not a weekday: {name:?}")))
+}
+
+fn static_weekday_opt<'de, D: Deserializer<'de>>(d: D) -> Result<Option<WeekdayName>, D::Error> {
+    #[derive(Deserialize)]
+    struct Name(#[serde(deserialize_with = "static_weekday")] WeekdayName);
+    Ok(Option::<Name>::deserialize(d)?.map(|n| n.0))
+}
+
+/// Monday to Sunday.
+pub const WEEKDAYS: [Weekday; 7] = [
+    Weekday::Monday,
+    Weekday::Tuesday,
+    Weekday::Wednesday,
+    Weekday::Thursday,
+    Weekday::Friday,
+    Weekday::Saturday,
+    Weekday::Sunday,
+];
+
+/// "Mon".
+pub fn short_weekday(day: Weekday) -> &'static str {
     &weekday_name(day)[..3]
 }
 
@@ -2269,6 +2444,41 @@ mod tests {
         );
         let f = summary_facts(&[new], &[], summary_week(), today, &TimeZone::UTC);
         assert!(f.missed.is_empty());
+
+        // Added during the week, finished after it: added as todo.
+        let added = done_at(
+            created(task(4, "Added"), "2026-11-10T09:00:00Z"),
+            "2026-11-17T10:00:00Z",
+        );
+        let events = vec![status(
+            1,
+            4,
+            "2026-11-17T10:00:00Z",
+            TaskStatus::Todo,
+            TaskStatus::Done,
+        )];
+        let f = summary_facts(&[added], &events, summary_week(), today, &TimeZone::UTC);
+        assert_eq!(f.added.len(), 1);
+        assert_eq!(f.added[0].status, TaskStatus::Todo);
+        assert!(!summary_facts_markdown(&f).contains("(done)"));
+
+        // Worked on during the week, deadline moved after it: progressed
+        // with the deadline it had then.
+        let moved = due(task(5, "Moved"), date(2026, 11, 27));
+        let events = vec![
+            log(1, Some(5), "2026-11-12T10:00:00Z", "Drafted"),
+            due_moved(
+                2,
+                5,
+                "2026-11-16T10:00:00Z",
+                Some(date(2026, 11, 20)),
+                Some(date(2026, 11, 27)),
+            ),
+        ];
+        let f = summary_facts(&[moved], &events, summary_week(), today, &TimeZone::UTC);
+        assert_eq!(f.progressed.len(), 1);
+        assert_eq!(f.progressed[0].due_on, Some(date(2026, 11, 20)));
+        assert_eq!(f.progressed[0].due_weekday, Some("Friday"));
     }
 
     #[test]
@@ -2624,6 +2834,21 @@ mod tests {
     }
 
     #[test]
+    fn plan_facts_read_back_as_sent() {
+        let f = plan_facts(
+            &plan_fixture(),
+            &plan_events(),
+            plan_week(),
+            plan_today(),
+            &Settings::default(),
+        );
+        let back: PlanFacts = serde_json::from_str(&facts_json(&f)).unwrap();
+        assert_eq!(back, f);
+        let bad = facts_json(&f).replace("\"Wednesday\"", "\"Caturday\"");
+        assert!(serde_json::from_str::<PlanFacts>(&bad).is_err());
+    }
+
+    #[test]
     fn undated_is_capped_but_counted() {
         let mut tasks: Vec<Task> = (1..=14).map(|i| task(i, "Undated")).collect();
         // Planned for this week: listed first despite its position.
@@ -2633,6 +2858,22 @@ mod tests {
         assert_eq!(f.undated[0].id, 14);
         assert_eq!(f.totals.undated, 14);
         assert!(plan_facts_markdown(&f).contains("No due date (showing 10 of 14)"));
+
+        // Tasks on today's list are never cut, however many others are
+        // planned for later this week and sit earlier in the list.
+        let mut tasks: Vec<Task> = (1..=12)
+            .map(|i| planned(task(i, "Later this week"), date(2026, 11, 19)))
+            .collect();
+        tasks.push(planned(task(13, "Today"), plan_today()));
+        tasks.push(planned(task(14, "Carried over"), date(2026, 11, 16)));
+        tasks.push(task(15, "Someday"));
+        let f = plan_facts(&tasks, &[], plan_week(), plan_today(), &Settings::default());
+        assert_eq!(f.undated.len(), MAX_UNDATED + 2);
+        assert_eq!(f.undated[0].id, 13);
+        assert_eq!(f.undated[1].id, 14);
+        assert!(f.undated[2..].iter().all(|t| !t.on_today_list));
+        assert_eq!(f.totals.undated, 15);
+        assert!(!plan_is_empty(&f));
     }
 
     // --- capacity ----------------------------------------------------------
@@ -2697,7 +2938,123 @@ mod tests {
         assert_eq!(hours(100), 1.7);
         assert_eq!(hours(360), 6.0);
         assert_eq!(fmt_hours(360), "6h");
-        assert_eq!(fmt_hours(45), "0.8h");
+        assert_eq!(fmt_hours(0), "0m");
+        assert_eq!(fmt_hours(30), "30m");
+        assert_eq!(fmt_hours(45), "45m");
+        assert_eq!(fmt_hours(60), "1h");
+        assert_eq!(fmt_hours(90), "1.5h");
+        assert_eq!(fmt_hours(100), "1.7h");
+        assert_eq!(fmt_hours(480), "8h");
+        assert_eq!(fmt_hours(u32::MAX), "71582788.3h");
+    }
+
+    #[test]
+    fn weekday_helpers() {
+        let names: Vec<&str> = WEEKDAYS.into_iter().map(weekday_name).collect();
+        assert_eq!(names[0], "Monday");
+        assert_eq!(names[6], "Sunday");
+        assert_eq!(short_weekday(Weekday::Thursday), "Thu");
+    }
+
+    /// The same figures the Week tab's load bars showed when this lived in
+    /// the view (`views/week.rs` `load_line`, `nominal_capacity`).
+    #[test]
+    fn column_load_shares_what_the_estimates_leave() {
+        let d = date(2026, 11, 18);
+        let est = |id, status, m: Option<u32>| {
+            let mut t = planned(task(id, "T"), d);
+            t.status = status;
+            t.estimate_minutes = m;
+            t
+        };
+        let wed = |cap| DayLoad {
+            date: d,
+            load_minutes: 0,
+            capacity_minutes: cap,
+            unestimated: 0,
+        };
+        let loads = [wed(480)];
+
+        // Four tasks without a time: a quarter of the day each.
+        let four: Vec<Task> = (1..=4).map(|i| est(i, TaskStatus::Todo, None)).collect();
+        let l = column_load(&four, &[d], &loads);
+        assert_eq!(l.capacity_minutes, 480);
+        assert_eq!((l.estimated_minutes, l.untimed), (0, 4));
+        assert_eq!(l.untimed_share, 120.0);
+        assert_eq!((l.fraction(), l.done_fraction()), (1.0, 0.0));
+
+        // Two 2h tasks and two without a time: 25% each; one of each done.
+        // A dropped task and another day's don't count.
+        let mut dropped = est(5, TaskStatus::Dropped, Some(600));
+        dropped.planned_for = Some(d);
+        let mixed = vec![
+            est(1, TaskStatus::Done, Some(120)),
+            est(2, TaskStatus::Todo, Some(120)),
+            est(3, TaskStatus::Done, None),
+            est(4, TaskStatus::Todo, None),
+            dropped,
+            planned(estimate(task(6, "Thursday"), 600), date(2026, 11, 19)),
+        ];
+        let l = column_load(&mixed, &[d], &loads);
+        assert_eq!((l.fraction(), l.done_fraction()), (1.0, 0.5));
+        assert_eq!(l.over_by, None);
+
+        // Only timed tasks: their share, nothing more.
+        let l = column_load(&mixed[..2], &[d], &loads);
+        assert_eq!((l.fraction(), l.done_fraction()), (0.5, 0.25));
+        assert_eq!((l.estimated_minutes, l.done_minutes), (240, 120.0));
+
+        // Estimates over capacity: untimed tasks get nothing, the bar is
+        // full and the overrun shows.
+        let over = vec![
+            est(1, TaskStatus::Todo, Some(540)),
+            est(2, TaskStatus::Done, None),
+        ];
+        let l = column_load(&over, &[d], &loads);
+        assert_eq!((l.fraction(), l.done_fraction()), (1.0, 0.0));
+        assert_eq!(l.over_by, Some(60));
+        assert_eq!((l.untimed, l.untimed_share), (1, 0.0));
+
+        // No tasks: an empty bar.
+        let l = column_load(&[], &[d], &loads);
+        assert_eq!((l.fraction(), l.done_fraction()), (0.0, 0.0));
+        assert_eq!(l.capacity_minutes, 480);
+
+        // The non-working column borrows a working day's capacity (the
+        // largest, 7h here) for each of its days with tasks; 8h without
+        // any working day.
+        let (sat, sun) = (date(2026, 11, 21), date(2026, 11, 22));
+        let weekend = |cap| {
+            [
+                wed(cap),
+                DayLoad {
+                    date: sat,
+                    capacity_minutes: 0,
+                    ..wed(0)
+                },
+                DayLoad {
+                    date: sun,
+                    capacity_minutes: 0,
+                    ..wed(0)
+                },
+            ]
+        };
+        let one = vec![planned(estimate(task(1, "Sat"), 210), sat)];
+        let l = column_load(&one, &[sat, sun], &weekend(420));
+        assert_eq!(l.capacity_minutes, 420);
+        assert_eq!(l.fraction(), 0.5);
+        let both = vec![
+            planned(estimate(task(1, "Sat"), 210), sat),
+            planned(task(2, "Sun"), sun),
+        ];
+        let l = column_load(&both, &[sat, sun], &weekend(420));
+        assert_eq!(l.capacity_minutes, 840);
+        assert_eq!(l.untimed_share, 630.0);
+        assert_eq!(
+            column_load(&[], &[sat, sun], &weekend(0)).capacity_minutes,
+            480
+        );
+        assert_eq!(column_load(&both, &[sat, sun], &[]).capacity_minutes, 960);
     }
 
     // --- prompts -----------------------------------------------------------
@@ -2800,6 +3157,28 @@ mod tests {
         );
         assert_eq!(parse_recommendations("## Focus\nno json"), None);
         assert_eq!(parse_recommendations("} {"), None);
+
+        // Braces in the prose around the object don't get in the way.
+        let one = |text: &str| parse_recommendations(text).map(|r| r.tasks.len());
+        assert_eq!(
+            one("{\"tasks\": [{\"id\": 3}]}\nI chose {3} because it is due."),
+            Some(1)
+        );
+        assert_eq!(
+            one("Looking at {the facts} first.\n{\"tasks\": [{\"id\": 3}]}"),
+            Some(1)
+        );
+        assert_eq!(
+            one("<think>maybe {3}? or {7}</think>{\"tasks\": [{\"id\": 7}]}"),
+            Some(1)
+        );
+        assert_eq!(one("{\"tasks\": []}"), Some(0));
+        // An object with other keys is not an empty recommendation.
+        assert_eq!(one("{\"recommendations\": [{\"id\": 3}]}"), None);
+        assert_eq!(
+            recommendations_markdown("{\"picks\": []}", &[]),
+            "{\"picks\": []}"
+        );
 
         let tasks = vec![task(3, "Write report")];
         assert_eq!(
@@ -2968,7 +3347,7 @@ mod tests {
         assert_eq!(r.model.as_deref(), Some("reported"));
         assert_eq!(r.endpoint_host.as_deref(), Some("localhost:11434"));
         assert_eq!(r.prompt_version, PROMPT_VERSION);
-        assert_eq!(r.prompt_version, 8);
+        assert_eq!(r.prompt_version, 9);
         assert_eq!(r.error, None);
         assert_eq!(r.digest_json, digest);
     }
