@@ -3,14 +3,13 @@
 //! environment, stdin or the clock.
 
 use crate::args::ListArgs;
-use crate::error::{CliError, CliResult};
+use crate::error::{CliError, CliResult, ErrorKind};
 use crate::llm_setup::LlmHandle;
 use fortnight_core::domain::{
-    NewTask, Report, ReportKind, ReportStatus, Settings, Task, TaskId, TaskStatus, WeekRef,
+    Report, ReportKey, ReportKind, ReportStatus, Settings, Task, TaskId, TaskStatus, WeekRef,
 };
 use fortnight_core::export::{self, ExportFormat};
-use fortnight_core::fallback::FallbackClient;
-use fortnight_core::llm::{ChatEvent, ChatResponse, LlmClient, LlmError};
+use fortnight_core::llm::{ChatEvent, ChatResponse, LlmError};
 use fortnight_core::parse;
 use fortnight_core::report::{self, Prepared};
 use fortnight_core::store::Store;
@@ -23,7 +22,6 @@ use jiff::tz::TimeZone;
 use std::cmp::{Ordering, Reverse};
 use std::io::Write;
 use std::path::Path;
-use std::sync::Arc;
 
 // ---------------------------------------------------------------- time
 
@@ -41,23 +39,15 @@ pub fn now_for(today: Option<Date>, tz: TimeZone) -> CliResult<ZonedDateTime> {
 
 // ----------------------------------------------------------------- add
 
-/// `add`: parses the quick-add words and stores the task.
+/// `add`: parses the quick-add words and stores the task. A date in the
+/// words is the day you plan to do it; without one the task is undated.
 pub fn add(store: &dyn Store, words: &[String], today: Date, out: &mut dyn Write) -> CliResult<()> {
-    let parsed = parse::parse_quick_add(&words.join(" "), today);
-    if parsed.title.trim().is_empty() {
+    let Some(new) = parse::quick_add_task(&words.join(" "), today, None) else {
         return Err(CliError::usage(
             "the task needs a title (only a date, project, estimate or priority was given)",
         ));
-    }
-    let task = store.add_task(NewTask {
-        title: parsed.title,
-        project: parsed.project,
-        // A quick-add date is the day you plan to do it.
-        planned_for: parsed.day,
-        estimate_minutes: parsed.estimate_minutes,
-        priority: parsed.priority,
-        ..NewTask::default()
-    })?;
+    };
+    let task = store.add_task(new)?;
     let mut extras = Vec::new();
     if let Some(d) = task.planned_for {
         extras.push(format!("on {d}"));
@@ -88,8 +78,10 @@ pub fn add(store: &dyn Store, words: &[String], today: Date, out: &mut dyn Write
 // ---------------------------------------------------------------- list
 
 /// The tasks `list` shows, in order: overdue first (by deadline), then by
-/// day (planned day, else deadline), then undated. Within a day, higher
-/// priority first, then manual order.
+/// planned day, then undated. Within a day, higher priority first, then
+/// manual order. `--today` is the Today tab's list (planned for today or
+/// carried over) plus overdue tasks; with `--all` it adds the tasks closed
+/// that were planned for today.
 pub fn select_tasks(
     tasks: &[Task],
     opts: &ListArgs,
@@ -104,7 +96,9 @@ pub fn select_tasks(
             if opts.week {
                 t.is_overdue(today) || t.day().is_some_and(|d| this_week.contains(d))
             } else if opts.today {
-                t.is_overdue(today) || t.day() == Some(today)
+                t.on_today_list(today)
+                    || t.is_overdue(today)
+                    || (!t.status.is_open() && t.day() == Some(today))
             } else {
                 true
             }
@@ -236,7 +230,8 @@ pub fn done(store: &dyn Store, ids: &[TaskId], undo: bool, out: &mut dyn Write) 
     }
 }
 
-/// `log`: a log line, attached to `task` if given.
+/// `log`: a note for today (a free-standing log line, which the Today tab
+/// shows as its Notes), or a log line on `task` if given.
 pub fn log(
     store: &dyn Store,
     task: Option<TaskId>,
@@ -275,8 +270,9 @@ pub fn parse_week_arg(arg: &str, today: Date, week_start: Weekday) -> CliResult<
 }
 
 /// The week a report command works on. With no argument: the plan is for
-/// this week; the summary is for the latest week whose summary is due (as
-/// the app decides), falling back to this week.
+/// this week (recommendations are about today, so `plan` never passes
+/// one); the summary is for the latest week whose summary is due (as the
+/// app decides), falling back to this week.
 pub fn resolve_week(
     kind: ReportKind,
     arg: Option<&str>,
@@ -297,22 +293,40 @@ pub fn resolve_week(
     Ok(this)
 }
 
+/// The request for this report, or `None` when its facts are empty
+/// (nothing to summarise or recommend: the app's rule), so the model isn't
+/// called and nothing is stored.
 fn prepare(
     store: &dyn Store,
     kind: ReportKind,
     week: WeekRef,
     now: &ZonedDateTime,
     settings: &Settings,
-) -> CliResult<Prepared> {
+) -> CliResult<Option<Prepared>> {
     let tasks = store.list_tasks()?;
     let events = store.events_between(Timestamp::MIN, Timestamp::MAX)?;
     let today = now.date();
+    let tz = now.time_zone();
     Ok(match kind {
         ReportKind::Summary => {
-            report::prepare_summary(&tasks, &events, week, today, now.time_zone(), settings)
+            let facts = report::summary_facts(&tasks, &events, week, today, tz);
+            (!report::summary_is_empty(&facts))
+                .then(|| report::prepare_summary(&tasks, &events, week, today, tz, settings))
         }
-        ReportKind::Plan => report::prepare_plan(&tasks, &events, week, today, settings),
+        ReportKind::Plan => {
+            let facts = report::plan_facts(&tasks, &events, week, today, settings);
+            (!report::plan_is_empty(&facts))
+                .then(|| report::prepare_plan(&tasks, &events, week, today, settings))
+        }
     })
+}
+
+/// Why a report was skipped (`prepare` gave `None`).
+fn nothing_to(kind: ReportKind) -> &'static str {
+    match kind {
+        ReportKind::Summary => "nothing to summarise",
+        ReportKind::Plan => "nothing to recommend",
+    }
 }
 
 fn facts_markdown(
@@ -350,18 +364,8 @@ pub async fn generate_report(
 ) -> CliResult<Report> {
     // Recommended tasks go to the decision model, if any, falling back to
     // the main endpoint.
-    let decision = match (&llm.decision, prepared.kind) {
-        (Some((client, host)), ReportKind::Plan) => Some((
-            Arc::new(FallbackClient::new(client.clone(), llm.client.clone())),
-            host.clone(),
-        )),
-        _ => None,
-    };
-    let client: Arc<dyn LlmClient> = match &decision {
-        Some((fc, _)) => fc.clone(),
-        None => llm.client.clone(),
-    };
-    let mut stream = client.chat_stream(prepared.request.clone());
+    let route = llm.route(prepared.kind);
+    let mut stream = route.client().chat_stream(prepared.request.clone());
     let mut text = String::new();
     let mut model = None;
     let mut failure = None;
@@ -391,25 +395,22 @@ pub async fn generate_report(
         (None, Some(model)) => Ok(ChatResponse { text, model }),
         (None, None) => Err(LlmError::Truncated),
     };
-    let (requested_model, host) = match &decision {
-        Some((fc, decision_host)) if !fc.used_fallback() => {
-            (fc.model().to_string(), decision_host.clone())
-        }
-        _ => (llm.client.model().to_string(), llm.endpoint_host.clone()),
-    };
+    let (requested_model, host) = route.answered_by();
     let new = report::finish(prepared, result, &requested_model, host);
     Ok(store.insert_report(new)?)
 }
 
 /// `summary` and `plan`. `make_client` is only called when the model is
-/// needed (never with `facts_only`).
+/// needed (never with `facts_only`, nor when there is nothing to report);
+/// its argument says whether the run makes recommendations (and so needs
+/// the decision model).
 pub async fn report_command(
     store: &dyn Store,
     kind: ReportKind,
     week_arg: Option<&str>,
     facts_only: bool,
     now: &ZonedDateTime,
-    make_client: &dyn Fn() -> CliResult<LlmHandle>,
+    make_client: &dyn Fn(bool) -> CliResult<LlmHandle>,
     out: &mut dyn Write,
 ) -> CliResult<()> {
     let settings = store.load_settings()?;
@@ -422,8 +423,16 @@ pub async fn report_command(
         }
         return Ok(());
     }
-    let prepared = prepare(store, kind, week, now, &settings)?;
-    let llm = make_client()?;
+    let Some(prepared) = prepare(store, kind, week, now, &settings)? else {
+        match kind {
+            ReportKind::Summary => {
+                writeln!(out, "Nothing to summarise for the week of {}.", week.start)?
+            }
+            ReportKind::Plan => writeln!(out, "Nothing to recommend for today.")?,
+        }
+        return Ok(());
+    };
+    let llm = make_client(kind == ReportKind::Plan)?;
     // The plan arrives as JSON: print it as a list once it is complete.
     let stored = match kind {
         ReportKind::Summary => generate_report(store, prepared, &llm, out).await?,
@@ -447,11 +456,13 @@ pub async fn report_command(
     }
 }
 
-/// `run-due`: generates whatever is due. Prints one line per report.
+/// `run-due`: generates whatever is due. Prints one line per report. A due
+/// report with nothing in it is skipped, as the app does. `make_client`'s
+/// argument says whether a recommendations report is to be made.
 pub async fn run_due(
     store: &dyn Store,
     now: &ZonedDateTime,
-    make_client: &dyn Fn() -> CliResult<LlmHandle>,
+    make_client: &dyn Fn(bool) -> CliResult<LlmHandle>,
     out: &mut dyn Write,
 ) -> CliResult<()> {
     let settings = store.load_settings()?;
@@ -461,24 +472,42 @@ pub async fn run_due(
         writeln!(out, "Nothing is due.")?;
         return Ok(());
     }
-    let llm = match make_client() {
+    let mut work = Vec::new();
+    for job in jobs {
+        match prepare(store, job.kind, job.week, now, &settings)? {
+            Some(prepared) => work.push((job, prepared)),
+            None => writeln!(
+                out,
+                "{} {}: {}",
+                job.kind.as_str(),
+                job.week.start,
+                nothing_to(job.kind)
+            )?,
+        }
+    }
+    if work.is_empty() {
+        return Ok(());
+    }
+    let uses_decision = work.iter().any(|(job, _)| job.kind == ReportKind::Plan);
+    let llm = match make_client(uses_decision) {
         Ok(llm) => llm,
         // PLAN.md 8: with no LLM configured nothing fails; the facts are
         // there in the app and through `summary --facts`.
-        Err(e) if e.code == crate::error::EXIT_USAGE => {
+        Err(e) if e.kind == ErrorKind::NotConfigured => {
             writeln!(
                 out,
                 "{} due. No LLM endpoint is configured, so nothing was generated.",
-                jobs.len()
+                work.len()
             )?;
             return Ok(());
         }
         Err(e) => return Err(e),
     };
+    let total = work.len();
     let mut failed = 0;
-    for job in &jobs {
+    for (job, prepared) in work {
         // The app may have generated it meanwhile.
-        let key = fortnight_core::domain::ReportKey {
+        let key = ReportKey {
             kind: job.kind,
             week_start: job.week.start,
         };
@@ -491,7 +520,6 @@ pub async fn run_due(
             )?;
             continue;
         }
-        let prepared = prepare(store, job.kind, job.week, now, &settings)?;
         let stored = generate_report(store, prepared, &llm, &mut std::io::sink()).await?;
         match stored.status {
             ReportStatus::Ready => writeln!(
@@ -517,8 +545,7 @@ pub async fn run_due(
         Ok(())
     } else {
         Err(CliError::failure(format!(
-            "{failed} of {} reports failed",
-            jobs.len()
+            "{failed} of {total} reports failed"
         )))
     }
 }
