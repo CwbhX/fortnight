@@ -225,6 +225,9 @@ struct Ready {
     /// Bumped by each edit of a new task's title or notes, so only the
     /// latest priority suggestion lands.
     suggest_seq: u64,
+    /// The open task form and its title and notes when a suggestion was
+    /// last asked for: a change asks again.
+    suggest_for: Option<(FormKey, String, String)>,
     /// Tasks were reloaded during this message (a change was made).
     tasks_changed: bool,
     testing: bool,
@@ -446,6 +449,7 @@ impl Ready {
             prompt_changed: HashMap::new(),
             next_generation: 0,
             suggest_seq: 0,
+            suggest_for: None,
             tasks_changed: false,
             testing: false,
             test_result: None,
@@ -521,7 +525,46 @@ impl Ready {
             self.api_key.clone(),
             self.decision_key.clone(),
         );
-        DecisionClient::new(config).ok()
+        // Suggestions are only worth having quickly.
+        DecisionClient::new(config)
+            .ok()
+            .map(|c| c.with_timeout(Duration::from_secs(15)))
+    }
+
+    /// The open task form, its title and its notes: the task dialog's, or
+    /// Today's inline form.
+    fn open_form_text(&self) -> Option<(FormKey, String, String)> {
+        if let Some(d) = &self.dialog {
+            return Some((FormKey::Dialog, d.form.title.clone(), d.form.notes.text()));
+        }
+        if self.tab != Tab::Today {
+            return None;
+        }
+        self.day_view
+            .form_text()
+            .map(|(id, title, notes)| (FormKey::Inline(id), title, notes))
+    }
+
+    /// With a decision model set up: when a task form opens or its title or
+    /// notes change, ask for a suggested priority once typing pauses.
+    fn maybe_suggest(&mut self) -> Task<Message> {
+        if !self.decision_active() {
+            return Task::none();
+        }
+        let now = self.open_form_text();
+        if now == self.suggest_for {
+            return Task::none();
+        }
+        let has_title = now.as_ref().is_some_and(|(_, t, _)| !t.trim().is_empty());
+        self.suggest_for = now;
+        self.suggest_seq += 1;
+        if !has_title {
+            return Task::none();
+        }
+        let seq = self.suggest_seq;
+        Task::perform(tokio::time::sleep(Duration::from_millis(500)), move |_| {
+            Message::SuggestPriority(seq)
+        })
     }
 
     fn decision_client_for(
@@ -1080,6 +1123,20 @@ impl Ready {
     // ---- update ----
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // Pointer moves change no form.
+        let pointer = matches!(
+            &message,
+            Message::Day(day::Message::Moved(_) | day::Message::Enter(_) | day::Message::Leave(_))
+                | Message::Week(week::Message::Moved(_) | week::Message::Hover(..))
+        );
+        let task = self.handle_message(message);
+        if pointer {
+            return task;
+        }
+        Task::batch([task, self.maybe_suggest()])
+    }
+
+    fn handle_message(&mut self, message: Message) -> Task<Message> {
         let task = match message {
             Message::Top(m) => self.top_bar(m),
             Message::Day(m) if m.is_pointer_move() => {
@@ -1211,14 +1268,12 @@ impl Ready {
                 Task::none()
             }
             Message::SuggestPriority(seq) => {
-                let Some(dialog) = self.dialog.as_ref().filter(|d| d.task.is_none()) else {
+                let Some((_, title, notes)) = self.suggest_for.clone() else {
                     return Task::none();
                 };
-                let title = dialog.form.title.trim().to_string();
-                if seq != self.suggest_seq || title.is_empty() {
+                if seq != self.suggest_seq || title.trim().is_empty() {
                     return Task::none();
                 }
-                let notes = dialog.form.notes.text();
                 let Some(client) = self.decision_model() else {
                     return Task::none();
                 };
@@ -1228,10 +1283,16 @@ impl Ready {
                 )
             }
             Message::PrioritySuggested(seq, priority) => {
-                if seq == self.suggest_seq
-                    && let Some(dialog) = self.dialog.as_mut().filter(|d| d.task.is_none())
-                {
-                    dialog.form.suggested = priority;
+                if seq == self.suggest_seq {
+                    match self.suggest_for.as_ref().map(|(form, _, _)| *form) {
+                        Some(FormKey::Dialog) => {
+                            if let Some(dialog) = self.dialog.as_mut() {
+                                dialog.form.suggested = priority;
+                            }
+                        }
+                        Some(FormKey::Inline(id)) => self.day_view.set_suggested(id, priority),
+                        None => {}
+                    }
                 }
                 Task::none()
             }
@@ -1392,7 +1453,6 @@ impl Ready {
 
     /// Opens the task dialog for a new task on `day` and focuses its title.
     fn open_new_task(&mut self, day: Date) -> Task<Message> {
-        self.suggest_seq += 1;
         self.dialog = Some(TaskDialog {
             day: Some(day),
             form: day::EditForm::blank(&self.tasks, self.settings.schedule.week_start),
@@ -1421,19 +1481,6 @@ impl Ready {
             return Task::none();
         };
         if dialog.form.handle(&message, today) {
-            // A new task's title or notes changed: suggest a priority once
-            // typing pauses.
-            let text_edit = matches!(
-                message,
-                day::Message::EditTitle(_) | day::Message::EditNotes(_)
-            );
-            if dialog.task.is_none() && text_edit && self.decision_active() {
-                self.suggest_seq += 1;
-                let seq = self.suggest_seq;
-                return Task::perform(tokio::time::sleep(Duration::from_millis(500)), move |_| {
-                    Message::SuggestPriority(seq)
-                });
-            }
             return Task::none();
         }
         match (message, dialog.task) {
@@ -2043,6 +2090,15 @@ fn detect_ollama() -> Task<Message> {
         },
         Message::OllamaDetected,
     )
+}
+
+/// Which task form a priority suggestion is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormKey {
+    /// The task dialog (new or existing task).
+    Dialog,
+    /// Today's inline form for this task.
+    Inline(TaskId),
 }
 
 /// A key `SetKey` saved, and the other key if the password opened it.

@@ -28,7 +28,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 /// Bump when a prompt changes.
-pub const PROMPT_VERSION: i64 = 6;
+pub const PROMPT_VERSION: i64 = 7;
 
 /// Notes and log lines longer than this (in characters) are cut and end
 /// in "…".
@@ -1186,7 +1186,7 @@ You pick the three tasks the user should do first today (`today`), most importan
 
 - Use only the facts provided. Do not invent tasks, deadlines or estimates.
 - Do no arithmetic: every date, day count and hour figure is already computed.
-- Overdue tasks and the nearest deadlines come first, then higher `priority` (0 low, 1 medium, 2 or more high), then tasks planned for today.
+- Higher `priority` comes first (2 or more high, 1 medium, 0 low). Among tasks of the same priority, overdue tasks and the nearest deadlines come first.
 - Prefer what fits in today's `capacity_hours` (the first of `remaining_working_days`).
 - Each reason is a few words, such as \"due Thursday\" or \"overdue 3 days\".";
 
@@ -2965,7 +2965,7 @@ mod tests {
         assert_eq!(r.model.as_deref(), Some("mock"));
         assert_eq!(r.endpoint_host.as_deref(), Some("localhost:11434"));
         assert_eq!(r.prompt_version, PROMPT_VERSION);
-        assert_eq!(r.prompt_version, 6);
+        assert_eq!(r.prompt_version, 7);
         assert_eq!(r.error, None);
         assert_eq!(r.digest_json, digest);
 

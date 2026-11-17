@@ -11,7 +11,10 @@
 //! ("which first?"), ranks them by probability
 //! and replies with the same JSON a chat model would
 //! (`report::parse_recommendations`). The reasons are written here from
-//! the facts ("overdue 2 days", "due Thursday"); the model gives none.
+//! the facts ("overdue 2 days", "high priority, due Thursday"); the model
+//! gives none. Priority counts twice: each option starts with it ("High
+//! priority; …"), and the ranking multiplies the probabilities by 1, 2 or
+//! 4 for low, medium and high (`priority_weight`).
 //!
 //! The Settings Test button's request (`ChatRequest::test`) sends one
 //! `noul` question and replies "OK". Any other request (a weekly summary)
@@ -32,7 +35,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Decision models answer in milliseconds; this leaves room for loading
+/// the model, not the ten minutes a local chat model may get, so a hung
+/// server soon gives way to the fallback.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The most options a `choice` question takes.
 const MAX_OPTIONS: usize = 26;
@@ -65,19 +71,14 @@ impl DecisionClient {
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|e| LlmError::Connection(crate::openai::error_chain(&e)))?;
-        let timeout = if crate::secure::is_local_endpoint(&config.base_url) {
-            crate::openai::LOCAL_TIMEOUT
-        } else {
-            DEFAULT_TIMEOUT
-        };
         Ok(DecisionClient {
             config,
             http,
-            timeout,
+            timeout: DEFAULT_TIMEOUT,
         })
     }
 
-    /// Time allowed for each request (default 120 s, 600 s locally).
+    /// Time allowed for each request (default 60 s).
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -269,6 +270,19 @@ struct Candidate {
     description: String,
     /// The reason shown with it if picked.
     why: String,
+    /// How much its priority counts in the ranking (`priority_weight`).
+    weight: f64,
+}
+
+/// The user's priority is a strong signal: the model's probability is
+/// multiplied by 1 (low), 2 (medium) or 4 (high) before ranking, so a lower
+/// priority task needs a much likelier answer to come first.
+fn priority_weight(priority: u64) -> f64 {
+    match priority {
+        0 => 1.0,
+        1 => 2.0,
+        _ => 4.0,
+    }
 }
 
 /// The systemone request for the plan facts in `user`, or `None` if `user`
@@ -335,7 +349,7 @@ fn plan_question(user: &str, model: &str) -> Option<Ask> {
         "questions": {
             "first": {
                 "type": "choice",
-                "instructions": "Which task should be done first today? Overdue tasks and the nearest deadlines come first, then higher priority, then tasks planned for today, then what fits the free hours.",
+                "instructions": "Which task should be done first today? Higher priority comes first: High before Medium before Low. Among tasks of the same priority, overdue tasks and the nearest deadlines come first, then what fits the free hours.",
                 "criteria": criteria,
             }
         }
@@ -362,7 +376,13 @@ fn candidate(id: i64, task: &Value, facts: &Value) -> Candidate {
         1 => "due tomorrow".to_string(),
         _ => format!("due {}", text("due_weekday")),
     });
-    let mut parts = vec![text("title")];
+    // Priority first, in the app's words (0 low, 1 medium, 2 or more high).
+    let level = match priority {
+        0 => "Low",
+        1 => "Medium",
+        _ => "High",
+    };
+    let mut parts = vec![format!("{level} priority"), text("title")];
     if let Some(project) = task.get("project").and_then(Value::as_str) {
         parts.push(format!("project {project}"));
     }
@@ -380,18 +400,19 @@ fn candidate(id: i64, task: &Value, facts: &Value) -> Candidate {
     } else if let Some(day) = task.get("planned_weekday").and_then(Value::as_str) {
         parts.push(format!("planned for {day}"));
     }
-    if priority > 0 {
-        parts.push(format!("priority {priority} of 3"));
-    }
     if let Some(minutes) = task.get("estimate_minutes").and_then(Value::as_u64) {
         parts.push(format!("about {minutes} minutes"));
     }
 
-    let why = match (&due, days) {
-        (Some(due), Some(d)) if d <= 7 => due.clone(),
+    let deadline = match (&due, days) {
+        (Some(due), Some(d)) if d <= 7 => Some(due.clone()),
+        _ => None,
+    };
+    let why = match (priority, deadline) {
+        (p, Some(deadline)) if p >= 2 => format!("high priority, {deadline}"),
+        (p, None) if p >= 2 => "high priority".into(),
+        (_, Some(deadline)) => deadline,
         _ if planned_today => "planned for today".into(),
-        _ if priority >= 2 => "high priority".into(),
-        (Some(due), _) => due.clone(),
         _ => "no deadline".into(),
     };
     Candidate {
@@ -399,11 +420,13 @@ fn candidate(id: i64, task: &Value, facts: &Value) -> Candidate {
         key: format!("t{id}"),
         description: parts.join("; "),
         why,
+        weight: priority_weight(priority),
     }
 }
 
 /// The recommended-tasks JSON from the `first` answer: the options by
-/// probability, highest first (or just the chosen one).
+/// probability times priority weight, highest first (or just the chosen
+/// one).
 fn plan_reply(answers: &Value, candidates: &[Candidate]) -> String {
     let first = answers.get("first");
     let mut ranked: Vec<(&Candidate, f64)> = first
@@ -412,7 +435,10 @@ fn plan_reply(answers: &Value, candidates: &[Candidate]) -> String {
         .map(|probs| {
             candidates
                 .iter()
-                .filter_map(|c| probs.get(&c.key).and_then(Value::as_f64).map(|p| (c, p)))
+                .filter_map(|c| {
+                    let p = probs.get(&c.key).and_then(Value::as_f64)?;
+                    Some((c, p * c.weight))
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -531,7 +557,7 @@ mod tests {
             criteria["t1"]
                 .as_str()
                 .unwrap()
-                .starts_with("Write report; due Thursday (in 3 days)"),
+                .starts_with("Low priority; Write report; due Thursday (in 3 days)"),
             "{criteria}"
         );
         assert!(
@@ -539,6 +565,63 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("Monday 2026-11-16")
+        );
+    }
+
+    #[tokio::test]
+    async fn priority_outweighs_a_somewhat_likelier_answer() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "nimble",
+                "answers": { "first": {
+                    "type": "choice",
+                    "choice": "t1",
+                    // Low 0.5 (x1), High 0.3 (x4 = 1.2), Medium 0.2 (x2 = 0.4).
+                    "probabilities": { "t1": 0.5, "t2": 0.3, "t3": 0.2 }
+                } }
+            })))
+            .mount(&server)
+            .await;
+        let low = task(1, "Tidy desk", None);
+        let high = Task {
+            priority: 2,
+            ..task(2, "Fix outage", Some(date(2026, 11, 17)))
+        };
+        let medium = Task {
+            priority: 1,
+            ..task(3, "Reply to Sam", None)
+        };
+        let reply = client(&server)
+            .chat(plan_request(&[low, high, medium]))
+            .await
+            .unwrap();
+        let rec = parse_recommendations(&reply.text).unwrap();
+        let picked: Vec<(i64, &str)> = rec.tasks.iter().map(|t| (t.id, t.why.as_str())).collect();
+        assert_eq!(
+            picked,
+            vec![
+                (2, "high priority, due tomorrow"),
+                (1, "planned for today"),
+                (3, "planned for today")
+            ]
+        );
+        let sent: Value = server.received_requests().await.unwrap()[0]
+            .body_json()
+            .unwrap();
+        let criteria = &sent["questions"]["first"]["criteria"];
+        assert!(
+            criteria["t2"]
+                .as_str()
+                .unwrap()
+                .starts_with("High priority; Fix outage")
+        );
+        assert!(
+            criteria["t3"]
+                .as_str()
+                .unwrap()
+                .starts_with("Medium priority; ")
         );
     }
 

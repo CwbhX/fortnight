@@ -102,6 +102,8 @@ pub enum Message {
     Close,
     /// Put a deleted task back.
     Restore(TaskId),
+    /// The × on a completed task: move it to Deleted.
+    Remove(TaskId),
     /// Remove a deleted task for good.
     DeleteForever(TaskId),
     ToggleShowDone,
@@ -861,6 +863,7 @@ impl DayView {
                 Some(drag) if !drag.active => self.update(Message::Expand(drag.id)),
                 _ => Action::None,
             },
+            Message::Remove(id) => Action::SetStatus(id, TaskStatus::Dropped),
             Message::Expand(id) => {
                 if self.editing.as_ref().is_some_and(|f| f.id == id) {
                     self.editing = None;
@@ -1077,6 +1080,21 @@ impl DayView {
             area = area.on_move(Message::Moved);
         }
         scrollable(area).height(Fill).into()
+    }
+
+    /// The open inline form's task, title and notes, for `main.rs`'s
+    /// priority suggestion.
+    pub fn form_text(&self) -> Option<(TaskId, String, String)> {
+        self.editing
+            .as_ref()
+            .map(|f| (f.id, f.title.clone(), f.notes.text()))
+    }
+
+    /// Shows a suggested priority on the inline form of task `id`.
+    pub fn set_suggested(&mut self, id: TaskId, priority: Option<Priority>) {
+        if let Some(form) = self.editing.as_mut().filter(|f| f.id == id) {
+            form.suggested = priority;
+        }
     }
 
     /// The task being dragged (past the threshold), if any.
@@ -1370,8 +1388,16 @@ fn card_content<'a>(
         );
     }
 
-    // The checkbox sits inside the card; it captures its own clicks, so
-    // they don't open the form.
+    // A completed task gets a quiet × to delete it. Like the checkbox, it
+    // captures its own clicks, so they don't open the form.
+    if task.is_done() {
+        line = line.push(
+            button(text("×").size(theme::TEXT_BODY))
+                .padding([0, 6])
+                .style(theme::text_button)
+                .on_press(Message::Remove(id)),
+        );
+    }
     row![
         checkbox(task.is_done()).on_toggle(move |b| Message::Toggle(id, b)),
         line,
@@ -1905,6 +1931,24 @@ mod tests {
             planned(task(11, "planned wed", None), date(2026, 11, 18)),
             with_status(task(12, "doing today", Some(today())), TaskStatus::Doing),
         ]
+    }
+
+    #[test]
+    fn completed_tasks_delete_with_the_cross_and_forms_report_their_text() {
+        let mut view = loaded(mixed());
+        assert_eq!(
+            view.update(Message::Remove(5)),
+            Action::SetStatus(5, TaskStatus::Dropped)
+        );
+        let _ = view.view();
+        assert_eq!(view.form_text(), None);
+        view.update(Message::Expand(2));
+        assert_eq!(view.form_text(), Some((2, "today".into(), String::new())));
+        view.set_suggested(2, Some(2));
+        assert_eq!(view.editing.as_ref().and_then(|f| f.suggested), Some(2));
+        // Another task's suggestion doesn't land on this form.
+        view.set_suggested(3, Some(0));
+        assert_eq!(view.editing.as_ref().and_then(|f| f.suggested), Some(2));
     }
 
     #[test]
