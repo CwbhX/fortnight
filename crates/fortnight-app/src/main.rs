@@ -33,10 +33,10 @@ use fortnight_app::views::week::{self, WeekData, WeekView};
 use fortnight_core::datadir::{self, DataLock};
 use fortnight_core::decision::DecisionClient;
 use fortnight_core::domain::{
-    DeletedTask, Event, EventId, LlmSettings, Priority, Protocol, ReportKey, ReportKind, Settings,
-    Task as CoreTask, TaskId, TaskStatus, WeekRef,
+    DeletedTask, Event, EventId, LlmSettings, Priority, Protocol, Report, ReportKey, ReportKind,
+    ReportStatus, Settings, Task as CoreTask, TaskId, TaskStatus, WeekRef,
 };
-use fortnight_core::fallback::{self, FallbackClient};
+use fortnight_core::fallback::{self, Endpoint, PlanRoute};
 use fortnight_core::llm::{
     self, ChatEvent, ChatRequest, ChatResponse, LlmClient, LlmConfig, LlmError,
 };
@@ -154,13 +154,12 @@ enum Shortcut {
 struct Generation {
     prepared: Prepared,
     text: String,
-    requested_model: String,
-    host: Option<String>,
-    /// Recommended tasks sent to the decision model: its client, to ask
-    /// whether it fell back, and the main endpoint's host, recorded instead
-    /// if it did.
-    decision: Option<(Arc<FallbackClient>, Option<String>)>,
-    /// Started by the schedule: badge the Week tab when it is ready.
+    /// Where the request went (recommended tasks: the decision model, if
+    /// any, falling back to the main endpoint), for the report's model and
+    /// host.
+    route: PlanRoute,
+    /// Started by the schedule: badge the Week tab when it is ready, and
+    /// never aborted for being out of view.
     scheduled: bool,
     /// Aborts the request (Lock stops requests that hold the key).
     abort: iced::task::Handle,
@@ -178,6 +177,9 @@ enum Undo {
     Changed {
         before: Box<CoreTask>,
         last_event: EventId,
+        /// Keep the task's position as it is at undo time (a later drag
+        /// stays), unless the change was a move, which set the position.
+        keep_position: bool,
     },
     /// Tasks were deleted for good (one, or all of Deleted at once); put
     /// them back with their history.
@@ -261,9 +263,29 @@ struct Ready {
     /// Recommended tasks for later days (not stored as reports): each with
     /// the facts it was worked out from, redone when those change.
     day_recs: HashMap<Date, (String, Vec<day::Recommended>)>,
-    /// Later days whose recommendations are being worked out, and from
-    /// which facts.
-    day_recs_pending: HashMap<Date, String>,
+    /// Later days whose recommendations are being worked out: from which
+    /// facts, and the request (aborted on Lock or when the day is left).
+    day_recs_pending: HashMap<Date, (String, iced::task::Handle)>,
+    /// Failures in a row per later day and when the last one was, for the
+    /// same retry backoff as reports.
+    day_recs_failures: HashMap<Date, (u32, Timestamp)>,
+    /// The priority suggestion in flight (it holds the key: Lock aborts it).
+    suggest_request: Option<iced::task::Handle>,
+    /// Today when the minute tick last looked: a new day moves the
+    /// selection along if it was on the old one.
+    last_today: Date,
+    /// Values worked out from the tasks, events, reports and settings,
+    /// kept until `invalidate`.
+    derived: Derived,
+    /// The Week tab's data as last loaded, so a streamed chunk updates
+    /// only its panel slot.
+    week_data: Option<WeekData>,
+    /// This message changed only what a view keeps itself: no refresh,
+    /// unless `must_refresh` is set too.
+    local: bool,
+    /// Data the views show changed (set by `invalidate` and when a request
+    /// starts or stops): refresh even after a `local` message.
+    must_refresh: bool,
     /// Test connection / Load models requests in flight, aborted on Lock.
     key_requests: Vec<iced::task::Handle>,
     /// The app icon last shown (`Some(true)` = dark), `None` before any.
@@ -285,7 +307,7 @@ impl App {
                 let mut ready = Box::new(ready);
                 // Due reports, then anything the open tab shows that is out
                 // of date (e.g. recommendations from an older prompt).
-                let start = Task::batch([ready.run_due(), ready.update_week_reports()]);
+                let start = ready.catch_up();
                 ready.refresh();
                 let tasks = Task::batch([
                     iced::system::theme().map(Message::ThemeMode),
@@ -303,9 +325,11 @@ impl App {
     }
 
     fn theme(&self) -> Option<Theme> {
+        // An unknown system appearance (`None`) gets Fortnight's light
+        // theme, not iced's stock one.
         match self {
-            App::Ready(_, Some(dark)) => Some(theme::theme_for(*dark)),
-            _ => None,
+            App::Ready(_, dark) => Some(theme::theme_for(dark.unwrap_or(false))),
+            App::Fatal(_) => None,
         }
     }
 
@@ -494,6 +518,13 @@ impl Ready {
             week_badge: false,
             day_recs: HashMap::new(),
             day_recs_pending: HashMap::new(),
+            day_recs_failures: HashMap::new(),
+            suggest_request: None,
+            last_today: today,
+            derived: Derived::default(),
+            week_data: None,
+            local: false,
+            must_refresh: false,
             key_requests: Vec::new(),
             icon_dark: None,
             _lock: lock,
@@ -531,10 +562,7 @@ impl Ready {
     /// needs it; a local one (Ollama, LM Studio) works without it and gets
     /// it only if it is unlocked.
     fn key_locked_for(&self, llm: &LlmSettings) -> bool {
-        self.key_exists
-            && self.api_key.is_none()
-            && !llm.keyless
-            && !secure::is_local_endpoint(&llm.base_url)
+        key_locked(self.key_exists, &self.api_key, llm)
     }
 
     /// The saved recommendations model is an Ollama decision model.
@@ -604,11 +632,7 @@ impl Ready {
         &self,
         llm: &LlmSettings,
     ) -> Result<(Arc<dyn LlmClient>, Option<String>), String> {
-        if self.decision_key_exists
-            && self.decision_key.is_none()
-            && !llm.keyless
-            && !secure::is_local_endpoint(&llm.base_url)
-        {
+        if key_locked(self.decision_key_exists, &self.decision_key, llm) {
             return Err("The decision model's API key is locked. Unlock it first.".into());
         }
         let config = fallback::decision_config(
@@ -641,11 +665,7 @@ impl Ready {
         if self.key_locked_for(llm) {
             return Err("The API key is locked. Unlock it first.".into());
         }
-        let config = LlmConfig {
-            base_url: llm.base_url.trim().to_string(),
-            model: llm.model.trim().to_string(),
-            api_key: self.api_key.clone().filter(|_| !llm.keyless),
-        };
+        let config = LlmConfig::from_settings(llm, self.api_key.clone());
         let host = config.endpoint_host();
         let client = llm::connect(llm.protocol, config).map_err(|e| e.to_string())?;
         Ok((client, host))
@@ -655,6 +675,7 @@ impl Ready {
 
     fn reload_tasks(&mut self) {
         self.tasks_changed = true;
+        self.invalidate();
         match self.store.list_tasks() {
             Ok(tasks) => self.tasks = tasks,
             Err(e) => self.error = Some(e.to_string()),
@@ -665,58 +686,60 @@ impl Ready {
         }
     }
 
+    /// Forgets every derived value (tasks, events, reports or settings
+    /// changed, or the minute ticked) and has the views refreshed.
+    fn invalidate(&mut self) {
+        self.derived = Derived::default();
+        self.must_refresh = true;
+    }
+
     /// Pushes fresh data into the visible tab (and Settings when open).
     fn refresh(&mut self) {
+        self.must_refresh = false;
         let today = self.today();
         match self.tab {
             Tab::Today => {
-                let logs = self
-                    .events
-                    .iter()
-                    .filter(|e| e.task_id.is_none())
-                    .filter_map(|e| {
-                        Some(LogLine {
-                            date: self.tz.to_datetime(e.at).date(),
-                            text: e.log_text()?.to_string(),
-                        })
+                let recommended = if self.selected == today {
+                    self.recommended_today()
+                } else {
+                    self.day_recs
+                        .get(&self.selected)
+                        .map(|(_, list)| list.clone())
+                        .unwrap_or_default()
+                };
+                let recommending = if self.selected == today {
+                    self.generating.contains_key(&ReportKey {
+                        kind: ReportKind::Plan,
+                        week_start: self.current_week().start,
                     })
-                    .collect();
+                } else {
+                    self.day_recs_pending.contains_key(&self.selected)
+                };
+                let logs = self.logs();
                 self.day_view.load(DayData {
                     day: self.selected,
                     today,
                     tz: self.tz.clone(),
                     tasks: self.tasks.clone(),
                     week_start: self.settings.schedule.week_start,
-                    recommended: if self.selected == today {
-                        self.recommended_today()
-                    } else {
-                        self.day_recs
-                            .get(&self.selected)
-                            .map(|(_, list)| list.clone())
-                            .unwrap_or_default()
-                    },
-                    recommending: if self.selected == today {
-                        self.generating.contains_key(&ReportKey {
-                            kind: ReportKind::Plan,
-                            week_start: self.current_week().start,
-                        })
-                    } else {
-                        self.day_recs_pending.contains_key(&self.selected)
-                    },
+                    recommended,
+                    recommending,
                     logs,
                 });
             }
             Tab::Week => {
                 let week = self.week_of(self.selected);
                 let panel = self.panel_data(week);
-                self.week_view.load(WeekData {
+                let data = WeekData {
                     week,
                     today,
                     tasks: self.tasks.clone(),
                     working_days: self.settings.schedule.working_days.clone(),
                     loads: report::day_loads(&self.tasks, week, &self.settings),
                     panel,
-                });
+                };
+                self.week_data = Some(data.clone());
+                self.week_view.load(data);
             }
             Tab::Month => {
                 let summary_weeks = match self.store.ready_report_keys() {
@@ -757,6 +780,48 @@ impl Ready {
         }
     }
 
+    /// A streamed chunk arrived for `key`: shows the text so far in its
+    /// Week panel slot, if that week is showing, without a full refresh.
+    fn show_streaming(&mut self, key: ReportKey) {
+        if self.tab != Tab::Week {
+            return;
+        }
+        let Some(text) = self.generating.get(&key).map(|g| g.text.clone()) else {
+            return;
+        };
+        let Some(data) = self.week_data.as_mut() else {
+            return;
+        };
+        if data.week.start != key.week_start {
+            return;
+        }
+        let Some(slot) = data.panel.slots.iter_mut().find(|s| s.kind == key.kind) else {
+            return;
+        };
+        slot.streaming = Some(text);
+        self.week_view.load(data.clone());
+    }
+
+    /// The free-standing log lines (day notes), each on its local date.
+    fn logs(&mut self) -> Vec<LogLine> {
+        if let Some(logs) = &self.derived.logs {
+            return logs.clone();
+        }
+        let logs: Vec<LogLine> = self
+            .events
+            .iter()
+            .filter(|e| e.task_id.is_none())
+            .filter_map(|e| {
+                Some(LogLine {
+                    date: self.tz.to_datetime(e.at).date(),
+                    text: e.log_text()?.to_string(),
+                })
+            })
+            .collect();
+        self.derived.logs = Some(logs.clone());
+        logs
+    }
+
     /// Which reports the Week tab shows for `week`: the Summary, for the
     /// current and past weeks. (Recommended tasks moved to the Today tab.)
     fn panel_kinds(&self, week: WeekRef) -> Vec<ReportKind> {
@@ -768,44 +833,67 @@ impl Ready {
     }
 
     /// Today's recommended tasks: the newest ready version of the current
-    /// week's Recommended tasks report that still names an
-    /// open task on the Today list (planned for today or carried over from
-    /// an earlier day) or overdue (a chat model may not keep to
-    /// that rule). An overdue task stays eligible until it is done or
-    /// deleted. Falling back to an older version keeps the last good list
-    /// on screen when the newest names none of them, e.g. while a new one
-    /// is worked out.
-    fn recommended_today(&self) -> Vec<day::Recommended> {
+    /// week's Recommended tasks report that still names an open task on
+    /// the Today tab's list or overdue (as the tab shows them: a chat model
+    /// may not keep to that rule). An overdue task stays eligible until it
+    /// is done or deleted. Falling back to an older version keeps the last
+    /// good list on screen when the newest names none of them, e.g. while
+    /// a new one is worked out.
+    fn recommended_today(&mut self) -> Vec<day::Recommended> {
+        if let Some(list) = &self.derived.recommended_today {
+            return list.clone();
+        }
         let today = self.today();
-        let reports = self
-            .store
-            .list_reports(ReportKind::Plan, self.current_week().start)
-            .unwrap_or_default();
-        reports
+        let versions = self.versions(ReportKey {
+            kind: ReportKind::Plan,
+            week_start: self.current_week().start,
+        });
+        let list = versions
             .iter()
-            .filter(|r| r.status == fortnight_core::domain::ReportStatus::Ready)
+            .filter(|r| r.status == ReportStatus::Ready)
             .filter_map(|r| r.text().and_then(report::parse_recommendations))
             .map(|rec| {
-                rec.tasks
+                recommended(rec)
                     .into_iter()
-                    .filter(|t| {
-                        self.task(t.id).is_some_and(|x| {
-                            x.status.is_open()
-                                && (x.day().is_some_and(|d| d <= today) || x.is_overdue(today))
-                        })
+                    .filter(|r| {
+                        self.task(r.id)
+                            .is_some_and(|t| t.on_today_list(today) || t.is_overdue(today))
                     })
-                    .map(|t| day::Recommended { id: t.id })
                     .collect::<Vec<_>>()
             })
             .find(|list| !list.is_empty())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        self.derived.recommended_today = Some(list.clone());
+        list
     }
 
-    /// Whether `kind` for `week` has nothing to work from, and whether it
-    /// needs (re)generating: no ready version, or the newest one was built
-    /// from other facts or before its prompt changed. An edited version
-    /// never needs it.
-    fn freshness(&self, kind: ReportKind, week: WeekRef) -> (bool, bool) {
+    /// Every version of a report, newest first (cached until `invalidate`).
+    fn versions(&mut self, key: ReportKey) -> Vec<Report> {
+        if let Some(v) = self.derived.versions.get(&key) {
+            return v.clone();
+        }
+        match self.store.list_reports(key.kind, key.week_start) {
+            Ok(v) => {
+                self.derived.versions.insert(key, v.clone());
+                v
+            }
+            Err(e) => {
+                self.error = Some(e.to_string());
+                Vec::new()
+            }
+        }
+    }
+
+    /// Whether `kind` for `week` has nothing to work from, and the digest
+    /// of its facts now (cached until `invalidate`).
+    fn facts(&mut self, kind: ReportKind, week: WeekRef) -> (bool, String) {
+        let key = ReportKey {
+            kind,
+            week_start: week.start,
+        };
+        if let Some(f) = self.derived.facts.get(&key) {
+            return f.clone();
+        }
         let today = self.today();
         let empty = match kind {
             ReportKind::Summary => report::summary_is_empty(&report::summary_facts(
@@ -823,24 +911,22 @@ impl Ready {
                 &self.settings,
             )),
         };
-        let ready = match self.store.latest_report(kind, week.start) {
-            Ok(r) => r,
-            Err(_) => return (empty, false),
-        };
-        let stale = match ready {
-            Some(r) if r.edited_md.is_some() => false,
-            Some(r) => {
-                // Recommendations made with an older prompt (the weekly list
-                // before it became today's top three) are redone.
-                (kind == ReportKind::Plan && r.prompt_version < report::PROMPT_VERSION)
-                    || r.digest_json != self.prepare(kind, week).digest_json
-                    || self
-                        .prompt_changed
-                        .get(&kind)
-                        .is_some_and(|at| r.created_at < *at)
-            }
-            None => !empty,
-        };
+        let f = (empty, self.prepare(kind, week).digest_json);
+        self.derived.facts.insert(key, f.clone());
+        f
+    }
+
+    /// Whether `kind` for `week` has nothing to work from, and whether it
+    /// needs (re)generating (`report_stale`), given its `versions`.
+    fn freshness(&mut self, kind: ReportKind, week: WeekRef, versions: &[Report]) -> (bool, bool) {
+        let (empty, digest) = self.facts(kind, week);
+        let stale = report_stale(
+            kind,
+            versions,
+            &digest,
+            self.prompt_changed.get(&kind).copied(),
+            empty,
+        );
         (empty, stale)
     }
 
@@ -865,18 +951,12 @@ impl Ready {
         let blocked = self.blocked();
         let mut slots = Vec::new();
         for kind in self.panel_kinds(week) {
-            let versions = match self.store.list_reports(kind, week.start) {
-                Ok(v) => v,
-                Err(e) => {
-                    self.error = Some(e.to_string());
-                    Vec::new()
-                }
-            };
             let key = ReportKey {
                 kind,
                 week_start: week.start,
             };
-            let (empty, stale) = self.freshness(kind, week);
+            let versions = self.versions(key);
+            let (empty, stale) = self.freshness(kind, week, &versions);
             slots.push(ReportSlot {
                 kind,
                 versions,
@@ -889,11 +969,78 @@ impl Ready {
         ReportPanelData { week, slots }
     }
 
+    /// The schedule's due reports and what the shown tab needs.
+    fn catch_up(&mut self) -> Task<Message> {
+        Task::batch([self.run_due(), self.update_week_reports()])
+    }
+
+    /// The date changed (past midnight): the selection follows it if it
+    /// was on the old today, and later-day recommendations now past are
+    /// dropped.
+    fn new_day(&mut self, today: Date) {
+        self.selected = follow_today(self.selected, self.last_today, today);
+        self.last_today = today;
+        self.day_recs.retain(|day, _| *day > today);
+        self.day_recs_failures.retain(|day, _| *day > today);
+        self.day_recs_pending.retain(|day, (_, handle)| {
+            let keep = *day > today;
+            if !keep {
+                handle.abort();
+            }
+            keep
+        });
+    }
+
+    /// Shows `tab` (and `selected`, if given): clears the Week badge when
+    /// the Week tab shows, closes the date picker, and catches up what the
+    /// tab shows.
+    fn show(&mut self, tab: Tab, selected: Option<Date>) -> Task<Message> {
+        self.tab = tab;
+        if let Some(day) = selected {
+            self.selected = day;
+        }
+        if tab == Tab::Week {
+            self.week_badge = false;
+        }
+        self.date_picker = None;
+        self.update_week_reports()
+    }
+
+    /// Aborts what browsing started and is no longer shown: generations
+    /// not started by the schedule for a week other than the current or
+    /// the shown one, and later-day recommendations for another day.
+    fn abort_browsing(&mut self) {
+        let current = self.current_week().start;
+        let shown = self.week_of(self.selected).start;
+        let mut aborted = false;
+        self.generating.retain(|key, g| {
+            let keep = keep_generation(g.scheduled, key.week_start, current, shown);
+            if !keep {
+                g.abort.abort();
+                aborted = true;
+            }
+            keep
+        });
+        let selected = self.selected;
+        self.day_recs_pending.retain(|day, (_, handle)| {
+            let keep = *day == selected;
+            if !keep {
+                handle.abort();
+                aborted = true;
+            }
+            keep
+        });
+        if aborted {
+            self.must_refresh = true;
+        }
+    }
+
     /// Generates the reports the shown tab needs that are out of date, once
     /// each (none while one is in flight, and failures back off): the Week
-    /// tab's Summary, and the Today tab's recommended tasks (when it shows
-    /// today).
+    /// tab's Summary, and the Today tab's recommended tasks (today's, or a
+    /// later day's). First aborts what browsing left behind.
     fn update_week_reports(&mut self) -> Task<Message> {
+        self.abort_browsing();
         if self.blocked().is_some() {
             return Task::none();
         }
@@ -917,7 +1064,8 @@ impl Ready {
             if kind == ReportKind::Summary && self.summary_waiting() {
                 continue;
             }
-            let (empty, stale) = self.freshness(kind, week);
+            let versions = self.versions(key);
+            let (empty, stale) = self.freshness(kind, week, &versions);
             if !empty && stale && !self.backing_off(key) {
                 tasks.push(self.generate(kind, week, false));
             }
@@ -928,8 +1076,8 @@ impl Ready {
     /// Works out the recommended tasks of the later day the Today tab
     /// shows, unless they are known for its current facts or on their way.
     /// Only the open tasks planned for that day take part: overdue ones are
-    /// today's business. Not stored; a failure shows none until the facts
-    /// change.
+    /// today's business. Not stored; a failure keeps what was shown and is
+    /// retried with the reports' backoff.
     fn update_day_recs(&mut self) -> Task<Message> {
         let day = self.selected;
         if self.tab != Tab::Today || day <= self.today() || self.blocked().is_some() {
@@ -949,30 +1097,43 @@ impl Ready {
             report::prepare_plan(&tasks, &self.events, self.week_of(day), day, &self.settings);
         let facts = prepared.digest_json;
         if self.day_recs.get(&day).is_some_and(|(f, _)| *f == facts)
-            || self.day_recs_pending.get(&day) == Some(&facts)
+            || self
+                .day_recs_pending
+                .get(&day)
+                .is_some_and(|(f, _)| *f == facts)
         {
             return Task::none();
         }
-        let Some(client) = self.plan_client() else {
+        let (failures, last) = self.day_recs_failures.get(&day).copied().unzip();
+        if backoff_active(failures.unwrap_or(0), last, Timestamp::now()) {
+            return Task::none();
+        }
+        let Ok(route) = self.plan_route(ReportKind::Plan) else {
             return Task::none();
         };
-        self.day_recs_pending.insert(day, facts.clone());
-        Task::perform(client.chat(prepared.request), move |result| {
-            Message::DayRecs(day, facts, result)
+        let sent = facts.clone();
+        let (task, handle) = Task::perform(route.client().chat(prepared.request), move |result| {
+            Message::DayRecs(day, sent, result)
         })
+        .abortable();
+        if let Some((_, old)) = self.day_recs_pending.insert(day, (facts, handle)) {
+            old.abort();
+        }
+        self.must_refresh = true;
+        task
     }
 
-    /// The client recommended tasks go to: the decision model when one is
-    /// set (and can be built), falling back to the main endpoint.
-    fn plan_client(&self) -> Option<Arc<dyn LlmClient>> {
-        let (main, _) = self.client_for(&self.settings.llm.clone()).ok()?;
-        let decision = self.settings.decision_llm.clone();
-        if decision.is_configured()
-            && let Ok((primary, _)) = self.decision_client_for(&decision)
-        {
-            return Some(Arc::new(FallbackClient::new(primary, main)));
-        }
-        Some(main)
+    /// Where a report of `kind` goes: the main endpoint, and for
+    /// recommended tasks the decision model first when one is set (and can
+    /// be built).
+    fn plan_route(&self, kind: ReportKind) -> Result<PlanRoute, String> {
+        let (client, host) = self.client_for(&self.settings.llm)?;
+        let decision = &self.settings.decision_llm;
+        let decision = (kind == ReportKind::Plan && decision.is_configured())
+            .then(|| self.decision_client_for(decision).ok())
+            .flatten()
+            .map(|(client, host)| Endpoint { client, host });
+        Ok(PlanRoute::new(Endpoint { client, host }, decision))
     }
 
     /// Whether the Work summary is still waiting after a Week-tab change.
@@ -980,19 +1141,28 @@ impl Ready {
         self.summary_wait.is_some_and(|at| Timestamp::now() < at)
     }
 
-    /// A recent attempt at `key` failed and its retry wait hasn't passed:
-    /// `RETRY_AFTER_MINUTES`, doubling with each further failure.
+    /// A recent attempt at `key` failed and its retry wait hasn't passed
+    /// (`backoff_active`).
     fn backing_off(&self, key: ReportKey) -> bool {
-        let failures = self.failures.get(&key).copied().unwrap_or(0);
-        if failures == 0 {
-            return false;
-        }
-        let wait = RETRY_AFTER_MINUTES
-            .saturating_mul(1 << (failures - 1).min(10))
-            .min(RETRY_MAX_MINUTES);
-        self.last_attempt
-            .get(&key)
-            .is_some_and(|t| Timestamp::now().duration_since(*t) < SignedDuration::from_mins(wait))
+        backoff_active(
+            self.failures.get(&key).copied().unwrap_or(0),
+            self.last_attempt.get(&key).copied(),
+            Timestamp::now(),
+        )
+    }
+
+    /// Counts a failed attempt at `key` now, for the backoff.
+    fn record_failure(&mut self, key: ReportKey) {
+        *self.failures.entry(key).or_insert(0) += 1;
+        self.last_attempt.insert(key, Timestamp::now());
+    }
+
+    /// Forgets every failure, so the next catch-up tries at once (the
+    /// endpoint or key changed).
+    fn reset_backoff(&mut self) {
+        self.failures.clear();
+        self.last_attempt.clear();
+        self.day_recs_failures.clear();
     }
 
     fn key_state(&self) -> KeyState {
@@ -1013,7 +1183,8 @@ impl Ready {
         }
     }
 
-    /// Starts streaming a report unless one is already in flight.
+    /// Starts streaming a report unless one is already in flight. A client
+    /// that can't be built counts as a failed attempt (it backs off).
     fn generate(&mut self, kind: ReportKind, week: WeekRef, scheduled: bool) -> Task<Message> {
         let key = ReportKey {
             kind,
@@ -1022,31 +1193,16 @@ impl Ready {
         if self.generating.contains_key(&key) {
             return Task::none();
         }
-        let (client, host) = match self.client_for(&self.settings.llm.clone()) {
-            Ok(c) => c,
+        let route = match self.plan_route(kind) {
+            Ok(route) => route,
             Err(e) => {
                 self.error = Some(e);
+                self.record_failure(key);
                 return Task::none();
             }
         };
-        // Recommended tasks go to the decision model when one is set (and
-        // can be built), falling back to the main endpoint.
-        let decision = self.settings.decision_llm.clone();
-        let (client, host, decision) = match kind {
-            ReportKind::Plan if decision.is_configured() => {
-                match self.decision_client_for(&decision) {
-                    Ok((primary, decision_host)) => {
-                        let fc = Arc::new(FallbackClient::new(primary, client));
-                        let as_client: Arc<dyn LlmClient> = fc.clone();
-                        (as_client, decision_host, Some((fc, host)))
-                    }
-                    Err(_) => (client, host, None),
-                }
-            }
-            _ => (client, host, None),
-        };
         let prepared = self.prepare(kind, week);
-        let stream = client.chat_stream(prepared.request.clone());
+        let stream = route.client().chat_stream(prepared.request.clone());
         self.next_generation += 1;
         let id = self.next_generation;
         let (task, abort) = Task::run(stream, move |item| Message::Stream(key, id, item))
@@ -1057,20 +1213,21 @@ impl Ready {
             Generation {
                 prepared,
                 text: String::new(),
-                requested_model: client.model().to_string(),
-                host,
-                decision,
+                route,
                 scheduled,
                 abort,
                 id,
             },
         );
         self.last_attempt.insert(key, Timestamp::now());
+        self.must_refresh = true;
         task
     }
 
     /// Stores the finished (or failed) report and forgets the generation.
-    /// A scheduled report that became ready sets the Week badge.
+    /// A failure is counted from the stored row (an unreadable plan is
+    /// stored `Failed`). A scheduled summary that became ready sets the
+    /// Week badge.
     fn finish(
         &mut self,
         key: ReportKey,
@@ -1083,27 +1240,29 @@ impl Ready {
         let Some(g) = self.generating.remove(&key) else {
             return Task::none();
         };
-        let ok = result.is_ok();
-        if ok {
+        self.invalidate();
+        let (requested_model, host) = g.route.answered_by();
+        let stored = report::finish(&self.store, g.prepared, result, &requested_model, host);
+        let ready = match &stored {
+            Ok(r) => r.status == ReportStatus::Ready,
+            Err(e) => {
+                self.error = Some(e.to_string());
+                false
+            }
+        };
+        if ready {
             self.failures.remove(&key);
         } else {
             *self.failures.entry(key).or_insert(0) += 1;
         }
-        let (requested_model, host) = match &g.decision {
-            Some((fc, main_host)) if fc.used_fallback() => {
-                (fc.fallback_model().to_string(), main_host.clone())
-            }
-            _ => (g.requested_model, g.host),
-        };
-        let new = report::finish(g.prepared, result, &requested_model, host);
-        if let Err(e) = self.store.insert_report(new) {
-            self.error = Some(e.to_string());
+        if stored.is_err() {
             return Task::none();
         }
-        if ok && g.scheduled && self.tab != Tab::Week {
+        if ready && g.scheduled && key.kind == ReportKind::Summary && self.tab != Tab::Week {
             self.week_badge = true;
         }
-        // Tasks may have changed while it ran: catch up straight away.
+        // Tasks may have changed while it ran: catch up straight away (a
+        // failure is backing off now, so this doesn't retry it).
         if (key.kind == ReportKind::Summary && self.tab == Tab::Week)
             || (key.kind == ReportKind::Plan && self.decision_active())
         {
@@ -1127,7 +1286,11 @@ impl Ready {
         };
         let result = match &last {
             Undo::Added(id) => self.undo_add(*id),
-            Undo::Changed { before, last_event } => self.undo_change(before, *last_event),
+            Undo::Changed {
+                before,
+                last_event,
+                keep_position,
+            } => self.undo_change(before, *last_event, *keep_position),
             Undo::Deleted(deleted) => {
                 // Put back what can be; keep the rest for another try.
                 let mut left = Vec::new();
@@ -1164,33 +1327,39 @@ impl Ready {
     }
 
     /// Deletes a task just added, unless it has since gained history (a log
-    /// line, an edit), which deleting would lose.
+    /// line, an edit), which deleting would lose. One transaction.
     fn undo_add(&mut self, id: TaskId) -> Result<(), String> {
-        let events = self.store.task_events(id).map_err(|e| e.to_string())?;
-        if events
-            .iter()
-            .any(|e| !matches!(e.kind, fortnight_core::domain::EventKind::Created { .. }))
-        {
-            return Err("the task has changed since you added it. Delete it instead".into());
+        match self.store.delete_new_task(id) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err("the task has changed since you added it. Delete it instead".into()),
+            Err(e) => Err(e.to_string()),
         }
+    }
+
+    /// Puts the task back as `before` (keeping its current position unless
+    /// `keep_position` is false) and drops the events written since
+    /// `last_event` except log lines. One transaction.
+    fn undo_change(
+        &mut self,
+        before: &CoreTask,
+        last_event: EventId,
+        keep_position: bool,
+    ) -> Result<(), String> {
+        let target = reverted(before, self.task(before.id), keep_position);
         self.store
-            .delete_task(id)
-            .map(|_| ())
+            .revert_task(&target, last_event)
             .map_err(|e| e.to_string())
     }
 
-    fn undo_change(&mut self, before: &CoreTask, last_event: EventId) -> Result<(), String> {
-        restore_snapshot(&self.store, before, last_event)
-    }
-
     /// Remembers `before` (the task as it is now) for undo of a change about
-    /// to be made.
-    fn snapshot(&self, id: TaskId) -> Option<Undo> {
+    /// to be made. `keep_position`: see `Undo::Changed`.
+    fn snapshot(&self, id: TaskId, keep_position: bool) -> Option<Undo> {
         let before = self.task(id)?.clone();
         let last_event = self.events.iter().map(|e| e.id).max().unwrap_or(0);
         Some(Undo::Changed {
             before: Box::new(before),
             last_event,
+            keep_position,
         })
     }
 
@@ -1200,9 +1369,10 @@ impl Ready {
 
     /// The schedule (PLAN.md section 8), at launch and every minute: from
     /// its day and time the summary is kept up to date (generated when
-    /// missing or out of date); Recommended tasks are generated when
-    /// missing (otherwise only while the Today tab shows today). Waits
-    /// quietly while locked or unconfigured; failures back off.
+    /// stale: out of date, or its newest attempt failed); Recommended tasks
+    /// are generated when there is no ready version (otherwise only while
+    /// the Today tab shows today). Waits quietly while locked or
+    /// unconfigured; failures back off.
     fn run_due(&mut self) -> Task<Message> {
         if self.blocked().is_some() || self.tasks.is_empty() {
             return Task::none();
@@ -1214,11 +1384,9 @@ impl Ready {
                 kind: job.kind,
                 week_start: job.week.start,
             };
-            let (empty, stale) = self.freshness(job.kind, job.week);
-            let missing = !matches!(
-                self.store.latest_report(job.kind, job.week.start),
-                Ok(Some(_))
-            );
+            let versions = self.versions(key);
+            let (empty, stale) = self.freshness(job.kind, job.week, &versions);
+            let missing = !versions.iter().any(|r| r.status == ReportStatus::Ready);
             let wanted = match job.kind {
                 ReportKind::Summary => stale,
                 ReportKind::Plan => missing,
@@ -1233,60 +1401,73 @@ impl Ready {
     // ---- update ----
 
     fn update(&mut self, message: Message) -> Task<Message> {
-        // Pointer moves change no form.
-        let pointer = matches!(
+        // Pointer moves, timers, streams and replies change no form.
+        let no_form_change = matches!(
             &message,
             Message::Day(day::Message::Moved(_) | day::Message::Enter(_) | day::Message::Leave(_))
                 | Message::Week(
                     week::Message::Moved(_) | week::Message::Hover(..) | week::Message::Leave(..)
                 )
+                | Message::Tick
+                | Message::SummaryWait
+                | Message::NotesTick
+                | Message::Stream(..)
+                | Message::StreamEnded(..)
+                | Message::DayRecs(..)
+                | Message::SuggestPriority(_)
+                | Message::PrioritySuggested(..)
         );
         let task = self.handle_message(message);
-        if pointer {
+        if no_form_change {
             return task;
         }
         Task::batch([task, self.maybe_suggest()])
     }
 
     fn handle_message(&mut self, message: Message) -> Task<Message> {
+        // Set by the arms whose message changes only what a view keeps.
+        self.local = false;
         let task = match message {
             Message::Top(m) => self.top_bar(m),
-            Message::Day(m) if m.is_pointer_move() => {
-                // Drag bookkeeping (or a click let go): the view redraws
-                // itself; no data changed, so skip the refresh.
-                let action = self.day_view.update(m);
-                return self.day_action(action);
-            }
             Message::Day(day::Message::DeleteAll) => {
                 self.delete_all_deleted();
                 Task::none()
             }
             Message::Day(m) => {
+                // Drag bookkeeping, typing, selection, opening a form: the
+                // view keeps that itself. An action that writes reloads.
                 let action = self.day_view.update(m);
+                self.local = true;
                 self.day_action(action)
             }
             Message::PointerUp => {
+                self.local = true;
                 let week = match self.week_view.update(week::Message::EndDrag) {
                     week::Action::Edit(id) => self.open_edit(id),
                     _ => Task::none(),
                 };
                 let action = self.day_view.update(day::Message::EndDrag);
                 let day = self.day_action(action);
-                return Task::batch([week, day]);
+                Task::batch([week, day])
             }
             Message::Week(m) if m.is_pointer_move() => {
                 // Drag bookkeeping only: no data changed, skip the refresh.
                 // A press let go without a drag is a click on the card.
-                return match self.week_view.update(m) {
+                self.local = true;
+                match self.week_view.update(m) {
                     week::Action::Edit(id) => self.open_edit(id),
                     _ => Task::none(),
-                };
+                }
             }
             Message::Week(m) => match self.week_view.update(m) {
-                week::Action::None => Task::none(),
+                week::Action::None => {
+                    self.local = true;
+                    Task::none()
+                }
                 week::Action::Move(id, day, position) => {
                     if let Some(task) = self.task(id).cloned() {
-                        let undo = self.snapshot(id);
+                        // Undo puts the old position back too.
+                        let undo = self.snapshot(id, false);
                         let mut result = Ok(());
                         if task.day() != Some(day) {
                             // Dropping on a day plans it there; the
@@ -1315,70 +1496,91 @@ impl Ready {
                 }
                 week::Action::NewTask(day) => self.open_new_task(day),
                 week::Action::Edit(id) => self.open_edit(id),
-                week::Action::OpenDay(day) => {
-                    self.selected = day;
-                    self.tab = Tab::Today;
-                    self.update_week_reports()
-                }
+                week::Action::OpenDay(day) => self.show(Tab::Today, Some(day)),
                 week::Action::Panel(action) => self.panel_action(action),
             },
             Message::Month(m) => match self.month_view.update(m) {
-                month::Action::None => Task::none(),
-                month::Action::OpenDay(day) => {
-                    self.selected = day;
-                    self.tab = Tab::Today;
-                    self.update_week_reports()
-                }
-                month::Action::OpenWeek(week) => {
-                    self.selected = week.start;
-                    self.tab = Tab::Week;
+                month::Action::None => {
+                    self.local = true;
                     Task::none()
                 }
+                month::Action::OpenDay(day) => self.show(Tab::Today, Some(day)),
+                month::Action::OpenWeek(week) => self.show(Tab::Week, Some(week.start)),
             },
             Message::Settings(m) => {
                 let action = self.settings_view.update(m);
+                if matches!(action, settings::Action::None) {
+                    self.local = true;
+                }
                 self.settings_action(action)
             }
             Message::CloseSettings => {
-                self.settings_open = false;
+                self.hide_settings();
                 Task::none()
             }
             Message::Dialog(m) => self.dialog_message(m),
             Message::Unlock(m) => match self.unlock_view.update(m) {
-                UnlockAction::None => Task::none(),
+                UnlockAction::None => {
+                    self.local = true;
+                    Task::none()
+                }
                 UnlockAction::Skip => {
-                    self.unlocking = false;
+                    self.close_unlock();
                     Task::none()
                 }
                 UnlockAction::Unlock(password) => self.unlock(password),
             },
-            Message::Tick => Task::batch([self.run_due(), self.update_week_reports()]),
+            Message::Tick => {
+                let today = self.today();
+                if today != self.last_today {
+                    self.new_day(today);
+                }
+                // Facts depend on the date and reports may come from the
+                // CLI: work everything out afresh once a minute.
+                self.invalidate();
+                self.catch_up()
+            }
             Message::NotesTick => {
+                // Saving reloads (and so refreshes); otherwise nothing changed.
+                self.local = true;
                 if let Some((day, notes)) = self.day_view.notes_to_save(std::time::Instant::now()) {
                     self.save_notes(day, &notes);
                 }
                 Task::none()
             }
             Message::DayRecs(day, facts, result) => {
-                if self.day_recs_pending.get(&day) == Some(&facts) {
-                    self.day_recs_pending.remove(&day);
+                // Only the latest request for that day counts (one left
+                // behind or aborted doesn't).
+                if self
+                    .day_recs_pending
+                    .get(&day)
+                    .is_none_or(|(f, _)| *f != facts)
+                {
+                    self.local = true;
+                    return Task::none();
                 }
-                // A failure keeps nothing to show, until the facts change.
-                let list = result
+                self.day_recs_pending.remove(&day);
+                match result
                     .ok()
                     .and_then(|r| report::parse_recommendations(&r.text))
-                    .map(|rec| {
-                        rec.tasks
-                            .into_iter()
-                            .map(|t| day::Recommended { id: t.id })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                self.day_recs.insert(day, (facts, list));
+                {
+                    Some(rec) => {
+                        self.day_recs.insert(day, (facts, recommended(rec)));
+                        self.day_recs_failures.remove(&day);
+                    }
+                    // Keeps what was shown; retried after the backoff.
+                    None => {
+                        let failures = self.day_recs_failures.get(&day).map_or(0, |f| f.0);
+                        self.day_recs_failures
+                            .insert(day, (failures + 1, Timestamp::now()));
+                    }
+                }
                 // Tasks may have changed while it ran.
                 self.update_day_recs()
             }
             Message::SummaryWait => {
+                // Starting a generation asks for the refresh.
+                self.local = true;
                 if self.summary_waiting() {
                     Task::none()
                 } else {
@@ -1386,25 +1588,30 @@ impl Ready {
                     self.update_week_reports()
                 }
             }
-            Message::Stream(key, id, item) => match item {
-                Ok(ChatEvent::Delta(d)) if self.generating.contains_key(&key) => {
-                    if let Some(g) = self.generating.get_mut(&key) {
-                        g.text.push_str(&d);
+            Message::Stream(key, id, item) => {
+                // A finished report invalidates (and so refreshes).
+                self.local = true;
+                match item {
+                    Ok(ChatEvent::Delta(d)) => {
+                        if let Some(g) = self.generating.get_mut(&key).filter(|g| g.id == id) {
+                            g.text.push_str(&d);
+                            self.show_streaming(key);
+                        }
+                        Task::none()
                     }
-                    Task::none()
+                    Ok(ChatEvent::Done { model }) => {
+                        let text = self
+                            .generating
+                            .get(&key)
+                            .map(|g| g.text.clone())
+                            .unwrap_or_default();
+                        self.finish(key, id, Ok(ChatResponse { text, model }))
+                    }
+                    Err(e) => self.finish(key, id, Err(e)),
                 }
-                Ok(ChatEvent::Done { model }) => {
-                    let text = self
-                        .generating
-                        .get(&key)
-                        .map(|g| g.text.clone())
-                        .unwrap_or_default();
-                    self.finish(key, id, Ok(ChatResponse { text, model }))
-                }
-                Err(e) => self.finish(key, id, Err(e)),
-                Ok(ChatEvent::Delta(_)) => Task::none(),
-            },
+            }
             Message::StreamEnded(key, id) => {
+                self.local = true;
                 // Only still generating if the stream ended without `Done`.
                 self.finish(key, id, Err(LlmError::Truncated))
             }
@@ -1417,22 +1624,39 @@ impl Ready {
                 Task::none()
             }
             Message::SuggestPriority(seq) => {
-                let Some((_, title, notes)) = self.suggest_for.clone() else {
+                self.local = true;
+                let Some((form, title, notes)) = self.suggest_for.clone() else {
                     return Task::none();
                 };
                 if seq != self.suggest_seq || title.trim().is_empty() {
                     return Task::none();
                 }
+                // A private task's title and notes never leave the machine.
+                let task = match form {
+                    FormKey::Dialog => self.dialog.as_ref().and_then(|d| d.task),
+                    FormKey::Inline(id) => Some(id),
+                };
+                if task.and_then(|id| self.task(id)).is_some_and(|t| t.private) {
+                    return Task::none();
+                }
                 let Some(client) = self.decision_model() else {
                     return Task::none();
                 };
-                Task::perform(
+                let (task, handle) = Task::perform(
                     async move { client.suggest_priority(&title, &notes).await.ok() },
                     move |p| Message::PrioritySuggested(seq, p),
                 )
+                .abortable();
+                if let Some(old) = self.suggest_request.replace(handle) {
+                    old.abort();
+                }
+                task
             }
             Message::PrioritySuggested(seq, priority) => {
+                // The forms draw the suggestion themselves.
+                self.local = true;
                 if seq == self.suggest_seq {
+                    self.suggest_request = None;
                     match self.suggest_for.as_ref().map(|(form, _, _)| *form) {
                         Some(FormKey::Dialog) => {
                             if let Some(dialog) = self.dialog.as_mut() {
@@ -1459,6 +1683,7 @@ impl Ready {
             }
             Message::Key(shortcut) => self.shortcut(shortcut),
             Message::DismissNotice => {
+                self.local = true;
                 self.notice = None;
                 Task::none()
             }
@@ -1471,12 +1696,14 @@ impl Ready {
                         if decision.is_some() {
                             self.decision_key = decision;
                         }
-                        self.unlocking = false;
+                        self.close_unlock();
                         self.key_message = None;
+                        // What failed while locked out may work now.
+                        self.reset_backoff();
                     }
                     Err(e) => self.unlock_view.set_error(e.to_string()),
                 }
-                Task::batch([self.run_due(), self.update_week_reports()])
+                self.catch_up()
             }
             Message::KeySaved(result) => {
                 match result {
@@ -1497,6 +1724,8 @@ impl Ready {
                             *other = saved.other;
                         }
                         self.key_message = None;
+                        // A new key may fix what failed.
+                        self.reset_backoff();
                     }
                     // Only the check against the other key can say this.
                     Err(VaultError::WrongPassword) => {
@@ -1508,9 +1737,10 @@ impl Ready {
                     }
                     Err(e) => self.key_message = Some(e.to_string()),
                 }
-                Task::batch([self.run_due(), self.update_week_reports()])
+                self.catch_up()
             }
             Message::DismissError => {
+                self.local = true;
                 self.error = None;
                 Task::none()
             }
@@ -1519,7 +1749,10 @@ impl Ready {
                 return Task::none();
             }
         };
-        self.refresh();
+        let local = std::mem::take(&mut self.local);
+        if !local || self.must_refresh {
+            self.refresh();
+        }
         if std::mem::take(&mut self.tasks_changed) {
             // The Work summary follows changes on the Week tab, once they
             // pause for `SUMMARY_WAIT_SECS`.
@@ -1537,13 +1770,7 @@ impl Ready {
 
     fn top_bar(&mut self, message: top_bar::Message) -> Task<Message> {
         match message {
-            top_bar::Message::Tab(tab) => {
-                self.tab = tab;
-                if tab == Tab::Week {
-                    self.week_badge = false;
-                }
-                self.update_week_reports()
-            }
+            top_bar::Message::Tab(tab) => self.show(tab, None),
             top_bar::Message::Prev => {
                 self.selected = top_bar::step(self.tab, self.selected, -1);
                 self.update_week_reports()
@@ -1557,7 +1784,9 @@ impl Ready {
                 self.date_picker = None;
                 self.update_week_reports()
             }
+            // The date picker is drawn from `date_picker` directly.
             top_bar::Message::ToggleCalendar => {
+                self.local = true;
                 self.date_picker = match self.date_picker {
                     Some(_) => None,
                     None => Some(self.selected.first_of_month()),
@@ -1565,10 +1794,12 @@ impl Ready {
                 Task::none()
             }
             top_bar::Message::CloseCalendar => {
+                self.local = true;
                 self.date_picker = None;
                 Task::none()
             }
             top_bar::Message::CalendarMonth(step) => {
+                self.local = true;
                 if let Some(month) = &mut self.date_picker {
                     *month = add_months(*month, step).first_of_month();
                 }
@@ -1588,15 +1819,31 @@ impl Ready {
                     UnlockView::focus().map(Message::Unlock)
                 }
             }
-            top_bar::Message::Settings => {
-                self.settings_open = !self.settings_open;
-                if self.settings_open {
-                    detect_ollama()
-                } else {
-                    Task::none()
-                }
+            top_bar::Message::Settings if self.settings_open => {
+                self.hide_settings();
+                Task::none()
             }
+            top_bar::Message::Settings => self.open_settings(),
         }
+    }
+
+    /// Opens Settings and checks for a local Ollama.
+    fn open_settings(&mut self) -> Task<Message> {
+        self.settings_open = true;
+        detect_ollama()
+    }
+
+    /// Hides Settings, by any route: typed secrets are wiped
+    /// (`SettingsView::on_hidden`); form edits are kept.
+    fn hide_settings(&mut self) {
+        self.settings_open = false;
+        self.settings_view.on_hidden();
+    }
+
+    /// Closes the unlock prompt, by any route, wiping what was typed.
+    fn close_unlock(&mut self) {
+        self.unlocking = false;
+        self.unlock_view.reset();
     }
 
     /// Opens the task dialog for a new task on `day` and focuses its title.
@@ -1629,6 +1876,8 @@ impl Ready {
             return Task::none();
         };
         if dialog.form.handle(&message, today) {
+            // The dialog is drawn from its form directly.
+            self.local = true;
             return Task::none();
         }
         match (message, dialog.task) {
@@ -1678,7 +1927,7 @@ impl Ready {
 
     fn set_status(&mut self, id: TaskId, status: TaskStatus) {
         let changed = self.task(id).is_some_and(|t| t.status != status);
-        let undo = self.snapshot(id);
+        let undo = self.snapshot(id, true);
         match self.store.set_status(id, status) {
             Ok(()) => {
                 if let (true, Some(undo)) = (changed, undo) {
@@ -1719,17 +1968,8 @@ impl Ready {
             return;
         }
         let ids: Vec<EventId> = old.iter().map(|(id, _, _)| *id).collect();
-        let result = ids
-            .into_iter()
-            .try_for_each(|id| self.store.delete_log(id))
-            .and_then(|()| {
-                if notes.is_empty() {
-                    Ok(())
-                } else {
-                    self.store.add_log_at(None, notes, at).map(|_| ())
-                }
-            });
-        if let Err(e) = result {
+        let text = (!notes.is_empty()).then_some(notes);
+        if let Err(e) = self.store.replace_logs(&ids, text, at) {
             self.error = Some(format!("Could not save the notes: {e}"));
         }
         self.reload_tasks();
@@ -1768,7 +2008,7 @@ impl Ready {
                 return Task::none();
             }
             day::Action::Update(task) => {
-                let undo = self.snapshot(task.id);
+                let undo = self.snapshot(task.id, true);
                 let r = self.store.update_task(&task);
                 if let (Ok(()), Some(undo)) = (&r, undo) {
                     self.remember(undo);
@@ -1786,9 +2026,7 @@ impl Ready {
                 self.add_task(new);
                 return Task::none();
             }
-            day::Action::Reorder(positions) => positions
-                .into_iter()
-                .try_for_each(|(id, position)| self.store.set_position(id, position)),
+            day::Action::Reorder(positions) => self.store.set_positions(&positions),
         };
         if let Err(e) = result {
             self.error = Some(e.to_string());
@@ -1811,6 +2049,7 @@ impl Ready {
                 if let Err(e) = self.store.set_report_edit(id, text.as_deref()) {
                     self.error = Some(e.to_string());
                 }
+                self.invalidate();
                 Task::none()
             }
             report_panel::Action::Copy(text) => iced::clipboard::write(text),
@@ -1822,22 +2061,24 @@ impl Ready {
     fn shortcut(&mut self, shortcut: Shortcut) -> Task<Message> {
         if self.unlocking {
             if shortcut == Shortcut::Escape {
-                self.unlocking = false;
+                self.close_unlock();
             }
             return Task::none();
         }
         if self.settings_open {
-            return match shortcut {
-                Shortcut::Escape | Shortcut::Settings => {
-                    self.settings_open = false;
-                    Task::none()
-                }
-                _ => Task::none(),
-            };
+            if matches!(shortcut, Shortcut::Escape | Shortcut::Settings) {
+                self.hide_settings();
+            }
+            return Task::none();
         }
-        if self.dialog.is_some() {
+        if let Some(dialog) = &mut self.dialog {
             if shortcut == Shortcut::Escape {
-                self.dialog = None;
+                // An open due calendar closes first, keeping the form.
+                if dialog.form.calendar.is_some() {
+                    dialog.form.calendar = None;
+                } else {
+                    self.dialog = None;
+                }
             }
             return Task::none();
         }
@@ -1849,14 +2090,11 @@ impl Ready {
             // In the Week tab, the new-task dialog for the selected day;
             // elsewhere the Today tab's add-a-task input.
             Shortcut::FocusQuickAdd if self.tab == Tab::Week => self.open_new_task(self.selected),
-            Shortcut::FocusQuickAdd => {
-                self.tab = Tab::Today;
-                operation::focus(day::QUICK_ADD_ID)
-            }
-            Shortcut::Settings => {
-                self.settings_open = true;
-                detect_ollama()
-            }
+            Shortcut::FocusQuickAdd => Task::batch([
+                self.show(Tab::Today, None),
+                operation::focus(day::QUICK_ADD_ID),
+            ]),
+            Shortcut::Settings => self.open_settings(),
             Shortcut::Undo => {
                 self.undo();
                 Task::none()
@@ -1895,6 +2133,14 @@ impl Ready {
         for handle in self.key_requests.drain(..) {
             handle.abort();
         }
+        for (_, (_, handle)) in self.day_recs_pending.drain() {
+            handle.abort();
+        }
+        if let Some(handle) = self.suggest_request.take() {
+            handle.abort();
+        }
+        // A suggestion already on its way is ignored.
+        self.suggest_seq += 1;
         self.testing = false;
         self.listing_models = false;
         self.key_message = None;
@@ -1906,7 +2152,7 @@ impl Ready {
         match action {
             settings::Action::None => Task::none(),
             settings::Action::Close => {
-                self.settings_open = false;
+                self.hide_settings();
                 Task::none()
             }
             settings::Action::Save(s) => {
@@ -1922,12 +2168,19 @@ impl Ready {
                 match self.store.save_settings(&s) {
                     Ok(()) => {
                         theme::set_accent(s.accent);
+                        // A fixed endpoint is tried again at once.
+                        if s.llm != self.settings.llm
+                            || s.decision_llm != self.settings.decision_llm
+                        {
+                            self.reset_backoff();
+                        }
                         self.settings = s;
-                        self.settings_open = false;
+                        self.invalidate();
+                        self.hide_settings();
                     }
                     Err(e) => self.error = Some(e.to_string()),
                 }
-                Task::batch([self.run_due(), self.update_week_reports()])
+                self.catch_up()
             }
             settings::Action::Test(llm, which) => match self.settings_client(&llm, which) {
                 Ok((client, _)) => {
@@ -1954,16 +2207,30 @@ impl Ready {
             },
             // Ollama (keyless, or a decision model): ask it directly, which
             // also says what each model can do.
-            settings::Action::ListModels(llm, _)
+            // A keyless server that isn't Ollama (LM Studio) answers the
+            // endpoint's own model list instead.
+            settings::Action::ListModels(llm, which)
                 if llm.keyless || llm.protocol == Protocol::OllamaDecision =>
             {
                 self.listing_models = true;
                 self.models = None;
+                let fallback = (llm.protocol != Protocol::OllamaDecision)
+                    .then(|| self.settings_client(&llm, which).ok())
+                    .flatten()
+                    .map(|(client, _)| client);
                 Task::perform(
                     async move {
-                        ollama::detect(&llm.base_url, Duration::from_secs(10))
-                            .await
-                            .map_err(|e| e.to_string())
+                        match ollama::detect(&llm.base_url, Duration::from_secs(10)).await {
+                            Ok(models) => Ok(models),
+                            Err(e) => match fallback {
+                                Some(client) => client
+                                    .list_models()
+                                    .await
+                                    .map(chat_models)
+                                    .map_err(|e| e.to_string()),
+                                None => Err(e.to_string()),
+                            },
+                        }
                     },
                     Message::Models,
                 )
@@ -1974,14 +2241,11 @@ impl Ready {
                     self.models = None;
                     let (task, handle) = Task::perform(
                         async move {
-                            let ids = client.list_models().await.map_err(|e| e.to_string())?;
-                            Ok(ids
-                                .into_iter()
-                                .map(|name| OllamaModel {
-                                    name,
-                                    kind: ModelKind::Chat,
-                                })
-                                .collect())
+                            client
+                                .list_models()
+                                .await
+                                .map(chat_models)
+                                .map_err(|e| e.to_string())
                         },
                         Message::Models,
                     )
@@ -2229,29 +2493,113 @@ fn forced_theme() -> Option<bool> {
     }
 }
 
-/// Undo of a change: puts a task back exactly as `before`, dropping the
-/// events written since `last_event` except log lines. Done as delete +
-/// restore, which the store does with the original ids; if the restore
-/// fails, the current state is put back so the task is never lost.
-fn restore_snapshot(
-    store: &impl Store,
-    before: &CoreTask,
-    last_event: EventId,
-) -> Result<(), String> {
-    let current = store.delete_task(before.id).map_err(|e| e.to_string())?;
-    let restored = DeletedTask {
-        task: before.clone(),
-        events: current
-            .events
-            .iter()
-            .filter(|e| e.id <= last_event || e.kind.is_log())
-            .cloned()
-            .collect(),
-    };
-    store.restore_task(&restored).map_err(|e| {
-        let _ = store.restore_task(&current);
-        e.to_string()
-    })
+/// The saved key is locked (`exists` but not open) and `llm` needs it
+/// (`secure::needs_saved_key`).
+fn key_locked(exists: bool, key: &Option<SecretString>, llm: &LlmSettings) -> bool {
+    exists && key.is_none() && secure::needs_saved_key(llm)
+}
+
+/// The tasks a recommendation names, in its order.
+fn recommended(rec: report::Recommendation) -> Vec<day::Recommended> {
+    rec.tasks
+        .into_iter()
+        .map(|t| day::Recommended { id: t.id })
+        .collect()
+}
+
+/// Model ids from an endpoint's model list, as chat models.
+fn chat_models(ids: Vec<String>) -> Vec<OllamaModel> {
+    ids.into_iter()
+        .map(|name| OllamaModel {
+            name,
+            kind: ModelKind::Chat,
+        })
+        .collect()
+}
+
+/// Values worked out from the tasks, events, reports and settings, kept
+/// until `Ready::invalidate`.
+#[derive(Default)]
+struct Derived {
+    /// Every version of a report, newest first.
+    versions: HashMap<ReportKey, Vec<Report>>,
+    /// Whether a report has nothing to work from, and its facts' digest.
+    facts: HashMap<ReportKey, (bool, String)>,
+    recommended_today: Option<Vec<day::Recommended>>,
+    logs: Option<Vec<LogLine>>,
+}
+
+/// Whether a report needs (re)generating, from its `versions` (newest
+/// first) and the `digest` of its facts now. Judged against the newest
+/// `Ready` version: an edited one never needs it; otherwise it does when
+/// the newest attempt failed, or the ready version was built from other
+/// facts, an older plan prompt, or before the prompt was changed
+/// (`prompt_changed`). With no versions, it does unless `empty`.
+fn report_stale(
+    kind: ReportKind,
+    versions: &[Report],
+    digest: &str,
+    prompt_changed: Option<Timestamp>,
+    empty: bool,
+) -> bool {
+    let ready = versions.iter().find(|r| r.status == ReportStatus::Ready);
+    match ready {
+        Some(r) if r.edited_md.is_some() => false,
+        _ if versions
+            .first()
+            .is_some_and(|r| r.status == ReportStatus::Failed) =>
+        {
+            true
+        }
+        Some(r) => {
+            // Recommendations made with an older prompt (the weekly list
+            // before it became today's top three) are redone.
+            (kind == ReportKind::Plan && r.prompt_version < report::PROMPT_VERSION)
+                || r.digest_json != digest
+                || prompt_changed.is_some_and(|at| r.created_at < at)
+        }
+        None => !empty,
+    }
+}
+
+/// After `failures` failed attempts in a row, the last at `last_attempt`,
+/// whether to wait before the next: `RETRY_AFTER_MINUTES`, doubling with
+/// each further failure, up to `RETRY_MAX_MINUTES`.
+fn backoff_active(failures: u32, last_attempt: Option<Timestamp>, now: Timestamp) -> bool {
+    if failures == 0 {
+        return false;
+    }
+    let wait = RETRY_AFTER_MINUTES
+        .saturating_mul(1 << (failures - 1).min(10))
+        .min(RETRY_MAX_MINUTES);
+    last_attempt.is_some_and(|t| now.duration_since(t) < SignedDuration::from_mins(wait))
+}
+
+/// Whether a generation stays when the user browses: one the schedule
+/// started, or one for the current week or the shown one.
+fn keep_generation(scheduled: bool, week_start: Date, current: Date, shown: Date) -> bool {
+    scheduled || week_start == current || week_start == shown
+}
+
+/// The selected date after the day changed from `last_today` to `today`:
+/// a user who was on the old today moves to the new one; one who had gone
+/// elsewhere stays.
+fn follow_today(selected: Date, last_today: Date, today: Date) -> Date {
+    if selected == last_today {
+        today
+    } else {
+        selected
+    }
+}
+
+/// What undo of an edit writes back: `before`, but with the task's
+/// `current` position when `keep_position` (a later drag stays).
+fn reverted(before: &CoreTask, current: Option<&CoreTask>, keep_position: bool) -> CoreTask {
+    let mut task = before.clone();
+    if keep_position && let Some(current) = current {
+        task.position = current.position;
+    }
+    task
 }
 
 /// Checks for Ollama on this machine (`Message::OllamaDetected`).
@@ -2354,32 +2702,113 @@ mod tests {
     use super::*;
     use keyboard::Modifiers;
 
-    /// Undoing "uncheck" must not move the completion into this week, and
-    /// leaves no extra history (correctness review, finding 1).
+    use fortnight_core::domain::NewReport;
+    use jiff::civil::date;
+
+    fn report(status: ReportStatus, digest: &str) -> Report {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .insert_report(NewReport {
+                kind: ReportKind::Summary,
+                week_start: date(2026, 11, 16),
+                status,
+                digest_json: digest.into(),
+                content_md: (status == ReportStatus::Ready).then(|| "text".into()),
+                model: Some("m".into()),
+                endpoint_host: None,
+                prompt_version: report::PROMPT_VERSION,
+                error: (status == ReportStatus::Failed).then(|| "down".into()),
+            })
+            .unwrap()
+    }
+
     #[test]
-    fn undo_restores_the_task_and_drops_the_change_events() {
+    fn a_failed_newest_attempt_is_stale_unless_edited() {
+        use ReportStatus::{Failed, Ready};
+        let stale = |versions: &[Report], empty| {
+            report_stale(ReportKind::Summary, versions, "d", None, empty)
+        };
+        // Nothing yet: wanted unless there is nothing to work from.
+        assert!(stale(&[], false));
+        assert!(!stale(&[], true));
+        // Ready from the same facts: up to date; other facts: stale.
+        assert!(!stale(&[report(Ready, "d")], false));
+        assert!(stale(&[report(Ready, "old")], false));
+        // A failure from the same facts doesn't count as up to date,
+        // with or without an earlier ready version.
+        assert!(stale(&[report(Failed, "d")], false));
+        assert!(stale(&[report(Failed, "d"), report(Ready, "d")], false));
+        // An older failure under a newer ready version is history.
+        assert!(!stale(&[report(Ready, "d"), report(Failed, "d")], false));
+        // An edited ready version still wins.
+        let mut edited = report(Ready, "old");
+        edited.edited_md = Some("mine".into());
+        assert!(!stale(&[report(Failed, "d"), edited], false));
+        // A prompt change after the ready version makes it stale.
+        let r = report(Ready, "d");
+        let later = r.created_at + SignedDuration::from_secs(1);
+        assert!(report_stale(
+            ReportKind::Summary,
+            &[r],
+            "d",
+            Some(later),
+            false
+        ));
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_a_day() {
+        let t0 = Timestamp::UNIX_EPOCH;
+        let after = |mins| t0 + SignedDuration::from_mins(mins);
+        assert!(!backoff_active(0, Some(t0), t0));
+        assert!(backoff_active(1, Some(t0), after(9)));
+        assert!(!backoff_active(1, Some(t0), after(10)));
+        assert!(backoff_active(2, Some(t0), after(19)));
+        assert!(!backoff_active(2, Some(t0), after(20)));
+        assert!(backoff_active(30, Some(t0), after(24 * 60 - 1)));
+        assert!(!backoff_active(30, Some(t0), after(24 * 60)));
+        // No attempt on record: nothing to wait for.
+        assert!(!backoff_active(3, None, t0));
+    }
+
+    #[test]
+    fn browsing_keeps_only_scheduled_current_and_shown_weeks() {
+        let (past, current, shown) = (date(2026, 11, 2), date(2026, 11, 16), date(2026, 11, 9));
+        assert!(!keep_generation(false, past, current, shown));
+        assert!(keep_generation(true, past, current, shown));
+        assert!(keep_generation(false, current, current, shown));
+        assert!(keep_generation(false, shown, current, shown));
+    }
+
+    #[test]
+    fn the_selection_follows_a_new_day_only_from_the_old_today() {
+        let (old, new) = (date(2026, 11, 17), date(2026, 11, 18));
+        assert_eq!(follow_today(old, old, new), new);
+        let elsewhere = date(2026, 11, 25);
+        assert_eq!(follow_today(elsewhere, old, new), elsewhere);
+    }
+
+    #[test]
+    fn undoing_an_edit_keeps_a_later_drag() {
         use fortnight_core::domain::NewTask;
         let store = SqliteStore::open_in_memory().unwrap();
-        let t = store
+        let mut before = store
             .add_task(NewTask {
                 title: "t".into(),
                 ..NewTask::default()
             })
             .unwrap();
-        store.set_status(t.id, TaskStatus::Done).unwrap();
-        let before = store.get_task(t.id).unwrap().unwrap();
-        let events_before = store.task_events(t.id).unwrap();
-        let last_event = events_before.iter().map(|e| e.id).max().unwrap();
-
-        store.set_status(t.id, TaskStatus::Todo).unwrap();
-        store.add_log(Some(t.id), "kept").unwrap();
-        restore_snapshot(&store, &before, last_event).unwrap();
-
-        let after = store.get_task(t.id).unwrap().unwrap();
-        assert_eq!(after, before);
-        let events_after = store.task_events(t.id).unwrap();
-        assert_eq!(events_after.len(), events_before.len() + 1);
-        assert!(events_after.last().unwrap().kind.is_log());
+        before.position = 1.0;
+        let mut now = before.clone();
+        now.title = "edited".into();
+        now.position = 5.0;
+        let undone = reverted(&before, Some(&now), true);
+        assert_eq!(undone.title, "t");
+        assert_eq!(undone.position, 5.0);
+        // A move's undo puts the old position back.
+        assert_eq!(reverted(&before, Some(&now), false).position, 1.0);
+        // The task is gone: nothing to keep.
+        assert_eq!(reverted(&before, None, true).position, 1.0);
     }
 
     #[test]

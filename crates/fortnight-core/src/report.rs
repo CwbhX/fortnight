@@ -3,8 +3,9 @@
 //!
 //! Flow: tasks + events → facts (pure, deterministic) → prompt
 //! (`prepare_summary`, `prepare_plan`) → the caller streams it to a client →
-//! `finish` → NewReport. The app and the CLI store the NewReport; this
-//! module never touches the store or the network.
+//! `finish`, which stores the report row and prunes old versions. Apart
+//! from that one call this module never touches the store, and it never
+//! touches the network.
 //! The LLM never does arithmetic: days until due, weekdays, overdue flags,
 //! hours, loads and capacities are computed here and handed over as facts.
 //! PLAN.md 4.1, 7.3, 7.4 and 7.5.
@@ -44,8 +45,9 @@ pub use summary::{
     summary_facts_markdown, summary_is_empty, summary_prompt,
 };
 
-use crate::domain::{NewReport, ReportKind, ReportStatus, WeekRef};
+use crate::domain::{NewReport, Report, ReportKind, ReportStatus, WeekRef};
 use crate::llm::{ChatRequest, ChatResponse, LlmError};
+use crate::store::{Store, StoreResult};
 use serde::Serialize;
 
 /// Bump when a prompt changes.
@@ -76,16 +78,38 @@ fn facts_json<T: Serialize>(facts: &T) -> String {
         .replace('>', "\\u003e")
 }
 
-/// The report row for a finished call: `Ready` with the reply, or `Failed`
-/// with the error message. `requested_model` is recorded when the call
-/// failed (there is no reported model then). The app and the CLI stream the
-/// reply (`chat_stream`) and call this with the result.
+/// How many versions of one report (kind and week) `finish` keeps; older
+/// ones are pruned (`Store::prune_reports`, which never deletes an edited
+/// version or the newest `Ready` one).
+pub const KEEP_VERSIONS: usize = 20;
+
+/// Stores the report row for a finished call and prunes old versions of
+/// that report to `KEEP_VERSIONS`; returns the stored row. The row is
+/// `Ready` with the reply, or `Failed` with the error message.
+/// `requested_model` is recorded when the call failed (there is no
+/// reported model then). The app and the CLI stream the reply
+/// (`chat_stream`) and call this with the result.
 ///
-/// A `Plan` reply that `parse_recommendations` can't read is still `Ready`:
-/// the app counts failures from the call's result, not the row, so a
-/// `Failed` row there would be retried without backoff once failed rows
-/// count as stale.
+/// A `Plan` reply that `parse_recommendations` can't read is stored
+/// `Failed` (malformed), so it is retried like any failure. Callers count
+/// failures from the stored row's status, not from `result`. Only the
+/// insert can fail this: a failed prune is ignored.
 pub fn finish(
+    store: &dyn Store,
+    prepared: Prepared,
+    result: Result<ChatResponse, LlmError>,
+    requested_model: &str,
+    endpoint_host: Option<String>,
+) -> StoreResult<Report> {
+    let new = report_row(prepared, result, requested_model, endpoint_host);
+    let (kind, week_start) = (new.kind, new.week_start);
+    let report = store.insert_report(new)?;
+    let _ = store.prune_reports(kind, week_start, KEEP_VERSIONS);
+    Ok(report)
+}
+
+/// The row `finish` stores.
+fn report_row(
     prepared: Prepared,
     result: Result<ChatResponse, LlmError>,
     requested_model: &str,
@@ -97,6 +121,12 @@ pub fn finish(
         digest_json,
         request: _,
     } = prepared;
+    let result = match result {
+        Ok(resp) if kind == ReportKind::Plan && parse_recommendations(&resp.text).is_none() => Err(
+            LlmError::Malformed("the reply holds no recommended tasks".into()),
+        ),
+        other => other,
+    };
     let (status, content_md, model, error) = match result {
         Ok(resp) => (ReportStatus::Ready, Some(resp.text), resp.model, None),
         Err(e) => (
@@ -336,7 +366,7 @@ mod tests {
             text: "## Highlights\n- Shipped login.".into(),
             model: "reported".into(),
         };
-        let r = finish(p, Ok(reply), "requested", Some("localhost:11434".into()));
+        let r = report_row(p, Ok(reply), "requested", Some("localhost:11434".into()));
         assert_eq!(r.status, ReportStatus::Ready);
         assert_eq!(r.kind, ReportKind::Summary);
         assert_eq!(r.week_start, date(2026, 11, 9));
@@ -361,7 +391,7 @@ mod tests {
             plan_today(),
             &Settings::default(),
         );
-        let r = finish(p, Err(LlmError::Unauthorized), "requested", None);
+        let r = report_row(p, Err(LlmError::Unauthorized), "requested", None);
         assert_eq!(r.status, ReportStatus::Failed);
         assert_eq!(r.kind, ReportKind::Plan);
         assert_eq!(r.content_md, None);
@@ -372,5 +402,62 @@ mod tests {
             Some("the endpoint rejected the API key")
         );
         assert_eq!(r.prompt_version, PROMPT_VERSION);
+    }
+
+    fn plan_prepared() -> Prepared {
+        prepare_plan(
+            &plan_fixture(),
+            &plan_events(),
+            plan_week(),
+            plan_today(),
+            &Settings::default(),
+        )
+    }
+
+    fn reply(text: &str) -> Result<ChatResponse, LlmError> {
+        Ok(ChatResponse {
+            text: text.into(),
+            model: "m".into(),
+        })
+    }
+
+    #[test]
+    fn an_unreadable_plan_reply_is_failed() {
+        let r = report_row(plan_prepared(), reply("Do the dishes first."), "m", None);
+        assert_eq!(r.status, ReportStatus::Failed);
+        assert_eq!(r.content_md, None);
+        assert!(r.error.unwrap().contains("malformed"));
+
+        let ok = r#"{"tasks":[{"id":1,"reason":"due today"}]}"#;
+        let r = report_row(plan_prepared(), reply(ok), "m", None);
+        assert_eq!(r.status, ReportStatus::Ready);
+        assert_eq!(r.content_md.as_deref(), Some(ok));
+    }
+
+    #[test]
+    fn finish_stores_and_prunes_old_versions() {
+        use crate::sqlite::SqliteStore;
+        let store = SqliteStore::open_in_memory().unwrap();
+        let week = plan_week();
+        for i in 0..KEEP_VERSIONS + 5 {
+            let text = format!(r#"{{"tasks":[{{"id":{i}}}]}}"#);
+            let r = finish(&store, plan_prepared(), reply(&text), "m", None).unwrap();
+            assert_eq!(r.status, ReportStatus::Ready);
+        }
+        let versions = store.list_reports(ReportKind::Plan, week.start).unwrap();
+        assert_eq!(versions.len(), KEEP_VERSIONS);
+        // The newest are kept.
+        let newest = format!(r#"{{"tasks":[{{"id":{}}}]}}"#, KEEP_VERSIONS + 4);
+        assert_eq!(versions[0].content_md.as_deref(), Some(newest.as_str()));
+
+        let r = finish(&store, plan_prepared(), reply("prose"), "m", None).unwrap();
+        assert_eq!(r.status, ReportStatus::Failed);
+        assert_eq!(
+            store
+                .list_reports(ReportKind::Plan, week.start)
+                .unwrap()
+                .len(),
+            KEEP_VERSIONS
+        );
     }
 }

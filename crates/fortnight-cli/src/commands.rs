@@ -396,8 +396,13 @@ pub async fn generate_report(
         (None, None) => Err(LlmError::Truncated),
     };
     let (requested_model, host) = route.answered_by();
-    let new = report::finish(prepared, result, &requested_model, host);
-    Ok(store.insert_report(new)?)
+    Ok(report::finish(
+        store,
+        prepared,
+        result,
+        &requested_model,
+        host,
+    )?)
 }
 
 /// `summary` and `plan`. `make_client` is only called when the model is
