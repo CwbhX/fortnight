@@ -5,9 +5,15 @@
 //! Layout (PLAN.md 4.2): the top bar (tabs, period navigation over one
 //! shared selected date, lock, gear, quick-add), then the active tab. Settings
 //! opens over the current view.
+//!
+//! Also here: undo (Ctrl/Cmd+Z: the last add, status change, edit or
+//! delete), the keyboard shortcuts of PLAN.md 4.4, OS notifications for
+//! scheduled reports, Lock, the data-folder lock file, the export dialog and
+//! the model list.
 
 use fortnight_app::theme;
 use fortnight_app::top_bar::{self, LockIcon, Tab};
+use fortnight_app::views::NavKey;
 use fortnight_app::views::day::{self, DayData, DayView, LogLine};
 use fortnight_app::views::month::{self, MonthData, MonthView};
 use fortnight_app::views::report_panel::{self, ReportPanelData, ReportSlot};
@@ -15,11 +21,12 @@ use fortnight_app::views::settings::{
     self, KeyState, SettingsData, SettingsView, UnlockAction, UnlockMessage, UnlockView,
 };
 use fortnight_app::views::week::{self, WeekData, WeekView};
-use fortnight_core::datadir;
+use fortnight_core::datadir::{self, DataLock};
 use fortnight_core::domain::{
-    Event, LlmSettings, ReportKey, ReportKind, Settings, Task as CoreTask, TaskId, TaskStatus,
-    WeekRef,
+    DeletedTask, Event, LlmSettings, ReportId, ReportKey, ReportKind, Settings, Task as CoreTask,
+    TaskId, TaskStatus, WeekRef,
 };
+use fortnight_core::export::{self, ExportFormat};
 use fortnight_core::llm::{
     self, ChatEvent, ChatRequest, ChatResponse, LlmClient, LlmConfig, LlmError,
 };
@@ -28,7 +35,7 @@ use fortnight_core::sqlite::SqliteStore;
 use fortnight_core::store::Store;
 use fortnight_core::vault::{self, VaultError};
 use fortnight_core::week::{due_reports, week_containing, week_label};
-use iced::keyboard::{self, Key};
+use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{
     button, center, column, container, mouse_area, opaque, operation, row, stack, text,
 };
@@ -77,6 +84,13 @@ enum Message {
     /// The stream for this report ended (after `Done` or an error, or early).
     StreamEnded(ReportKey),
     Tested(Result<String, String>),
+    Models(Result<Vec<String>, String>),
+    /// A keyboard shortcut (applied only where it makes sense).
+    Key(Shortcut),
+    Undo,
+    /// The export dialog finished: the path written, `None` if cancelled.
+    Exported(Result<Option<PathBuf>, String>),
+    DismissNotice,
     Unlocked(Result<SecretString, VaultError>),
     KeySaved(Result<SecretString, VaultError>),
     PasswordChanged(Result<(), VaultError>),
@@ -85,13 +99,47 @@ enum Message {
     Shot(iced::window::Screenshot),
 }
 
+/// A key pressed while no widget captured it (PLAN.md 4.4). Single keys
+/// arrive only when no text field has focus, because a focused text input
+/// captures them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shortcut {
+    Tab(Tab),
+    Prev,
+    Next,
+    Today,
+    FocusQuickAdd,
+    Settings,
+    Undo,
+    Escape,
+    Nav(NavKey),
+}
+
 /// A report being generated: what was asked, and the text so far.
 struct Generation {
     prepared: Prepared,
     text: String,
     requested_model: String,
     host: Option<String>,
+    /// Started by the schedule (not a button): notify when it is ready.
+    scheduled: bool,
 }
+
+/// One change that Ctrl/Cmd+Z can take back.
+#[derive(Debug, Clone)]
+enum Undo {
+    /// A task was added: delete it.
+    Added(TaskId),
+    /// A task's status changed from this one.
+    Status(TaskId, TaskStatus),
+    /// A task was edited; this is how it was before.
+    Edited(Box<CoreTask>),
+    /// A task was deleted; put it back with its history.
+    Deleted(Box<DeletedTask>),
+}
+
+/// How many changes undo remembers.
+const UNDO_DEPTH: usize = 30;
 
 /// Everything that needs the open database.
 struct Ready {
@@ -129,6 +177,13 @@ struct Ready {
     models: Option<Result<Vec<String>, String>>,
     listing_models: bool,
     error: Option<String>,
+    /// A short, dismissable message (undo hint, export result, lock warning).
+    notice: Option<String>,
+    undo: Vec<Undo>,
+    /// A report became ready while the Week tab wasn't showing.
+    week_badge: bool,
+    /// Held for the app's lifetime; removes the lock file when dropped.
+    _lock: Option<DataLock>,
 }
 
 enum App {
@@ -175,16 +230,7 @@ impl App {
                 let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
                     return None;
                 };
-                if !modifiers.command() {
-                    return None;
-                }
-                match key.as_ref() {
-                    Key::Character("1") => Some(Message::Top(top_bar::Message::Tab(Tab::Today))),
-                    Key::Character("2") => Some(Message::Top(top_bar::Message::Tab(Tab::Week))),
-                    Key::Character("3") => Some(Message::Top(top_bar::Message::Tab(Tab::Month))),
-                    Key::Character(",") => Some(Message::Top(top_bar::Message::Settings)),
-                    _ => None,
-                }
+                shortcut_for(key.as_ref(), modifiers).map(Message::Key)
             }),
         ])
     }
@@ -246,6 +292,29 @@ impl Ready {
             _ => (Tab::Today, false),
         };
         let unlocking = key_exists && std::env::var_os("FORTNIGHT_SKIP_UNLOCK").is_none();
+        // One writer at a time (PLAN.md 3.5): warn, never refuse.
+        let (lock, notice) = match datadir::acquire_lock(&dir) {
+            Ok((lock, None)) => (Some(lock), None),
+            Ok((lock, Some(previous))) => {
+                let since = previous
+                    .since
+                    .to_zoned_datetime(tz.clone())
+                    .strftime("%a %-d %b %H:%M")
+                    .to_string();
+                (
+                    Some(lock),
+                    Some(format!(
+                        "This data folder was already open on {} (since {since}), or Fortnight \
+                         didn't close cleanly. Don't use one folder on two machines at once.",
+                        previous.host
+                    )),
+                )
+            }
+            Err(e) => (
+                None,
+                Some(format!("Could not take the data folder lock: {e}")),
+            ),
+        };
         Ok(Ready {
             store,
             data_dir: dir,
@@ -273,6 +342,10 @@ impl Ready {
             models: None,
             listing_models: false,
             error: None,
+            notice,
+            undo: Vec::new(),
+            week_badge: false,
+            _lock: lock,
         })
     }
 
@@ -505,7 +578,7 @@ impl Ready {
     }
 
     /// Starts streaming a report unless one is already in flight.
-    fn generate(&mut self, kind: ReportKind, week: WeekRef) -> Task<Message> {
+    fn generate(&mut self, kind: ReportKind, week: WeekRef, scheduled: bool) -> Task<Message> {
         let key = ReportKey {
             kind,
             week_start: week.start,
@@ -529,6 +602,7 @@ impl Ready {
                 text: String::new(),
                 requested_model: client.model().to_string(),
                 host,
+                scheduled,
             },
         );
         self.last_attempt.insert(key, Timestamp::now());
@@ -537,14 +611,80 @@ impl Ready {
     }
 
     /// Stores the finished (or failed) report and forgets the generation.
-    fn finish(&mut self, key: ReportKey, result: Result<ChatResponse, LlmError>) {
+    /// A scheduled report that became ready sets the Week badge and, if
+    /// enabled, shows an OS notification.
+    fn finish(&mut self, key: ReportKey, result: Result<ChatResponse, LlmError>) -> Task<Message> {
         let Some(g) = self.generating.remove(&key) else {
-            return;
+            return Task::none();
         };
+        let ok = result.is_ok();
         let new = report::finish(g.prepared, result, &g.requested_model, g.host);
         if let Err(e) = self.store.insert_report(new) {
             self.error = Some(e.to_string());
+            return Task::none();
         }
+        if !(ok && g.scheduled) {
+            return Task::none();
+        }
+        if self.tab != Tab::Week {
+            self.week_badge = true;
+        }
+        if !self.settings.notifications {
+            return Task::none();
+        }
+        let body = match key.kind {
+            ReportKind::Summary => "Your weekly summary is ready.",
+            ReportKind::Plan => "Advice for your week is ready.",
+        };
+        // Best-effort (PLAN.md 3.5): failures are ignored.
+        Task::perform(
+            async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    notify_rust::Notification::new()
+                        .summary("Fortnight")
+                        .body(body)
+                        .show()
+                        .map(|_| ())
+                })
+                .await;
+            },
+            |()| Message::DismissNotice,
+        )
+        .discard()
+    }
+
+    /// Remembers a change for undo.
+    fn remember(&mut self, undo: Undo) {
+        self.undo.push(undo);
+        if self.undo.len() > UNDO_DEPTH {
+            self.undo.remove(0);
+        }
+    }
+
+    /// Takes back the last change (Ctrl/Cmd+Z).
+    fn undo(&mut self) {
+        let Some(last) = self.undo.pop() else {
+            self.notice = Some("Nothing to undo.".into());
+            return;
+        };
+        let (result, what) = match last {
+            Undo::Added(id) => (
+                self.store.delete_task(id).map(|_| ()),
+                "Removed the new task.",
+            ),
+            Undo::Status(id, before) => (self.store.set_status(id, before), "Status restored."),
+            Undo::Edited(before) => (self.store.update_task(&before), "Edit undone."),
+            Undo::Deleted(deleted) => (self.store.restore_task(&deleted), "Task restored."),
+        };
+        match result {
+            Ok(()) => self.notice = Some(what.into()),
+            Err(e) => self.error = Some(format!("Could not undo: {e}")),
+        }
+        self.reload_tasks();
+    }
+
+    fn task(&self, id: TaskId) -> Option<&CoreTask> {
+        self.tasks.iter().find(|t| t.id == id)
     }
 
     /// The schedule: generates whatever is due (PLAN.md section 8). Runs at
@@ -573,7 +713,7 @@ impl Ready {
                 now.duration_since(*t) < SignedDuration::from_mins(RETRY_AFTER_MINUTES)
             });
             if !recently_tried {
-                tasks.push(self.generate(job.kind, job.week));
+                tasks.push(self.generate(job.kind, job.week, true));
             }
         }
         Task::batch(tasks)
@@ -631,33 +771,55 @@ impl Ready {
                 UnlockAction::Unlock(password) => self.unlock(password),
             },
             Message::Tick => self.run_due(),
-            Message::Stream(key, item) => {
-                match item {
-                    Ok(ChatEvent::Delta(d)) => {
-                        if let Some(g) = self.generating.get_mut(&key) {
-                            g.text.push_str(&d);
-                        }
+            Message::Stream(key, item) => match item {
+                Ok(ChatEvent::Delta(d)) if self.generating.contains_key(&key) => {
+                    if let Some(g) = self.generating.get_mut(&key) {
+                        g.text.push_str(&d);
                     }
-                    Ok(ChatEvent::Done { model }) => {
-                        let text = self
-                            .generating
-                            .get(&key)
-                            .map(|g| g.text.clone())
-                            .unwrap_or_default();
-                        self.finish(key, Ok(ChatResponse { text, model }));
-                    }
-                    Err(e) => self.finish(key, Err(e)),
+                    Task::none()
                 }
-                Task::none()
-            }
+                Ok(ChatEvent::Done { model }) => {
+                    let text = self
+                        .generating
+                        .get(&key)
+                        .map(|g| g.text.clone())
+                        .unwrap_or_default();
+                    self.finish(key, Ok(ChatResponse { text, model }))
+                }
+                Err(e) => self.finish(key, Err(e)),
+                Ok(ChatEvent::Delta(_)) => Task::none(),
+            },
             Message::StreamEnded(key) => {
                 // Only still generating if the stream ended without `Done`.
-                self.finish(key, Err(LlmError::Truncated));
-                Task::none()
+                self.finish(key, Err(LlmError::Truncated))
             }
             Message::Tested(result) => {
                 self.testing = false;
                 self.test_result = Some(result);
+                Task::none()
+            }
+            Message::Models(result) => {
+                self.listing_models = false;
+                self.models = Some(result);
+                Task::none()
+            }
+            Message::Key(shortcut) => self.shortcut(shortcut),
+            Message::Undo => {
+                self.undo();
+                Task::none()
+            }
+            Message::Exported(result) => {
+                match result {
+                    Ok(Some(path)) => {
+                        self.notice = Some(format!("Exported to {}", path.display()));
+                    }
+                    Ok(None) => {}
+                    Err(e) => self.error = Some(format!("Export failed: {e}")),
+                }
+                Task::none()
+            }
+            Message::DismissNotice => {
+                self.notice = None;
                 Task::none()
             }
             Message::Unlocked(result) => {
@@ -706,6 +868,9 @@ impl Ready {
         match message {
             top_bar::Message::Tab(tab) => {
                 self.tab = tab;
+                if tab == Tab::Week {
+                    self.week_badge = false;
+                }
                 Task::none()
             }
             top_bar::Message::Prev => {
@@ -743,7 +908,10 @@ impl Ready {
                     top_bar::quick_add_task(&self.quick_add, self.tab, self.selected, today)
                 {
                     match self.store.add_task(new) {
-                        Ok(_) => self.quick_add.clear(),
+                        Ok(task) => {
+                            self.quick_add.clear();
+                            self.remember(Undo::Added(task.id));
+                        }
                         Err(e) => self.error = Some(e.to_string()),
                     }
                     self.reload_tasks();
@@ -754,8 +922,14 @@ impl Ready {
     }
 
     fn set_status(&mut self, id: TaskId, status: TaskStatus) {
-        if let Err(e) = self.store.set_status(id, status) {
-            self.error = Some(e.to_string());
+        let before = self.task(id).map(|t| t.status);
+        match self.store.set_status(id, status) {
+            Ok(()) => {
+                if let Some(before) = before.filter(|b| *b != status) {
+                    self.remember(Undo::Status(id, before));
+                }
+            }
+            Err(e) => self.error = Some(e.to_string()),
         }
         self.reload_tasks();
     }
@@ -763,9 +937,34 @@ impl Ready {
     fn day_action(&mut self, action: day::Action) -> Task<Message> {
         let result = match action {
             day::Action::None => return Task::none(),
-            day::Action::SetStatus(id, status) => self.store.set_status(id, status),
-            day::Action::Update(task) => self.store.update_task(&task),
-            day::Action::Delete(id) => self.store.delete_task(id).map(|_| ()),
+            day::Action::SetStatus(id, status) => {
+                self.set_status(id, status);
+                return Task::none();
+            }
+            day::Action::Update(task) => {
+                let before = self.task(task.id).cloned();
+                let r = self.store.update_task(&task);
+                if let (Ok(()), Some(before)) = (&r, before) {
+                    self.remember(Undo::Edited(Box::new(before)));
+                }
+                r
+            }
+            day::Action::Delete(id) => match self.store.delete_task(id) {
+                Ok(deleted) => {
+                    self.notice = Some(format!(
+                        "Deleted “{}”. Press {}Z to undo.",
+                        deleted.task.title,
+                        if cfg!(target_os = "macos") {
+                            "⌘"
+                        } else {
+                            "Ctrl+"
+                        }
+                    ));
+                    self.remember(Undo::Deleted(Box::new(deleted)));
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            },
             day::Action::AddLog { task_id, text } => self.store.add_log(task_id, &text).map(|_| ()),
             day::Action::DeleteLog(id) => self.store.delete_log(id),
         };
@@ -779,7 +978,7 @@ impl Ready {
     fn panel_action(&mut self, action: report_panel::Action) -> Task<Message> {
         match action {
             report_panel::Action::None => Task::none(),
-            report_panel::Action::Generate(kind, week) => self.generate(kind, week),
+            report_panel::Action::Generate(kind, week) => self.generate(kind, week, false),
             report_panel::Action::SaveEdit(id, text) => {
                 if let Err(e) = self.store.set_report_edit(id, Some(&text)) {
                     self.error = Some(e.to_string());
@@ -787,9 +986,89 @@ impl Ready {
                 Task::none()
             }
             report_panel::Action::Copy(text) => iced::clipboard::write(text),
-            report_panel::Action::Export(_id, _format) => {
-                // STEP 1: the export dialog is wired in step 3.
+            report_panel::Action::Export(id, format) => self.export_report(id, format),
+        }
+    }
+
+    /// Asks where to save one report version, then writes it.
+    fn export_report(&mut self, id: ReportId, format: ExportFormat) -> Task<Message> {
+        let report = match self.store.all_reports() {
+            Ok(all) => all.into_iter().find(|r| r.id == id),
+            Err(e) => {
+                self.error = Some(e.to_string());
+                return Task::none();
+            }
+        };
+        let Some(report) = report else {
+            self.error = Some(format!("Report {id} not found."));
+            return Task::none();
+        };
+        let name = export::report_file_name(format, &report);
+        let content = export::export_report(format, &report);
+        Task::perform(
+            async move {
+                let Some(file) = rfd::AsyncFileDialog::new()
+                    .set_title("Export report")
+                    .set_file_name(&name)
+                    .add_filter(format.extension(), &[format.extension()])
+                    .save_file()
+                    .await
+                else {
+                    return Ok(None);
+                };
+                let path = file.path().to_path_buf();
+                std::fs::write(&path, content)
+                    .map(|()| Some(path))
+                    .map_err(|e| e.to_string())
+            },
+            Message::Exported,
+        )
+    }
+
+    /// Applies a keyboard shortcut. While the unlock prompt or Settings is
+    /// showing, only the keys that close or toggle them apply.
+    fn shortcut(&mut self, shortcut: Shortcut) -> Task<Message> {
+        if self.unlocking {
+            return Task::none();
+        }
+        if self.settings_open {
+            return match shortcut {
+                Shortcut::Escape | Shortcut::Settings => {
+                    self.settings_open = false;
+                    Task::none()
+                }
+                _ => Task::none(),
+            };
+        }
+        match shortcut {
+            Shortcut::Tab(tab) => self.top_bar(top_bar::Message::Tab(tab)),
+            Shortcut::Prev => self.top_bar(top_bar::Message::Prev),
+            Shortcut::Next => self.top_bar(top_bar::Message::Next),
+            Shortcut::Today => self.top_bar(top_bar::Message::Today),
+            Shortcut::FocusQuickAdd => operation::focus(top_bar::QUICK_ADD_ID),
+            Shortcut::Settings => {
+                self.settings_open = true;
                 Task::none()
+            }
+            Shortcut::Undo => {
+                self.undo();
+                Task::none()
+            }
+            Shortcut::Escape => {
+                if self.tab == Tab::Today {
+                    let action = self.day_view.on_key(NavKey::Close);
+                    self.day_action(action)
+                } else {
+                    Task::none()
+                }
+            }
+            Shortcut::Nav(key) => {
+                if self.tab == Tab::Today {
+                    let action = self.day_view.on_key(key);
+                    self.day_action(action)
+                } else {
+                    Task::none()
+                }
             }
         }
     }
@@ -834,10 +1113,20 @@ impl Ready {
                     Task::none()
                 }
             },
-            settings::Action::ListModels(_llm) => {
-                // STEP 1: wired in step 3.
-                Task::none()
-            }
+            settings::Action::ListModels(llm) => match self.client_for(&llm) {
+                Ok((client, _)) => {
+                    self.listing_models = true;
+                    self.models = None;
+                    Task::perform(
+                        async move { client.list_models().await.map_err(|e| e.to_string()) },
+                        Message::Models,
+                    )
+                }
+                Err(e) => {
+                    self.models = Some(Err(e));
+                    Task::none()
+                }
+            },
             settings::Action::SetKey { api_key, password } => {
                 self.key_message = None;
                 blocking(
@@ -895,7 +1184,7 @@ impl Ready {
                 KeyState::Locked => Some(LockIcon::Locked),
                 KeyState::Unlocked => Some(LockIcon::Unlocked),
             },
-            week_badge: false,
+            week_badge: self.week_badge,
         })
         .map(Message::Top);
 
@@ -906,6 +1195,24 @@ impl Ready {
         };
 
         let mut main = column![bar, container(content).width(Fill).height(Fill)];
+        if let Some(n) = &self.notice {
+            let mut bar = row![text(n.as_str()).width(Fill).style(theme::muted)]
+                .spacing(theme::SPACING)
+                .align_y(iced::Center);
+            if n.starts_with("Deleted") && !self.undo.is_empty() {
+                bar = bar.push(
+                    button(text("Undo"))
+                        .style(theme::secondary_button)
+                        .on_press(Message::Undo),
+                );
+            }
+            bar = bar.push(
+                button(text("Dismiss"))
+                    .style(theme::text_button)
+                    .on_press(Message::DismissNotice),
+            );
+            main = main.push(container(bar).padding([8.0, theme::SPACING * 1.5]));
+        }
         if let Some(e) = &self.error {
             main = main.push(
                 container(
@@ -943,6 +1250,39 @@ impl Ready {
             )
         ]
         .into()
+    }
+}
+
+/// The shortcut for a key press that no widget captured (PLAN.md 4.4).
+fn shortcut_for(key: Key<&str>, modifiers: keyboard::Modifiers) -> Option<Shortcut> {
+    if modifiers.command() {
+        return match key {
+            Key::Character("1") => Some(Shortcut::Tab(Tab::Today)),
+            Key::Character("2") => Some(Shortcut::Tab(Tab::Week)),
+            Key::Character("3") => Some(Shortcut::Tab(Tab::Month)),
+            Key::Character(",") => Some(Shortcut::Settings),
+            Key::Character("n") => Some(Shortcut::FocusQuickAdd),
+            Key::Character("z") if !modifiers.shift() => Some(Shortcut::Undo),
+            _ => None,
+        };
+    }
+    if modifiers.alt() || modifiers.control() || modifiers.logo() {
+        return None;
+    }
+    match key {
+        Key::Character("1") => Some(Shortcut::Tab(Tab::Today)),
+        Key::Character("2") => Some(Shortcut::Tab(Tab::Week)),
+        Key::Character("3") => Some(Shortcut::Tab(Tab::Month)),
+        Key::Character("t" | "T") => Some(Shortcut::Today),
+        Key::Character("n" | "N") => Some(Shortcut::FocusQuickAdd),
+        Key::Named(Named::ArrowLeft) => Some(Shortcut::Prev),
+        Key::Named(Named::ArrowRight) => Some(Shortcut::Next),
+        Key::Named(Named::ArrowUp) => Some(Shortcut::Nav(NavKey::Up)),
+        Key::Named(Named::ArrowDown) => Some(Shortcut::Nav(NavKey::Down)),
+        Key::Named(Named::Space) => Some(Shortcut::Nav(NavKey::Toggle)),
+        Key::Named(Named::Enter) => Some(Shortcut::Nav(NavKey::Open)),
+        Key::Named(Named::Escape) => Some(Shortcut::Escape),
+        _ => None,
     }
 }
 
@@ -1006,4 +1346,45 @@ fn save_screenshot(shot: iced::window::Screenshot) -> Task<Message> {
         }
     }
     iced::exit()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keyboard::Modifiers;
+
+    #[test]
+    fn shortcuts_follow_plan_4_4() {
+        let none = Modifiers::empty();
+        let cmd = Modifiers::COMMAND;
+        let key = |k: Key<&'static str>, m| shortcut_for(k, m);
+        assert_eq!(
+            key(Key::Character("2"), none),
+            Some(Shortcut::Tab(Tab::Week))
+        );
+        assert_eq!(
+            key(Key::Character("3"), cmd),
+            Some(Shortcut::Tab(Tab::Month))
+        );
+        assert_eq!(key(Key::Character("t"), none), Some(Shortcut::Today));
+        assert_eq!(key(Key::Character("n"), cmd), Some(Shortcut::FocusQuickAdd));
+        assert_eq!(key(Key::Character(","), cmd), Some(Shortcut::Settings));
+        assert_eq!(key(Key::Character("z"), cmd), Some(Shortcut::Undo));
+        assert_eq!(key(Key::Character("z"), cmd | Modifiers::SHIFT), None);
+        assert_eq!(
+            key(Key::Named(Named::ArrowLeft), none),
+            Some(Shortcut::Prev)
+        );
+        assert_eq!(
+            key(Key::Named(Named::Space), none),
+            Some(Shortcut::Nav(NavKey::Toggle))
+        );
+        assert_eq!(
+            key(Key::Named(Named::Enter), none),
+            Some(Shortcut::Nav(NavKey::Open))
+        );
+        assert_eq!(key(Key::Named(Named::Escape), none), Some(Shortcut::Escape));
+        assert_eq!(key(Key::Character("x"), none), None);
+        assert_eq!(key(Key::Character("t"), Modifiers::ALT), None);
+    }
 }
