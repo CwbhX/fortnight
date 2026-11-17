@@ -1,9 +1,11 @@
-//! The Tasks view: quick-add bar and sections. Owner: agent E.
+//! The Today tab: one day's tasks. Owner: agent J (round 2).
 //!
-//! Layout: a quick-add bar with a syntax hint, then the open tasks grouped
-//! into Overdue, Today, Next 7 days, Later and No date (empty groups are
-//! hidden), then a "Done" toggle that reveals completed tasks. Clicking a
-//! row expands it in place into an edit form; one row at a time.
+//! STEP 1 PLACEHOLDER: round 1's Tasks view moved here unchanged in looks
+//! (sections Overdue, Today, Next 7 days, Later, No date, Done) behind the
+//! round 2 contract (`DayData`, `Action`, `on_key`). The quick-add bar now
+//! lives in the top bar (`main.rs`). Agent J rebuilds it per PLAN.md 4.2.
+//!
+//! Clicking a row expands it in place into an edit form; one row at a time.
 //!
 //! The logic lives in small pure functions ([`section_of`], [`due_label`],
 //! [`sorted_section`], [`EditForm::apply`]) so it can be tested without a
@@ -12,23 +14,21 @@
 //! Skipped for the prototype: keyboard navigation, undo, drag ordering,
 //! delete confirmation, strikethrough on done tasks (iced text has none).
 
-use fortnight_core::domain::{NewTask, Task, TaskId};
+use fortnight_core::domain::{EventId, Task, TaskId, TaskStatus};
 use fortnight_core::parse;
 use iced::widget::{
-    Column, Space, button, checkbox, column, container, operation, row, scrollable, text,
-    text_editor, text_input,
+    Column, Space, button, checkbox, column, container, row, scrollable, text, text_editor,
+    text_input,
 };
 use iced::{Center, Element, Fill};
+use jiff::Timestamp;
 use jiff::civil::Date;
 
+use super::NavKey;
 use crate::theme;
-
-const QUICK_ADD_ID: &str = "tasks-quick-add";
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    QuickAddChanged(String),
-    QuickAddSubmitted,
     /// The checkbox on a row.
     Toggle(TaskId, bool),
     /// A click on a collapsed row: expand it (or collapse it if open).
@@ -44,20 +44,57 @@ pub enum Message {
     ToggleShowDone,
 }
 
-/// What `main.rs` must do. Contract: do not change without the orchestrator.
+/// What `main.rs` must do. FROZEN contract (round 2).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     None,
-    Add(NewTask),
-    SetDone(TaskId, bool),
-    /// Save the editable fields (title, notes, project, due_on).
+    /// Set a task's status (checkbox: `Done`/`Todo`; also `Doing` for in
+    /// progress and `Dropped` for won't do).
+    SetStatus(TaskId, TaskStatus),
+    /// Save the editable fields (title, notes, project, due_on, planned_for,
+    /// estimate_minutes, priority, private). `main.rs` records it for undo.
     Update(Task),
+    /// Delete a task. `main.rs` keeps it for undo (Ctrl/Cmd+Z).
     Delete(TaskId),
+    /// Add a log line: attached to a task, or free-standing (`None`).
+    /// `main.rs` stamps it with the current time.
+    AddLog {
+        task_id: Option<TaskId>,
+        text: String,
+    },
+    DeleteLog(EventId),
+}
+
+/// A log line, as the view needs it. FROZEN contract (round 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogLine {
+    pub id: EventId,
+    /// `None` for a free-standing log line.
+    pub task_id: Option<TaskId>,
+    pub at: Timestamp,
+    /// The local date of `at`.
+    pub date: Date,
+    pub text: String,
+}
+
+/// Everything the view shows, supplied by `main.rs`. FROZEN contract
+/// (round 2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DayData {
+    /// The day shown (the shared selected date).
+    pub day: Date,
+    /// The local date today. Overdue is relative to this.
+    pub today: Date,
+    /// Every task, done or not. The view picks what to show using
+    /// `Task::day()` and `Task::is_overdue(today)`.
+    pub tasks: Vec<Task>,
+    /// Every log line, oldest first.
+    pub logs: Vec<LogLine>,
 }
 
 #[derive(Debug, Default)]
-pub struct TasksView {
-    quick_add: String,
+pub struct DayView {
+    data: Option<DayData>,
     show_done: bool,
     editing: Option<EditForm>,
 }
@@ -229,40 +266,49 @@ impl EditForm {
     }
 }
 
-impl TasksView {
+impl DayView {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// A task that focuses the quick-add input (called at launch).
-    pub fn focus_quick_add() -> iced::Task<Message> {
-        operation::focus(QUICK_ADD_ID)
+    /// Replaces what the view shows. `main.rs` calls this after EVERY
+    /// message (and on the minute tick), so it must be cheap: if `data`
+    /// equals what the view already has, return early. It must keep
+    /// in-progress UI state (an open edit form, typed text, the selection)
+    /// unless the thing it belongs to is gone.
+    pub fn load(&mut self, data: DayData) {
+        if self.data.as_ref() == Some(&data) {
+            return;
+        }
+        if let Some(form) = &self.editing
+            && !data.tasks.iter().any(|t| t.id == form.id)
+        {
+            self.editing = None;
+        }
+        self.data = Some(data);
     }
 
-    /// `tasks` is every task (done or not); `today` is the local date.
-    pub fn update(&mut self, message: Message, tasks: &[Task], today: Date) -> Action {
+    /// A key pressed while no text field has focus (PLAN.md 4.4: ↑ ↓ move
+    /// the selection, Space toggles done, Enter expands, Escape closes).
+    pub fn on_key(&mut self, key: NavKey) -> Action {
+        let _ = key; // STUB: agent J implements keyboard navigation.
+        Action::None
+    }
+
+    pub fn update(&mut self, message: Message) -> Action {
+        let Some(data) = &self.data else {
+            return Action::None;
+        };
+        let (tasks, today) = (data.tasks.as_slice(), data.today);
         match message {
-            Message::QuickAddChanged(s) => {
-                self.quick_add = s;
-                Action::None
-            }
-            Message::QuickAddSubmitted => {
-                if self.quick_add.trim().is_empty() {
-                    return Action::None;
-                }
-                let parsed = parse::parse_quick_add(&self.quick_add, today);
-                if parsed.title.trim().is_empty() {
-                    return Action::None;
-                }
-                self.quick_add.clear();
-                Action::Add(NewTask {
-                    title: parsed.title,
-                    notes: String::new(),
-                    project: parsed.project,
-                    due_on: parsed.due_on,
-                })
-            }
-            Message::Toggle(id, done) => Action::SetDone(id, done),
+            Message::Toggle(id, done) => Action::SetStatus(
+                id,
+                if done {
+                    TaskStatus::Done
+                } else {
+                    TaskStatus::Todo
+                },
+            ),
             Message::Expand(id) => {
                 if self.editing.as_ref().is_some_and(|f| f.id == id) {
                     self.editing = None;
@@ -323,27 +369,12 @@ impl TasksView {
         Action::None
     }
 
-    pub fn view<'a>(&'a self, tasks: &'a [Task], today: Date) -> Element<'a, Message> {
-        let quick_add = text_input(
-            "Add a task — e.g. Write Q4 report fri #work",
-            &self.quick_add,
-        )
-        .id(QUICK_ADD_ID)
-        .on_input(Message::QuickAddChanged)
-        .on_submit(Message::QuickAddSubmitted)
-        .padding([10, 14])
-        .size(theme::TEXT_BODY + 1.0)
-        .style(theme::input);
-
-        let hint = text("Dates: today · tomorrow · fri · nov 20 · +3d     Project: #name")
-            .size(theme::TEXT_SMALL)
-            .style(theme::muted);
-
-        let mut content = column![
-            theme::title("Tasks"),
-            column![quick_add, hint].spacing(theme::SPACING / 2.0),
-        ]
-        .spacing(theme::SPACING * 1.5);
+    pub fn view(&self) -> Element<'_, Message> {
+        let Some(data) = &self.data else {
+            return text("Loading…").style(theme::muted).into();
+        };
+        let (tasks, today) = (data.tasks.as_slice(), data.today);
+        let mut content = Column::new().spacing(theme::SPACING * 1.5);
 
         let mut any_open = false;
         for section in Section::OPEN {
@@ -356,7 +387,7 @@ impl TasksView {
         }
         if !any_open {
             content = content.push(
-                text("Nothing to do. Add something above.")
+                text("Nothing to do. Add a task in the bar above.")
                     .size(theme::TEXT_BODY)
                     .style(theme::muted),
             );
@@ -547,7 +578,6 @@ fn edit_card<'a>(task: &'a Task, form: &'a EditForm) -> Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fortnight_core::domain::TaskStatus;
     use jiff::Timestamp;
     use jiff::civil::date;
 
@@ -568,7 +598,19 @@ mod tests {
             created_at: Timestamp::UNIX_EPOCH,
             updated_at: Timestamp::UNIX_EPOCH,
             completed_at: None,
+            ..Task::default()
         }
+    }
+
+    fn loaded(tasks: Vec<Task>) -> DayView {
+        let mut view = DayView::new();
+        view.load(DayData {
+            day: today(),
+            today: today(),
+            tasks,
+            logs: Vec::new(),
+        });
+        view
     }
 
     fn no_parse(_: &str, _: Date) -> Option<Date> {
@@ -638,39 +680,33 @@ mod tests {
 
     #[test]
     fn toggling_returns_set_done() {
-        let tasks = vec![task(7, "t", None)];
-        let mut view = TasksView::new();
+        let mut view = loaded(vec![task(7, "t", None)]);
         assert_eq!(
-            view.update(Message::Toggle(7, true), &tasks, today()),
-            Action::SetDone(7, true)
+            view.update(Message::Toggle(7, true)),
+            Action::SetStatus(7, TaskStatus::Done)
         );
         assert_eq!(
-            view.update(Message::Toggle(7, false), &tasks, today()),
-            Action::SetDone(7, false)
+            view.update(Message::Toggle(7, false)),
+            Action::SetStatus(7, TaskStatus::Todo)
         );
     }
 
     #[test]
     fn delete_returns_delete_and_closes() {
-        let tasks = vec![task(3, "t", None)];
-        let mut view = TasksView::new();
-        view.update(Message::Expand(3), &tasks, today());
+        let mut view = loaded(vec![task(3, "t", None)]);
+        view.update(Message::Expand(3));
         assert!(view.editing.is_some());
-        assert_eq!(
-            view.update(Message::Delete, &tasks, today()),
-            Action::Delete(3)
-        );
+        assert_eq!(view.update(Message::Delete), Action::Delete(3));
         assert!(view.editing.is_none());
     }
 
     #[test]
     fn save_with_unchanged_due_returns_update_with_new_title() {
         // The due field is untouched, so parse_date (a stub here) is not called.
-        let tasks = vec![task(4, "Old", Some(date(2026, 11, 20)))];
-        let mut view = TasksView::new();
-        view.update(Message::Expand(4), &tasks, today());
-        view.update(Message::EditTitle("New title".into()), &tasks, today());
-        let Action::Update(updated) = view.update(Message::Save, &tasks, today()) else {
+        let mut view = loaded(vec![task(4, "Old", Some(date(2026, 11, 20)))]);
+        view.update(Message::Expand(4));
+        view.update(Message::EditTitle("New title".into()));
+        let Action::Update(updated) = view.update(Message::Save) else {
             panic!("expected Update");
         };
         assert_eq!(updated.title, "New title");
@@ -680,27 +716,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_quick_add_returns_none() {
-        let mut view = TasksView::new();
-        assert_eq!(
-            view.update(Message::QuickAddSubmitted, &[], today()),
-            Action::None
-        );
-        view.update(Message::QuickAddChanged("   ".into()), &[], today());
-        assert_eq!(
-            view.update(Message::QuickAddSubmitted, &[], today()),
-            Action::None
-        );
-    }
-
-    #[test]
     fn only_one_row_expanded_and_click_again_collapses() {
-        let tasks = vec![task(1, "a", None), task(2, "b", None)];
-        let mut view = TasksView::new();
-        view.update(Message::Expand(1), &tasks, today());
-        view.update(Message::Expand(2), &tasks, today());
+        let mut view = loaded(vec![task(1, "a", None), task(2, "b", None)]);
+        view.update(Message::Expand(1));
+        view.update(Message::Expand(2));
         assert_eq!(view.editing.as_ref().map(|f| f.id), Some(2));
-        view.update(Message::Expand(2), &tasks, today());
+        view.update(Message::Expand(2));
         assert!(view.editing.is_none());
     }
 

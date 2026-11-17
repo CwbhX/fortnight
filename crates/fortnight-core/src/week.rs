@@ -31,6 +31,36 @@ pub fn week_label(week: WeekRef) -> String {
     format!("Week {number} · {range}")
 }
 
+/// The first day of `date`'s month.
+pub fn month_start(date: Date) -> Date {
+    date.first_of_month()
+}
+
+/// The weeks a month calendar shows: from the week containing the 1st to
+/// the week containing the last day (four to six weeks).
+pub fn month_weeks(date: Date, week_start: Weekday) -> Vec<WeekRef> {
+    let first = date.first_of_month();
+    let last = date.last_of_month();
+    let mut week = week_containing(first, week_start);
+    let mut out = Vec::new();
+    while week.start <= last {
+        out.push(week);
+        week = week.next();
+    }
+    out
+}
+
+/// The same day `months` months away, clamped to the month's length
+/// (Jan 31 + 1 month = Feb 28).
+pub fn add_months(date: Date, months: i32) -> Date {
+    date.checked_add(months.months()).unwrap_or(date)
+}
+
+/// "November 2026".
+pub fn month_label(date: Date) -> String {
+    date.strftime("%B %Y").to_string()
+}
+
 fn month_abbr(d: Date) -> &'static str {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -102,6 +132,35 @@ fn latest_due_week(
     } else {
         // A week earlier, so its due moment has certainly passed.
         Some(week.prev())
+    }
+}
+
+#[cfg(test)]
+mod month_tests {
+    use super::*;
+    use jiff::civil::date;
+
+    #[test]
+    fn month_weeks_cover_the_month() {
+        // November 2026: Sun 1st to Mon 30th; Monday weeks Oct 26 .. Nov 30.
+        let w = month_weeks(date(2026, 11, 17), Weekday::Monday);
+        assert_eq!(w.first().unwrap().start, date(2026, 10, 26));
+        assert_eq!(w.last().unwrap().start, date(2026, 11, 30));
+        assert_eq!(w.len(), 6);
+        // February 2027 starts on a Monday: exactly four weeks.
+        assert_eq!(month_weeks(date(2027, 2, 10), Weekday::Monday).len(), 4);
+        // Sunday-start weeks.
+        let s = month_weeks(date(2026, 11, 1), Weekday::Sunday);
+        assert_eq!(s[0].start, date(2026, 11, 1));
+        assert_eq!(s.len(), 5);
+    }
+
+    #[test]
+    fn add_months_clamps() {
+        assert_eq!(add_months(date(2026, 1, 31), 1), date(2026, 2, 28));
+        assert_eq!(add_months(date(2026, 3, 15), -1), date(2026, 2, 15));
+        assert_eq!(month_label(date(2026, 11, 16)), "November 2026");
+        assert_eq!(month_start(date(2026, 11, 16)), date(2026, 11, 1));
     }
 }
 

@@ -1,4 +1,9 @@
-//! Settings view and the unlock prompt. Owner: agent I.
+//! Settings overlay and the unlock prompt. Owner: agent M (round 2; was
+//! agent I).
+//!
+//! STEP 1: round 1's view behind the round 2 contract. The protocol, focus
+//! hours and notification switch are carried through Save unchanged but not
+//! yet editable; the model list and Close are not wired. Agent M adds them.
 //!
 //! Settings is one scrollable column under a fixed header that holds the
 //! title and the single Save button (it saves the whole form: endpoint,
@@ -14,7 +19,7 @@
 //! capacity hours, a "working…" indicator while Argon2 runs, selectable
 //! data-folder text (iced 0.14 has no selectable text widget).
 
-use fortnight_core::domain::{LlmSettings, Schedule, Settings};
+use fortnight_core::domain::{LlmSettings, Protocol, Schedule, Settings};
 use fortnight_core::vault::MIN_PASSWORD_LEN;
 use iced::widget::{
     Space, button, checkbox, column, container, operation, pick_list, row, scrollable, text,
@@ -90,10 +95,15 @@ pub enum Message {
     CancelKey,
 }
 
-/// What `main.rs` must do. Contract: do not change without the orchestrator.
+/// What `main.rs` must do. FROZEN contract (round 2).
 #[derive(Debug, Clone)]
 pub enum Action {
     None,
+    /// Close the overlay (the close button or Escape).
+    Close,
+    /// Fetch the endpoint's model list using these endpoint fields and the
+    /// current key. The result arrives as `SettingsData::models`.
+    ListModels(LlmSettings),
     /// Save these settings (endpoint, schedule, summary instructions).
     Save(Settings),
     /// Send a test request using these endpoint fields and the current key.
@@ -125,6 +135,11 @@ pub struct SettingsData {
     /// shown near the key controls. `Err` for failures such as a wrong
     /// password.
     pub key_message: Option<Result<String, String>>,
+    /// Result of the last model-list fetch: `Ok(ids)` (may be empty when the
+    /// endpoint can't say; fall back to free text) or `Err(message)`.
+    pub models: Option<Result<Vec<String>, String>>,
+    /// A model-list fetch is in flight.
+    pub listing_models: bool,
 }
 
 /// Monday to Sunday.
@@ -199,6 +214,9 @@ struct Form {
     /// Indexed Monday = 0.
     working_days: [bool; 7],
     summary_instructions: String,
+    protocol: Protocol,
+    focus_minutes_per_day: u32,
+    notifications: bool,
 }
 
 impl Default for Form {
@@ -220,6 +238,9 @@ impl Form {
             plan_time: format_time(sched.plan_time),
             working_days: WEEK.map(|d| sched.working_days.contains(&d)),
             summary_instructions: s.summary_instructions.clone(),
+            protocol: s.llm.protocol,
+            focus_minutes_per_day: s.focus_minutes_per_day,
+            notifications: s.notifications,
         }
     }
 
@@ -241,11 +262,14 @@ impl Form {
                     .collect(),
             },
             summary_instructions: self.summary_instructions.trim().to_string(),
+            focus_minutes_per_day: self.focus_minutes_per_day,
+            notifications: self.notifications,
         })
     }
 
     fn llm(&self) -> LlmSettings {
         LlmSettings {
+            protocol: self.protocol,
             base_url: self.base_url.trim().to_string(),
             model: self.model.trim().to_string(),
         }
@@ -1128,6 +1152,8 @@ mod tests {
             test_result: None,
             testing: false,
             key_message: None,
+            models: None,
+            listing_models: false,
         }
     }
 

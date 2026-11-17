@@ -1,4 +1,5 @@
-//! Theme and shared styles. Owner: agent E.
+//! Theme and shared styles. Owner: orchestrator (round 2; was agent E).
+//! Views may add private style helpers in their own files.
 //!
 //! Follows the system light/dark theme. One accent colour, `#ea580c`, used
 //! sparingly (primary buttons, focus rings, checked boxes). Generous spacing,
@@ -53,10 +54,24 @@
 //!
 //! - [`input`]: `text_input(..).style(theme::input)`; soft fill, accent focus.
 //! - [`editor`]: the same look for `text_editor`.
+//!
+//! # Round 2: navigation and calendar
+//!
+//! - [`top_bar`]: the slim bar across the top (container).
+//! - [`tab_bar`] + [`tab_button`]: the Today | Week | Month segmented control.
+//! - [`icon`] + [`icon_button`]: SVG icons ([`Icon`]) in square, fill-on-hover
+//!   buttons (lock, gear, chevrons).
+//! - [`day_column`]: a column of the Week tab; `is_today` adds the accent ring.
+//! - [`calendar_cell`]: a Month grid cell, by [`Cell`] (today, weekend,
+//!   outside the month).
+//! - [`load_bar`]: a `progress_bar` style; accent, or red when over capacity.
+//! - [`backdrop`] + [`overlay_panel`]: the dimmed layer and the panel of an
+//!   overlay (Settings).
+//! - [`priority_color`]: the colour of a priority marker.
 
 use iced::border::{self, Border};
 use iced::theme::{Palette, palette};
-use iced::widget::{button, container, text, text_editor, text_input};
+use iced::widget::{button, container, progress_bar, svg, text, text_editor, text_input};
 use iced::{Background, Color, Padding, Theme, color};
 
 /// The accent colour, `#ea580c`.
@@ -358,6 +373,221 @@ pub fn editor(theme: &Theme, status: text_editor::Status) -> text_editor::Style 
         value: s.value,
         selection: s.selection,
     }
+}
+
+// ------------------------------------------------------- round 2: navigation
+
+/// The slim bar across the top: the background, a hairline below.
+pub fn top_bar(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(theme.palette().background.into()),
+        border: Border {
+            width: 0.0,
+            ..Border::default()
+        },
+        shadow: iced::Shadow {
+            color: tint(theme, 0.12),
+            offset: iced::Vector::new(0.0, 1.0),
+            blur_radius: 0.0,
+        },
+        ..container::Style::default()
+    }
+}
+
+/// The pill that holds the tab buttons.
+pub fn tab_bar(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(field_fill(theme).into()),
+        border: border::rounded(RADIUS),
+        ..container::Style::default()
+    }
+}
+
+/// A tab inside [`tab_bar`]: the active one is a raised background-coloured
+/// pill with accent text; the others are muted text.
+pub fn tab_button(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let p = theme.palette();
+        if active {
+            button::Style {
+                background: Some(p.background.into()),
+                text_color: ACCENT,
+                border: border::rounded(RADIUS - 2.0),
+                shadow: iced::Shadow {
+                    color: Color::BLACK.scale_alpha(0.12),
+                    offset: iced::Vector::new(0.0, 1.0),
+                    blur_radius: 2.0,
+                },
+                ..button::Style::default()
+            }
+        } else {
+            let text_color = match status {
+                button::Status::Hovered | button::Status::Pressed => p.text,
+                _ => muted_color(theme),
+            };
+            button::Style {
+                text_color,
+                border: border::rounded(RADIUS - 2.0),
+                ..button::Style::default()
+            }
+        }
+    }
+}
+
+/// Padding for a [`tab_button`].
+pub fn tab_padding() -> Padding {
+    Padding::from([5, 14])
+}
+
+/// The icons the app draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Icon {
+    Gear,
+    Lock,
+    Unlock,
+    ChevronLeft,
+    ChevronRight,
+    Close,
+}
+
+impl Icon {
+    fn bytes(self) -> &'static [u8] {
+        match self {
+            Icon::Gear => include_bytes!("../../../assets/icons/gear.svg"),
+            Icon::Lock => include_bytes!("../../../assets/icons/lock.svg"),
+            Icon::Unlock => include_bytes!("../../../assets/icons/unlock.svg"),
+            Icon::ChevronLeft => include_bytes!("../../../assets/icons/chevron-left.svg"),
+            Icon::ChevronRight => include_bytes!("../../../assets/icons/chevron-right.svg"),
+            Icon::Close => include_bytes!("../../../assets/icons/close.svg"),
+        }
+    }
+}
+
+/// An 18 px icon in the muted text colour (full text colour on hover when
+/// inside a button).
+pub fn icon<'a>(which: Icon) -> svg::Svg<'a, Theme> {
+    svg(svg::Handle::from_memory(which.bytes()))
+        .width(18)
+        .height(18)
+        .style(|theme: &Theme, status| svg::Style {
+            color: Some(match status {
+                svg::Status::Hovered => theme.palette().text,
+                svg::Status::Idle => muted_color(theme),
+            }),
+        })
+}
+
+/// A square icon button: no fill until hovered.
+pub fn icon_button(theme: &Theme, status: button::Status) -> button::Style {
+    let base = button_base(None, muted_color(theme));
+    match status {
+        button::Status::Active => base,
+        button::Status::Hovered | button::Status::Pressed => button::Style {
+            text_color: theme.palette().text,
+            ..base.with_background(soft_fill(theme))
+        },
+        button::Status::Disabled => faded(base),
+    }
+}
+
+/// Padding for an [`icon_button`].
+pub const ICON_PADDING: f32 = 6.0;
+
+// --------------------------------------------------------- round 2: calendar
+
+/// A column of the Week tab. Today's column has an accent ring.
+pub fn day_column(is_today: bool) -> impl Fn(&Theme) -> container::Style {
+    move |theme| container::Style {
+        background: Some(soft_fill(theme).into()),
+        border: Border {
+            radius: RADIUS.into(),
+            width: if is_today { 1.5 } else { 0.0 },
+            color: ACCENT,
+        },
+        ..container::Style::default()
+    }
+}
+
+/// What kind of day a Month cell is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Cell {
+    pub today: bool,
+    /// A non-working day: muted.
+    pub weekend: bool,
+    /// A day of the previous or next month: faded.
+    pub outside: bool,
+}
+
+/// A Month grid cell: a soft fill (weaker on weekends, none outside the
+/// month), with an accent ring on today.
+pub fn calendar_cell(cell: Cell) -> impl Fn(&Theme) -> container::Style {
+    move |theme| {
+        let fill = if cell.outside {
+            None
+        } else if cell.weekend {
+            Some(tint(theme, 0.02))
+        } else {
+            Some(soft_fill(theme))
+        };
+        container::Style {
+            background: fill.map(Background::Color),
+            text_color: (cell.outside || cell.weekend).then(|| muted_color(theme)),
+            border: Border {
+                radius: (RADIUS - 2.0).into(),
+                width: if cell.today { 1.5 } else { 0.0 },
+                color: ACCENT,
+            },
+            ..container::Style::default()
+        }
+    }
+}
+
+/// A load bar (`progress_bar(0.0..=1.0, load).style(theme::load_bar(over))`):
+/// accent fill, red when the day is over capacity.
+pub fn load_bar(over: bool) -> impl Fn(&Theme) -> progress_bar::Style {
+    move |theme| progress_bar::Style {
+        background: Background::Color(field_fill(theme)),
+        bar: Background::Color(if over { danger_color(theme) } else { ACCENT }),
+        border: border::rounded(999),
+    }
+}
+
+/// The dimmed layer behind an overlay.
+pub fn backdrop(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Color::BLACK.scale_alpha(0.45).into()),
+        ..container::Style::default()
+    }
+}
+
+/// The panel of an overlay: the plain background, rounded, with a shadow.
+pub fn overlay_panel(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(theme.palette().background.into()),
+        border: border::rounded(RADIUS * 1.5),
+        shadow: iced::Shadow {
+            color: Color::BLACK.scale_alpha(0.3),
+            offset: iced::Vector::new(0.0, 8.0),
+            blur_radius: 24.0,
+        },
+        ..container::Style::default()
+    }
+}
+
+/// The colour of a priority marker: accent for 1, red for 2 and above,
+/// `None` for normal priority.
+pub fn priority_color(theme: &Theme, priority: u8) -> Option<Color> {
+    match priority {
+        0 => None,
+        1 => Some(ACCENT),
+        _ => Some(danger_color(theme)),
+    }
+}
+
+/// A due/overdue/muted label colour helper for text: `theme::danger` when
+/// `overdue`, otherwise `theme::muted`.
+pub fn due_style(overdue: bool) -> fn(&Theme) -> text::Style {
+    if overdue { danger } else { muted }
 }
 
 #[cfg(test)]

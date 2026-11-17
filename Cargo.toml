@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/fortnight-core", "crates/fortnight-app"]
+members = ["crates/fortnight-core", "crates/fortnight-app", "crates/fortnight-cli", "xtask"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,7 +11,7 @@ license = "MIT"
 fortnight-core = { path = "crates/fortnight-core" }
 iced = { version = "0.14", features = ["tokio", "markdown", "svg", "advanced"] }
 rusqlite = { version = "0.43", features = ["bundled"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 jiff = { version = "1.0", features = ["serde"] }
 argon2 = "0.6"
@@ -23,6 +23,12 @@ serde_json = "1"
 thiserror = "2"
 insta = { version = "1.49", features = ["json"] }
 wiremock = "0.6"
+clap = { version = "4", features = ["derive"] }
+rpassword = "7.5"
+eventsource-stream = "0.2"
+futures-util = "0.3"
+notify-rust = "4.19"
+rfd = "0.18"
 
 [profile.release]
 strip = true

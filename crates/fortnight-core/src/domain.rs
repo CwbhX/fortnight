@@ -1,4 +1,4 @@
-//! Domain types shared by every module. FROZEN after step 1: do not edit.
+//! Domain types shared by every module. FROZEN (round 2): do not edit.
 //!
 //! Conventions:
 //! - Deadlines are civil dates (`jiff::civil::Date`), stored as `YYYY-MM-DD`.
@@ -11,12 +11,14 @@ use serde::{Deserialize, Serialize};
 
 pub type TaskId = i64;
 pub type ReportId = i64;
+pub type EventId = i64;
 
-/// Task status. The prototype only uses `Todo` and `Done`; the other two
-/// exist so the schema matches PLAN.md section 6 without a later migration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Task status. `Doing` is "in progress"; `Dropped` is "won't do" (kept for
+/// the history, shown dimmed like `Done`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskStatus {
+    #[default]
     Todo,
     Doing,
     Done,
@@ -50,14 +52,29 @@ impl TaskStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Priority: 0 is normal; 1 to 3 are increasingly high (`!`, `!!`, `!!!`
+/// in the quick-add bar).
+pub type Priority = u8;
+
+/// The highest priority the app uses.
+pub const MAX_PRIORITY: Priority = 3;
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,
     pub title: String,
     pub notes: String,
     pub status: TaskStatus,
     pub project: Option<String>,
+    /// The deadline.
     pub due_on: Option<Date>,
+    /// The day you intend to do it, if different from the deadline.
+    pub planned_for: Option<Date>,
+    /// Estimated effort in minutes (`~2h` → 120).
+    pub estimate_minutes: Option<u32>,
+    pub priority: Priority,
+    /// Never sent to the LLM: excluded from every digest.
+    pub private: bool,
     /// Manual ordering; lower sorts first.
     pub position: f64,
     pub created_at: Timestamp,
@@ -70,6 +87,18 @@ impl Task {
     pub fn is_done(&self) -> bool {
         self.status == TaskStatus::Done
     }
+
+    /// The day the task is shown on in the Today, Week and Month tabs:
+    /// `planned_for` if set, otherwise `due_on`. `None` means "No date"
+    /// (the inbox). Every view and the load maths use this one rule.
+    pub fn day(&self) -> Option<Date> {
+        self.planned_for.or(self.due_on)
+    }
+
+    /// Open and its deadline is before `today`.
+    pub fn is_overdue(&self, today: Date) -> bool {
+        self.status.is_open() && self.due_on.is_some_and(|d| d < today)
+    }
 }
 
 /// What the store needs to create a task. Status starts as `Todo`.
@@ -79,6 +108,92 @@ pub struct NewTask {
     pub notes: String,
     pub project: Option<String>,
     pub due_on: Option<Date>,
+    pub planned_for: Option<Date>,
+    pub estimate_minutes: Option<u32>,
+    pub priority: Priority,
+    pub private: bool,
+}
+
+// ------------------------------------------------------------------ history
+
+/// What happened, with its data. Stored as `events.kind` (`as_str`) plus
+/// `events.payload` (this value as JSON, internally tagged by `kind`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EventKind {
+    /// The task was created.
+    Created {
+        title: String,
+    },
+    StatusChanged {
+        from: TaskStatus,
+        to: TaskStatus,
+    },
+    /// The deadline moved (or was set or cleared).
+    DueChanged {
+        from: Option<Date>,
+        to: Option<Date>,
+    },
+    PlannedChanged {
+        from: Option<Date>,
+        to: Option<Date>,
+    },
+    /// Other fields changed. `fields` names them, from: `title`, `notes`,
+    /// `project`, `estimate`, `priority`, `private`.
+    Edited {
+        fields: Vec<String>,
+    },
+    /// A log line: work that isn't a checkbox. Attached to a task, or
+    /// free-standing (`Event::task_id` is `None`).
+    Log {
+        text: String,
+    },
+}
+
+impl EventKind {
+    /// The string stored in the `events.kind` column.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EventKind::Created { .. } => "created",
+            EventKind::StatusChanged { .. } => "status_changed",
+            EventKind::DueChanged { .. } => "due_changed",
+            EventKind::PlannedChanged { .. } => "planned_changed",
+            EventKind::Edited { .. } => "edited",
+            EventKind::Log { .. } => "log",
+        }
+    }
+
+    pub fn is_log(&self) -> bool {
+        matches!(self, EventKind::Log { .. })
+    }
+}
+
+/// One entry in the append-only history (PLAN.md section 6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Event {
+    pub id: EventId,
+    /// `None` for free-standing log lines.
+    pub task_id: Option<TaskId>,
+    pub at: Timestamp,
+    pub kind: EventKind,
+}
+
+impl Event {
+    /// The text of a log line; `None` for other kinds.
+    pub fn log_text(&self) -> Option<&str> {
+        match &self.kind {
+            EventKind::Log { text } => Some(text),
+            _ => None,
+        }
+    }
+}
+
+/// A deleted task and its history, as returned by `Store::delete_task`, so
+/// that undo can put both back exactly (same ids).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeletedTask {
+    pub task: Task,
+    pub events: Vec<Event>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -227,13 +342,70 @@ impl WeekRef {
     }
 }
 
+/// The wire format of the endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    /// OpenAI-compatible Chat Completions: `POST {base_url}/chat/completions`.
+    #[default]
+    OpenAi,
+    /// Anthropic Messages: `POST {base_url}/v1/messages`.
+    Anthropic,
+}
+
+impl Protocol {
+    pub const ALL: [Protocol; 2] = [Protocol::OpenAi, Protocol::Anthropic];
+
+    /// `openai` or `anthropic` (settings JSON, `FORTNIGHT_LLM_PROTOCOL`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Protocol::OpenAi => "openai",
+            Protocol::Anthropic => "anthropic",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "openai" => Some(Protocol::OpenAi),
+            "anthropic" => Some(Protocol::Anthropic),
+            _ => None,
+        }
+    }
+
+    /// For the UI: "OpenAI-compatible" or "Anthropic".
+    pub fn label(self) -> &'static str {
+        match self {
+            Protocol::OpenAi => "OpenAI-compatible",
+            Protocol::Anthropic => "Anthropic",
+        }
+    }
+
+    /// A placeholder base URL for the settings form.
+    pub fn example_base_url(self) -> &'static str {
+        match self {
+            Protocol::OpenAi => "http://localhost:11434/v1",
+            Protocol::Anthropic => "https://api.anthropic.com",
+        }
+    }
+}
+
+impl std::fmt::Display for Protocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 /// LLM endpoint settings. The API key is not here: it lives encrypted in the
 /// key file (see `vault`) and in memory once unlocked.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LlmSettings {
+    /// Missing in round 1 data, which therefore loads as `OpenAi`.
+    pub protocol: Protocol,
     /// e.g. `https://api.openai.com/v1` or `http://localhost:11434/v1`.
-    /// The client appends `/chat/completions`.
+    /// The OpenAI client appends `/chat/completions`; the Anthropic client
+    /// appends `/v1/messages` (tolerating a base URL that already ends in
+    /// `/v1`).
     pub base_url: String,
     pub model: String,
 }
@@ -313,15 +485,36 @@ impl Default for Schedule {
 }
 
 /// All user settings. Stored in the `settings` table so they travel with
-/// the data folder. Missing fields fall back to defaults.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// the data folder. Missing fields fall back to defaults, so round 1
+/// settings load unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub llm: LlmSettings,
     pub schedule: Schedule,
     /// Free-form extra instructions for the summary (length, tone, ...).
     pub summary_instructions: String,
+    /// Focus time available on each working day, in minutes (shown as
+    /// hours). The capacity the load bars and plan facts compare against.
+    pub focus_minutes_per_day: u32,
+    /// Show an OS notification when a report is ready.
+    pub notifications: bool,
 }
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            llm: LlmSettings::default(),
+            schedule: Schedule::default(),
+            summary_instructions: String::new(),
+            focus_minutes_per_day: DEFAULT_FOCUS_MINUTES,
+            notifications: false,
+        }
+    }
+}
+
+/// Six focus hours per working day.
+pub const DEFAULT_FOCUS_MINUTES: u32 = 6 * 60;
 
 #[cfg(test)]
 mod tests {
@@ -333,6 +526,47 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), s);
         assert_eq!(serde_json::from_str::<Settings>("{}").unwrap(), s);
+    }
+
+    #[test]
+    fn round1_settings_json_loads_with_new_defaults() {
+        let json = r#"{"llm":{"base_url":"http://x/v1","model":"m"},"schedule":{"week_start":1,"summary_day":5,"summary_time":"16:00:00","plan_day":1,"plan_time":"08:00:00","working_days":[1,2,3,4]},"summary_instructions":"short"}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.llm.protocol, Protocol::OpenAi);
+        assert_eq!(s.llm.base_url, "http://x/v1");
+        assert_eq!(s.schedule.working_days.len(), 4);
+        assert_eq!(s.summary_instructions, "short");
+        assert_eq!(s.focus_minutes_per_day, DEFAULT_FOCUS_MINUTES);
+        assert!(!s.notifications);
+    }
+
+    #[test]
+    fn event_kind_json_is_tagged() {
+        let k = EventKind::StatusChanged {
+            from: TaskStatus::Todo,
+            to: TaskStatus::Done,
+        };
+        let json = serde_json::to_string(&k).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"status_changed","from":"todo","to":"done"}"#
+        );
+        assert_eq!(serde_json::from_str::<EventKind>(&json).unwrap(), k);
+        assert_eq!(k.as_str(), "status_changed");
+    }
+
+    #[test]
+    fn task_day_prefers_planned() {
+        let mut t = Task {
+            due_on: Some(jiff::civil::date(2026, 11, 20)),
+            ..Task::default()
+        };
+        assert_eq!(t.day(), t.due_on);
+        t.planned_for = Some(jiff::civil::date(2026, 11, 18));
+        assert_eq!(t.day(), t.planned_for);
+        assert!(t.is_overdue(jiff::civil::date(2026, 11, 21)));
+        t.status = TaskStatus::Done;
+        assert!(!t.is_overdue(jiff::civil::date(2026, 11, 21)));
     }
 
     #[test]

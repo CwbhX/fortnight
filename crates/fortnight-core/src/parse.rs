@@ -19,6 +19,10 @@ pub struct QuickAdd {
     pub title: String,
     pub project: Option<String>,
     pub due_on: Option<Date>,
+    /// `~2h`, `~30m`, `~1h30m`, `~1.5h` (round 2, agent B).
+    pub estimate_minutes: Option<u32>,
+    /// `!` = 1, `!!` = 2, `!!!` = 3 (round 2, agent B).
+    pub priority: u8,
 }
 
 /// Parses a quick-add line relative to `today`.
@@ -185,6 +189,7 @@ mod tests {
             title: title.to_string(),
             project: project.map(str::to_string),
             due_on: due,
+            ..QuickAdd::default()
         }
     }
 

@@ -186,44 +186,74 @@ cargo build --release --locked
 
 ### 4.2 Views
 
-**Tasks** (default)
-- A quick-add bar at the top. `Write Q4 report fri #work ~2h !` creates a task due Friday, in project `work`, estimated at two hours, high priority.
-- Sections: Overdue, Today, This week, Later, No date. Done items collapse at the bottom.
-- Each row: checkbox, title, project chip, relative due label (`Fri`, `in 3d`, red when overdue).
-- Selecting a row expands it in place for notes, due date, estimate and a progress log.
-- A **log line** records work that isn't a checkbox ("helped Sam debug the deploy"), attached to a task or free-standing. Unplanned work is often half of an honest weekly summary.
+There is no sidebar. One slim bar across the top holds everything:
 
-**This week** (the week ahead)
-- Tasks grouped by day, with estimated load against your configured capacity per day.
-- An **Advice** card with the LLM's feedback: what is at risk, a suggested order, and what to cut or renegotiate.
+```
+[ Today | Week | Month ]      ‹  Mon 16 – Fri 20 Nov  ›   Today                 lock  gear
+[ Add a task — e.g. Write Q4 report fri #work                                           ]
+```
 
-**Review** (the week behind)
-- A week switcher (`← Week 46 →`).
-- Left: the facts — completed, progressed, slipped, added, dropped.
-- Right: the manager summary, rendered as Markdown. Actions: Edit, Copy, Export `.md`, Regenerate.
+The three tabs are three zoom levels over the same tasks and the same selected date, the way a calendar app works. `‹` `›` move by a day, a week or a month depending on the tab; **Today** jumps back. Settings and Lock are icons, not tabs.
 
-**Settings**
-- LLM: protocol, base URL, model, API key, and a **Test connection** button. Key controls: set, change password, remove, and **Lock**.
+The quick-add bar is always visible. `Write Q4 report fri #work ~2h !` creates a task due Friday, in project `work`, estimated at two hours, high priority. In the Today tab, a task typed without a date lands on the day being shown.
+
+**Today**
+- Overdue (only if there is any), then the day's tasks, then done items collapsed.
+- **No date** sits collapsed at the bottom with a count. It is the inbox: tasks you haven't scheduled.
+- Each row: checkbox, title, project chip, due label. Selecting a row expands it in place for notes, due date, estimate and its log.
+- A **log line** records work that isn't a checkbox ("helped Sam debug the deploy"), attached to a task or free-standing.
+- Nothing else is on screen. This is the view the app opens on.
+
+**Week** (the work week)
+- One column per working day, each listing that day's tasks with checkboxes, and a load bar once tasks have estimates. Today's column is marked with the accent colour.
+- A weekend column appears only when Saturday or Sunday has tasks.
+- Below the columns, one report panel that depends on the week:
+  - the current or a future week shows **Advice** — what is at risk, a suggested order, what to cut;
+  - a past week shows the **Summary** for your manager, beside the facts it was built from;
+  - once the current week's summary is due, the panel offers both.
+- Panel actions: Edit, Copy, Export, Regenerate, earlier versions, and "what will be sent".
+
+This one tab replaces the earlier This-week and Review tabs: paging back through weeks is how you reach old summaries.
+
+**Month**
+- A calendar grid. Each day shows its date and up to three task titles, then `+2 more`. Done tasks are dimmed, overdue ones red, today outlined in the accent colour, weekends muted.
+- Clicking a day opens it in the Today tab. Clicking a week's label opens it in the Week tab; the label carries a dot when that week has a summary.
+- The grid is for seeing and navigating, not editing.
+
+**Settings** (the gear; opens over the current view)
+- LLM: protocol, base URL, model, API key, and a **Test connection** button. Key controls: set, change password, remove.
 - Schedule: week start day, summary day and time (default Friday 16:00), plan day and time (default Monday 08:00).
 - Capacity: working days and focus hours per day.
 - Summary style: length, tone, and free-form extra instructions.
-- Privacy: preview of the outgoing payload; default for the private flag.
+- Data folder path.
+
+Left out on purpose: drag-and-drop between days, hour-by-hour time blocking, and custom views. A task is moved by editing its date.
+
+**Where the ideas come from**
+- *Things 3*: Today shows only today and what is overdue; everything else stays out of sight.
+- *Sunsama*: the week as one column per day with a daily workload, and a review at the end of the week.
+- *TickTick*: day, week and month as views of one calendar, switched with `1` `2` `3`, with unscheduled tasks kept to one side.
+- *Todoist*: the same task list shown as a list, a week or a month rather than as separate places.
 
 ### 4.3 Visual design
 
 - Follows the system light/dark theme. One accent colour, taken from the existing icon (`#ea580c`).
 - One bundled typeface, generous spacing, no borders where whitespace will do.
-- A slim sidebar with three destinations and a settings gear. No toolbars.
+- No sidebar and no toolbars: the top bar and the quick-add bar are the only chrome.
 
 ### 4.4 Keyboard
 
+Single-letter keys apply when no text field has focus.
+
 | Key | Action |
 |---|---|
-| `Ctrl/Cmd+N` | Focus quick-add |
+| `1` `2` `3` | Today, Week, Month |
+| `←` `→` | Previous / next day, week or month |
+| `T` | Jump to today |
+| `N` or `Ctrl/Cmd+N` | Focus quick-add |
 | `↑` `↓` | Move selection |
 | `Space` | Toggle done |
 | `Enter` | Expand / edit |
-| `Ctrl/Cmd+1` `2` `3` | Switch view |
 | `Ctrl/Cmd+,` | Settings |
 | `Ctrl/Cmd+Z` | Undo last change |
 
@@ -577,6 +607,7 @@ Defaults are in place for all of these, so none of them blocks starting.
 - [Are we GUI yet?](https://areweguiyet.com/)
 - [genai](https://docs.rs/genai/latest/genai/), [async-openai](https://docs.rs/async-openai)
 - [keyring](https://docs.rs/keyring/latest/keyring/)
+- [Things 3 features](https://culturedcode.com/things/features/), [TickTick calendar guide](https://ticktick.com/resources/article/7340680464711024640/calendar-workflows-guide), [Sunsama guided planning and reviews](https://sunsama.com/features/guided-planning-and-reviews), [Todoist calendar layout](https://todoist.com/help/articles/use-the-calendar-layout-in-todoist-lPHRQTu0o)
 - [Weekly Updates: Improving Communication](https://theresponsibleengineer.substack.com/p/weekly-updates-communication)
 - [Hidden Powers of Weekly Reports](https://engmanage.substack.com/p/hidden-powers-of-weekly-reports)
 - [How to write async status updates managers read](https://remote-work-tools.pages.dev/how-to-write-async-status-updates-that-managers-actually-read)

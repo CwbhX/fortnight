@@ -1,33 +1,43 @@
 //! Fortnight: the application shell. Owns all state, carries out the actions
 //! the views return, talks to the store, the key vault and the LLM, and runs
 //! the minute tick that generates due reports.
+//!
+//! Layout (PLAN.md 4.2): the top bar (tabs, period navigation over one
+//! shared selected date, lock, gear, quick-add), then the active tab. Settings
+//! opens over the current view.
 
 use fortnight_app::theme;
-use fortnight_app::views::review::{self, ReviewData, ReviewView};
+use fortnight_app::top_bar::{self, LockIcon, Tab};
+use fortnight_app::views::day::{self, DayData, DayView, LogLine};
+use fortnight_app::views::month::{self, MonthData, MonthView};
+use fortnight_app::views::report_panel::{self, ReportPanelData, ReportSlot};
 use fortnight_app::views::settings::{
     self, KeyState, SettingsData, SettingsView, UnlockAction, UnlockMessage, UnlockView,
 };
-use fortnight_app::views::tasks::{self, TasksView};
 use fortnight_app::views::week::{self, WeekData, WeekView};
 use fortnight_core::datadir;
 use fortnight_core::domain::{
-    LlmSettings, NewReport, ReportKey, ReportKind, Settings, Task as CoreTask, WeekRef,
+    Event, LlmSettings, ReportKey, ReportKind, Settings, Task as CoreTask, TaskId, TaskStatus,
+    WeekRef,
 };
-use fortnight_core::llm::{ChatRequest, LlmClient, LlmConfig};
-use fortnight_core::openai::OpenAiClient;
-use fortnight_core::report;
+use fortnight_core::llm::{
+    self, ChatEvent, ChatRequest, ChatResponse, LlmClient, LlmConfig, LlmError,
+};
+use fortnight_core::report::{self, Prepared};
 use fortnight_core::sqlite::SqliteStore;
 use fortnight_core::store::Store;
 use fortnight_core::vault::{self, VaultError};
 use fortnight_core::week::{due_reports, week_containing, week_label};
 use iced::keyboard::{self, Key};
-use iced::widget::{button, center, column, container, row, text};
+use iced::widget::{
+    button, center, column, container, mouse_area, opaque, operation, row, stack, text,
+};
 use iced::{Element, Fill, Subscription, Task, Theme};
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp, ZonedDateTime};
 use secrecy::SecretString;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,25 +61,21 @@ pub fn main() -> iced::Result {
         .run()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Page {
-    Tasks,
-    Week,
-    Review,
-    Settings,
-}
-
 #[derive(Debug, Clone)]
 enum Message {
-    Nav(Page),
-    Tasks(tasks::Message),
+    Top(top_bar::Message),
+    Day(day::Message),
     Week(week::Message),
-    Review(review::Message),
+    Month(month::Message),
     Settings(settings::Message),
     Unlock(UnlockMessage),
+    CloseSettings,
     Tick,
     ThemeMode(iced::theme::Mode),
-    Generated(ReportKey, NewReport),
+    /// A piece of a streamed report.
+    Stream(ReportKey, Result<ChatEvent, LlmError>),
+    /// The stream for this report ended (after `Done` or an error, or early).
+    StreamEnded(ReportKey),
     Tested(Result<String, String>),
     Unlocked(Result<SecretString, VaultError>),
     KeySaved(Result<SecretString, VaultError>),
@@ -79,33 +85,49 @@ enum Message {
     Shot(iced::window::Screenshot),
 }
 
+/// A report being generated: what was asked, and the text so far.
+struct Generation {
+    prepared: Prepared,
+    text: String,
+    requested_model: String,
+    host: Option<String>,
+}
+
 /// Everything that needs the open database.
 struct Ready {
     store: SqliteStore,
     data_dir: PathBuf,
     settings: Settings,
     tasks: Vec<CoreTask>,
+    /// Every event, oldest first. Reloaded with the tasks.
+    events: Vec<Event>,
     tz: TimeZone,
 
-    page: Page,
-    tasks_view: TasksView,
+    tab: Tab,
+    /// The one selected date all three tabs zoom around.
+    selected: Date,
+    quick_add: String,
+    settings_open: bool,
+
+    day_view: DayView,
     week_view: WeekView,
-    review_view: ReviewView,
+    month_view: MonthView,
     settings_view: SettingsView,
     unlock_view: UnlockView,
     /// The unlock prompt is showing (launch with a key file, until unlocked
-    /// or skipped).
+    /// or skipped; or the lock icon while locked).
     unlocking: bool,
 
     key_exists: bool,
     api_key: Option<SecretString>,
-    review_week: WeekRef,
 
-    generating: HashSet<ReportKey>,
+    generating: HashMap<ReportKey, Generation>,
     last_attempt: HashMap<ReportKey, Timestamp>,
     testing: bool,
     test_result: Option<Result<String, String>>,
     key_message: Option<Result<String, String>>,
+    models: Option<Result<Vec<String>, String>>,
+    listing_models: bool,
     error: Option<String>,
 }
 
@@ -127,7 +149,7 @@ impl App {
                     if ready.unlocking {
                         UnlockView::focus().map(Message::Unlock)
                     } else {
-                        TasksView::focus_quick_add().map(Message::Tasks)
+                        operation::focus(top_bar::QUICK_ADD_ID)
                     },
                     start,
                     shoot_after_delay(),
@@ -157,10 +179,10 @@ impl App {
                     return None;
                 }
                 match key.as_ref() {
-                    Key::Character("1") => Some(Message::Nav(Page::Tasks)),
-                    Key::Character("2") => Some(Message::Nav(Page::Week)),
-                    Key::Character("3") => Some(Message::Nav(Page::Review)),
-                    Key::Character(",") => Some(Message::Nav(Page::Settings)),
+                    Key::Character("1") => Some(Message::Top(top_bar::Message::Tab(Tab::Today))),
+                    Key::Character("2") => Some(Message::Top(top_bar::Message::Tab(Tab::Week))),
+                    Key::Character("3") => Some(Message::Top(top_bar::Message::Tab(Tab::Month))),
+                    Key::Character(",") => Some(Message::Top(top_bar::Message::Settings)),
                     _ => None,
                 }
             }),
@@ -210,15 +232,17 @@ impl Ready {
         let store = SqliteStore::open(&datadir::db_path(&dir)).map_err(|e| e.to_string())?;
         let settings = store.load_settings().map_err(|e| e.to_string())?;
         let tasks = store.list_tasks().map_err(|e| e.to_string())?;
+        let events = store
+            .events_between(Timestamp::MIN, Timestamp::MAX)
+            .map_err(|e| e.to_string())?;
         let tz = TimeZone::system();
-        let review_week =
-            latest_summary_week(&Timestamp::now().to_zoned_datetime(tz.clone()), &settings);
+        let today = Timestamp::now().to_zoned_datetime(tz.clone()).date();
         let key_exists = vault::key_path(&dir).exists();
-        let page = match std::env::var("FORTNIGHT_PAGE").as_deref() {
-            Ok("week") => Page::Week,
-            Ok("review") => Page::Review,
-            Ok("settings") => Page::Settings,
-            _ => Page::Tasks,
+        let (tab, settings_open) = match std::env::var("FORTNIGHT_PAGE").as_deref() {
+            Ok("week") => (Tab::Week, false),
+            Ok("month") => (Tab::Month, false),
+            Ok("settings") => (Tab::Today, true),
+            _ => (Tab::Today, false),
         };
         let unlocking = key_exists && std::env::var_os("FORTNIGHT_SKIP_UNLOCK").is_none();
         Ok(Ready {
@@ -226,22 +250,27 @@ impl Ready {
             data_dir: dir,
             settings,
             tasks,
+            events,
             tz,
-            page,
-            tasks_view: TasksView::new(),
+            tab,
+            selected: today,
+            quick_add: String::new(),
+            settings_open,
+            day_view: DayView::new(),
             week_view: WeekView::new(),
-            review_view: ReviewView::new(),
+            month_view: MonthView::new(),
             settings_view: SettingsView::new(),
             unlock_view: UnlockView::new(),
             unlocking,
             key_exists,
             api_key: None,
-            review_week,
-            generating: HashSet::new(),
+            generating: HashMap::new(),
             last_attempt: HashMap::new(),
             testing: false,
             test_result: None,
             key_message: None,
+            models: None,
+            listing_models: false,
             error: None,
         })
     }
@@ -254,8 +283,12 @@ impl Ready {
         self.now().date()
     }
 
+    fn week_of(&self, date: Date) -> WeekRef {
+        week_containing(date, self.settings.schedule.week_start)
+    }
+
     fn current_week(&self) -> WeekRef {
-        week_containing(self.today(), self.settings.schedule.week_start)
+        self.week_of(self.today())
     }
 
     /// Why the LLM can't be used right now, if it can't.
@@ -282,8 +315,8 @@ impl Ready {
             api_key: self.api_key.clone(),
         };
         let host = config.endpoint_host();
-        let client = OpenAiClient::new(config).map_err(|e| e.to_string())?;
-        Ok((Arc::new(client), host))
+        let client = llm::connect(llm.protocol, config).map_err(|e| e.to_string())?;
+        Ok((client, host))
     }
 
     // ---- data flow ----
@@ -293,64 +326,172 @@ impl Ready {
             Ok(tasks) => self.tasks = tasks,
             Err(e) => self.error = Some(e.to_string()),
         }
+        match self.store.events_between(Timestamp::MIN, Timestamp::MAX) {
+            Ok(events) => self.events = events,
+            Err(e) => self.error = Some(e.to_string()),
+        }
     }
 
-    /// Pushes fresh data into every view.
+    /// Pushes fresh data into the visible tab (and Settings when open).
     fn refresh(&mut self) {
         let today = self.today();
-        let current = self.current_week();
+        match self.tab {
+            Tab::Today => {
+                let logs = self
+                    .events
+                    .iter()
+                    .filter_map(|e| {
+                        Some(LogLine {
+                            id: e.id,
+                            task_id: e.task_id,
+                            at: e.at,
+                            date: self.tz.to_datetime(e.at).date(),
+                            text: e.log_text()?.to_string(),
+                        })
+                    })
+                    .collect();
+                self.day_view.load(DayData {
+                    day: self.selected,
+                    today,
+                    tasks: self.tasks.clone(),
+                    logs,
+                });
+            }
+            Tab::Week => {
+                let week = self.week_of(self.selected);
+                let panel = self.panel_data(week);
+                self.week_view.load(WeekData {
+                    week,
+                    today,
+                    tasks: self.tasks.clone(),
+                    working_days: self.settings.schedule.working_days.clone(),
+                    loads: report::day_loads(&self.tasks, week, &self.settings),
+                    panel,
+                });
+            }
+            Tab::Month => {
+                let summary_weeks = match self.store.ready_report_keys() {
+                    Ok(keys) => keys
+                        .into_iter()
+                        .filter(|k| k.kind == ReportKind::Summary)
+                        .map(|k| k.week_start)
+                        .collect(),
+                    Err(e) => {
+                        self.error = Some(e.to_string());
+                        Vec::new()
+                    }
+                };
+                self.month_view.load(MonthData {
+                    month: self.selected.first_of_month(),
+                    today,
+                    week_start: self.settings.schedule.week_start,
+                    working_days: self.settings.schedule.working_days.clone(),
+                    tasks: self.tasks.clone(),
+                    summary_weeks,
+                });
+            }
+        }
 
-        let summary_facts = report::summary_facts(&self.tasks, self.review_week, today, &self.tz);
-        let summary = self.latest(ReportKind::Summary, self.review_week);
-        self.review_view.load(ReviewData {
-            week: self.review_week,
-            week_label: week_label(self.review_week),
-            facts_md: report::summary_facts_markdown(&summary_facts),
-            report: summary,
-            generating: self.generating.contains(&ReportKey {
-                kind: ReportKind::Summary,
-                week_start: self.review_week.start,
-            }),
-            blocked: self.blocked(),
-        });
-
-        let plan_facts = report::plan_facts(&self.tasks, current, today, &self.settings);
-        let advice = self.latest(ReportKind::Plan, current);
-        self.week_view.load(WeekData {
-            week: current,
-            week_label: week_label(current),
-            today,
-            tasks: self.tasks.clone(),
-            facts_md: report::plan_facts_markdown(&plan_facts),
-            advice,
-            generating: self.generating.contains(&ReportKey {
-                kind: ReportKind::Plan,
-                week_start: current.start,
-            }),
-            blocked: self.blocked(),
-        });
-
-        self.settings_view.load(SettingsData {
-            settings: self.settings.clone(),
-            data_dir: self.data_dir.clone(),
-            key_state: self.key_state(),
-            test_result: self.test_result.clone(),
-            testing: self.testing,
-            key_message: self.key_message.clone(),
-        });
+        if self.settings_open {
+            self.settings_view.load(SettingsData {
+                settings: self.settings.clone(),
+                data_dir: self.data_dir.clone(),
+                key_state: self.key_state(),
+                test_result: self.test_result.clone(),
+                testing: self.testing,
+                key_message: self.key_message.clone(),
+                models: self.models.clone(),
+                listing_models: self.listing_models,
+            });
+        }
     }
 
-    fn latest(
-        &mut self,
-        kind: ReportKind,
-        week: WeekRef,
-    ) -> Option<fortnight_core::domain::Report> {
-        match self.store.latest_report(kind, week.start) {
-            Ok(r) => r,
-            Err(e) => {
-                self.error = Some(e.to_string());
-                None
+    /// Which reports the panel offers for `week` (PLAN.md 4.2): a past week
+    /// its Summary; the current week Advice, plus the Summary once due; a
+    /// future week Advice.
+    fn panel_kinds(&self, week: WeekRef) -> Vec<ReportKind> {
+        let current = self.current_week();
+        if week < current {
+            vec![ReportKind::Summary]
+        } else if week > current {
+            vec![ReportKind::Plan]
+        } else if self.summary_due(current) {
+            vec![ReportKind::Summary, ReportKind::Plan]
+        } else {
+            vec![ReportKind::Plan]
+        }
+    }
+
+    /// The summary for `week` is due (its summary day and time have passed).
+    fn summary_due(&self, week: WeekRef) -> bool {
+        due_reports(&self.now(), &self.settings.schedule, &[])
+            .iter()
+            .any(|job| job.kind == ReportKind::Summary && job.week == week)
+    }
+
+    fn prepare(&self, kind: ReportKind, week: WeekRef) -> Prepared {
+        let today = self.today();
+        match kind {
+            ReportKind::Summary => report::prepare_summary(
+                &self.tasks,
+                &self.events,
+                week,
+                today,
+                &self.tz,
+                &self.settings,
+            ),
+            ReportKind::Plan => {
+                report::prepare_plan(&self.tasks, &self.events, week, today, &self.settings)
             }
+        }
+    }
+
+    fn panel_data(&mut self, week: WeekRef) -> ReportPanelData {
+        let today = self.today();
+        let blocked = self.blocked();
+        let mut slots = Vec::new();
+        for kind in self.panel_kinds(week) {
+            let facts_md = match kind {
+                ReportKind::Summary => report::summary_facts_markdown(&report::summary_facts(
+                    &self.tasks,
+                    &self.events,
+                    week,
+                    today,
+                    &self.tz,
+                )),
+                ReportKind::Plan => report::plan_facts_markdown(&report::plan_facts(
+                    &self.tasks,
+                    &self.events,
+                    week,
+                    today,
+                    &self.settings,
+                )),
+            };
+            let preview = report::request_preview(&self.prepare(kind, week).request);
+            let versions = match self.store.list_reports(kind, week.start) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.error = Some(e.to_string());
+                    Vec::new()
+                }
+            };
+            let key = ReportKey {
+                kind,
+                week_start: week.start,
+            };
+            slots.push(ReportSlot {
+                kind,
+                facts_md,
+                preview,
+                versions,
+                streaming: self.generating.get(&key).map(|g| g.text.clone()),
+                blocked: blocked.clone(),
+            });
+        }
+        ReportPanelData {
+            week,
+            week_label: week_label(week),
+            slots,
         }
     }
 
@@ -362,13 +503,13 @@ impl Ready {
         }
     }
 
-    /// Starts generating a report unless one is already in flight.
+    /// Starts streaming a report unless one is already in flight.
     fn generate(&mut self, kind: ReportKind, week: WeekRef) -> Task<Message> {
         let key = ReportKey {
             kind,
             week_start: week.start,
         };
-        if self.generating.contains(&key) {
+        if self.generating.contains_key(&key) {
             return Task::none();
         }
         let (client, host) = match self.client_for(&self.settings.llm.clone()) {
@@ -378,19 +519,31 @@ impl Ready {
                 return Task::none();
             }
         };
-        let prepared = match kind {
-            ReportKind::Summary => {
-                report::prepare_summary(&self.tasks, week, self.today(), &self.tz, &self.settings)
-            }
-            ReportKind::Plan => {
-                report::prepare_plan(&self.tasks, week, self.today(), &self.settings)
-            }
-        };
-        self.generating.insert(key);
+        let prepared = self.prepare(kind, week);
+        let stream = client.chat_stream(prepared.request.clone());
+        self.generating.insert(
+            key,
+            Generation {
+                prepared,
+                text: String::new(),
+                requested_model: client.model().to_string(),
+                host,
+            },
+        );
         self.last_attempt.insert(key, Timestamp::now());
-        Task::perform(report::generate(client, prepared, host), move |r| {
-            Message::Generated(key, r)
-        })
+        Task::run(stream, move |item| Message::Stream(key, item))
+            .chain(Task::done(Message::StreamEnded(key)))
+    }
+
+    /// Stores the finished (or failed) report and forgets the generation.
+    fn finish(&mut self, key: ReportKey, result: Result<ChatResponse, LlmError>) {
+        let Some(g) = self.generating.remove(&key) else {
+            return;
+        };
+        let new = report::finish(g.prepared, result, &g.requested_model, g.host);
+        if let Err(e) = self.store.insert_report(new) {
+            self.error = Some(e.to_string());
+        }
     }
 
     /// The schedule: generates whatever is due (PLAN.md section 8). Runs at
@@ -429,49 +582,44 @@ impl Ready {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         let task = match message {
-            Message::Nav(page) => {
-                self.page = page;
-                if page == Page::Tasks {
-                    TasksView::focus_quick_add().map(Message::Tasks)
-                } else {
-                    Task::none()
-                }
-            }
-            Message::Tasks(m) => {
-                let today = self.today();
-                let action = self.tasks_view.update(m, &self.tasks, today);
-                self.tasks_action(action);
-                Task::none()
+            Message::Top(m) => self.top_bar(m),
+            Message::Day(m) => {
+                let action = self.day_view.update(m);
+                self.day_action(action)
             }
             Message::Week(m) => match self.week_view.update(m) {
                 week::Action::None => Task::none(),
-                week::Action::Generate => {
-                    let w = self.current_week();
-                    self.generate(ReportKind::Plan, w)
-                }
-                week::Action::SetDone(id, done) => {
-                    self.tasks_action(tasks::Action::SetDone(id, done));
+                week::Action::SetStatus(id, status) => {
+                    self.set_status(id, status);
                     Task::none()
                 }
+                week::Action::OpenDay(day) => {
+                    self.selected = day;
+                    self.tab = Tab::Today;
+                    Task::none()
+                }
+                week::Action::Panel(action) => self.panel_action(action),
             },
-            Message::Review(m) => match self.review_view.update(m) {
-                review::Action::None => Task::none(),
-                review::Action::ShowWeek(w) => {
-                    self.review_week = w;
+            Message::Month(m) => match self.month_view.update(m) {
+                month::Action::None => Task::none(),
+                month::Action::OpenDay(day) => {
+                    self.selected = day;
+                    self.tab = Tab::Today;
                     Task::none()
                 }
-                review::Action::Generate(w) => self.generate(ReportKind::Summary, w),
-                review::Action::SaveEdit(id, text) => {
-                    if let Err(e) = self.store.set_report_edit(id, Some(&text)) {
-                        self.error = Some(e.to_string());
-                    }
+                month::Action::OpenWeek(week) => {
+                    self.selected = week.start;
+                    self.tab = Tab::Week;
                     Task::none()
                 }
-                review::Action::Copy(text) => iced::clipboard::write(text),
             },
             Message::Settings(m) => {
                 let action = self.settings_view.update(m);
                 self.settings_action(action)
+            }
+            Message::CloseSettings => {
+                self.settings_open = false;
+                Task::none()
             }
             Message::Unlock(m) => match self.unlock_view.update(m) {
                 UnlockAction::None => Task::none(),
@@ -482,11 +630,28 @@ impl Ready {
                 UnlockAction::Unlock(password) => self.unlock(password),
             },
             Message::Tick => self.run_due(),
-            Message::Generated(key, new) => {
-                self.generating.remove(&key);
-                if let Err(e) = self.store.insert_report(new) {
-                    self.error = Some(e.to_string());
+            Message::Stream(key, item) => {
+                match item {
+                    Ok(ChatEvent::Delta(d)) => {
+                        if let Some(g) = self.generating.get_mut(&key) {
+                            g.text.push_str(&d);
+                        }
+                    }
+                    Ok(ChatEvent::Done { model }) => {
+                        let text = self
+                            .generating
+                            .get(&key)
+                            .map(|g| g.text.clone())
+                            .unwrap_or_default();
+                        self.finish(key, Ok(ChatResponse { text, model }));
+                    }
+                    Err(e) => self.finish(key, Err(e)),
                 }
+                Task::none()
+            }
+            Message::StreamEnded(key) => {
+                // Only still generating if the stream ended without `Done`.
+                self.finish(key, Err(LlmError::Truncated));
                 Task::none()
             }
             Message::Tested(result) => {
@@ -536,24 +701,111 @@ impl Ready {
         task
     }
 
-    fn tasks_action(&mut self, action: tasks::Action) {
+    fn top_bar(&mut self, message: top_bar::Message) -> Task<Message> {
+        match message {
+            top_bar::Message::Tab(tab) => {
+                self.tab = tab;
+                Task::none()
+            }
+            top_bar::Message::Prev => {
+                self.selected = top_bar::step(self.tab, self.selected, -1);
+                Task::none()
+            }
+            top_bar::Message::Next => {
+                self.selected = top_bar::step(self.tab, self.selected, 1);
+                Task::none()
+            }
+            top_bar::Message::Today => {
+                self.selected = self.today();
+                Task::none()
+            }
+            top_bar::Message::Lock => {
+                if self.api_key.is_some() {
+                    self.lock();
+                    Task::none()
+                } else {
+                    self.unlocking = true;
+                    UnlockView::focus().map(Message::Unlock)
+                }
+            }
+            top_bar::Message::Settings => {
+                self.settings_open = !self.settings_open;
+                Task::none()
+            }
+            top_bar::Message::QuickAdd(s) => {
+                self.quick_add = s;
+                Task::none()
+            }
+            top_bar::Message::QuickAddSubmit => {
+                let today = self.today();
+                if let Some(new) =
+                    top_bar::quick_add_task(&self.quick_add, self.tab, self.selected, today)
+                {
+                    match self.store.add_task(new) {
+                        Ok(_) => self.quick_add.clear(),
+                        Err(e) => self.error = Some(e.to_string()),
+                    }
+                    self.reload_tasks();
+                }
+                Task::none()
+            }
+        }
+    }
+
+    fn set_status(&mut self, id: TaskId, status: TaskStatus) {
+        if let Err(e) = self.store.set_status(id, status) {
+            self.error = Some(e.to_string());
+        }
+        self.reload_tasks();
+    }
+
+    fn day_action(&mut self, action: day::Action) -> Task<Message> {
         let result = match action {
-            tasks::Action::None => return,
-            tasks::Action::Add(new) => self.store.add_task(new).map(|_| ()),
-            tasks::Action::SetDone(id, done) => self.store.set_done(id, done),
-            tasks::Action::Update(task) => self.store.update_task(&task),
-            tasks::Action::Delete(id) => self.store.delete_task(id),
+            day::Action::None => return Task::none(),
+            day::Action::SetStatus(id, status) => self.store.set_status(id, status),
+            day::Action::Update(task) => self.store.update_task(&task),
+            day::Action::Delete(id) => self.store.delete_task(id).map(|_| ()),
+            day::Action::AddLog { task_id, text } => self.store.add_log(task_id, &text).map(|_| ()),
+            day::Action::DeleteLog(id) => self.store.delete_log(id),
         };
         if let Err(e) = result {
             self.error = Some(e.to_string());
         }
         self.reload_tasks();
+        Task::none()
+    }
+
+    fn panel_action(&mut self, action: report_panel::Action) -> Task<Message> {
+        match action {
+            report_panel::Action::None => Task::none(),
+            report_panel::Action::Generate(kind, week) => self.generate(kind, week),
+            report_panel::Action::SaveEdit(id, text) => {
+                if let Err(e) = self.store.set_report_edit(id, Some(&text)) {
+                    self.error = Some(e.to_string());
+                }
+                Task::none()
+            }
+            report_panel::Action::Copy(text) => iced::clipboard::write(text),
+            report_panel::Action::Export(_id, _format) => {
+                // STEP 1: the export dialog is wired in step 3.
+                Task::none()
+            }
+        }
+    }
+
+    fn lock(&mut self) {
+        self.api_key = None; // dropping the SecretString zeroizes it
+        self.key_message = Some(Ok("Locked.".into()));
     }
 
     fn settings_action(&mut self, action: settings::Action) -> Task<Message> {
         let key_path = vault::key_path(&self.data_dir);
         match action {
             settings::Action::None => Task::none(),
+            settings::Action::Close => {
+                self.settings_open = false;
+                Task::none()
+            }
             settings::Action::Save(s) => {
                 match self.store.save_settings(&s) {
                     Ok(()) => self.settings = s,
@@ -581,6 +833,10 @@ impl Ready {
                     Task::none()
                 }
             },
+            settings::Action::ListModels(_llm) => {
+                // STEP 1: wired in step 3.
+                Task::none()
+            }
             settings::Action::SetKey { api_key, password } => {
                 self.key_message = None;
                 blocking(
@@ -607,8 +863,7 @@ impl Ready {
                 Task::none()
             }
             settings::Action::Lock => {
-                self.api_key = None; // dropping the SecretString zeroizes it
-                self.key_message = Some(Ok("Locked.".into()));
+                self.lock();
                 Task::none()
             }
             settings::Action::Unlock(password) => self.unlock(password),
@@ -627,50 +882,29 @@ impl Ready {
             return self.unlock_view.view().map(Message::Unlock);
         }
 
-        let nav = |label: &'static str, page: Page| {
-            let style = if self.page == page {
-                nav_active
-            } else {
-                theme::row_button
-            };
-            button(text(label))
-                .width(Fill)
-                .padding([8, 12])
-                .style(style)
-                .on_press(Message::Nav(page))
-        };
-        let sidebar = container(
-            column![
-                text("Fortnight")
-                    .size(theme::TEXT_HEADING)
-                    .style(theme::accent),
-                column![
-                    nav("Tasks", Page::Tasks),
-                    nav("This week", Page::Week),
-                    nav("Review", Page::Review),
-                ]
-                .spacing(4),
-                iced::widget::space::vertical(),
-                nav("Settings", Page::Settings),
-            ]
-            .spacing(theme::SPACING * 2.0)
-            .padding(theme::SPACING),
-        )
-        .width(180)
-        .height(Fill)
-        .style(sidebar);
+        let today = self.today();
+        let bar = top_bar::view(top_bar::Bar {
+            tab: self.tab,
+            selected: self.selected,
+            today,
+            schedule: &self.settings.schedule,
+            quick_add: &self.quick_add,
+            lock: match self.key_state() {
+                KeyState::NoKey => None,
+                KeyState::Locked => Some(LockIcon::Locked),
+                KeyState::Unlocked => Some(LockIcon::Unlocked),
+            },
+            week_badge: false,
+        })
+        .map(Message::Top);
 
-        let content: Element<'_, Message> = match self.page {
-            Page::Tasks => {
-                let today = self.today();
-                self.tasks_view.view(&self.tasks, today).map(Message::Tasks)
-            }
-            Page::Week => self.week_view.view().map(Message::Week),
-            Page::Review => self.review_view.view().map(Message::Review),
-            Page::Settings => self.settings_view.view().map(Message::Settings),
+        let content: Element<'_, Message> = match self.tab {
+            Tab::Today => self.day_view.view().map(Message::Day),
+            Tab::Week => self.week_view.view().map(Message::Week),
+            Tab::Month => self.month_view.view().map(Message::Month),
         };
 
-        let mut main = column![container(content).width(Fill).height(Fill)];
+        let mut main = column![bar, container(content).width(Fill).height(Fill)];
         if let Some(e) = &self.error {
             main = main.push(
                 container(
@@ -685,43 +919,30 @@ impl Ready {
                 .padding(theme::SPACING),
             );
         }
+        let base: Element<'_, Message> = main.height(Fill).into();
 
-        row![sidebar, main].height(Fill).into()
+        if !self.settings_open {
+            return base;
+        }
+        let panel = container(self.settings_view.view().map(Message::Settings))
+            .max_width(760)
+            .height(Fill)
+            .style(theme::overlay_panel);
+        stack![
+            base,
+            opaque(
+                mouse_area(
+                    container(opaque(panel))
+                        .padding([32, 24])
+                        .center_x(Fill)
+                        .height(Fill)
+                        .style(theme::backdrop)
+                )
+                .on_press(Message::CloseSettings)
+            )
+        ]
+        .into()
     }
-}
-
-/// The sidebar: a faint neutral fill, no border.
-fn sidebar(theme: &Theme) -> container::Style {
-    let p = theme.palette();
-    let mix = |a: f32, b: f32| a + (b - a) * 0.035;
-    container::Style::default().background(iced::Color::from_rgb(
-        mix(p.background.r, p.text.r),
-        mix(p.background.g, p.text.g),
-        mix(p.background.b, p.text.b),
-    ))
-}
-
-/// The current page in the sidebar: accent text on a soft fill.
-fn nav_active(theme: &Theme, status: button::Status) -> button::Style {
-    let hovered = theme::row_button(theme, button::Status::Hovered);
-    button::Style {
-        text_color: theme::ACCENT,
-        ..theme::row_button(theme, status).with_background(
-            hovered
-                .background
-                .unwrap_or(iced::Background::Color(iced::Color::TRANSPARENT)),
-        )
-    }
-}
-
-/// The week the Review page opens on: the most recent week whose summary
-/// is due (last week until Friday 16:00 by default, then this week).
-fn latest_summary_week(now: &ZonedDateTime, settings: &Settings) -> WeekRef {
-    due_reports(now, &settings.schedule, &[])
-        .into_iter()
-        .find(|job| job.kind == ReportKind::Summary)
-        .map(|job| job.week)
-        .unwrap_or_else(|| week_containing(now.date(), settings.schedule.week_start))
 }
 
 /// Runs blocking work (Argon2) off the UI thread.

@@ -86,6 +86,66 @@ pub fn db_path(dir: &Path) -> PathBuf {
     dir.join("fortnight.db")
 }
 
+// ---- lock file (round 2, agent G) ----
+//
+// PLAN.md section 3.5: one writer at a time. The GUI takes the lock at
+// launch and warns (but carries on) if a lock already existed, since the
+// folder may be open on another machine through a sync service. The CLI
+// does not take the lock (it may run beside the GUI on the same machine);
+// it only reads it to warn when another host holds it.
+
+/// Who holds the lock: stored as JSON in the lock file.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LockInfo {
+    /// The machine's name, or "unknown".
+    pub host: String,
+    pub pid: u32,
+    pub since: jiff::Timestamp,
+}
+
+/// The held lock. Dropping it removes the lock file (if it is still ours).
+#[derive(Debug)]
+pub struct DataLock {
+    path: PathBuf,
+}
+
+impl Drop for DataLock {
+    fn drop(&mut self) {
+        // STUB: agent G removes the file only if it still holds our info.
+        let _ = &self.path;
+    }
+}
+
+/// `<dir>/fortnight.lock`.
+pub fn lock_path(dir: &Path) -> PathBuf {
+    dir.join("fortnight.lock")
+}
+
+/// The name of this machine, or "unknown".
+pub fn host_name() -> String {
+    "unknown".into() // STUB
+}
+
+/// Takes the lock, replacing any existing lock file. Returns the lock and,
+/// if a lock file already existed (another instance, another machine, or a
+/// crash), what it said, so the caller can warn. An unreadable existing
+/// file is reported as a `LockInfo` with host "unknown".
+pub fn acquire_lock(dir: &Path) -> Result<(DataLock, Option<LockInfo>), DataDirError> {
+    // STUB: agent G implements.
+    Ok((
+        DataLock {
+            path: lock_path(dir),
+        },
+        None,
+    ))
+}
+
+/// What the lock file says, if there is one.
+pub fn read_lock(dir: &Path) -> Option<LockInfo> {
+    let _ = dir;
+    None // STUB
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

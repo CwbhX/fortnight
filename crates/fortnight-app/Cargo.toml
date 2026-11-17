@@ -14,3 +14,6 @@ iced.workspace = true
 jiff.workspace = true
 secrecy.workspace = true
 tokio.workspace = true
+futures-util.workspace = true
+notify-rust.workspace = true
+rfd.workspace = true

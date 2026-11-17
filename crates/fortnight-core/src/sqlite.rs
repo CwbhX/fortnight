@@ -13,8 +13,8 @@
 //! - Settings: the whole `Settings` as one JSON value under key `settings`.
 
 use crate::domain::{
-    NewReport, NewTask, Report, ReportId, ReportKey, ReportKind, ReportStatus, Settings, Task,
-    TaskId, TaskStatus,
+    DeletedTask, Event, EventId, NewReport, NewTask, Report, ReportId, ReportKey, ReportKind,
+    ReportStatus, Settings, Task, TaskId, TaskStatus,
 };
 use crate::store::{Store, StoreError, StoreResult};
 use jiff::Timestamp;
@@ -186,6 +186,8 @@ impl TaskRow {
             created_at: ts_from_sql(&self.created_at)?,
             updated_at: ts_from_sql(&self.updated_at)?,
             completed_at: self.completed_at.as_deref().map(ts_from_sql).transpose()?,
+            // STUB (round 2 step 1): agent A reads these columns.
+            ..Task::default()
         })
     }
 }
@@ -340,13 +342,9 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    fn set_done(&self, id: TaskId, done: bool) -> StoreResult<()> {
+    fn set_status(&self, id: TaskId, status: TaskStatus) -> StoreResult<()> {
         let now = ts_to_sql(Timestamp::now());
-        let (status, completed_at) = if done {
-            (TaskStatus::Done, Some(now.as_str()))
-        } else {
-            (TaskStatus::Todo, None)
-        };
+        let completed_at = (status == TaskStatus::Done).then_some(now.as_str());
         let n = self
             .conn
             .execute(
@@ -360,7 +358,8 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    fn delete_task(&self, id: TaskId) -> StoreResult<()> {
+    fn delete_task(&self, id: TaskId) -> StoreResult<DeletedTask> {
+        let task = self.get_task(id)?.ok_or(StoreError::TaskNotFound(id))?;
         let n = self
             .conn
             .execute("DELETE FROM tasks WHERE id = ?1", [id])
@@ -368,7 +367,40 @@ impl Store for SqliteStore {
         if n == 0 {
             return Err(StoreError::TaskNotFound(id));
         }
-        Ok(())
+        Ok(DeletedTask {
+            task,
+            events: Vec::new(),
+        })
+    }
+
+    // STUBS (round 2 step 1): agent A implements these.
+
+    fn restore_task(&self, _deleted: &DeletedTask) -> StoreResult<()> {
+        Err(StoreError::Db("restore_task is not implemented yet".into()))
+    }
+
+    fn add_log(&self, _task_id: Option<TaskId>, _text: &str) -> StoreResult<Event> {
+        Err(StoreError::Db("log lines are not implemented yet".into()))
+    }
+
+    fn delete_log(&self, id: EventId) -> StoreResult<()> {
+        Err(StoreError::EventNotFound(id))
+    }
+
+    fn task_events(&self, _id: TaskId) -> StoreResult<Vec<Event>> {
+        Ok(Vec::new())
+    }
+
+    fn events_between(&self, _from: Timestamp, _to: Timestamp) -> StoreResult<Vec<Event>> {
+        Ok(Vec::new())
+    }
+
+    fn list_reports(&self, kind: ReportKind, week_start: Date) -> StoreResult<Vec<Report>> {
+        Ok(self.latest_report(kind, week_start)?.into_iter().collect())
+    }
+
+    fn all_reports(&self) -> StoreResult<Vec<Report>> {
+        Ok(Vec::new())
     }
 
     fn insert_report(&self, new: NewReport) -> StoreResult<Report> {
@@ -526,6 +558,7 @@ mod tests {
                 notes: "n".into(),
                 project: Some("work".into()),
                 due_on: Some(date(2026, 11, 20)),
+                ..NewTask::default()
             })
             .unwrap();
         let b = s.add_task(new_task("b")).unwrap();

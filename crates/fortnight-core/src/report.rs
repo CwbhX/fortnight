@@ -6,8 +6,10 @@
 //! The LLM never does arithmetic: days until due, weekdays and overdue
 //! flags are computed here and handed over as facts. PLAN.md 7.3 and 7.4.
 
-use crate::domain::{NewReport, ReportKind, ReportStatus, Settings, Task, TaskStatus, WeekRef};
-use crate::llm::{ChatRequest, LlmClient};
+use crate::domain::{
+    Event, NewReport, ReportKind, ReportStatus, Settings, Task, TaskStatus, WeekRef,
+};
+use crate::llm::{ChatRequest, ChatResponse, LlmClient, LlmError};
 use jiff::Timestamp;
 use jiff::ToSpan;
 use jiff::civil::{Date, Weekday};
@@ -117,7 +119,14 @@ pub struct ProjectCount {
 /// Builds summary facts. `tz` converts timestamps (completed_at,
 /// created_at) to local civil dates. `today` is clamped to the week's end,
 /// so a past week is described as of its last day.
-pub fn summary_facts(tasks: &[Task], week: WeekRef, today: Date, tz: &TimeZone) -> SummaryFacts {
+pub fn summary_facts(
+    tasks: &[Task],
+    events: &[Event],
+    week: WeekRef,
+    today: Date,
+    tz: &TimeZone,
+) -> SummaryFacts {
+    let _ = events; // STUB (round 2): agent E uses the history.
     let local = |ts: Timestamp| tz.to_datetime(ts).date();
     let week_end = week.end();
     let as_of = today.min(week_end);
@@ -293,7 +302,14 @@ pub struct PlanTotals {
 }
 
 /// Builds plan facts from open tasks, relative to `today`.
-pub fn plan_facts(tasks: &[Task], week: WeekRef, today: Date, settings: &Settings) -> PlanFacts {
+pub fn plan_facts(
+    tasks: &[Task],
+    events: &[Event],
+    week: WeekRef,
+    today: Date,
+    settings: &Settings,
+) -> PlanFacts {
+    let _ = events; // STUB (round 2): agent E counts deadline moves.
     let week_end = week.end();
     let horizon = today.saturating_add(LOOKAHEAD_DAYS.days());
     let working = &settings.schedule.working_days;
@@ -650,12 +666,13 @@ fn summary_system(settings: &Settings) -> String {
 
 pub fn prepare_summary(
     tasks: &[Task],
+    events: &[Event],
     week: WeekRef,
     today: Date,
     tz: &TimeZone,
     settings: &Settings,
 ) -> Prepared {
-    let facts = summary_facts(tasks, week, today, tz);
+    let facts = summary_facts(tasks, events, week, today, tz);
     let digest_json = facts_json(&facts);
     let user = format!(
         "Write my weekly update for the week {} to {}.\n\n<facts>\n{digest_json}\n</facts>",
@@ -673,8 +690,14 @@ pub fn prepare_summary(
     }
 }
 
-pub fn prepare_plan(tasks: &[Task], week: WeekRef, today: Date, settings: &Settings) -> Prepared {
-    let facts = plan_facts(tasks, week, today, settings);
+pub fn prepare_plan(
+    tasks: &[Task],
+    events: &[Event],
+    week: WeekRef,
+    today: Date,
+    settings: &Settings,
+) -> Prepared {
+    let facts = plan_facts(tasks, events, week, today, settings);
     let digest_json = facts_json(&facts);
     let user = format!(
         "Plan my week {} to {}. Today is {}.\n\n<facts>\n{digest_json}\n</facts>",
@@ -695,25 +718,38 @@ pub fn prepare_plan(tasks: &[Task], week: WeekRef, today: Date, settings: &Setti
 
 /// Calls the model and returns a report row to insert: `Ready` with the
 /// content on success, `Failed` with the error message otherwise. Never
-/// panics on a client error.
+/// panics on a client error. The app streams instead (`chat_stream`) and
+/// calls `finish`; the CLI uses this.
 pub async fn generate(
     client: Arc<dyn LlmClient>,
     prepared: Prepared,
+    endpoint_host: Option<String>,
+) -> NewReport {
+    let result = client.chat(prepared.request.clone()).await;
+    finish(prepared, result, client.model(), endpoint_host)
+}
+
+/// The report row for a finished call: `Ready` with the reply, or `Failed`
+/// with the error message. `requested_model` is recorded when the call
+/// failed (there is no reported model then).
+pub fn finish(
+    prepared: Prepared,
+    result: Result<ChatResponse, LlmError>,
+    requested_model: &str,
     endpoint_host: Option<String>,
 ) -> NewReport {
     let Prepared {
         kind,
         week,
         digest_json,
-        request,
+        request: _,
     } = prepared;
-    let result = client.chat(request).await;
     let (status, content_md, model, error) = match result {
         Ok(resp) => (ReportStatus::Ready, Some(resp.text), resp.model, None),
         Err(e) => (
             ReportStatus::Failed,
             None,
-            client.model().to_string(),
+            requested_model.to_string(),
             Some(e.to_string()),
         ),
     };
@@ -728,6 +764,48 @@ pub async fn generate(
         prompt_version: PROMPT_VERSION,
         error,
     }
+}
+
+/// Exactly what a request sends, for "what will be sent": the system
+/// prompt, then the user message (which holds the facts).
+pub fn request_preview(request: &ChatRequest) -> String {
+    format!(
+        "System prompt\n-------------\n{}\n\nUser message\n------------\n{}",
+        request.system, request.user
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Capacity
+// ---------------------------------------------------------------------------
+
+/// Estimated load on one day against its capacity. For the Week tab's load
+/// bars and the plan facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DayLoad {
+    pub date: Date,
+    /// Sum of `estimate_minutes` of open tasks whose `Task::day()` is this
+    /// date.
+    pub load_minutes: u32,
+    /// `Settings::focus_minutes_per_day` on working days, 0 otherwise.
+    pub capacity_minutes: u32,
+    /// Open tasks on this day with no estimate.
+    pub unestimated: usize,
+}
+
+/// One `DayLoad` per day of `week`, in order (seven entries).
+pub fn day_loads(tasks: &[Task], week: WeekRef, settings: &Settings) -> Vec<DayLoad> {
+    // STUB (round 2): agent E implements and tests.
+    let _ = (tasks, settings);
+    week.days()
+        .into_iter()
+        .map(|date| DayLoad {
+            date,
+            load_minutes: 0,
+            capacity_minutes: 0,
+            unestimated: 0,
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -835,6 +913,7 @@ mod tests {
             created_at: ts("2026-10-01T09:00:00Z"),
             updated_at: ts("2026-10-01T09:00:00Z"),
             completed_at: None,
+            ..Task::default()
         }
     }
 
@@ -974,6 +1053,7 @@ mod tests {
     fn completed_respects_week_bounds_in_local_time() {
         let f = summary_facts(
             &summary_fixture(),
+            &[],
             summary_week(),
             summary_week().end(),
             &TimeZone::UTC,
@@ -985,14 +1065,20 @@ mod tests {
         // Completed Sunday 23:30 UTC: in the week in UTC, Monday in UTC+2.
         let late = vec![done_at(task(1, "Late"), "2026-11-15T23:30:00Z")];
         assert_eq!(
-            summary_facts(&late, summary_week(), summary_week().end(), &TimeZone::UTC)
-                .completed
-                .len(),
+            summary_facts(
+                &late,
+                &[],
+                summary_week(),
+                summary_week().end(),
+                &TimeZone::UTC
+            )
+            .completed
+            .len(),
             1
         );
         let plus2 = TimeZone::fixed(tz::offset(2));
         assert!(
-            summary_facts(&late, summary_week(), summary_week().end(), &plus2)
+            summary_facts(&late, &[], summary_week(), summary_week().end(), &plus2)
                 .completed
                 .is_empty()
         );
@@ -1002,7 +1088,13 @@ mod tests {
     fn reopened_task_is_not_completed() {
         // Reopened: status back to Todo, completed_at cleared.
         let tasks = vec![updated(task(1, "Reopened"), "2026-11-11T10:00:00Z")];
-        let f = summary_facts(&tasks, summary_week(), summary_week().end(), &TimeZone::UTC);
+        let f = summary_facts(
+            &tasks,
+            &[],
+            summary_week(),
+            summary_week().end(),
+            &TimeZone::UTC,
+        );
         assert!(f.completed.is_empty());
         assert!(f.completed_by_project.is_empty());
         assert_eq!(f.in_progress.len(), 1);
@@ -1011,9 +1103,15 @@ mod tests {
         let mut odd = task(2, "Odd");
         odd.status = TaskStatus::Done;
         assert!(
-            summary_facts(&[odd], summary_week(), summary_week().end(), &TimeZone::UTC)
-                .completed
-                .is_empty()
+            summary_facts(
+                &[odd],
+                &[],
+                summary_week(),
+                summary_week().end(),
+                &TimeZone::UTC
+            )
+            .completed
+            .is_empty()
         );
     }
 
@@ -1021,6 +1119,7 @@ mod tests {
     fn missed_next_week_and_counts() {
         let f = summary_facts(
             &summary_fixture(),
+            &[],
             summary_week(),
             summary_week().end(),
             &TimeZone::UTC,
@@ -1049,14 +1148,20 @@ mod tests {
     fn mid_week_counts_overdue_from_today() {
         // Wednesday: Thursday's and Sunday's tasks are not overdue yet.
         let wed = summary_week().start.saturating_add(2.days());
-        let f = summary_facts(&summary_fixture(), summary_week(), wed, &TimeZone::UTC);
+        let f = summary_facts(&summary_fixture(), &[], summary_week(), wed, &TimeZone::UTC);
         assert_eq!(f.as_of, wed);
         assert!(f.missed.is_empty());
         let next: Vec<i64> = f.next_week.iter().map(|t| t.id).collect();
         assert_eq!(next, vec![6, 7, 5, 11]);
         // A later "today" is clamped to the week's end.
         let later = summary_week().end().saturating_add(30.days());
-        let f = summary_facts(&summary_fixture(), summary_week(), later, &TimeZone::UTC);
+        let f = summary_facts(
+            &summary_fixture(),
+            &[],
+            summary_week(),
+            later,
+            &TimeZone::UTC,
+        );
         assert_eq!(f.as_of, summary_week().end());
     }
 
@@ -1065,7 +1170,13 @@ mod tests {
         let mut t = task(1, "Notes");
         t.notes = format!("  {}  ", "é".repeat(500));
         let t = done_at(t, "2026-11-10T10:00:00Z");
-        let f = summary_facts(&[t], summary_week(), summary_week().end(), &TimeZone::UTC);
+        let f = summary_facts(
+            &[t],
+            &[],
+            summary_week(),
+            summary_week().end(),
+            &TimeZone::UTC,
+        );
         let notes = &f.completed[0].notes;
         assert_eq!(notes.chars().count(), NOTES_MAX_CHARS + 1);
         assert!(notes.ends_with('…'));
@@ -1077,6 +1188,7 @@ mod tests {
     fn plan_buckets_overdue_this_week_and_soon() {
         let f = plan_facts(
             &plan_fixture(),
+            &[],
             plan_week(),
             plan_today(),
             &Settings::default(),
@@ -1106,7 +1218,7 @@ mod tests {
     #[test]
     fn remaining_working_days_follow_settings() {
         let days = |today: Date, s: &Settings| {
-            plan_facts(&[], plan_week(), today, s)
+            plan_facts(&[], &[], plan_week(), today, s)
                 .remaining_working_days
                 .iter()
                 .map(|d| d.weekday)
@@ -1130,7 +1242,7 @@ mod tests {
     #[test]
     fn undated_is_capped_but_counted() {
         let tasks: Vec<Task> = (1..=14).map(|i| task(i, "Undated")).collect();
-        let f = plan_facts(&tasks, plan_week(), plan_today(), &Settings::default());
+        let f = plan_facts(&tasks, &[], plan_week(), plan_today(), &Settings::default());
         assert_eq!(f.undated.len(), MAX_UNDATED);
         assert_eq!(f.totals.undated, 14);
         assert!(plan_facts_markdown(&f).contains("No due date (showing 10 of 14)"));
@@ -1146,6 +1258,7 @@ mod tests {
         )];
         let p = prepare_summary(
             &tasks,
+            &[],
             summary_week(),
             summary_week().end(),
             &TimeZone::UTC,
@@ -1165,6 +1278,7 @@ mod tests {
         let mut s = Settings::default();
         let p = prepare_summary(
             &[],
+            &[],
             summary_week(),
             summary_week().end(),
             &TimeZone::UTC,
@@ -1173,6 +1287,7 @@ mod tests {
         assert!(!p.request.system.contains("preferences"));
         s.summary_instructions = "  Under 150 words. Friendly.  ".into();
         let p = prepare_summary(
+            &[],
             &[],
             summary_week(),
             summary_week().end(),
@@ -1188,13 +1303,20 @@ mod tests {
     #[test]
     fn snapshot_summary() {
         let tasks = summary_fixture();
-        let facts = summary_facts(&tasks, summary_week(), summary_week().end(), &TimeZone::UTC);
+        let facts = summary_facts(
+            &tasks,
+            &[],
+            summary_week(),
+            summary_week().end(),
+            &TimeZone::UTC,
+        );
         let settings = Settings {
             summary_instructions: "Keep it under 200 words.".into(),
             ..Settings::default()
         };
         let p = prepare_summary(
             &tasks,
+            &[],
             summary_week(),
             summary_week().end(),
             &TimeZone::UTC,
@@ -1211,8 +1333,8 @@ mod tests {
     #[test]
     fn snapshot_plan() {
         let tasks = plan_fixture();
-        let facts = plan_facts(&tasks, plan_week(), plan_today(), &Settings::default());
-        let p = prepare_plan(&tasks, plan_week(), plan_today(), &Settings::default());
+        let facts = plan_facts(&tasks, &[], plan_week(), plan_today(), &Settings::default());
+        let p = prepare_plan(&tasks, &[], plan_week(), plan_today(), &Settings::default());
         snap_settings().bind(|| {
             insta::assert_json_snapshot!("report__plan_facts", facts);
             insta::assert_snapshot!("report__plan_markdown", plan_facts_markdown(&facts));
@@ -1224,8 +1346,14 @@ mod tests {
     #[test]
     fn snapshot_empty_week() {
         let s = Settings::default();
-        let summary = summary_facts(&[], summary_week(), summary_week().end(), &TimeZone::UTC);
-        let plan = plan_facts(&[], plan_week(), plan_today(), &s);
+        let summary = summary_facts(
+            &[],
+            &[],
+            summary_week(),
+            summary_week().end(),
+            &TimeZone::UTC,
+        );
+        let plan = plan_facts(&[], &[], plan_week(), plan_today(), &s);
         snap_settings().bind(|| {
             insta::assert_json_snapshot!("report__empty_summary_facts", summary);
             insta::assert_snapshot!(
@@ -1250,6 +1378,7 @@ mod tests {
         let mock = Arc::new(MockClient::new("## Highlights\n- Shipped login."));
         let p = prepare_summary(
             &summary_fixture(),
+            &[],
             summary_week(),
             summary_week().end(),
             &TimeZone::UTC,
@@ -1284,6 +1413,7 @@ mod tests {
         mock.push_reply(Err(LlmError::Unauthorized));
         let p = prepare_plan(
             &plan_fixture(),
+            &[],
             plan_week(),
             plan_today(),
             &Settings::default(),
