@@ -4,8 +4,9 @@
 //! A header of weekday names from `week_start`, then one row per week from
 //! `month_weeks`. Each row starts with its week label ("W47"), which opens
 //! the week in the Week tab and carries an accent dot when the week has a
-//! ready summary. Each day cell shows the date and up to three task titles
-//! (open first, then done or dropped dimmed; overdue red), then "+N more".
+//! ready summary. Each day cell shows the date and up to three tasks as
+//! small cards like the Week tab's (open first, with the priority `!`; done
+//! or dropped dimmed; overdue red), then "+N more".
 //! Clicking a cell opens the day in the Today tab.
 //!
 //! The grid fills the content area with equal cells. When the rows get too
@@ -107,25 +108,33 @@ const GAP: f32 = 6.0;
 const OUTER_PAD_X: f32 = theme::SPACING * 1.5;
 const OUTER_PAD_Y: f32 = theme::SPACING;
 /// Padding inside a cell: sides, then top and bottom.
-const CELL_PAD_X: f32 = 8.0;
-const CELL_PAD_Y: f32 = 6.0;
+const CELL_PAD_X: f32 = 6.0;
+const CELL_PAD_Y: f32 = 5.0;
+/// Padding inside a task card: sides, then top and bottom.
+const PILL_PAD_X: f32 = 7.0;
+const PILL_PAD_Y: f32 = 2.0;
+/// Space between the date and the first card.
+const DATE_GAP: f32 = 3.0;
 /// Text size of the date number.
 const DATE_SIZE: f32 = theme::TEXT_SMALL;
 /// Text size of task titles and "+N more".
 const TITLE_SIZE: f32 = 12.0;
 /// Line height factor for all text in the grid.
 const LINE: f32 = 1.25;
-/// Space between the date and the first title, and between titles.
-const LINE_GAP: f32 = 1.0;
+/// Space between task cards.
+const LINE_GAP: f32 = 2.0;
 /// Height of the weekday header row (text plus the gap under it).
 const HEADER_HEIGHT: f32 = DATE_SIZE * LINE + GAP;
 /// Average glyph width of Inter as a fraction of the font size; slightly
 /// generous so titles are cut before they reach the clip edge.
 const GLYPH_WIDTH: f32 = 0.54;
 
+/// Height of one task card line, with the gap above it.
+const LINE_HEIGHT: f32 = TITLE_SIZE * LINE + PILL_PAD_Y * 2.0 + LINE_GAP;
+
 /// Height of a cell that shows the date and `lines` title lines.
 fn cell_height(lines: usize) -> f32 {
-    CELL_PAD_Y * 2.0 + DATE_SIZE * LINE + lines as f32 * (TITLE_SIZE * LINE + LINE_GAP)
+    CELL_PAD_Y * 2.0 + DATE_SIZE * LINE + DATE_GAP + lines as f32 * LINE_HEIGHT
 }
 
 /// How many title lines (including a "+N more" line) fit in a row of
@@ -135,7 +144,7 @@ fn lines_that_fit(height: f32) -> usize {
     if free <= 0.0 {
         0
     } else {
-        (free / (TITLE_SIZE * LINE + LINE_GAP)).floor() as usize
+        (free / LINE_HEIGHT).floor() as usize
     }
 }
 
@@ -153,7 +162,8 @@ fn grid(data: &MonthData, size: Size) -> Element<'_, Message> {
     let lines = lines_that_fit(row_height).min(MAX_TITLES + 1);
 
     let cell_width = (size.width - OUTER_PAD_X * 2.0 - LABEL_WIDTH - GAP * 7.0) / 7.0;
-    let max_chars = ((cell_width - CELL_PAD_X * 2.0) / (TITLE_SIZE * GLYPH_WIDTH))
+    let max_chars = ((cell_width - CELL_PAD_X * 2.0 - PILL_PAD_X * 2.0)
+        / (TITLE_SIZE * GLYPH_WIDTH))
         .floor()
         .max(1.0) as usize;
 
@@ -237,26 +247,23 @@ fn day_cell(data: &MonthData, day: Date, lines: usize, max_chars: usize) -> Elem
         });
     }
 
-    let mut col = Column::new().spacing(LINE_GAP).push(date);
+    let mut cards = Column::new().spacing(LINE_GAP);
     for t in &content.titles {
-        let style = title_style(t.done, t.overdue);
-        col = col.push(
-            text(truncate(&t.title, max_chars))
-                .size(TITLE_SIZE)
-                .line_height(LINE)
-                .wrapping(Wrapping::None)
-                .style(style),
-        );
+        cards = cards.push(task_pill(t, max_chars));
     }
     if content.more > 0 {
-        col = col.push(
-            text(format!("+{} more", content.more))
-                .size(TITLE_SIZE)
-                .line_height(LINE)
-                .wrapping(Wrapping::None)
-                .style(theme::muted),
+        cards = cards.push(
+            container(
+                text(format!("+{} more", content.more))
+                    .size(TITLE_SIZE)
+                    .line_height(LINE)
+                    .wrapping(Wrapping::None)
+                    .style(theme::muted),
+            )
+            .padding([PILL_PAD_Y, PILL_PAD_X]),
         );
     }
+    let col = column![date, cards].spacing(DATE_GAP);
 
     button(
         container(col)
@@ -273,19 +280,58 @@ fn day_cell(data: &MonthData, day: Date, lines: usize, max_chars: usize) -> Elem
     .into()
 }
 
-/// The colour of a title: red when overdue, faint when done or dropped,
-/// otherwise the cell's own text colour (muted on weekends and outside the
-/// month).
-fn title_style(done: bool, overdue: bool) -> impl Fn(&Theme) -> text::Style {
-    move |theme| text::Style {
-        color: if overdue {
-            Some(theme::danger_color(theme))
-        } else if done {
-            Some(theme.palette().text.scale_alpha(0.35))
-        } else {
-            None
-        },
+/// One task as a small card, like the Week tab's: the priority `!` in its
+/// colour, then the title. Overdue is red on a red tint; done or dropped is
+/// faint on a fainter fill.
+fn task_pill<'a>(t: &TitleLine, max_chars: usize) -> Element<'a, Message> {
+    let (done, overdue) = (t.done, t.overdue);
+    let mut line = Row::new().spacing(3);
+    let level = t.priority.min(2);
+    let mut chars = max_chars;
+    if !done && level > 0 {
+        chars = chars.saturating_sub(usize::from(level) + 1);
+        line = line.push(
+            text("!".repeat(usize::from(level)))
+                .size(TITLE_SIZE)
+                .line_height(LINE)
+                .style(move |theme: &Theme| text::Style {
+                    color: theme::priority_color(theme, level),
+                }),
+        );
     }
+    line = line.push(
+        text(truncate(&t.title, chars.max(1)))
+            .size(TITLE_SIZE)
+            .line_height(LINE)
+            .wrapping(Wrapping::None)
+            .style(move |theme: &Theme| text::Style {
+                color: Some(if overdue {
+                    theme::danger_color(theme)
+                } else if done {
+                    theme.palette().text.scale_alpha(0.4)
+                } else {
+                    theme.palette().text
+                }),
+            }),
+    );
+    container(line)
+        .padding([PILL_PAD_Y, PILL_PAD_X])
+        .width(Fill)
+        .clip(true)
+        .style(move |theme: &Theme| {
+            let p = theme.palette();
+            let fill = if overdue {
+                theme::danger_color(theme).scale_alpha(0.14)
+            } else {
+                mix(p.background, p.text, if done { 0.06 } else { 0.11 })
+            };
+            container::Style {
+                background: Some(fill.into()),
+                border: border::rounded(5),
+                ..container::Style::default()
+            }
+        })
+        .into()
 }
 
 /// [`theme::calendar_cell`] as a button style, a little darker on hover.
@@ -332,6 +378,8 @@ struct TitleLine {
     done: bool,
     /// Open with a deadline before today: red.
     overdue: bool,
+    /// Shown as `!` / `!!` on open tasks.
+    priority: u8,
 }
 
 /// What a day cell lists.
@@ -372,6 +420,7 @@ fn cell_content(tasks: &[Task], day: Date, today: Date, lines: usize) -> CellCon
                 title: t.title.clone(),
                 done: !t.status.is_open(),
                 overdue: t.is_overdue(today),
+                priority: t.priority,
             })
             .collect(),
         more: total - shown,
