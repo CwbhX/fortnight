@@ -456,6 +456,34 @@ impl SqliteStore {
         Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate).map_err(db)
     }
 
+    /// `Store::add_log` at a given time instead of now: the Today tab's
+    /// notes for a day other than today are stamped on that day.
+    pub fn add_log_at(
+        &self,
+        task_id: Option<TaskId>,
+        text: &str,
+        at: Timestamp,
+    ) -> StoreResult<Event> {
+        let tx = self.write_tx()?;
+        if let Some(id) = task_id
+            && !task_exists(&tx, id)?
+        {
+            return Err(StoreError::TaskNotFound(id));
+        }
+        let kind = EventKind::Log {
+            text: text.to_string(),
+        };
+        let id = insert_event(&tx, task_id, &ts_to_sql(at), &kind)?;
+        tx.commit().map_err(db)?;
+        // Nine fraction digits are lossless, so this equals a later read.
+        Ok(Event {
+            id,
+            task_id,
+            at,
+            kind,
+        })
+    }
+
     fn report_by_id(&self, id: ReportId) -> StoreResult<Option<Report>> {
         self.conn
             .query_row(
@@ -698,25 +726,7 @@ impl Store for SqliteStore {
     }
 
     fn add_log(&self, task_id: Option<TaskId>, text: &str) -> StoreResult<Event> {
-        let tx = self.write_tx()?;
-        if let Some(id) = task_id
-            && !task_exists(&tx, id)?
-        {
-            return Err(StoreError::TaskNotFound(id));
-        }
-        let at = Timestamp::now();
-        let kind = EventKind::Log {
-            text: text.to_string(),
-        };
-        let id = insert_event(&tx, task_id, &ts_to_sql(at), &kind)?;
-        tx.commit().map_err(db)?;
-        // Nine fraction digits are lossless, so this equals a later read.
-        Ok(Event {
-            id,
-            task_id,
-            at,
-            kind,
-        })
+        self.add_log_at(task_id, text, Timestamp::now())
     }
 
     fn delete_log(&self, id: EventId) -> StoreResult<()> {
@@ -1898,6 +1908,22 @@ mod tests {
         // Restoring twice fails and adds nothing.
         assert!(matches!(s.restore_task(&deleted), Err(StoreError::Db(_))));
         assert_eq!(all_events(&s), expected);
+    }
+
+    #[test]
+    fn a_log_line_can_be_dated() {
+        let s = store();
+        let later: Timestamp = "2030-01-02T12:00:00Z".parse().unwrap();
+        let dated = s.add_log_at(None, "a future day's notes", later).unwrap();
+        assert_eq!(dated.at, later);
+        assert_eq!(
+            s.events_between(later, Timestamp::MAX).unwrap(),
+            vec![dated]
+        );
+        assert_eq!(
+            s.add_log_at(Some(42), "x", later),
+            Err(StoreError::TaskNotFound(42))
+        );
     }
 
     #[test]

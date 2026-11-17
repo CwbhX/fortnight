@@ -649,14 +649,10 @@ pub fn overlay_panel(theme: &Theme) -> container::Style {
     }
 }
 
-/// The colour of a priority marker: accent for 1, red for 2 and above,
-/// `None` for normal priority.
-pub fn priority_color(theme: &Theme, priority: u8) -> Option<Color> {
-    match priority {
-        0 => None,
-        1 => Some(accent_color()),
-        _ => Some(danger_color(theme)),
-    }
+/// The colour of a priority marker (`!` or `!!`): the accent, `None` for
+/// normal priority.
+pub fn priority_color(_theme: &Theme, priority: u8) -> Option<Color> {
+    (priority > 0).then(accent_color)
 }
 
 /// A task title followed by its priority marks ("Write report !!") in the

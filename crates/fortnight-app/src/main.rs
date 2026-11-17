@@ -100,8 +100,11 @@ enum Message {
     Tick,
     /// Checks whether the Work summary's wait after an edit is over.
     SummaryWait,
-    /// While Today's Notes have unsaved typing: save them once it pauses.
+    /// While a day's notes have unsaved typing: save them once it pauses.
     NotesTick,
+    /// A later day's recommended tasks came back: the day, the facts they
+    /// were worked out from, and the reply.
+    DayRecs(Date, String, Result<ChatResponse, LlmError>),
     ThemeMode(iced::theme::Mode),
     /// A piece of a streamed report.
     Stream(ReportKey, u64, Result<ChatEvent, LlmError>),
@@ -257,6 +260,12 @@ struct Ready {
     undo: Vec<Undo>,
     /// A report became ready while the Week tab wasn't showing.
     week_badge: bool,
+    /// Recommended tasks for later days (not stored as reports): each with
+    /// the facts it was worked out from, redone when those change.
+    day_recs: HashMap<Date, (String, Vec<day::Recommended>)>,
+    /// Later days whose recommendations are being worked out, and from
+    /// which facts.
+    day_recs_pending: HashMap<Date, String>,
     /// Test connection / Load models requests in flight, aborted on Lock.
     key_requests: Vec<iced::task::Handle>,
     /// The app icon last shown (`Some(true)` = dark), `None` before any.
@@ -490,6 +499,8 @@ impl Ready {
             notice,
             undo: Vec::new(),
             week_badge: false,
+            day_recs: HashMap::new(),
+            day_recs_pending: HashMap::new(),
             key_requests: Vec::new(),
             icon_dark: None,
             _lock: lock,
@@ -686,11 +697,22 @@ impl Ready {
                     tz: self.tz.clone(),
                     tasks: self.tasks.clone(),
                     week_start: self.settings.schedule.week_start,
-                    recommended: self.recommended_today(),
-                    recommending: self.generating.contains_key(&ReportKey {
-                        kind: ReportKind::Plan,
-                        week_start: self.current_week().start,
-                    }),
+                    recommended: if self.selected == today {
+                        self.recommended_today()
+                    } else {
+                        self.day_recs
+                            .get(&self.selected)
+                            .map(|(_, list)| list.clone())
+                            .unwrap_or_default()
+                    },
+                    recommending: if self.selected == today {
+                        self.generating.contains_key(&ReportKey {
+                            kind: ReportKind::Plan,
+                            week_start: self.current_week().start,
+                        })
+                    } else {
+                        self.day_recs_pending.contains_key(&self.selected)
+                    },
                     logs,
                 });
             }
@@ -902,6 +924,7 @@ impl Ready {
             Tab::Today if self.selected == self.today() => {
                 (self.current_week(), vec![ReportKind::Plan])
             }
+            Tab::Today => return self.update_day_recs(),
             _ => return Task::none(),
         };
         let mut tasks = Vec::new();
@@ -919,6 +942,56 @@ impl Ready {
             }
         }
         Task::batch(tasks)
+    }
+
+    /// Works out the recommended tasks of the later day the Today tab
+    /// shows, unless they are known for its current facts or on their way.
+    /// Only the open tasks planned for that day take part: overdue ones are
+    /// today's business. Not stored; a failure shows none until the facts
+    /// change.
+    fn update_day_recs(&mut self) -> Task<Message> {
+        let day = self.selected;
+        if self.tab != Tab::Today || day <= self.today() || self.blocked().is_some() {
+            return Task::none();
+        }
+        let tasks: Vec<CoreTask> = self
+            .tasks
+            .iter()
+            .filter(|t| t.status.is_open() && t.planned_for == Some(day))
+            .cloned()
+            .collect();
+        if tasks.is_empty() {
+            self.day_recs.remove(&day);
+            return Task::none();
+        }
+        let prepared =
+            report::prepare_plan(&tasks, &self.events, self.week_of(day), day, &self.settings);
+        let facts = prepared.digest_json;
+        if self.day_recs.get(&day).is_some_and(|(f, _)| *f == facts)
+            || self.day_recs_pending.get(&day) == Some(&facts)
+        {
+            return Task::none();
+        }
+        let Some(client) = self.plan_client() else {
+            return Task::none();
+        };
+        self.day_recs_pending.insert(day, facts.clone());
+        Task::perform(client.chat(prepared.request), move |result| {
+            Message::DayRecs(day, facts, result)
+        })
+    }
+
+    /// The client recommended tasks go to: the decision model when one is
+    /// set (and can be built), falling back to the main endpoint.
+    fn plan_client(&self) -> Option<Arc<dyn LlmClient>> {
+        let (main, _) = self.client_for(&self.settings.llm.clone()).ok()?;
+        let decision = self.settings.decision_llm.clone();
+        if decision.is_configured()
+            && let Ok((primary, _)) = self.decision_client_for(&decision)
+        {
+            return Some(Arc::new(FallbackClient::new(primary, main)));
+        }
+        Some(main)
     }
 
     /// Whether the Work summary is still waiting after a Week-tab change.
@@ -1271,7 +1344,7 @@ impl Ready {
                 week::Action::OpenDay(day) => {
                     self.selected = day;
                     self.tab = Tab::Today;
-                    Task::none()
+                    self.update_week_reports()
                 }
                 week::Action::Panel(action) => self.panel_action(action),
             },
@@ -1280,7 +1353,7 @@ impl Ready {
                 month::Action::OpenDay(day) => {
                     self.selected = day;
                     self.tab = Tab::Today;
-                    Task::none()
+                    self.update_week_reports()
                 }
                 month::Action::OpenWeek(week) => {
                     self.selected = week.start;
@@ -1307,10 +1380,32 @@ impl Ready {
             },
             Message::Tick => Task::batch([self.run_due(), self.update_week_reports()]),
             Message::NotesTick => {
-                if let Some(notes) = self.day_view.notes_to_save(std::time::Instant::now()) {
-                    self.save_todays_notes(&notes);
+                if let Some((day, notes)) = self.day_view.notes_to_save(std::time::Instant::now()) {
+                    self.save_notes(day, &notes);
                 }
                 Task::none()
+            }
+            Message::DayRecs(day, facts, result) => {
+                if self.day_recs_pending.get(&day) == Some(&facts) {
+                    self.day_recs_pending.remove(&day);
+                }
+                // A failure keeps nothing to show, until the facts change.
+                let list = result
+                    .ok()
+                    .and_then(|r| report::parse_recommendations(&r.text))
+                    .map(|rec| {
+                        rec.tasks
+                            .into_iter()
+                            .map(|t| day::Recommended {
+                                id: t.id,
+                                why: t.why,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.day_recs.insert(day, (facts, list));
+                // Tasks may have changed while it ran.
+                self.update_day_recs()
             }
             Message::SummaryWait => {
                 if self.summary_waiting() {
@@ -1633,23 +1728,35 @@ impl Ready {
         self.reload_tasks();
     }
 
-    /// Saves Today's Notes: today's free-standing log lines are replaced by
-    /// one holding `notes` (none if it is empty). Nothing is written when
-    /// they already say the same.
-    fn save_todays_notes(&mut self, notes: &str) {
-        let today = self.today();
-        let old: Vec<(EventId, &str)> = self
+    /// Saves a day's notes: its free-standing log lines are replaced by one
+    /// holding `notes` (none if it is empty), stamped when the first of
+    /// them was, else now on today, else noon on that day. Nothing is
+    /// written when they already say the same.
+    fn save_notes(&mut self, day: Date, notes: &str) {
+        let old: Vec<(EventId, Timestamp, &str)> = self
             .events
             .iter()
-            .filter(|e| e.task_id.is_none() && self.tz.to_datetime(e.at).date() == today)
-            .filter_map(|e| Some((e.id, e.log_text()?.trim_end())))
+            .filter(|e| e.task_id.is_none() && self.tz.to_datetime(e.at).date() == day)
+            .filter_map(|e| Some((e.id, e.at, e.log_text()?.trim_end())))
             .collect();
+        let at = match old.first() {
+            Some((_, at, _)) => *at,
+            None if day == self.today() => Timestamp::now(),
+            None => self
+                .tz
+                .to_timestamp(day.at(12, 0, 0, 0))
+                .unwrap_or_else(|_| Timestamp::now()),
+        };
         let notes = notes.trim();
-        let same = old.iter().map(|(_, t)| *t).collect::<Vec<_>>().join("\n");
+        let same = old
+            .iter()
+            .map(|(_, _, t)| *t)
+            .collect::<Vec<_>>()
+            .join("\n");
         if same == notes {
             return;
         }
-        let ids: Vec<EventId> = old.iter().map(|(id, _)| *id).collect();
+        let ids: Vec<EventId> = old.iter().map(|(id, _, _)| *id).collect();
         let result = ids
             .into_iter()
             .try_for_each(|id| self.store.delete_log(id))
@@ -1657,11 +1764,11 @@ impl Ready {
                 if notes.is_empty() {
                     Ok(())
                 } else {
-                    self.store.add_log(None, notes).map(|_| ())
+                    self.store.add_log_at(None, notes, at).map(|_| ())
                 }
             });
         if let Err(e) = result {
-            self.error = Some(format!("Could not save today's notes: {e}"));
+            self.error = Some(format!("Could not save the notes: {e}"));
         }
         self.reload_tasks();
     }

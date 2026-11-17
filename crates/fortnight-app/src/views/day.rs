@@ -2,9 +2,10 @@
 //!
 //! Sections, top to bottom:
 //!
-//! - **Recommended** (only when the shown day is today): the model's top
-//!   three open tasks (on the Tasks list, carried-over ones included, or
-//!   overdue), most important
+//! - **Recommended** (today and later days): the model's top three open
+//!   tasks. On today from the Tasks list (carried-over ones included) and
+//!   the overdue tasks; on a later day only from the tasks planned for it.
+//!   Most important
 //!   first, numbered (the model's reasons aren't shown). They are left out of
 //!   the sections below.
 //! - **Tasks**: open tasks whose [`Task::day`] (the planned day) is the
@@ -12,11 +13,11 @@
 //!   open tasks planned for an earlier day whose deadline has not passed.
 //! - **Overdue** (only when the shown day is today, and only if any): open
 //!   tasks whose deadline has passed.
-//! - **Today's Notes** (today): a free-text box to jot down anything from
-//!   the day. Saved a moment after typing stops, as one free-standing log
-//!   line dated today (replacing that day's others), so it reaches the
-//!   weekly summary as `log_lines`. Older side work lines show up as lines
-//!   of the notes. Other days show their notes read only, if any.
+//! - **Notes** ("Today's Notes" on today): a free-text box for the shown
+//!   day, any day. Saved a moment after typing stops (or on moving to
+//!   another day), as one free-standing log line dated that day (replacing
+//!   its others), so it reaches the weekly summary as `log_lines`. Older
+//!   side work lines show up as lines of the notes.
 //! - **Completed**, collapsed: done tasks whose day is the shown day (as on
 //!   the Week tab), whenever they were ticked; a done task with no day shows
 //!   on the day it was ticked.
@@ -54,9 +55,8 @@
 //! The other sections keep their own order and don't drag.
 //!
 //! Skipped for the prototype: undo for a drag, strikethrough on done tasks
-//! (iced text has none), editing the notes of a day other than today (the
-//! store stamps log lines now), undo for the notes, and saving notes typed
-//! in the last moment before quitting.
+//! (iced text has none), undo for the notes, and saving notes typed in the
+//! last moment before quitting.
 
 use std::cmp::Ordering;
 use std::time::{Duration, Instant};
@@ -256,10 +256,14 @@ pub struct DayView {
     selected: Option<TaskId>,
     /// The expanded row's form.
     editing: Option<EditForm>,
-    /// Today's Notes: always today's, whatever day is shown.
+    /// The shown day's notes.
     notes: text_editor::Content,
+    /// The day `notes` belong to.
+    notes_day: Option<Date>,
     /// When the notes were last typed in, while not yet saved.
     notes_edited: Option<Instant>,
+    /// Another day's notes left with unsaved typing: saved straight away.
+    notes_left: Option<(Date, String)>,
     /// The add-a-task input.
     quick_add: String,
     /// A held Tasks card.
@@ -343,10 +347,12 @@ fn open_order(a: &Task, b: &Task) -> Ordering {
 /// How many recommended tasks the Today tab shows.
 pub const MAX_RECOMMENDED: usize = 3;
 
-/// The recommended tasks shown: only when the shown day is today, those
-/// still open, at most [`MAX_RECOMMENDED`], in the model's order.
+/// The recommended tasks shown: on today and later days (not past ones),
+/// those still open, at most [`MAX_RECOMMENDED`], in the model's order.
+/// `main.rs` works them out for the shown day: on today from today's list
+/// and the overdue tasks, on a later day from the tasks planned for it.
 fn recommended_tasks(data: &DayData) -> Vec<&Task> {
-    if data.day != data.today {
+    if data.day < data.today {
         return Vec::new();
     }
     data.recommended
@@ -750,9 +756,18 @@ impl DayView {
             return;
         }
         let before = self.visible();
-        // Unsaved typing wins over what is stored.
-        if self.notes_edited.is_none() {
-            let stored = day_notes(&data, data.today);
+        if self.notes_day != Some(data.day) {
+            // Another day: what was typed on the last one is saved first.
+            if self.notes_edited.take().is_some()
+                && let Some(day) = self.notes_day
+            {
+                self.notes_left = Some((day, self.notes.text().trim_end().to_string()));
+            }
+            self.notes = text_editor::Content::with_text(&day_notes(&data, data.day));
+            self.notes_day = Some(data.day);
+        } else if self.notes_edited.is_none() {
+            // Unsaved typing wins over what is stored.
+            let stored = day_notes(&data, data.day);
             if self.notes.text().trim_end() != stored {
                 self.notes = text_editor::Content::with_text(&stored);
             }
@@ -1011,11 +1026,11 @@ impl DayView {
         if !recommended.is_empty() {
             let heading = section_title(&recommended, "Recommended Task", text::default);
             content = content.push(self.group(heading, recommended, data));
-        } else if data.recommending && data.day == data.today {
+        } else if data.recommending && data.day >= data.today {
             content = content.push(
                 column![
                     text("Recommended Tasks").size(theme::TEXT_HEADING),
-                    text("Picking today's top tasks…")
+                    text("Picking the top tasks…")
                         .size(theme::TEXT_BODY)
                         .style(theme::muted),
                 ]
@@ -1046,9 +1061,7 @@ impl DayView {
             content = content.push(self.group(heading, overdue, data));
         }
 
-        if let Some(notes) = self.day_notes_view(data) {
-            content = content.push(notes);
-        }
+        content = content.push(self.day_notes_view(data));
 
         let collapsibles = [
             (
@@ -1116,64 +1129,47 @@ impl DayView {
             .map(|f| (f.id, f.title.clone(), f.notes.text()))
     }
 
-    /// Whether Today's Notes have unsaved typing (`main.rs` then checks
+    /// Whether some day's notes have unsaved typing (`main.rs` then checks
     /// [`Self::notes_to_save`] every so often).
     pub fn notes_pending(&self) -> bool {
-        self.notes_edited.is_some()
+        self.notes_edited.is_some() || self.notes_left.is_some()
     }
 
-    /// Today's Notes to save, once typing has paused for
+    /// A day's notes to save: those of a day left with unsaved typing
+    /// straight away, the shown day's once typing has paused for
     /// [`NOTES_SAVE_DELAY`] (then they count as saved).
-    pub fn notes_to_save(&mut self, now: Instant) -> Option<String> {
+    pub fn notes_to_save(&mut self, now: Instant) -> Option<(Date, String)> {
+        if let Some(left) = self.notes_left.take() {
+            return Some(left);
+        }
         let edited = self.notes_edited?;
         if now.saturating_duration_since(edited) < NOTES_SAVE_DELAY {
             return None;
         }
         self.notes_edited = None;
-        Some(self.notes.text().trim_end().to_string())
+        Some((self.notes_day?, self.notes.text().trim_end().to_string()))
     }
 
-    /// Today's Notes on today (an editor, saved as you type), or the
-    /// shown day's notes, read only, on another day that has some.
-    fn day_notes_view<'a>(&'a self, data: &'a DayData) -> Option<Element<'a, Message>> {
-        if data.day == data.today {
-            let heading = text("Today's Notes").size(theme::TEXT_HEADING);
-            let editor = text_editor(&self.notes)
-                .placeholder("What's on your mind?")
-                .on_action(Message::EditDayNotes)
-                // Grows with the text, then scrolls.
-                .min_height(120)
-                .max_height(480)
-                .padding([11, 14])
-                .size(theme::TEXT_BODY)
-                .style(theme::editor);
-            return Some(
-                column![heading, editor]
-                    .spacing(theme::SPACING / 2.0)
-                    .into(),
-            );
-        }
-        let notes = day_notes(data, data.day);
-        if notes.is_empty() {
-            return None;
-        }
-        let body = container(text(notes).size(theme::TEXT_BODY))
-            .width(Fill)
+    /// The shown day's notes, saved as you type: "Today's Notes" on today,
+    /// "Notes" on any other day.
+    fn day_notes_view<'a>(&'a self, data: &'a DayData) -> Element<'a, Message> {
+        let heading = if data.day == data.today {
+            "Today's Notes"
+        } else {
+            "Notes"
+        };
+        let editor = text_editor(&self.notes)
+            .placeholder("What's on your mind?")
+            .on_action(Message::EditDayNotes)
+            // Grows with the text, then scrolls.
+            .min_height(120)
+            .max_height(480)
             .padding([11, 14])
-            .style(|t: &Theme| {
-                let b = task_card_style(false, false)(t, button::Status::Active);
-                container::Style {
-                    background: b.background,
-                    text_color: Some(b.text_color),
-                    border: b.border,
-                    ..container::Style::default()
-                }
-            });
-        Some(
-            column![text("Notes").size(theme::TEXT_HEADING), body]
-                .spacing(theme::SPACING / 2.0)
-                .into(),
-        )
+            .size(theme::TEXT_BODY)
+            .style(theme::editor);
+        column![text(heading).size(theme::TEXT_HEADING), editor]
+            .spacing(theme::SPACING / 2.0)
+            .into()
     }
 
     /// Shows a suggested priority on the inline form of task `id`.
@@ -1297,7 +1293,7 @@ impl DayView {
                 let rec = data
                     .recommended
                     .iter()
-                    .filter(|_| data.day == data.today)
+                    .filter(|_| data.day >= data.today)
                     .position(|r| r.id == task.id)
                     .map(|i| i + 1);
                 task_row(task, data.today, self.selected == Some(task.id), rec)
@@ -2367,9 +2363,12 @@ mod tests {
         assert_eq!(ids(&data, Section::Day), [3, 5]);
         assert_eq!(visible_rows(&data, false, false), [4, 2, 1, 3, 5]);
 
-        // Another day: no recommendations.
-        data.day = date(2026, 11, 17);
+        // A past day: no recommendations. A later one shows its own (as
+        // `main.rs` gives them).
+        data.day = date(2026, 11, 15);
         assert!(ids(&data, Section::Recommended).is_empty());
+        data.day = date(2026, 11, 17);
+        assert!(!ids(&data, Section::Recommended).is_empty());
     }
 
     #[test]
@@ -2466,11 +2465,32 @@ mod tests {
         view.load(data_for(today(), vec![]));
         assert_eq!(view.notes.text(), "helped Sam\nstandup ran long!");
         assert_eq!(
-            view.notes_to_save(typed + NOTES_SAVE_DELAY).as_deref(),
-            Some("helped Sam\nstandup ran long!")
+            view.notes_to_save(typed + NOTES_SAVE_DELAY),
+            Some((today(), "helped Sam\nstandup ran long!".to_string()))
         );
         assert!(!view.notes_pending());
         assert_eq!(view.notes_to_save(typed + NOTES_SAVE_DELAY * 2), None);
+
+        // Another day shows its own notes; typing there and moving on saves
+        // them for that day straight away.
+        let sunday = date(2026, 11, 15);
+        let mut other = data.clone();
+        other.day = sunday;
+        view.load(other);
+        assert_eq!(view.notes.text(), "Sunday");
+        view.update(Message::EditDayNotes(text_editor::Action::Move(
+            text_editor::Motion::DocumentEnd,
+        )));
+        view.update(Message::EditDayNotes(text_editor::Action::Edit(
+            text_editor::Edit::Insert('?'),
+        )));
+        view.load(data);
+        assert_eq!(view.notes.text(), "helped Sam\nstandup ran long");
+        assert_eq!(
+            view.notes_to_save(Instant::now()),
+            Some((sunday, "Sunday?".to_string()))
+        );
+        assert!(!view.notes_pending());
     }
 
     #[test]
