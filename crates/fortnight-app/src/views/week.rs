@@ -34,8 +34,8 @@ use fortnight_core::domain::{ReportKind, Task, TaskId, TaskStatus, WeekRef};
 use fortnight_core::report::DayLoad;
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Column, Row, button, checkbox, column, container, mouse_area, pin, progress_bar, rich_text,
-    row, scrollable, space, span, stack, text, tooltip,
+    Column, Row, button, checkbox, column, container, mouse_area, pin, progress_bar, row,
+    scrollable, space, stack, text, tooltip,
 };
 use iced::{Center, Color, Element, Fill, Point, Theme, mouse};
 use jiff::civil::{Date, Weekday};
@@ -924,21 +924,17 @@ fn task_card<'a>(
     if let Some(rank) = rank {
         title = title.push(rank_badge(rank, done));
     }
-    if !done && task.priority > 0 {
-        title = title.push(title_with_marks(
-            &task.title,
-            task.priority.min(2),
-            title_style,
-        ));
-    } else {
-        title = title.push(
-            text(task.title.as_str())
-                .size(theme::TEXT_SMALL)
-                .style(title_style)
+    let level = if done { 0 } else { task.priority.min(2) };
+    title = title.push(theme::title_with_marks(
+        task.title.as_str(),
+        level,
+        title_style,
+        |t| {
+            t.size(theme::TEXT_SMALL)
                 .wrapping(Wrapping::WordOrGlyph)
-                .width(Fill),
-        );
-    }
+                .width(Fill)
+        },
+    ));
 
     let mut body = Column::new().spacing(2).width(Fill).push(title);
     if !done {
@@ -973,39 +969,6 @@ fn task_card<'a>(
 }
 
 /// A raised, rounded card; quieter when done, see-through while dragged.
-/// A card title with the priority `!`s after its last word, in the priority
-/// colour (a non-breaking space keeps them on the last word's line). A rich
-/// text's spans take fixed colours, but both colours here come from the
-/// theme, so two copies of the same text are stacked: one draws the title
-/// with the `!`s hidden, the other only the `!`s. Same text, same layout.
-fn title_with_marks<'a>(
-    title: &'a str,
-    level: u8,
-    title_style: fn(&Theme) -> text::Style,
-) -> Element<'a, Message> {
-    let marks = format!("\u{a0}{}", "!".repeat(usize::from(level)));
-    let layer = |show_title: bool| {
-        let hidden = Some(Color::TRANSPARENT);
-        rich_text([
-            span::<(), _>(title).color_maybe(if show_title { None } else { hidden }),
-            span(marks.clone()).color_maybe(if show_title { hidden } else { None }),
-        ])
-        .size(theme::TEXT_SMALL)
-        .wrapping(Wrapping::WordOrGlyph)
-        .width(Fill)
-        .style(move |t: &Theme| {
-            if show_title {
-                title_style(t)
-            } else {
-                text::Style {
-                    color: theme::priority_color(t, level),
-                }
-            }
-        })
-    };
-    stack![layer(true), layer(false)].width(Fill).into()
-}
-
 fn card_style(theme: &Theme, done: bool, faded: bool) -> container::Style {
     let p = theme.palette();
     let amount = if done { 0.05 } else { 0.1 };

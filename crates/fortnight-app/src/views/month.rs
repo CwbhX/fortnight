@@ -281,39 +281,33 @@ fn day_cell(data: &MonthData, day: Date, lines: usize, max_chars: usize) -> Elem
     .into()
 }
 
-/// One task as a small card, like the Week tab's: the priority `!` in its
-/// colour, then the title. Overdue is red on a red tint; done or dropped is
+/// One task as a small card, like the Week tab's: the title, then the
+/// priority `!` in its colour. Overdue is red on a red tint; done or dropped is
 /// faint on a fainter fill.
 fn task_pill<'a>(t: &TitleLine, max_chars: usize) -> Element<'a, Message> {
     let (done, overdue) = (t.done, t.overdue);
-    let mut line = Row::new().spacing(3);
-    let level = t.priority.min(2);
-    let mut chars = max_chars;
-    if !done && level > 0 {
-        chars = chars.saturating_sub(usize::from(level) + 1);
-        line = line.push(
-            text("!".repeat(usize::from(level)))
-                .size(TITLE_SIZE)
-                .line_height(LINE)
-                .style(move |theme: &Theme| text::Style {
-                    color: theme::priority_color(theme, level),
-                }),
-        );
-    }
-    line = line.push(
-        text(truncate(&t.title, chars.max(1)))
-            .size(TITLE_SIZE)
-            .line_height(LINE)
-            .wrapping(Wrapping::None)
-            .style(move |theme: &Theme| text::Style {
-                color: Some(if overdue {
-                    theme::danger_color(theme)
-                } else if done {
-                    theme.palette().text.scale_alpha(0.4)
-                } else {
-                    theme.palette().text
-                }),
+    let level = if done { 0 } else { t.priority.min(2) };
+    let chars = match level {
+        0 => max_chars,
+        _ => max_chars.saturating_sub(usize::from(level) + 1),
+    };
+    let line = theme::title_with_marks(
+        truncate(&t.title, chars.max(1)),
+        level,
+        move |theme: &Theme| text::Style {
+            color: Some(if overdue {
+                theme::danger_color(theme)
+            } else if done {
+                theme.palette().text.scale_alpha(0.4)
+            } else {
+                theme.palette().text
             }),
+        },
+        |r| {
+            r.size(TITLE_SIZE)
+                .line_height(LINE)
+                .wrapping(Wrapping::None)
+        },
     );
     container(line)
         .padding([PILL_PAD_Y, PILL_PAD_X])

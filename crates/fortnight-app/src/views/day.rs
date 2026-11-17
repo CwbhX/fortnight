@@ -1322,19 +1322,6 @@ fn task_card_style(done: bool, selected: bool) -> impl Fn(&Theme, button::Status
     }
 }
 
-/// `!` for Medium, `!!` for High, in the priority colour; `None` for Low.
-fn priority_marker<'a>(priority: Priority) -> Option<Element<'a, Message>> {
-    let level = priority_level(priority);
-    (level > 0).then(|| {
-        text("!".repeat(usize::from(level)))
-            .size(theme::TEXT_BODY)
-            .style(move |theme: &Theme| text::Style {
-                color: theme::priority_color(theme, level),
-            })
-            .into()
-    })
-}
-
 /// What a task card shows: checkbox, title and details. `rec` is its rank
 /// and reason when it is recommended: a numbered badge before the title and
 /// the reason after it.
@@ -1350,14 +1337,18 @@ fn card_content<'a>(
     if let Some((rank, _)) = rec {
         line = line.push(rank_badge(rank));
     }
-    if open && let Some(marker) = priority_marker(task.priority) {
-        line = line.push(marker);
-    }
-    let mut title = text(&task.title).size(theme::TEXT_BODY);
-    if !open {
-        title = title.style(theme::muted);
-    }
-    line = line.push(title);
+    // The title, then `!` for Medium or `!!` for High (open tasks only).
+    let (level, style): (u8, fn(&Theme) -> text::Style) = if open {
+        (priority_level(task.priority), text::default)
+    } else {
+        (0, theme::muted)
+    };
+    line = line.push(theme::title_with_marks(
+        task.title.as_str(),
+        level,
+        style,
+        |t| t.size(theme::TEXT_BODY),
+    ));
     if let Some(project) = &task.project {
         line = line.push(project_chip(project));
     }

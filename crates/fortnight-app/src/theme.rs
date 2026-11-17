@@ -72,8 +72,10 @@
 
 use iced::border::{self, Border};
 use iced::theme::{Palette, palette};
-use iced::widget::{button, container, progress_bar, svg, text, text_editor, text_input};
-use iced::{Background, Color, Padding, Theme, color};
+use iced::widget::{
+    button, container, progress_bar, rich_text, span, stack, svg, text, text_editor, text_input,
+};
+use iced::{Background, Color, Element, Padding, Theme, color};
 
 /// The accent colour, `#ea580c`.
 pub const ACCENT: Color = Color::from_rgb(
@@ -599,6 +601,36 @@ pub fn priority_color(theme: &Theme, priority: u8) -> Option<Color> {
         1 => Some(ACCENT),
         _ => Some(danger_color(theme)),
     }
+}
+
+/// A task title followed by its priority marks ("Write report !!") in the
+/// priority colour, the same on every tab; `level` 0 shows the title alone.
+/// A non-breaking space keeps the marks on the last word's line. Rich text
+/// spans only take fixed colours and both colours here come from the theme,
+/// so two copies of the same text are stacked (same text, same layout): one
+/// draws the title with the marks hidden, the other only the marks. `build`
+/// sets size, width, wrapping and so on, alike for both.
+pub fn title_with_marks<'a, M: 'a>(
+    title: impl text::IntoFragment<'a>,
+    level: u8,
+    title_style: impl Fn(&Theme) -> text::Style + Clone + 'a,
+    build: impl Fn(text::Rich<'a, (), M>) -> text::Rich<'a, (), M>,
+) -> Element<'a, M> {
+    let title = title.into_fragment();
+    if level == 0 {
+        return build(rich_text([span(title)]).style(title_style)).into();
+    }
+    let marks = format!("\u{a0}{}", "!".repeat(usize::from(level)));
+    let hidden = Some(Color::TRANSPARENT);
+    let title_layer = rich_text([span(title.clone()), span(marks.clone()).color_maybe(hidden)])
+        .style(title_style);
+    let marks_layer =
+        rich_text([span(title).color_maybe(hidden), span(marks)]).style(move |theme: &Theme| {
+            text::Style {
+                color: priority_color(theme, level),
+            }
+        });
+    stack![build(title_layer), build(marks_layer)].into()
 }
 
 /// A due/overdue/muted label colour helper for text: `theme::danger` when

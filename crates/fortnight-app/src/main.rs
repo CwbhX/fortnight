@@ -66,6 +66,10 @@ use std::time::Duration;
 const RETRY_AFTER_MINUTES: i64 = 10;
 const RETRY_MAX_MINUTES: i64 = 24 * 60;
 
+/// After a change on the Week tab, the Work summary waits this long for
+/// more changes (each one restarts the wait) before it is redone.
+const SUMMARY_WAIT_SECS: i64 = 30;
+
 pub fn main() -> iced::Result {
     iced::application(App::boot, App::update, App::view)
         .title("Fortnight")
@@ -94,6 +98,8 @@ enum Message {
     /// The task dialog (the Week tab's `+`, or a click on a card).
     Dialog(day::Message),
     Tick,
+    /// Checks whether the Work summary's wait after an edit is over.
+    SummaryWait,
     ThemeMode(iced::theme::Mode),
     /// A piece of a streamed report.
     Stream(ReportKey, u64, Result<ChatEvent, LlmError>),
@@ -230,6 +236,10 @@ struct Ready {
     suggest_for: Option<(FormKey, String, String)>,
     /// Tasks were reloaded during this message (a change was made).
     tasks_changed: bool,
+    /// The Work summary isn't redone before this: set by each change made
+    /// on the Week tab (`SUMMARY_WAIT_SECS`), so a run of edits makes one
+    /// new summary, not one each.
+    summary_wait: Option<Timestamp>,
     testing: bool,
     test_result: Option<Result<String, String>>,
     key_message: Option<Result<String, String>>,
@@ -294,8 +304,15 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
+        let summary_wait = match self {
+            App::Ready(ready, _) if ready.summary_wait.is_some() => {
+                iced::time::every(Duration::from_secs(1)).map(|_| Message::SummaryWait)
+            }
+            _ => Subscription::none(),
+        };
         Subscription::batch([
             iced::time::every(Duration::from_secs(60)).map(|_| Message::Tick),
+            summary_wait,
             iced::system::theme_changes().map(Message::ThemeMode),
             iced::window::open_events().map(|_| Message::WindowOpened),
             // Ends a card drag (Week or Today) even when the button is let
@@ -451,6 +468,7 @@ impl Ready {
             suggest_seq: 0,
             suggest_for: None,
             tasks_changed: false,
+            summary_wait: None,
             testing: false,
             test_result: None,
             key_message: None,
@@ -877,12 +895,20 @@ impl Ready {
                 kind,
                 week_start: week.start,
             };
+            if kind == ReportKind::Summary && self.summary_waiting() {
+                continue;
+            }
             let (empty, stale) = self.freshness(kind, week);
             if !empty && stale && !self.backing_off(key) {
                 tasks.push(self.generate(kind, week, false));
             }
         }
         Task::batch(tasks)
+    }
+
+    /// Whether the Work summary is still waiting after a Week-tab change.
+    fn summary_waiting(&self) -> bool {
+        self.summary_wait.is_some_and(|at| Timestamp::now() < at)
     }
 
     /// A recent attempt at `key` failed and its retry wait hasn't passed:
@@ -1242,6 +1268,14 @@ impl Ready {
                 UnlockAction::Unlock(password) => self.unlock(password),
             },
             Message::Tick => Task::batch([self.run_due(), self.update_week_reports()]),
+            Message::SummaryWait => {
+                if self.summary_waiting() {
+                    Task::none()
+                } else {
+                    self.summary_wait = None;
+                    self.update_week_reports()
+                }
+            }
             Message::Stream(key, id, item) => match item {
                 Ok(ChatEvent::Delta(d)) if self.generating.contains_key(&key) => {
                     if let Some(g) = self.generating.get_mut(&key) {
@@ -1385,12 +1419,17 @@ impl Ready {
             }
         };
         self.refresh();
-        // A decision model is quick: recommendations follow every change.
-        // On the Week tab the Work summary does too (when its facts change).
-        if std::mem::take(&mut self.tasks_changed)
-            && (self.decision_active() || self.tab == Tab::Week)
-        {
-            return Task::batch([task, self.update_week_reports()]);
+        if std::mem::take(&mut self.tasks_changed) {
+            // The Work summary follows changes on the Week tab, once they
+            // pause for `SUMMARY_WAIT_SECS`.
+            if self.tab == Tab::Week {
+                self.summary_wait =
+                    Some(Timestamp::now() + SignedDuration::from_secs(SUMMARY_WAIT_SECS));
+            }
+            // A decision model is quick: recommendations follow every change.
+            if self.decision_active() {
+                return Task::batch([task, self.update_week_reports()]);
+            }
         }
         task
     }
