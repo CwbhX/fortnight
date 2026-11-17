@@ -20,6 +20,7 @@
 
 mod shell {
     pub(crate) mod dev;
+    pub(crate) mod edits;
     pub(crate) mod keys;
     pub(crate) mod shortcuts;
 }
@@ -37,8 +38,8 @@ use fortnight_app::views::task_form;
 use fortnight_app::views::week::{self, WeekData, WeekView};
 use fortnight_core::datadir::{self, DataLock};
 use fortnight_core::domain::{
-    DeletedTask, Event, EventId, Priority, Protocol, Report, ReportKey, ReportKind, ReportStatus,
-    Settings, Task as CoreTask, TaskId, TaskStatus, WeekRef,
+    Event, Priority, Protocol, Report, ReportKey, ReportKind, ReportStatus, Settings,
+    Task as CoreTask, TaskId, TaskStatus, WeekRef,
 };
 use fortnight_core::fallback::{Endpoint, PlanRoute};
 use fortnight_core::llm::{ChatEvent, ChatRequest, ChatResponse, LlmError};
@@ -58,6 +59,7 @@ use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp, ZonedDateTime};
 use secrecy::SecretString;
 use shell::dev::{self, data_dir_flag, forced_theme, save_screenshot, shoot_after_delay};
+use shell::edits::UndoStack;
 use shell::keys::{Keys, SavedKey};
 use shell::shortcuts::{Shortcut, shortcut_for};
 use std::collections::HashMap;
@@ -153,29 +155,6 @@ struct Generation {
     id: u64,
 }
 
-/// One change that Ctrl/Cmd+Z can take back.
-#[derive(Debug, Clone)]
-enum Undo {
-    /// A task was added: delete it (only while it has no other history).
-    Added(TaskId),
-    /// A task's status or fields changed. Undo puts the task back exactly as
-    /// it was (including `completed_at`) and drops the events the change
-    /// wrote (ids above `last_event`), keeping log lines.
-    Changed {
-        before: Box<CoreTask>,
-        last_event: EventId,
-        /// Keep the task's position as it is at undo time (a later drag
-        /// stays), unless the change was a move, which set the position.
-        keep_position: bool,
-    },
-    /// Tasks were deleted for good (one, or all of Deleted at once); put
-    /// them back with their history.
-    Deleted(Vec<DeletedTask>),
-}
-
-/// How many changes undo remembers.
-const UNDO_DEPTH: usize = 30;
-
 /// Everything that needs the open database.
 struct Ready {
     store: SqliteStore,
@@ -239,7 +218,7 @@ struct Ready {
     error: Option<String>,
     /// A short, dismissable message (the lock warning).
     notice: Option<String>,
-    undo: Vec<Undo>,
+    undo: UndoStack,
     /// A report became ready while the Week tab wasn't showing.
     week_badge: bool,
     /// Recommended tasks for later days (not stored as reports): each with
@@ -487,7 +466,7 @@ impl Ready {
             listing_models: false,
             error: None,
             notice,
-            undo: Vec::new(),
+            undo: UndoStack::default(),
             week_badge: false,
             day_recs: HashMap::new(),
             day_recs_pending: HashMap::new(),
@@ -1142,98 +1121,6 @@ impl Ready {
         Task::none()
     }
 
-    /// Remembers a change for undo.
-    fn remember(&mut self, undo: Undo) {
-        self.undo.push(undo);
-        if self.undo.len() > UNDO_DEPTH {
-            self.undo.remove(0);
-        }
-    }
-
-    /// Takes back the last change (Ctrl/Cmd+Z).
-    fn undo(&mut self) {
-        let Some(last) = self.undo.pop() else {
-            return;
-        };
-        let result = match &last {
-            Undo::Added(id) => self.undo_add(*id),
-            Undo::Changed {
-                before,
-                last_event,
-                keep_position,
-            } => self.undo_change(before, *last_event, *keep_position),
-            Undo::Deleted(deleted) => {
-                // Put back what can be; keep the rest for another try.
-                let mut left = Vec::new();
-                let mut failed = None;
-                for d in deleted {
-                    if failed.is_none()
-                        && let Err(e) = self.store.restore_task(d)
-                    {
-                        failed = Some(e.to_string());
-                    }
-                    if failed.is_some() {
-                        left.push(d.clone());
-                    }
-                }
-                match failed {
-                    None => Ok(()),
-                    Some(e) => {
-                        self.undo.push(Undo::Deleted(left));
-                        self.error = Some(format!("Could not undo: {e}"));
-                        self.reload_tasks();
-                        return;
-                    }
-                }
-            }
-        };
-        if let Err(e) = result {
-            self.error = Some(format!("Could not undo: {e}"));
-            // Keep the entry (and its saved copy) for another try.
-            if !matches!(last, Undo::Added(_)) {
-                self.undo.push(last);
-            }
-        }
-        self.reload_tasks();
-    }
-
-    /// Deletes a task just added, unless it has since gained history (a log
-    /// line, an edit), which deleting would lose. One transaction.
-    fn undo_add(&mut self, id: TaskId) -> Result<(), String> {
-        match self.store.delete_new_task(id) {
-            Ok(Some(_)) => Ok(()),
-            Ok(None) => Err("the task has changed since you added it. Delete it instead".into()),
-            Err(e) => Err(e.to_string()),
-        }
-    }
-
-    /// Puts the task back as `before` (keeping its current position unless
-    /// `keep_position` is false) and drops the events written since
-    /// `last_event` except log lines. One transaction.
-    fn undo_change(
-        &mut self,
-        before: &CoreTask,
-        last_event: EventId,
-        keep_position: bool,
-    ) -> Result<(), String> {
-        let target = reverted(before, self.task(before.id), keep_position);
-        self.store
-            .revert_task(&target, last_event)
-            .map_err(|e| e.to_string())
-    }
-
-    /// Remembers `before` (the task as it is now) for undo of a change about
-    /// to be made. `keep_position`: see `Undo::Changed`.
-    fn snapshot(&self, id: TaskId, keep_position: bool) -> Option<Undo> {
-        let before = self.task(id)?.clone();
-        let last_event = self.events.iter().map(|e| e.id).max().unwrap_or(0);
-        Some(Undo::Changed {
-            before: Box::new(before),
-            last_event,
-            keep_position,
-        })
-    }
-
     fn task(&self, id: TaskId) -> Option<&CoreTask> {
         self.tasks.iter().find(|t| t.id == id)
     }
@@ -1336,29 +1223,7 @@ impl Ready {
                     Task::none()
                 }
                 week::Action::Move(id, day, position) => {
-                    if let Some(task) = self.task(id).cloned() {
-                        // Undo puts the old position back too.
-                        let undo = self.snapshot(id, false);
-                        let mut result = Ok(());
-                        if task.day() != Some(day) {
-                            // Dropping on a day plans it there; the
-                            // deadline stays as it is.
-                            result = self.store.update_task(&CoreTask {
-                                planned_for: Some(day),
-                                ..task
-                            });
-                        }
-                        let result = result.and_then(|()| self.store.set_position(id, position));
-                        match result {
-                            Ok(()) => {
-                                if let Some(undo) = undo {
-                                    self.remember(undo);
-                                }
-                            }
-                            Err(e) => self.error = Some(e.to_string()),
-                        }
-                        self.reload_tasks();
-                    }
+                    self.move_task(id, day, position);
                     Task::none()
                 }
                 week::Action::SetStatus(id, status) => {
@@ -1737,125 +1602,6 @@ impl Ready {
         Task::none()
     }
 
-    /// Stores a new task, remembers it for undo, and reloads.
-    fn add_task(&mut self, new: fortnight_core::domain::NewTask) {
-        match self.store.add_task(new) {
-            Ok(task) => self.remember(Undo::Added(task.id)),
-            Err(e) => self.error = Some(e.to_string()),
-        }
-        self.reload_tasks();
-    }
-
-    fn set_status(&mut self, id: TaskId, status: TaskStatus) {
-        let changed = self.task(id).is_some_and(|t| t.status != status);
-        let undo = self.snapshot(id, true);
-        match self.store.set_status(id, status) {
-            Ok(()) => {
-                if let (true, Some(undo)) = (changed, undo) {
-                    self.remember(undo);
-                }
-            }
-            Err(e) => self.error = Some(e.to_string()),
-        }
-        self.reload_tasks();
-    }
-
-    /// Saves a day's notes: its free-standing log lines are replaced by one
-    /// holding `notes` (none if it is empty), stamped when the first of
-    /// them was, else now on today, else noon on that day. Nothing is
-    /// written when they already say the same.
-    fn save_notes(&mut self, day: Date, notes: &str) {
-        let old: Vec<(EventId, Timestamp, &str)> = self
-            .events
-            .iter()
-            .filter(|e| e.task_id.is_none() && self.tz.to_datetime(e.at).date() == day)
-            .filter_map(|e| Some((e.id, e.at, e.log_text()?.trim_end())))
-            .collect();
-        let at = match old.first() {
-            Some((_, at, _)) => *at,
-            None if day == self.today() => Timestamp::now(),
-            None => self
-                .tz
-                .to_timestamp(day.at(12, 0, 0, 0))
-                .unwrap_or_else(|_| Timestamp::now()),
-        };
-        let notes = notes.trim();
-        let same = old
-            .iter()
-            .map(|(_, _, t)| *t)
-            .collect::<Vec<_>>()
-            .join("\n");
-        if same == notes {
-            return;
-        }
-        let ids: Vec<EventId> = old.iter().map(|(id, _, _)| *id).collect();
-        let text = (!notes.is_empty()).then_some(notes);
-        if let Err(e) = self.store.replace_logs(&ids, text, at) {
-            self.error = Some(format!("Could not save the notes: {e}"));
-        }
-        self.reload_tasks();
-    }
-
-    /// Removes every deleted task for good (Delete all on the Today tab's
-    /// Deleted section). One undo puts them all back.
-    fn delete_all_deleted(&mut self) {
-        let ids: Vec<TaskId> = self
-            .tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::Dropped)
-            .map(|t| t.id)
-            .collect();
-        let mut removed = Vec::new();
-        for id in ids {
-            match self.store.delete_task(id) {
-                Ok(deleted) => removed.push(deleted),
-                Err(e) => {
-                    self.error = Some(e.to_string());
-                    break;
-                }
-            }
-        }
-        if !removed.is_empty() {
-            self.remember(Undo::Deleted(removed));
-        }
-        self.reload_tasks();
-    }
-
-    fn day_action(&mut self, action: day::Action) -> Task<Message> {
-        let result = match action {
-            day::Action::None => return Task::none(),
-            day::Action::SetStatus(id, status) => {
-                self.set_status(id, status);
-                return Task::none();
-            }
-            day::Action::Update(task) => {
-                let undo = self.snapshot(task.id, true);
-                let r = self.store.update_task(&task);
-                if let (Ok(()), Some(undo)) = (&r, undo) {
-                    self.remember(undo);
-                }
-                r
-            }
-            day::Action::Delete(id) => match self.store.delete_task(id) {
-                Ok(deleted) => {
-                    self.remember(Undo::Deleted(vec![deleted]));
-                    Ok(())
-                }
-                Err(e) => Err(e),
-            },
-            day::Action::Add(new) => {
-                self.add_task(new);
-                return Task::none();
-            }
-            day::Action::Reorder(positions) => self.store.set_positions(&positions),
-        };
-        if let Err(e) = result {
-            self.error = Some(e.to_string());
-        }
-        self.reload_tasks();
-        Task::none()
-    }
-
     fn panel_action(&mut self, action: report_panel::Action) -> Task<Message> {
         match action {
             report_panel::Action::None => Task::none(),
@@ -2211,16 +1957,6 @@ fn follow_today(selected: Date, last_today: Date, today: Date) -> Date {
     }
 }
 
-/// What undo of an edit writes back: `before`, but with the task's
-/// `current` position when `keep_position` (a later drag stays).
-fn reverted(before: &CoreTask, current: Option<&CoreTask>, keep_position: bool) -> CoreTask {
-    let mut task = before.clone();
-    if keep_position && let Some(current) = current {
-        task.position = current.position;
-    }
-    task
-}
-
 /// Checks for Ollama on this machine (`Message::OllamaDetected`).
 fn detect_ollama() -> Task<Message> {
     Task::perform(
@@ -2330,28 +2066,5 @@ mod tests {
         assert_eq!(follow_today(old, old, new), new);
         let elsewhere = date(2026, 11, 25);
         assert_eq!(follow_today(elsewhere, old, new), elsewhere);
-    }
-
-    #[test]
-    fn undoing_an_edit_keeps_a_later_drag() {
-        use fortnight_core::domain::NewTask;
-        let store = SqliteStore::open_in_memory().unwrap();
-        let mut before = store
-            .add_task(NewTask {
-                title: "t".into(),
-                ..NewTask::default()
-            })
-            .unwrap();
-        before.position = 1.0;
-        let mut now = before.clone();
-        now.title = "edited".into();
-        now.position = 5.0;
-        let undone = reverted(&before, Some(&now), true);
-        assert_eq!(undone.title, "t");
-        assert_eq!(undone.position, 5.0);
-        // A move's undo puts the old position back.
-        assert_eq!(reverted(&before, Some(&now), false).position, 1.0);
-        // The task is gone: nothing to keep.
-        assert_eq!(reverted(&before, None, true).position, 1.0);
     }
 }
