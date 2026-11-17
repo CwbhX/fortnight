@@ -1,10 +1,63 @@
 //! Theme and shared styles. Owner: agent E.
 //!
-//! Follows the system light/dark theme. One accent colour, `#ea580c`.
-//! Generous spacing, no borders where whitespace will do. Other views use
-//! the constants and style functions here so the app looks like one thing.
+//! Follows the system light/dark theme. One accent colour, `#ea580c`, used
+//! sparingly (primary buttons, focus rings, checked boxes). Generous spacing,
+//! no borders where whitespace will do. Other views use the constants and
+//! style functions here so the app looks like one thing.
+//!
+//! # Picking light or dark
+//!
+//! `main.rs` keeps a `dark: bool`, asks the system once at launch with
+//! `iced::system::theme()` (a `Task<iced::theme::Mode>`), follows changes with
+//! the subscription `iced::system::theme_changes()`, and returns
+//! `Some(theme_for(mode == iced::theme::Mode::Dark))` from its `theme` fn.
+//!
+//! # Constants
+//!
+//! - [`ACCENT`]: the accent colour.
+//! - [`SPACING`]: the base spacing unit; use multiples of it.
+//! - [`RADIUS`]: corner radius for cards, inputs and buttons.
+//! - [`TEXT_SMALL`], [`TEXT_BODY`], [`TEXT_HEADING`], [`TEXT_TITLE`]: sizes.
+//! - [`CONTENT_WIDTH`]: max width of a view's main column.
+//!
+//! # Colours (for `.color(...)` or custom styles)
+//!
+//! - [`muted_color`]: secondary text (hints, labels, done tasks).
+//! - [`danger_color`]: errors and overdue dates.
+//!
+//! # Text styles (`text(..).style(theme::muted)`)
+//!
+//! - [`muted`]: secondary text.
+//! - [`danger`]: errors, overdue.
+//! - [`accent`]: the accent colour; use rarely.
+//!
+//! # Text helpers (return a ready-made `Text`)
+//!
+//! - [`title`]: a view's title ("Tasks", "Week 46").
+//! - [`section_heading`]: a small muted heading above a group.
+//!
+//! # Containers (`container(..).style(theme::card)`)
+//!
+//! - [`card`]: a softly filled rounded panel, no border.
+//! - [`chip`]: a small pill, e.g. a project tag. Use with [`chip_padding`].
+//!
+//! # Buttons (`button(..).style(theme::primary_button)`)
+//!
+//! - [`primary_button`]: the one main action on screen; accent fill.
+//! - [`secondary_button`]: other actions; soft neutral fill.
+//! - [`text_button`]: link-like; muted text, no fill.
+//! - [`danger_button`]: destructive action as red text, no fill.
+//! - [`row_button`]: a whole list row; invisible until hovered.
+//!
+//! # Inputs
+//!
+//! - [`input`]: `text_input(..).style(theme::input)`; soft fill, accent focus.
+//! - [`editor`]: the same look for `text_editor`.
 
-use iced::{Color, Theme};
+use iced::border::{self, Border};
+use iced::theme::{Palette, palette};
+use iced::widget::{button, container, text, text_editor, text_input};
+use iced::{Background, Color, Padding, Theme, color};
 
 /// The accent colour, `#ea580c`.
 pub const ACCENT: Color = Color::from_rgb(
@@ -16,8 +69,302 @@ pub const ACCENT: Color = Color::from_rgb(
 /// Standard spacing unit, in logical pixels.
 pub const SPACING: f32 = 12.0;
 
+/// Corner radius for cards, inputs and buttons.
+pub const RADIUS: f32 = 8.0;
+
+/// Small text: hints, chips, due labels, section headings.
+pub const TEXT_SMALL: f32 = 13.0;
+/// Body text.
+pub const TEXT_BODY: f32 = 15.0;
+/// Card or sub-section headings.
+pub const TEXT_HEADING: f32 = 18.0;
+/// A view's title.
+pub const TEXT_TITLE: f32 = 26.0;
+
+/// Maximum width of a view's main column, so lines stay readable.
+pub const CONTENT_WIDTH: f32 = 760.0;
+
+const LIGHT: Palette = Palette {
+    background: color!(0xfcfcfb),
+    text: color!(0x1c1917),
+    primary: ACCENT,
+    success: color!(0x15803d),
+    warning: color!(0xb45309),
+    danger: color!(0xdc2626),
+};
+
+const DARK: Palette = Palette {
+    background: color!(0x1a1918),
+    text: color!(0xe7e5e4),
+    primary: ACCENT,
+    success: color!(0x4ade80),
+    warning: color!(0xfbbf24),
+    danger: color!(0xf87171),
+};
+
 /// The app theme for light (`dark = false`) or dark mode, with the accent.
-/// `main.rs` picks `dark` from the system setting.
+/// `main.rs` picks `dark` from the system setting (see the module doc).
 pub fn theme_for(dark: bool) -> Theme {
-    if dark { Theme::Dark } else { Theme::Light }
+    if dark {
+        Theme::custom_with_fn("Fortnight Dark", DARK, extended)
+    } else {
+        Theme::custom_with_fn("Fortnight Light", LIGHT, extended)
+    }
+}
+
+/// iced's generated palette, with white text on the accent and the
+/// background shades replaced by plain mixes of background and text
+/// (iced's own drift warm in light mode).
+fn extended(palette: Palette) -> palette::Extended {
+    let mut ext = palette::Extended::generate(palette);
+    // White on the accent (checkmarks, primary buttons) in both modes.
+    ext.primary.base.text = Color::WHITE;
+    ext.primary.strong.text = Color::WHITE;
+    let shade = |amount: f32| {
+        palette::Pair::new(mix(palette.background, palette.text, amount), palette.text)
+    };
+    ext.background = palette::Background {
+        base: palette::Pair::new(palette.background, palette.text),
+        weakest: shade(0.03),
+        weaker: shade(0.05),
+        weak: shade(0.075),
+        neutral: shade(0.10),
+        strong: shade(0.15),
+        stronger: shade(0.20),
+        strongest: shade(0.25),
+    };
+    ext
+}
+
+/// `a` moved `amount` (0–1) towards `b`.
+fn mix(a: Color, b: Color, amount: f32) -> Color {
+    Color::from_rgb(
+        a.r + (b.r - a.r) * amount,
+        a.g + (b.g - a.g) * amount,
+        a.b + (b.b - a.b) * amount,
+    )
+}
+
+// ---------------------------------------------------------------- colours
+
+/// Secondary text colour: hints, labels, done tasks.
+pub fn muted_color(theme: &Theme) -> Color {
+    theme.palette().text.scale_alpha(0.55)
+}
+
+/// Error and overdue colour.
+pub fn danger_color(theme: &Theme) -> Color {
+    theme.palette().danger
+}
+
+/// The background moved `amount` (0–1) towards the text colour: a neutral
+/// fill that works the same way in light and dark.
+fn tint(theme: &Theme, amount: f32) -> Color {
+    let p = theme.palette();
+    mix(p.background, p.text, amount)
+}
+
+/// Fill for cards and hovered rows.
+fn soft_fill(theme: &Theme) -> Color {
+    tint(theme, 0.04)
+}
+
+/// Fill for inputs, chips and secondary buttons (visible on a card too).
+fn field_fill(theme: &Theme) -> Color {
+    tint(theme, 0.075)
+}
+
+// ------------------------------------------------------------ text styles
+
+/// Secondary text.
+pub fn muted(theme: &Theme) -> text::Style {
+    text::Style {
+        color: Some(muted_color(theme)),
+    }
+}
+
+/// Error or overdue text.
+pub fn danger(theme: &Theme) -> text::Style {
+    text::Style {
+        color: Some(danger_color(theme)),
+    }
+}
+
+/// Accent-coloured text. Use rarely.
+pub fn accent(_theme: &Theme) -> text::Style {
+    text::Style {
+        color: Some(ACCENT),
+    }
+}
+
+/// A view's title.
+pub fn title<'a>(label: impl text::IntoFragment<'a>) -> text::Text<'a, Theme> {
+    text(label).size(TEXT_TITLE)
+}
+
+/// A small muted heading above a group of items.
+pub fn section_heading<'a>(label: impl text::IntoFragment<'a>) -> text::Text<'a, Theme> {
+    text(label).size(TEXT_SMALL).style(muted)
+}
+
+// ------------------------------------------------------------- containers
+
+/// A softly filled rounded panel with no border.
+pub fn card(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(soft_fill(theme).into()),
+        border: border::rounded(RADIUS),
+        ..container::Style::default()
+    }
+}
+
+/// A small pill, e.g. a project tag.
+pub fn chip(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(field_fill(theme).into()),
+        text_color: Some(muted_color(theme)),
+        border: border::rounded(999),
+        ..container::Style::default()
+    }
+}
+
+/// Padding to use with [`chip`].
+pub fn chip_padding() -> Padding {
+    Padding::from([2, 8])
+}
+
+// ---------------------------------------------------------------- buttons
+
+fn button_base(background: Option<Color>, text_color: Color) -> button::Style {
+    button::Style {
+        background: background.map(Background::Color),
+        text_color,
+        border: border::rounded(RADIUS),
+        ..button::Style::default()
+    }
+}
+
+fn faded(style: button::Style) -> button::Style {
+    button::Style {
+        background: style.background.map(|b| b.scale_alpha(0.5)),
+        text_color: style.text_color.scale_alpha(0.5),
+        ..style
+    }
+}
+
+/// The one main action on screen: accent fill, white text.
+pub fn primary_button(theme: &Theme, status: button::Status) -> button::Style {
+    let palette = theme.extended_palette();
+    let base = button_base(Some(ACCENT), Color::WHITE);
+    match status {
+        button::Status::Active => base,
+        button::Status::Hovered | button::Status::Pressed => {
+            base.with_background(palette.primary.strong.color)
+        }
+        button::Status::Disabled => faded(base),
+    }
+}
+
+/// Other actions: soft neutral fill.
+pub fn secondary_button(theme: &Theme, status: button::Status) -> button::Style {
+    let base = button_base(Some(field_fill(theme)), theme.palette().text);
+    match status {
+        button::Status::Active => base,
+        button::Status::Hovered | button::Status::Pressed => {
+            base.with_background(tint(theme, 0.12))
+        }
+        button::Status::Disabled => faded(base),
+    }
+}
+
+/// A link-like button: muted text, no fill; full text colour on hover.
+pub fn text_button(theme: &Theme, status: button::Status) -> button::Style {
+    let base = button_base(None, muted_color(theme));
+    match status {
+        button::Status::Active => base,
+        button::Status::Hovered | button::Status::Pressed => button::Style {
+            text_color: theme.palette().text,
+            ..base
+        },
+        button::Status::Disabled => faded(base),
+    }
+}
+
+/// A destructive action shown as red text; a faint red fill on hover.
+pub fn danger_button(theme: &Theme, status: button::Status) -> button::Style {
+    let red = danger_color(theme);
+    let base = button_base(None, red);
+    match status {
+        button::Status::Active => base,
+        button::Status::Hovered | button::Status::Pressed => {
+            base.with_background(red.scale_alpha(0.12))
+        }
+        button::Status::Disabled => faded(base),
+    }
+}
+
+/// A whole list row: no fill until hovered.
+pub fn row_button(theme: &Theme, status: button::Status) -> button::Style {
+    let base = button_base(None, theme.palette().text);
+    match status {
+        button::Status::Active | button::Status::Disabled => base,
+        button::Status::Hovered | button::Status::Pressed => base.with_background(soft_fill(theme)),
+    }
+}
+
+// ----------------------------------------------------------------- inputs
+
+/// A text input with a soft fill, no border, and an accent ring on focus.
+pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
+    let palette = theme.extended_palette();
+    let ring = match status {
+        text_input::Status::Focused { .. } => ACCENT,
+        text_input::Status::Hovered => tint(theme, 0.15),
+        _ => Color::TRANSPARENT,
+    };
+    text_input::Style {
+        background: Background::Color(field_fill(theme)),
+        border: Border {
+            radius: RADIUS.into(),
+            width: 1.0,
+            color: ring,
+        },
+        icon: muted_color(theme),
+        placeholder: muted_color(theme),
+        value: theme.palette().text,
+        selection: palette.primary.weak.color,
+    }
+}
+
+/// The [`input`] look for a multi-line `text_editor`.
+pub fn editor(theme: &Theme, status: text_editor::Status) -> text_editor::Style {
+    let as_input = match status {
+        text_editor::Status::Active => text_input::Status::Active,
+        text_editor::Status::Hovered => text_input::Status::Hovered,
+        text_editor::Status::Focused { is_hovered } => text_input::Status::Focused { is_hovered },
+        text_editor::Status::Disabled => text_input::Status::Disabled,
+    };
+    let s = input(theme, as_input);
+    text_editor::Style {
+        background: s.background,
+        border: s.border,
+        placeholder: s.placeholder,
+        value: s.value,
+        selection: s.selection,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn themes_use_the_accent_and_report_their_mode() {
+        let light = theme_for(false);
+        let dark = theme_for(true);
+        assert_eq!(light.palette().primary, ACCENT);
+        assert_eq!(dark.palette().primary, ACCENT);
+        assert!(!light.extended_palette().is_dark);
+        assert!(dark.extended_palette().is_dark);
+    }
 }
