@@ -108,20 +108,24 @@ Development aids for the app: `FORTNIGHT_PAGE=today|week|month|settings`, `FORTN
 
 ## Command line
 
-`fortnight-cli` works on the same data folder, with no window. Global options: `--data-dir <path>`, and `--password-stdin` to read the key password from standard input instead of asking on the terminal (only commands that call the LLM need it).
+`fortnight-cli` works on the same data folder, with no window. `--data-dir <path>` can go anywhere on the line. It does not take the folder lock (it can run beside the app on the same machine); it warns on stderr if another machine holds it.
 
 ```
-fortnight-cli add "Write Q4 report fri #work ~2h !"   # quick-add syntax
-fortnight-cli list                                    # tasks
-fortnight-cli done <id>                               # mark a task done
-fortnight-cli log "helped Sam debug the deploy"       # a log line
-fortnight-cli summary [--week]                        # the weekly summary
-fortnight-cli plan                                    # the week-ahead advice
-fortnight-cli run-due                                 # generate whatever is due, then exit
-fortnight-cli export                                  # tasks and reports to Markdown or JSON
+fortnight-cli add <words...>                    # quick-add: fri, nov 20, +3d, #project, ~2h, !
+fortnight-cli list [--all] [--today] [--week]   # open tasks; --all adds done and dropped
+fortnight-cli done <id>... [--undo]             # mark done (or reopen)
+fortnight-cli log [--task <id>] <words...>      # a log line, on a task or free-standing
+fortnight-cli summary [--week this|last|YYYY-MM-DD] [--facts]   # the weekly summary, streamed
+fortnight-cli plan [--week this|last|YYYY-MM-DD] [--facts]      # the week-ahead advice, streamed
+fortnight-cli run-due                           # generate whatever is due, then exit
+fortnight-cli export [--format md|json] [--out <path>]           # everything, to stdout or a file
 ```
 
-Run `fortnight-cli --help` for the exact arguments; the flags above are as planned and may differ in detail.
+- `summary` defaults to the latest week whose summary is due; `plan` to this week. `--facts` prints the deterministic facts and never calls the LLM.
+- LLM commands take `--protocol openai|anthropic`, `--base-url`, `--model` (these beat the `FORTNIGHT_LLM_*` variables, which beat saved settings) and `--password-stdin`.
+- The key: `FORTNIGHT_LLM_API_KEY` if set; otherwise, if a key file exists, the password from `--password-stdin` or a terminal prompt.
+- Exit codes: 0 success; 1 a failed report, missing task or I/O error; 2 bad arguments or no endpoint configured.
+- A generated report is stored, so the app shows it too. A failed one is stored as failed.
 
 ## Development
 
