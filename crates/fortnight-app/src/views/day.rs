@@ -133,6 +133,8 @@ pub enum Message {
     LeaveNotes,
     /// The pointer entered (`true`) or left the notes panel.
     HoverNotes(bool),
+    /// A click on a link in the formatted notes.
+    OpenLink(String),
     Save,
     /// Move the open task to Deleted.
     Delete,
@@ -223,6 +225,8 @@ pub enum Action {
     NewTask(Date),
     /// Give the day's notes the keyboard focus (after a toolbar click).
     FocusNotes,
+    /// Open a web address from the notes in the browser.
+    OpenLink(String),
 }
 
 /// A task the model recommends doing on the shown day.
@@ -770,6 +774,7 @@ impl DayView {
                 self.notes_hovered = over;
                 Action::None
             }
+            Message::OpenLink(url) => Action::OpenLink(url),
             Message::Save => {
                 let Some(form) = self.editing.as_mut() else {
                     return Action::None;
@@ -1001,7 +1006,7 @@ impl DayView {
             let shown = container(row![
                 // As tall as the empty editor.
                 Space::new().height(120.0 - 2.0 * f32::from(CARD_PADDING[0])),
-                rich_notes::preview(&self.notes.text()),
+                rich_notes::preview(&self.notes.text(), Message::OpenLink),
             ])
             .padding(CARD_PADDING)
             .width(Fill)

@@ -293,6 +293,12 @@ impl Ready {
             day::Action::Reorder(positions) => self.store.set_positions(&positions),
             day::Action::NewTask(day) => return self.open_new_task(day),
             day::Action::FocusNotes => return iced::widget::operation::focus(day::NOTES_ID),
+            day::Action::OpenLink(url) => {
+                if let Err(e) = open_link(&url) {
+                    self.error = Some(e);
+                }
+                return Task::none();
+            }
         };
         if let Err(e) = result {
             self.error = Some(e.to_string());
@@ -300,6 +306,31 @@ impl Ready {
         self.reload_tasks();
         Task::none()
     }
+}
+
+/// Opens a web or mail address from the notes with the system's handler.
+/// Other schemes (`file:`, `javascript:`, …) are refused.
+fn open_link(url: &str) -> Result<(), String> {
+    let allowed = ["https://", "http://", "mailto:"]
+        .iter()
+        .any(|p| url.len() > p.len() && url[..p.len()].eq_ignore_ascii_case(p));
+    if !allowed {
+        return Err(format!("Only web and mail links open from notes: {url}"));
+    }
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut cmd = std::process::Command::new("xdg-open");
+    cmd.arg(url)
+        .spawn()
+        .map(drop)
+        .map_err(|e| format!("Could not open {url}: {e}"))
 }
 
 #[cfg(test)]

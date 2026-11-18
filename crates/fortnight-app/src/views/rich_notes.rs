@@ -13,6 +13,10 @@
 //!   right after a marker removes it; `Tab` / `Shift+Tab` indent and
 //!   outdent the line.
 //!
+//! - Links: `[text](url)` (`⌘K`), and bare web addresses. Drawn in the
+//!   accent colour; in the formatted view underlined, and a click opens
+//!   them.
+//!
 //! While the notes are not being edited they are shown by [`preview`]:
 //! markers hidden, underline drawn as underline.
 //!
@@ -53,6 +57,9 @@ pub enum Command {
     Numbers,
     Indent,
     Outdent,
+    /// Make the selection (or the word at the cursor) a link, or take a
+    /// link away.
+    Link,
 }
 
 // ------------------------------------------------------------------ lists
@@ -241,6 +248,7 @@ pub fn command(lines: &[String], cursor: Cursor, cmd: Command) -> Option<Change>
         Command::Bullets => toggle_list(lines, cursor, Kind::Bullet),
         Command::Dashes => toggle_list(lines, cursor, Kind::Dash),
         Command::Numbers => toggle_list(lines, cursor, Kind::Number),
+        Command::Link => toggle_link(lines, cursor),
         Command::Indent => indent(lines, cursor, true),
         Command::Outdent => indent(lines, cursor, false),
     }
@@ -532,6 +540,149 @@ fn toggle_inline(lines: &[String], cursor: Cursor, style: Inline) -> Option<Chan
     splice_lines(lines, first, &splices, cursor)
 }
 
+// ------------------------------------------------------------------ links
+
+/// A link in a line: Markdown's `[text](url)`, or a bare web address
+/// (`https://…`, `http://…`, `www.…`), whose text is its address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Link {
+    whole: Range<usize>,
+    text: Range<usize>,
+    url: Range<usize>,
+    bare: bool,
+}
+
+fn is_address(s: &str) -> bool {
+    ["https://", "http://", "www.", "mailto:"]
+        .iter()
+        .any(|p| s.starts_with(p))
+        && !s.contains(char::is_whitespace)
+}
+
+/// The links in `line`, in order.
+fn links(line: &str) -> Vec<Link> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < line.len() {
+        let rest = &line[i..];
+        if let Some(link) = markdown_link(line, i) {
+            i = link.whole.end;
+            out.push(link);
+            continue;
+        }
+        let word_start = line[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        if word_start
+            && ["https://", "http://", "www."]
+                .iter()
+                .any(|p| rest.starts_with(p))
+        {
+            let mut end = i + rest.find(char::is_whitespace).unwrap_or(rest.len());
+            // Trailing punctuation belongs to the sentence (or is a
+            // formatting marker).
+            while end > i
+                && line[..end].ends_with(['.', ',', ';', ':', '!', '?', ')', '"', '\'', '*', '_'])
+            {
+                end -= 1;
+            }
+            if end > i {
+                out.push(Link {
+                    whole: i..end,
+                    text: i..end,
+                    url: i..end,
+                    bare: true,
+                });
+                i = end;
+                continue;
+            }
+        }
+        i += rest.chars().next().map_or(1, char::len_utf8);
+    }
+    out
+}
+
+/// A `[text](url)` link starting at byte `i` (the URL without spaces).
+fn markdown_link(line: &str, i: usize) -> Option<Link> {
+    let rest = line[i..].strip_prefix('[')?;
+    let close = i + 1 + rest.find(']')?;
+    if line[i + 1..close].contains('[') {
+        return None;
+    }
+    let url_start = close + 2;
+    if !line[close + 1..].starts_with('(') {
+        return None;
+    }
+    let url_end = url_start + line[url_start..].find(|c: char| c == ')' || c.is_whitespace())?;
+    if url_end == url_start || !line[url_end..].starts_with(')') {
+        return None;
+    }
+    Some(Link {
+        whole: i..url_end + 1,
+        text: i + 1..close,
+        url: url_start..url_end,
+        bare: false,
+    })
+}
+
+/// Where a link's address takes you: a scheme is added to `www.…` and
+/// other addresses without one.
+pub fn href(url: &str) -> String {
+    if url.contains("://") || url.starts_with("mailto:") {
+        url.to_string()
+    } else {
+        format!("https://{url}")
+    }
+}
+
+/// `⌘K`: inside a `[text](url)` link, take the link away (keeping the
+/// text). Otherwise the selection, a bare address at the cursor, or the
+/// word at the cursor becomes `[text](|)`, the cursor where the address
+/// goes; an address becomes `[|](address)`, the cursor where its text
+/// goes. Nothing selected and no word: `[|]()`.
+fn toggle_link(lines: &[String], cursor: Cursor) -> Option<Change> {
+    let (start, end) = ends(cursor);
+    if start.line != end.line {
+        return None;
+    }
+    let n = start.line;
+    let line = lines.get(n)?;
+    let found = links(line);
+    let change = |text: String, column: usize| Change {
+        first: n,
+        last: n,
+        text,
+        cursor: at(n, column),
+    };
+    let inside = |l: &&Link| l.whole.start <= start.column && end.column <= l.whole.end;
+    if let Some(l) = found.iter().filter(|l| !l.bare).find(inside) {
+        let text = if l.text.is_empty() { &l.url } else { &l.text };
+        let text = &line[text.clone()];
+        return Some(change(
+            format!("{}{text}{}", &line[..l.whole.start], &line[l.whole.end..]),
+            l.whole.start + text.len(),
+        ));
+    }
+    let (a, b) = if let Some(l) = found.iter().filter(|l| l.bare).find(inside) {
+        (l.whole.start, l.whole.end)
+    } else if start == end {
+        word_at(line, start.column)
+    } else {
+        let seg = &line[start.column..end.column];
+        (
+            start.column + (seg.len() - seg.trim_start().len()),
+            end.column - (seg.len() - seg.trim_end().len()),
+        )
+    };
+    let (before, sel, after) = (&line[..a], &line[a..b], &line[b..]);
+    Some(if is_address(sel) {
+        change(format!("{before}[]({sel}){after}"), a + 1)
+    } else {
+        change(format!("{before}[{sel}](){after}"), a + sel.len() + 3)
+    })
+}
+
 // ----------------------------------------------------------------- typing
 
 /// `Enter` in a list item: the next item, or the end of the list on an
@@ -693,6 +844,7 @@ pub fn key_binding<M>(press: KeyPress, on: fn(Command) -> M, leave: M) -> Option
             (Some('b'), false) => Some(Command::Bold),
             (Some('i'), false) => Some(Command::Italic),
             (Some('u'), false) => Some(Command::Underline),
+            (Some('k'), false) => Some(Command::Link),
             (Some('8'), true) => Some(Command::Bullets),
             (Some('7'), true) => Some(Command::Numbers),
             _ => None,
@@ -724,18 +876,22 @@ pub struct Look {
     faint: bool,
     /// A list marker: muted.
     list: bool,
+    /// Link text: the index of its link in the line.
+    link: Option<u16>,
 }
 
 /// The looks of a line's stretches. Unstyled text is left out.
 pub fn looks(line: &str) -> Vec<(Range<usize>, Look)> {
     stretches(line)
+        .0
         .into_iter()
         .filter(|(_, look)| *look != Look::default())
         .collect()
 }
 
-/// The looks of all of a line's stretches, in order.
-fn stretches(line: &str) -> Vec<(Range<usize>, Look)> {
+/// The looks of all of a line's stretches, in order, and the line's
+/// links (which [`Look::link`] points into).
+fn stretches(line: &str) -> (Vec<(Range<usize>, Look)>, Vec<Link>) {
     let mut each = vec![Look::default(); line.len()];
     let mut start = 0;
     if let Some(it) = item(line) {
@@ -746,6 +902,33 @@ fn stretches(line: &str) -> Vec<(Range<usize>, Look)> {
     }
     fn mark(each: &mut [Look], range: Range<usize>, f: impl Fn(&mut Look)) {
         each[range].iter_mut().for_each(f);
+    }
+    // Links: `[` and `](url)` faint, the text a link. Addresses are left
+    // out of the emphasis below (`_` and `*` are common in them).
+    let found: Vec<Link> = links(&line[start..])
+        .into_iter()
+        .map(|l| Link {
+            whole: l.whole.start + start..l.whole.end + start,
+            text: l.text.start + start..l.text.end + start,
+            url: l.url.start + start..l.url.end + start,
+            bare: l.bare,
+        })
+        .collect();
+    let mut plain = vec![true; line.len()];
+    for (k, l) in found.iter().enumerate() {
+        let id = Some(k as u16);
+        // `[](url)` shows its address as its text.
+        let text = if l.text.is_empty() { &l.url } else { &l.text };
+        mark(&mut each, l.whole.clone(), |l| l.faint = true);
+        mark(&mut each, text.clone(), |l| {
+            l.faint = false;
+            l.link = id;
+        });
+        if l.bare {
+            plain[l.whole.clone()].fill(false);
+        } else {
+            plain[l.url.clone()].fill(false);
+        }
     }
     // Underline: each `<u>` with the next `</u>`.
     let mut from = start;
@@ -770,7 +953,7 @@ fn stretches(line: &str) -> Vec<(Range<usize>, Look)> {
     let mut i = start;
     while i < line.len() {
         let c = bytes[i] as char;
-        if c != '*' && c != '_' {
+        if (c != '*' && c != '_') || !plain[i] {
             i += 1;
             continue;
         }
@@ -827,7 +1010,7 @@ fn stretches(line: &str) -> Vec<(Range<usize>, Look)> {
         out.push((i..j, look));
         i = j;
     }
-    out
+    (out, found)
 }
 
 /// The editor's highlighter: each line on its own, by [`looks`].
@@ -886,7 +1069,7 @@ pub fn format(look: &Look, theme: &Theme) -> highlighter::Format<Font> {
         Some(theme.palette().text.scale_alpha(0.35))
     } else if look.list {
         Some(theme::muted_color(theme))
-    } else if look.underline {
+    } else if look.underline || look.link.is_some() {
         Some(theme::accent_color())
     } else {
         None
@@ -899,13 +1082,15 @@ pub fn format(look: &Look, theme: &Theme) -> highlighter::Format<Font> {
 /// The notes drawn as they read, for when they are not being edited:
 /// markers hidden, bold, italic and underline drawn, list markers as `•`,
 /// `–` or the number with the item's text hanging beside it.
-pub fn preview<'a, M: 'a>(notes: &str) -> Element<'a, M> {
-    Column::with_children(notes.lines().map(preview_line)).into()
+/// Links are underlined in the accent colour; a click on one sends
+/// `on_link` with its address ([`href`]).
+pub fn preview<'a, M: 'a>(notes: &str, on_link: fn(String) -> M) -> Element<'a, M> {
+    Column::with_children(notes.lines().map(|line| preview_line(line, on_link))).into()
 }
 
-fn preview_line<'a, M: 'a>(line: &str) -> Element<'a, M> {
+fn preview_line<'a, M: 'a>(line: &str, on_link: fn(String) -> M) -> Element<'a, M> {
     let Some(it) = item(line) else {
-        return rich_line(line, 0);
+        return rich_line(line, 0, on_link);
     };
     let mark = match it.kind {
         Kind::Bullet => "•",
@@ -924,27 +1109,37 @@ fn preview_line<'a, M: 'a>(line: &str) -> Element<'a, M> {
                 .style(theme::muted)
         )
         .width(24),
-        rich_line(line, it.end),
+        rich_line(line, it.end, on_link),
     ]
     .into()
 }
 
 /// `line[start..]` as rich text, without its formatting markers.
-fn rich_line<'a, M: 'a>(line: &str, start: usize) -> Element<'a, M> {
-    let spans: Vec<_> = stretches(line)
+fn rich_line<'a, M: 'a>(line: &str, start: usize, on_link: fn(String) -> M) -> Element<'a, M> {
+    let (all, found) = stretches(line);
+    let spans: Vec<_> = all
         .into_iter()
         .filter(|(r, look)| r.end > start && !look.faint)
         .map(|(r, look)| {
-            span::<(), Font>(line[r.start.max(start)..r.end].to_string())
+            let s = span::<String, Font>(line[r.start.max(start)..r.end].to_string())
                 .font_maybe(face(&look))
-                .underline(look.underline)
+                .underline(look.underline || look.link.is_some());
+            match look.link.and_then(|k| found.get(usize::from(k))) {
+                Some(l) => s
+                    .link(href(&line[l.url.clone()]))
+                    .color(theme::accent_color()),
+                None => s,
+            }
         })
         .collect();
     if spans.is_empty() {
         // A blank line keeps its height.
         return text(" ").size(theme::TEXT_BODY).into();
     }
-    rich_text(spans).size(theme::TEXT_BODY).into()
+    rich_text(spans)
+        .size(theme::TEXT_BODY)
+        .on_link_click(on_link)
+        .into()
 }
 
 // ----------------------------------------------------------------- toolbar
@@ -994,6 +1189,11 @@ pub fn toolbar<'a, M: Clone + 'a>(on: fn(Command) -> M) -> Element<'a, M> {
             underline,
             format!("Underline  {}", shortcut("U")),
             Command::Underline
+        ),
+        tool(
+            list(theme::Icon::Link),
+            format!("Link  {}", shortcut("K")),
+            Command::Link
         ),
         container(text("")).width(6),
         tool(
@@ -1254,9 +1454,85 @@ mod tests {
                 ("__", "faint"),
             ]
         );
+        // Links: the text accent, the rest faint; no emphasis in addresses.
+        let linked = |line: &str| -> Vec<(String, bool, bool)> {
+            looks(line)
+                .into_iter()
+                .map(|(r, l)| (line[r].to_string(), l.link.is_some(), l.faint))
+                .collect()
+        };
+        assert_eq!(
+            linked("[**go**](https://a_b_c) x https://d_e_f"),
+            vec![
+                ("[".into(), false, true),
+                ("**".into(), true, true),
+                ("go".into(), true, false),
+                ("**".into(), true, true),
+                ("](https://a_b_c)".into(), false, true),
+                ("https://d_e_f".into(), true, false),
+            ]
+        );
         // Unclosed or spaced markers are plain text.
         assert!(looks("2 * 3 * 4 and **open").is_empty());
         assert_eq!(styled("12. x"), vec![("12.", "list")]);
+    }
+
+    #[test]
+    fn cmd_k_makes_and_removes_links() {
+        // Selection or word: the cursor goes where the address is typed.
+        assert_eq!(
+            run_on("see {the docs} now", Command::Link),
+            "see [the docs](|) now"
+        );
+        assert_eq!(run_on("see do|cs", Command::Link), "see [docs](|)");
+        assert_eq!(run_on("a |", Command::Link), "a [](|)");
+        // An address: the cursor goes where its text is typed.
+        assert_eq!(
+            run_on("at https://ex.am/p|le_x.", Command::Link),
+            "at [|](https://ex.am/ple_x)."
+        );
+        assert_eq!(run_on("{www.ex.am}", Command::Link), "[|](www.ex.am)");
+        // Inside a link: take it away, keeping the text.
+        assert_eq!(
+            run_on("see [the d|ocs](https://x.y) now", Command::Link),
+            "see the docs| now"
+        );
+        assert_eq!(run_on("[](https://x.y|)", Command::Link), "https://x.y|");
+        // Over several lines: nothing.
+        assert!(
+            command(
+                &lines("a\nb"),
+                Cursor {
+                    position: Position { line: 1, column: 1 },
+                    selection: Some(Position { line: 0, column: 0 })
+                },
+                Command::Link
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn links_in_a_line() {
+        let found = |line: &str| -> Vec<(String, String, bool)> {
+            links(line)
+                .into_iter()
+                .map(|l| (line[l.text].to_string(), line[l.url].to_string(), l.bare))
+                .collect()
+        };
+        assert_eq!(
+            found("[a b](https://x.y/z_1) and (https://q.r/s), www.t.u!"),
+            vec![
+                ("a b".into(), "https://x.y/z_1".into(), false),
+                ("https://q.r/s".into(), "https://q.r/s".into(), true),
+                ("www.t.u".into(), "www.t.u".into(), true),
+            ]
+        );
+        // Not links: a checkbox, spaces in the address, mid-word.
+        assert!(found("- [ ] task [a](b c) xhttps://no").is_empty());
+        assert_eq!(href("www.x.y"), "https://www.x.y");
+        assert_eq!(href("http://x.y"), "http://x.y");
+        assert_eq!(href("mailto:a@b.c"), "mailto:a@b.c");
     }
 
     #[test]

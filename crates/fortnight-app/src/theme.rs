@@ -527,6 +527,7 @@ pub enum Icon {
     ListBullet,
     ListDash,
     ListNumber,
+    Link,
 }
 
 impl Icon {
@@ -547,6 +548,7 @@ impl Icon {
             Icon::ListBullet => include_bytes!("../../../assets/icons/list-bullet.svg"),
             Icon::ListDash => include_bytes!("../../../assets/icons/list-dash.svg"),
             Icon::ListNumber => include_bytes!("../../../assets/icons/list-number.svg"),
+            Icon::Link => include_bytes!("../../../assets/icons/link.svg"),
         }
     }
 }
