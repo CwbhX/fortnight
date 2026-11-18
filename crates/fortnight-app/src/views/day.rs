@@ -35,7 +35,8 @@
 //! title bar with the name in bold and the count muted, over Week-style
 //! cards. The day's own panel is laid out like its Week column: the weekday
 //! (accent on today) and date, a `+` for the new-task dialog, and the same
-//! load bar. The collapsed sections are panels whose title bar opens them.
+//! load bar. The collapsed sections are panels whose title bar opens them;
+//! they stay even when empty, so the page doesn't jump as tasks come and go.
 //!
 //! The date navigation lives in the top bar.
 //!
@@ -994,12 +995,11 @@ impl DayView {
                 Message::ToggleShowDeleted,
             ),
         ];
+        // Always there, even empty: a footer that comes and goes would jolt
+        // the page each time a first task lands in it or a last one leaves.
         for (section, label, open, toggle) in collapsibles {
             let tasks = self.placement.tasks(data, section);
-            let shown = !tasks.is_empty();
-            content = content.push(place(
-                section,
-                shown,
+            content = content.push(below(
                 self.collapsible(section, label, open, toggle, tasks, data),
             ));
         }
@@ -1301,7 +1301,7 @@ impl DayView {
             row![
                 theme::disclosure(open),
                 text(label).size(theme::TEXT_BODY).font(theme::FONT_BOLD),
-                // None while it folds away after its last.
+                // None when empty.
                 text(if tasks.is_empty() {
                     String::new()
                 } else {
@@ -1333,7 +1333,8 @@ impl DayView {
             ));
         }
         // Built closed too, to be drawn folding away.
-        let body = if section == Section::Deleted {
+        let empty = tasks.is_empty();
+        let list = if section == Section::Deleted {
             let mut list = Self::list(data, 6.0);
             for (task, left) in self.shown(section, tasks) {
                 list = list.push(self.item(section, task, left, deleted_row(task)));
@@ -1342,7 +1343,20 @@ impl DayView {
         } else {
             self.rows(section, tasks, data, false)
         };
-        panel::folding_panel(head.into(), open, body, section as u64)
+        let nothing = text(match section {
+            Section::Done => "Nothing completed",
+            Section::Deleted => "Nothing deleted",
+            _ => "Nothing without a date",
+        })
+        .size(theme::TEXT_SMALL)
+        .style(theme::muted);
+        // Swaps with the last task leaving as its gap closes, like the
+        // day's "Nothing planned".
+        let body = column![
+            motion::fold(empty, nothing).key(day_key(data.day) * 8 + section as u64),
+            list,
+        ];
+        panel::folding_panel(head.into(), open, body.into(), section as u64)
     }
 
     /// The rows of a section. `ranked` (the Recommended section only)
