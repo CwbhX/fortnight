@@ -10,7 +10,10 @@
 //! left to the owner of the form.
 //!
 //! Subtasks are kept in the task's notes as Markdown checklist lines
-//! (`fortnight_core::notes`).
+//! (`fortnight_core::notes`). The notes take the day notes' Markdown
+//! shortcuts (`rich_notes`): `⌘B` / `⌘I` / `⌘U` (or `Ctrl`), `⌘K` for a
+//! link, and lists started with `* `, `- ` or `1. ` that carry on with
+//! `Enter`.
 
 use fortnight_core::domain::{NewTask, Priority, Task, TaskId};
 use fortnight_core::notes::{Subtask, join_notes, split_notes};
@@ -25,6 +28,7 @@ use iced::{Center, Color, Element, Fill, Theme, border};
 use jiff::civil::{Date, Weekday};
 
 use super::day::Message;
+use super::rich_notes;
 use crate::calendar::{Popup, month_picker};
 use crate::theme;
 
@@ -207,7 +211,14 @@ impl EditForm {
             Message::EditTitle(s) => self.title = s.clone(),
             Message::EditProject(s) | Message::PickProject(s) => self.project = s.clone(),
             Message::EditEstimate(s) => self.estimate = s.clone(),
-            Message::EditNotes(action) => self.notes.perform(action.clone()),
+            Message::EditNotes(action) => {
+                if !rich_notes::intercept(&mut self.notes, action) {
+                    self.notes.perform(action.clone());
+                }
+            }
+            Message::FormatTaskNotes(cmd) => {
+                rich_notes::run(&mut self.notes, *cmd);
+            }
             Message::SetPriority(p) => self.priority = priority_level(*p),
             Message::ToggleCalendar => {
                 self.calendar = match self.calendar {
@@ -431,6 +442,8 @@ pub(super) fn form_fields<'a>(
     let notes = text_editor(&form.notes)
         .placeholder("Notes")
         .on_action(Message::EditNotes)
+        .highlight_with::<rich_notes::Notes>((), rich_notes::format)
+        .key_binding(|press| rich_notes::key_binding(press, Message::FormatTaskNotes, None))
         .height(96)
         .padding(10)
         .size(theme::TEXT_BODY)

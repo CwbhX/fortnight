@@ -139,8 +139,10 @@ pub(super) fn clean_title(title: &str) -> String {
     title.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// A task's notes for the facts: Markdown kept line by line
+/// ([`crate::notes::to_markdown`]), cut at [`NOTES_MAX_CHARS`].
 pub(super) fn trim_notes(notes: &str) -> String {
-    cut_text(notes, NOTES_MAX_CHARS)
+    cut_text(&crate::notes::to_markdown(notes), NOTES_MAX_CHARS)
 }
 
 /// A log line for the facts: its Markdown kept line by line

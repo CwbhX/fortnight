@@ -104,6 +104,8 @@ pub enum Message {
     PickProject(String),
     EditEstimate(String),
     EditNotes(text_editor::Action),
+    /// A formatting shortcut in a task's notes.
+    FormatTaskNotes(rich_notes::Command),
     SetPriority(Priority),
     /// Open or close the due-date calendar.
     ToggleCalendar,
@@ -992,7 +994,7 @@ impl DayView {
                 .on_action(Message::EditDayNotes)
                 .highlight_with::<rich_notes::Notes>((), rich_notes::format)
                 .key_binding(|press| {
-                    rich_notes::key_binding(press, Message::FormatNotes, Message::LeaveNotes)
+                    rich_notes::key_binding(press, Message::FormatNotes, Some(Message::LeaveNotes))
                 })
                 // Grows with the text, then scrolls.
                 .min_height(120)
@@ -1902,6 +1904,45 @@ mod tests {
         let mut view = loaded(vec![t]);
         view.update(Message::Expand(4));
         assert_eq!(view.update(Message::Save), Action::None);
+    }
+
+    /// A task's notes take the Markdown shortcuts: lists carry on with
+    /// `Enter`, `⌘B` bolds the word at the cursor, `⌘K` makes a link.
+    #[test]
+    fn task_notes_take_markdown_shortcuts() {
+        let mut t = task(4, "Notes", None);
+        t.planned_for = Some(today());
+        let mut view = loaded(vec![t]);
+        view.update(Message::Expand(4));
+        let edit =
+            |view: &mut DayView, e| view.update(Message::EditNotes(text_editor::Action::Edit(e)));
+        edit(&mut view, text_editor::Edit::Insert('*'));
+        edit(&mut view, text_editor::Edit::Insert(' '));
+        edit(
+            &mut view,
+            text_editor::Edit::Paste(std::sync::Arc::new("call Sam".into())),
+        );
+        edit(&mut view, text_editor::Edit::Enter);
+        edit(
+            &mut view,
+            text_editor::Edit::Paste(std::sync::Arc::new("docs".into())),
+        );
+        view.update(Message::FormatTaskNotes(rich_notes::Command::Link));
+        edit(
+            &mut view,
+            text_editor::Edit::Paste(std::sync::Arc::new("https://x.y".into())),
+        );
+        view.update(Message::EditNotes(text_editor::Action::Move(
+            text_editor::Motion::DocumentStart,
+        )));
+        view.update(Message::EditNotes(text_editor::Action::Move(
+            text_editor::Motion::End,
+        )));
+        view.update(Message::FormatTaskNotes(rich_notes::Command::Bold));
+        assert_eq!(
+            view.editing.as_ref().unwrap().notes.text(),
+            "• call **Sam**\n• [docs](https://x.y)"
+        );
     }
 
     #[test]

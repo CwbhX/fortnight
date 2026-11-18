@@ -27,6 +27,9 @@
 //! commands mark each selected line, or unmark them when all already are
 //! that kind of list.
 //!
+//! A task's notes use the same editing ([`intercept`], [`key_binding`],
+//! the [`Notes`] highlighter) without the toolbar or the formatted view.
+//!
 //! The editing itself is plain text functions (testable without a
 //! window) returning a [`Change`]: lines to replace and where the cursor
 //! goes. [`apply`] makes it in the editor by selecting those lines and
@@ -825,21 +828,27 @@ pub fn intercept(content: &mut Content, action: &Action) -> bool {
     }
 }
 
-/// The editor's keys: the formatting shortcuts, `Tab` / `Shift+Tab`, and
-/// `Escape`, which leaves the editor and sends `leave`; then iced's usual
-/// bindings.
-pub fn key_binding<M>(press: KeyPress, on: fn(Command) -> M, leave: M) -> Option<Binding<M>> {
+/// The editor's keys: the formatting shortcuts (with `⌘` or `Ctrl`),
+/// `Tab` / `Shift+Tab`, and, given `leave`, `Escape`, which leaves the
+/// editor and sends it; then iced's usual bindings.
+pub fn key_binding<M>(
+    press: KeyPress,
+    on: fn(Command) -> M,
+    leave: Option<M>,
+) -> Option<Binding<M>> {
     if !matches!(press.status, Status::Focused { .. }) {
         return None;
     }
-    if press.key == keyboard::Key::Named(Named::Escape) {
+    if press.key == keyboard::Key::Named(Named::Escape)
+        && let Some(leave) = leave
+    {
         return Some(Binding::Sequence(vec![
             Binding::Unfocus,
             Binding::Custom(leave),
         ]));
     }
     let m = press.modifiers;
-    let cmd = if m.command() && !m.alt() {
+    let cmd = if (m.command() || m.control()) && !m.alt() {
         match (press.key.to_latin(press.physical_key), m.shift()) {
             (Some('b'), false) => Some(Command::Bold),
             (Some('i'), false) => Some(Command::Italic),
@@ -849,7 +858,11 @@ pub fn key_binding<M>(press: KeyPress, on: fn(Command) -> M, leave: M) -> Option
             (Some('7'), true) => Some(Command::Numbers),
             _ => None,
         }
-    } else if !m.command() && !m.alt() && press.key == keyboard::Key::Named(Named::Tab) {
+    } else if !m.command()
+        && !m.control()
+        && !m.alt()
+        && press.key == keyboard::Key::Named(Named::Tab)
+    {
         Some(if m.shift() {
             Command::Outdent
         } else {
