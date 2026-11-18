@@ -584,13 +584,16 @@ pub fn dropdown<'a, M: 'a>(list: impl Into<Element<'a, M>>) -> Element<'a, M> {
         .style(|theme: &Theme, _| svg::Style {
             color: Some(muted_color(theme)),
         });
-    crate::open_below::open_below(stack![
-        list.into(),
+    // The list itself is wrapped: a stack hands its menu up in a group
+    // that `open_below` can't move.
+    stack![
+        crate::open_below::open_below(list),
         container(chevron)
             .align_right(iced::Fill)
             .center_y(iced::Fill)
             .padding(Padding::ZERO.right(12))
-    ])
+    ]
+    .into()
 }
 
 /// Padding for a pick list shown with [`dropdown`]: room at the right for

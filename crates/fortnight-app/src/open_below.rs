@@ -5,25 +5,31 @@
 //! upwards even when the menu would fit below. [`open_below`] wraps such a
 //! field (it is otherwise invisible) and moves the menu under the field
 //! whenever it fits, leaving iced's choice only for menus that don't.
+//!
+//! Wrap the pick list or combo box itself, not a stack or row around it:
+//! those hand their children's menus up as one window-sized group, which
+//! can't be moved as a menu.
 
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Shell, Widget, overlay, renderer};
-use iced::{Element, Event, Length, Point, Rectangle, Renderer, Size, Theme, Vector, mouse};
+use iced::{Element, Event, Length, Point, Rectangle, Size, Vector, mouse};
 
-/// `content` (a pick list or combo box, possibly inside a stack) with its
+/// `content` (a pick list or combo box itself, see the module doc) with its
 /// menu opening below it whenever the menu fits there.
-pub fn open_below<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Element<'a, M> {
+pub fn open_below<'a, M: 'a, T: 'a, R: renderer::Renderer + 'a>(
+    content: impl Into<Element<'a, M, T, R>>,
+) -> Element<'a, M, T, R> {
     Element::new(OpenBelow {
         content: content.into(),
     })
 }
 
-struct OpenBelow<'a, M> {
-    content: Element<'a, M>,
+struct OpenBelow<'a, M, T, R> {
+    content: Element<'a, M, T, R>,
 }
 
-impl<M> Widget<M, Theme, Renderer> for OpenBelow<'_, M> {
+impl<M, T, R: renderer::Renderer> Widget<M, T, R> for OpenBelow<'_, M, T, R> {
     fn size(&self) -> Size<Length> {
         self.content.as_widget().size()
     }
@@ -32,20 +38,15 @@ impl<M> Widget<M, Theme, Renderer> for OpenBelow<'_, M> {
         self.content.as_widget().size_hint()
     }
 
-    fn layout(
-        &mut self,
-        tree: &mut Tree,
-        renderer: &Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
+    fn layout(&mut self, tree: &mut Tree, renderer: &R, limits: &layout::Limits) -> layout::Node {
         self.content.as_widget_mut().layout(tree, renderer, limits)
     }
 
     fn draw(
         &self,
         tree: &Tree,
-        renderer: &mut Renderer,
-        theme: &Theme,
+        renderer: &mut R,
+        theme: &T,
         style: &renderer::Style,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
@@ -76,7 +77,7 @@ impl<M> Widget<M, Theme, Renderer> for OpenBelow<'_, M> {
         &mut self,
         tree: &mut Tree,
         layout: Layout<'_>,
-        renderer: &Renderer,
+        renderer: &R,
         operation: &mut dyn Operation,
     ) {
         self.content
@@ -90,7 +91,7 @@ impl<M> Widget<M, Theme, Renderer> for OpenBelow<'_, M> {
         event: &Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
-        renderer: &Renderer,
+        renderer: &R,
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, M>,
         viewport: &Rectangle,
@@ -106,7 +107,7 @@ impl<M> Widget<M, Theme, Renderer> for OpenBelow<'_, M> {
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         viewport: &Rectangle,
-        renderer: &Renderer,
+        renderer: &R,
     ) -> mouse::Interaction {
         self.content
             .as_widget()
@@ -117,10 +118,10 @@ impl<M> Widget<M, Theme, Renderer> for OpenBelow<'_, M> {
         &'b mut self,
         tree: &'b mut Tree,
         layout: Layout<'b>,
-        renderer: &Renderer,
+        renderer: &R,
         viewport: &Rectangle,
         translation: Vector,
-    ) -> Option<overlay::Element<'b, M, Theme, Renderer>> {
+    ) -> Option<overlay::Element<'b, M, T, R>> {
         // Where the field is on screen, as iced's menu works it out.
         let field_bottom = layout.position().y + translation.y + layout.bounds().height;
         let menu =
@@ -241,6 +242,73 @@ mod tests {
 
     fn rect(y: f32, height: f32) -> Rectangle {
         Rectangle::new(Point::new(40.0, y), Size::new(200.0, height))
+    }
+
+    /// Opens `field` (laid out 300 px wide at y = 500 in an 800 px tall
+    /// window) with a click, and returns where its menu's first item is
+    /// and the field's bottom edge.
+    fn open_at_500(mut field: Element<'_, String, iced::Theme, ()>) -> (f32, f32) {
+        use iced::advanced::clipboard;
+        let window = Size::new(300.0, 800.0);
+        let mut tree = Tree::new(&field);
+        let node = field
+            .as_widget_mut()
+            .layout(&mut tree, &(), &layout::Limits::new(Size::ZERO, window))
+            .move_to(Point::new(0.0, 500.0));
+        let bottom = node.bounds().y + node.bounds().height;
+        let viewport = Rectangle::new(Point::ORIGIN, window);
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        field.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Layout::new(&node),
+            mouse::Cursor::Available(Point::new(10.0, 510.0)),
+            &(),
+            &mut clipboard::Null,
+            &mut shell,
+            &viewport,
+        );
+        let mut menu = field
+            .as_widget_mut()
+            .overlay(&mut tree, Layout::new(&node), &(), &viewport, Vector::ZERO)
+            .expect("the click opens the menu");
+        let mut placed = menu.as_overlay_mut().layout(&(), window);
+        // A group (a stack's) holds the menu as its child.
+        while placed.children().len() == 1 && placed.size() == window {
+            placed = placed.children()[0].clone();
+        }
+        (placed.bounds().y, bottom)
+    }
+
+    fn pick()
+    -> iced::widget::PickList<'static, String, Vec<String>, String, String, iced::Theme, ()> {
+        iced::widget::pick_list(
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            None,
+            |s: String| s,
+        )
+    }
+
+    #[test]
+    fn iced_alone_opens_a_low_pick_list_upwards() {
+        // The behaviour being fixed, so the tests below mean something.
+        let (menu_top, bottom) = open_at_500(pick().into());
+        assert!(menu_top < bottom, "{menu_top} {bottom}");
+    }
+
+    #[test]
+    fn a_wrapped_pick_list_low_in_the_window_opens_below() {
+        let (menu_top, bottom) = open_at_500(open_below(pick()));
+        assert_eq!(menu_top, bottom);
+    }
+
+    #[test]
+    fn a_wrapped_pick_list_inside_a_stack_opens_below() {
+        // As `theme::dropdown` builds it: the chevron stacked over it.
+        let field = iced::widget::stack![open_below(pick()), iced::widget::space()];
+        let (menu_top, bottom) = open_at_500(field.into());
+        assert_eq!(menu_top, bottom);
     }
 
     #[test]
