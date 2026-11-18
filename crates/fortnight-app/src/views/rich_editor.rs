@@ -1,0 +1,910 @@
+//! The notes editor: edits a [`Content`] showing its formatting (bold,
+//! italic, underline, links, lists) rather than its Markdown.
+//!
+//! Each block is laid out as one iced paragraph of styled spans
+//! (`Paragraph::with_spans`), indented by its level, with its list marker
+//! (`•`, `–` or its number) drawn in a gutter beside it. The caret,
+//! selection and underlines are drawn from the paragraphs' cosmic-text
+//! layout runs (iced draws no underlines for a paragraph itself), and
+//! clicks are placed with the same layout (`Buffer::hit`).
+//!
+//! The widget only reports what was done as [`Action`]s, through
+//! `on_action`; the owner applies them to the content
+//! ([`Content::perform`]), as with iced's `text_editor`. Copy, cut and
+//! paste go through the clipboard as Markdown. A click on a link opens it
+//! (`on_link`) when the editor isn't focused, or with `⌘` held.
+//!
+//! The widget works with iced's own renderer only, whose paragraphs are
+//! cosmic-text buffers.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use iced::advanced::graphics::text::Paragraph;
+use iced::advanced::graphics::text::cosmic_text;
+use iced::advanced::input_method::{self, InputMethod};
+use iced::advanced::layout::{self, Layout};
+use iced::advanced::text::{
+    Alignment, LineHeight, Paragraph as _, Renderer as _, Shaping, Span, Text, Wrapping,
+};
+use iced::advanced::widget::{self, Id, Widget, operation, tree};
+use iced::advanced::{Clipboard, Shell, clipboard, mouse, renderer};
+use iced::alignment::Vertical;
+use iced::keyboard::{self, key::Named};
+use iced::time::{Duration, Instant};
+use iced::widget::text_editor::Status;
+use iced::{Element, Event, Font, Length, Padding, Pixels, Point, Rectangle, Size, Theme, window};
+
+use super::rich_notes::{Action, Command, Content, List, Motion, Pos, href};
+use crate::theme;
+
+/// The indentation of one level.
+const INDENT: f32 = 18.0;
+/// The width of a list item's marker column.
+const GUTTER: f32 = 24.0;
+
+static NEXT_CONTENT: AtomicU64 = AtomicU64::new(1);
+
+/// A number for each new [`Content`], so the editor can tell a different
+/// one from an edited one.
+pub(super) fn content_id() -> u64 {
+    NEXT_CONTENT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// An editor for `content`, reporting what is done with `on_action`.
+pub fn rich_editor<'a, Message>(
+    content: &'a Content,
+    on_action: impl Fn(Action) -> Message + 'a,
+) -> RichEditor<'a, Message> {
+    RichEditor {
+        content,
+        id: None,
+        placeholder: "",
+        on_action: Box::new(on_action),
+        on_link: None,
+        min_height: 0.0,
+        padding: Padding::new(10.0),
+        size: theme::TEXT_BODY,
+    }
+}
+
+pub struct RichEditor<'a, Message> {
+    content: &'a Content,
+    id: Option<Id>,
+    placeholder: &'a str,
+    on_action: Box<dyn Fn(Action) -> Message + 'a>,
+    on_link: Option<Box<dyn Fn(String) -> Message + 'a>>,
+    min_height: f32,
+    padding: Padding,
+    size: f32,
+}
+
+impl<'a, Message> RichEditor<'a, Message> {
+    pub fn id(mut self, id: impl Into<Id>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    pub fn placeholder(mut self, placeholder: &'a str) -> Self {
+        self.placeholder = placeholder;
+        self
+    }
+
+    /// What a click on a link sends, with its address ([`href`]).
+    pub fn on_link(mut self, on_link: impl Fn(String) -> Message + 'a) -> Self {
+        self.on_link = Some(Box::new(on_link));
+        self
+    }
+
+    pub fn min_height(mut self, min_height: f32) -> Self {
+        self.min_height = min_height;
+        self
+    }
+
+    pub fn padding(mut self, padding: impl Into<Padding>) -> Self {
+        self.padding = padding.into();
+        self
+    }
+
+    pub fn size(mut self, size: f32) -> Self {
+        self.size = size;
+        self
+    }
+}
+
+// ------------------------------------------------------------------ state
+
+#[derive(Debug, Clone)]
+struct Focus {
+    updated_at: Instant,
+    now: Instant,
+    window_focused: bool,
+}
+
+impl Focus {
+    const BLINK: u128 = 500;
+
+    fn now() -> Self {
+        let now = Instant::now();
+        Focus {
+            updated_at: now,
+            now,
+            window_focused: true,
+        }
+    }
+
+    fn caret_visible(&self) -> bool {
+        self.window_focused
+            && ((self.now - self.updated_at).as_millis() / Self::BLINK).is_multiple_of(2)
+    }
+}
+
+/// One block, laid out.
+#[derive(Debug, Default)]
+struct Laid {
+    paragraph: Paragraph,
+    marker: Option<Paragraph>,
+    /// The text's top left, from the top left of the text area.
+    origin: Point,
+    height: f32,
+    /// The block's characters (byte and character places differ).
+    plain: String,
+    /// For each span: underlined, and its link.
+    spans: Vec<(bool, Option<Arc<str>>)>,
+}
+
+#[derive(Debug, Default)]
+struct State {
+    focus: Option<Focus>,
+    last_click: Option<mouse::Click>,
+    dragging: bool,
+    modifiers: keyboard::Modifiers,
+    /// What the layout was made for: the content's id and version, the
+    /// width and the text size.
+    made_for: Option<(u64, u64, f32, f32)>,
+    blocks: Vec<Laid>,
+    placeholder: Paragraph,
+}
+
+impl operation::Focusable for State {
+    fn is_focused(&self) -> bool {
+        self.focus.is_some()
+    }
+
+    fn focus(&mut self) {
+        self.focus = Some(Focus::now());
+    }
+
+    fn unfocus(&mut self) {
+        self.focus = None;
+        self.dragging = false;
+    }
+}
+
+fn text<C>(content: C, width: f32, size: f32) -> Text<C, Font> {
+    Text {
+        content,
+        bounds: Size::new(width, f32::INFINITY),
+        size: Pixels(size),
+        line_height: LineHeight::default(),
+        font: theme::FONT,
+        align_x: Alignment::Default,
+        align_y: Vertical::Top,
+        shaping: Shaping::Advanced,
+        wrapping: Wrapping::WordOrGlyph,
+    }
+}
+
+fn line_height(size: f32) -> f32 {
+    LineHeight::default().to_absolute(Pixels(size)).0
+}
+
+fn byte_of(plain: &str, col: usize) -> usize {
+    plain
+        .char_indices()
+        .nth(col)
+        .map_or(plain.len(), |(i, _)| i)
+}
+
+fn col_of(plain: &str, byte: usize) -> usize {
+    let mut byte = byte.min(plain.len());
+    while !plain.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    plain[..byte].chars().count()
+}
+
+impl State {
+    fn lay_out(&mut self, content: &Content, width: f32, size: f32, placeholder: &str) {
+        let numbers = content.numbers();
+        let mut y = 0.0;
+        self.blocks = content
+            .blocks()
+            .iter()
+            .zip(numbers)
+            .map(|(block, number)| {
+                let indent = f32::from(block.indent) * INDENT;
+                let gutter = if block.list == List::None {
+                    0.0
+                } else {
+                    GUTTER
+                };
+                let runs = block.runs();
+                let spans: Vec<Span<'_, (), Font>> = runs
+                    .iter()
+                    .map(|(t, style)| {
+                        let span = Span::new(t.as_str()).font(style.font());
+                        if style.link.is_some() {
+                            span.color(theme::accent_color())
+                        } else {
+                            span
+                        }
+                    })
+                    .collect();
+                let width = (width - indent - gutter).max(1.0);
+                let paragraph = Paragraph::with_spans(text(spans.as_slice(), width, size));
+                let marker = match block.list {
+                    List::None => None,
+                    List::Bullet => Some("•".to_string()),
+                    List::Dash => Some("–".to_string()),
+                    List::Number => Some(format!("{number}.")),
+                }
+                .map(|m| Paragraph::with_text(text(m.as_str(), GUTTER, size)));
+                let height = paragraph.min_bounds().height.max(line_height(size));
+                let laid = Laid {
+                    paragraph,
+                    marker,
+                    origin: Point::new(indent + gutter, y),
+                    height,
+                    plain: block.plain(),
+                    spans: runs
+                        .into_iter()
+                        .map(|(_, s)| (s.underline || s.link.is_some(), s.link))
+                        .collect(),
+                };
+                y += height;
+                laid
+            })
+            .collect();
+        self.placeholder = Paragraph::with_text(text(placeholder, width, size));
+    }
+
+    fn total_height(&self) -> f32 {
+        self.blocks.last().map_or(0.0, |b| b.origin.y + b.height)
+    }
+
+    /// The block under a point of the text area (the nearest one).
+    fn block_at(&self, p: Point) -> usize {
+        self.blocks
+            .iter()
+            .rposition(|b| b.origin.y <= p.y)
+            .unwrap_or(0)
+    }
+
+    /// The place at a point of the text area.
+    fn hit(&self, p: Point) -> Pos {
+        let b = self.block_at(p);
+        let Some(laid) = self.blocks.get(b) else {
+            return Pos::default();
+        };
+        let x = p.x - laid.origin.x;
+        let y = (p.y - laid.origin.y).clamp(0.0, (laid.height - 1.0).max(0.0));
+        let col = laid
+            .paragraph
+            .buffer()
+            .hit(x.max(0.0), y)
+            .map_or(laid.plain.chars().count(), |c| col_of(&laid.plain, c.index));
+        Pos::new(b, col)
+    }
+
+    /// The link under a point of the text area.
+    fn link_at(&self, p: Point) -> Option<Arc<str>> {
+        let laid = self.blocks.get(self.block_at(p))?;
+        let local = Point::new(p.x - laid.origin.x, p.y - laid.origin.y);
+        if local.x < 0.0 || local.y < 0.0 || local.y > laid.height {
+            return None;
+        }
+        let span = laid.paragraph.hit_span(local)?;
+        laid.spans.get(span)?.1.clone()
+    }
+
+    /// The caret at a place: its top left in the text area and height.
+    fn caret(&self, at: Pos, size: f32) -> (Point, f32) {
+        let Some(laid) = self.blocks.get(at.block) else {
+            return (Point::ORIGIN, line_height(size));
+        };
+        let index = byte_of(&laid.plain, at.col);
+        let mut found = None;
+        let mut last = (0.0, 0.0, line_height(size));
+        for run in laid.paragraph.buffer().layout_runs() {
+            let (top, h) = (run.line_top, run.line_height);
+            let (Some(first), Some(end)) = (run.glyphs.first(), run.glyphs.last()) else {
+                last = (0.0, top, h);
+                continue;
+            };
+            if index < first.start {
+                // A space a line was wrapped at has no glyph: the caret
+                // stays at the end of the line before.
+                found = Some(if run.line_i == 0 && top > 0.0 {
+                    last
+                } else {
+                    (first.x, top, h)
+                });
+                break;
+            }
+            if let Some(g) = run
+                .glyphs
+                .iter()
+                .find(|g| g.start <= index && index < g.end)
+            {
+                let part = if index > g.start {
+                    g.w * (index - g.start) as f32 / (g.end - g.start) as f32
+                } else {
+                    0.0
+                };
+                found = Some((g.x + part, top, h));
+                break;
+            }
+            last = (end.x + end.w, top, h);
+        }
+        let (x, top, h) = found.unwrap_or(last);
+        (Point::new(laid.origin.x + x, laid.origin.y + top), h)
+    }
+
+    /// The place a line up (or down) from `at`, at the same x.
+    fn vertical(&self, at: Pos, down: bool, size: f32) -> Pos {
+        let (p, h) = self.caret(at, size);
+        let y = if down { p.y + h + 1.0 } else { p.y - 1.0 };
+        if y < 0.0 {
+            return Pos::new(0, 0);
+        }
+        if y >= self.total_height() {
+            let last = self.blocks.len().saturating_sub(1);
+            return Pos::new(
+                last,
+                self.blocks.get(last).map_or(0, |b| b.plain.chars().count()),
+            );
+        }
+        self.hit(Point::new(p.x, y))
+    }
+}
+
+// ----------------------------------------------------------------- widget
+
+impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<State>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(State::default())
+    }
+
+    fn size(&self) -> Size<Length> {
+        Size::new(Length::Fill, Length::Shrink)
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut widget::Tree,
+        _renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        let state = tree.state.downcast_mut::<State>();
+        let limits = limits.width(Length::Fill).height(Length::Shrink);
+        let width = limits.max().width;
+        let inner = (width - self.padding.x()).max(1.0);
+        let made_for = (self.content.id(), self.content.version(), inner, self.size);
+        if state.made_for != Some(made_for) {
+            state.lay_out(self.content, inner, self.size, self.placeholder);
+            state.made_for = Some(made_for);
+        }
+        let height = (state.total_height() + self.padding.y()).max(self.min_height);
+        layout::Node::new(limits.resolve(Length::Fill, Length::Shrink, Size::new(width, height)))
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut widget::Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        _renderer: &iced::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        _viewport: &Rectangle,
+    ) {
+        let state = tree.state.downcast_mut::<State>();
+        let bounds = layout.bounds();
+        let text_bounds = bounds.shrink(self.padding);
+        let local = |p: Point| Point::new(p.x - text_bounds.x, p.y - text_bounds.y);
+        let publish =
+            |shell: &mut Shell<'_, Message>, action| shell.publish((self.on_action)(action));
+
+        match event {
+            Event::Window(window::Event::Unfocused) => {
+                if let Some(f) = &mut state.focus {
+                    f.window_focused = false;
+                }
+            }
+            Event::Window(window::Event::Focused) => {
+                if let Some(f) = &mut state.focus {
+                    f.window_focused = true;
+                    f.updated_at = Instant::now();
+                    shell.request_redraw();
+                }
+            }
+            Event::Window(window::Event::RedrawRequested(now)) => {
+                let ime = match &mut state.focus {
+                    Some(f) if f.window_focused => {
+                        f.now = *now;
+                        let wait = Focus::BLINK - (f.now - f.updated_at).as_millis() % Focus::BLINK;
+                        shell.request_redraw_at(*now + Duration::from_millis(wait as u64));
+                        let (p, h) = state.caret(self.content.cursor(), self.size);
+                        InputMethod::Enabled {
+                            cursor: Rectangle::new(
+                                Point::new(text_bounds.x + p.x, text_bounds.y + p.y),
+                                Size::new(1.0, h),
+                            ),
+                            purpose: input_method::Purpose::Normal,
+                            preedit: None,
+                        }
+                    }
+                    _ => InputMethod::Disabled,
+                };
+                shell.request_input_method::<&str>(&ime);
+            }
+            Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => state.modifiers = *m,
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                let Some(p) = cursor.position_over(bounds) else {
+                    if state.focus.is_some() {
+                        state.focus = None;
+                        state.dragging = false;
+                    }
+                    return;
+                };
+                let p = local(p);
+                if let Some(on_link) = &self.on_link
+                    && (state.focus.is_none() || state.modifiers.command())
+                    && let Some(url) = state.link_at(p)
+                {
+                    shell.publish(on_link(href(&url)));
+                    shell.capture_event();
+                    return;
+                }
+                let at = state.hit(p);
+                let click = mouse::Click::new(p, mouse::Button::Left, state.last_click);
+                let action = match click.kind() {
+                    mouse::click::Kind::Single => {
+                        state.dragging = true;
+                        Action::MoveTo {
+                            at,
+                            select: state.modifiers.shift(),
+                        }
+                    }
+                    mouse::click::Kind::Double => Action::SelectWord(at),
+                    mouse::click::Kind::Triple => Action::SelectBlock(at),
+                };
+                state.last_click = Some(click);
+                state.focus = Some(Focus::now());
+                publish(shell, action);
+                shell.capture_event();
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                state.dragging = false;
+            }
+            Event::Mouse(mouse::Event::CursorMoved { position }) if state.dragging => {
+                let at = state.hit(local(*position));
+                publish(shell, Action::MoveTo { at, select: true });
+            }
+            Event::InputMethod(input_method::Event::Commit(s)) if state.focus.is_some() => {
+                publish(shell, Action::Insert(s.clone()));
+                if let Some(f) = &mut state.focus {
+                    f.updated_at = Instant::now();
+                }
+                shell.capture_event();
+            }
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                modified_key,
+                physical_key,
+                modifiers,
+                text,
+                ..
+            }) if state.focus.is_some() => {
+                let m = *modifiers;
+                let mut actions = Vec::new();
+                let shortcut = m.command() || m.control();
+                let letter = key.to_latin(*physical_key);
+                if shortcut && !m.alt() {
+                    let cmd = m.command();
+                    match (letter, m.shift()) {
+                        (Some('c'), _) if cmd => {
+                            if let Some(s) = self.content.selected_text() {
+                                clipboard.write(clipboard::Kind::Standard, s);
+                            }
+                        }
+                        (Some('x'), _) if cmd => {
+                            if let Some(s) = self.content.selected_text() {
+                                clipboard.write(clipboard::Kind::Standard, s);
+                                actions.push(Action::Delete);
+                            }
+                        }
+                        (Some('v'), false) if cmd => {
+                            if let Some(s) = clipboard.read(clipboard::Kind::Standard) {
+                                actions.push(Action::Paste(s));
+                            }
+                        }
+                        (Some('a'), _) if cmd => actions.push(Action::SelectAll),
+                        (Some('b'), false) => actions.push(Action::Format(Command::Bold)),
+                        (Some('i'), false) => actions.push(Action::Format(Command::Italic)),
+                        (Some('u'), false) => actions.push(Action::Format(Command::Underline)),
+                        (Some('k'), false) => actions.push(Action::Format(Command::Link)),
+                        (Some('8'), true) => actions.push(Action::Format(Command::Bullets)),
+                        (Some('7'), true) => actions.push(Action::Format(Command::Numbers)),
+                        _ => {}
+                    }
+                }
+                let select = m.shift();
+                let moving = |motion| Action::Move { motion, select };
+                let jump = m.jump();
+                let line = m.macos_command();
+                match modified_key.as_ref() {
+                    keyboard::Key::Named(Named::Enter) => actions.push(Action::Enter),
+                    keyboard::Key::Named(named @ (Named::Backspace | Named::Delete)) => {
+                        let back = named == Named::Backspace;
+                        if self.content.selection().is_none() && (jump || line) {
+                            let motion = match (back, line) {
+                                (true, true) => Motion::BlockStart,
+                                (true, false) => Motion::WordLeft,
+                                (false, true) => Motion::BlockEnd,
+                                (false, false) => Motion::WordRight,
+                            };
+                            actions.push(Action::Move {
+                                motion,
+                                select: true,
+                            });
+                        }
+                        actions.push(if back {
+                            Action::Backspace
+                        } else {
+                            Action::Delete
+                        });
+                    }
+                    keyboard::Key::Named(Named::Tab) if !shortcut => {
+                        actions.push(Action::Format(if m.shift() {
+                            Command::Outdent
+                        } else {
+                            Command::Indent
+                        }));
+                    }
+                    keyboard::Key::Named(Named::Escape) => {
+                        state.focus = None;
+                        state.dragging = false;
+                        // Not captured: Escape also does what it does
+                        // around the editor.
+                        return;
+                    }
+                    keyboard::Key::Named(Named::ArrowLeft) => actions.push(moving(if line {
+                        Motion::BlockStart
+                    } else if jump {
+                        Motion::WordLeft
+                    } else {
+                        Motion::Left
+                    })),
+                    keyboard::Key::Named(Named::ArrowRight) => actions.push(moving(if line {
+                        Motion::BlockEnd
+                    } else if jump {
+                        Motion::WordRight
+                    } else {
+                        Motion::Right
+                    })),
+                    keyboard::Key::Named(named @ (Named::ArrowUp | Named::ArrowDown)) => {
+                        let down = named == Named::ArrowDown;
+                        actions.push(if line {
+                            moving(if down {
+                                Motion::DocEnd
+                            } else {
+                                Motion::DocStart
+                            })
+                        } else {
+                            let at = state.vertical(self.content.cursor(), down, self.size);
+                            Action::MoveTo { at, select }
+                        });
+                    }
+                    keyboard::Key::Named(Named::Home) => actions.push(moving(Motion::BlockStart)),
+                    keyboard::Key::Named(Named::End) => actions.push(moving(Motion::BlockEnd)),
+                    _ if !shortcut => {
+                        let typed: String = text
+                            .as_deref()
+                            .unwrap_or_default()
+                            .chars()
+                            .filter(|c| !c.is_control())
+                            .collect();
+                        if !typed.is_empty() {
+                            actions.push(Action::Insert(typed));
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(f) = &mut state.focus {
+                    f.updated_at = Instant::now();
+                }
+                for action in actions {
+                    publish(shell, action);
+                }
+                shell.capture_event();
+            }
+            _ => {}
+        }
+    }
+
+    fn draw(
+        &self,
+        tree: &widget::Tree,
+        renderer: &mut iced::Renderer,
+        theme: &Theme,
+        _style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+    ) {
+        use iced::advanced::Renderer as _;
+
+        let state = tree.state.downcast_ref::<State>();
+        let bounds = layout.bounds();
+        let status = match &state.focus {
+            Some(_) => Status::Focused {
+                is_hovered: cursor.is_over(bounds),
+            },
+            None if cursor.is_over(bounds) => Status::Hovered,
+            None => Status::Active,
+        };
+        let style = theme::editor(theme, status);
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds,
+                border: style.border,
+                ..renderer::Quad::default()
+            },
+            style.background,
+        );
+        let text_bounds = bounds.shrink(self.padding);
+        let at = |p: Point| Point::new(text_bounds.x + p.x, text_bounds.y + p.y);
+
+        if self.content.is_empty() {
+            renderer.fill_paragraph(
+                &state.placeholder,
+                at(Point::ORIGIN),
+                style.placeholder,
+                text_bounds,
+            );
+        }
+
+        // The selection, behind the text.
+        if let (Some(_), Some((from, to))) = (&state.focus, self.content.selection()) {
+            for b in from.block..=to.block {
+                let Some(laid) = state.blocks.get(b) else {
+                    continue;
+                };
+                let start = if b == from.block {
+                    byte_of(&laid.plain, from.col)
+                } else {
+                    0
+                };
+                let end = if b == to.block {
+                    byte_of(&laid.plain, to.col)
+                } else {
+                    laid.plain.len()
+                };
+                for run in laid.paragraph.buffer().layout_runs() {
+                    let Some((x, w)) = run.highlight(
+                        cosmic_text::Cursor::new(0, start),
+                        cosmic_text::Cursor::new(0, end),
+                    ) else {
+                        continue;
+                    };
+                    // A selected line break shows as a sliver.
+                    let w = if b < to.block
+                        && run.glyphs.last().is_none_or(|g| g.end >= laid.plain.len())
+                    {
+                        w + 4.0
+                    } else {
+                        w
+                    };
+                    let rect = Rectangle::new(
+                        at(Point::new(laid.origin.x + x, laid.origin.y + run.line_top)),
+                        Size::new(w, run.line_height),
+                    );
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: rect,
+                            ..renderer::Quad::default()
+                        },
+                        style.selection,
+                    );
+                }
+            }
+        }
+
+        let muted = theme::muted_color(theme);
+        for laid in &state.blocks {
+            if let Some(marker) = &laid.marker {
+                let p = at(Point::new(laid.origin.x - GUTTER, laid.origin.y));
+                renderer.fill_paragraph(marker, p, muted, text_bounds);
+            }
+            let origin = at(laid.origin);
+            renderer.fill_paragraph(&laid.paragraph, origin, style.value, text_bounds);
+            // Underlines (and link underlines) under their glyphs.
+            for run in laid.paragraph.buffer().layout_runs() {
+                let mut line: Option<(f32, f32, bool)> = None;
+                let flush = |line: &mut Option<(f32, f32, bool)>, renderer: &mut iced::Renderer| {
+                    if let Some((x0, x1, link)) = line.take() {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: Rectangle::new(
+                                    Point::new(origin.x + x0, origin.y + run.line_y + 2.0),
+                                    Size::new(x1 - x0, 1.0),
+                                ),
+                                ..renderer::Quad::default()
+                            },
+                            if link {
+                                theme::accent_color()
+                            } else {
+                                style.value
+                            },
+                        );
+                    }
+                };
+                for g in run.glyphs {
+                    let (under, link) = laid
+                        .spans
+                        .get(g.metadata)
+                        .map_or((false, false), |(u, l)| (*u, l.is_some()));
+                    match &mut line {
+                        Some((_, x1, l)) if under && *l == link => *x1 = g.x + g.w,
+                        _ => {
+                            flush(&mut line, renderer);
+                            if under {
+                                line = Some((g.x, g.x + g.w, link));
+                            }
+                        }
+                    }
+                }
+                flush(&mut line, renderer);
+            }
+        }
+
+        // The caret.
+        if let Some(focus) = &state.focus
+            && focus.caret_visible()
+            && self.content.selection().is_none()
+        {
+            let (p, h) = state.caret(self.content.cursor(), self.size);
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: Rectangle::new(at(p), Size::new(1.0, h)),
+                    ..renderer::Quad::default()
+                },
+                style.value,
+            );
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &widget::Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+        _renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        let state = tree.state.downcast_ref::<State>();
+        let bounds = layout.bounds();
+        let Some(p) = cursor.position_over(bounds) else {
+            return mouse::Interaction::default();
+        };
+        let text_bounds = bounds.shrink(self.padding);
+        let p = Point::new(p.x - text_bounds.x, p.y - text_bounds.y);
+        let opens = self.on_link.is_some() && (state.focus.is_none() || state.modifiers.command());
+        if opens && state.link_at(p).is_some() {
+            mouse::Interaction::Pointer
+        } else {
+            mouse::Interaction::Text
+        }
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut widget::Tree,
+        layout: Layout<'_>,
+        _renderer: &iced::Renderer,
+        operation: &mut dyn widget::Operation,
+    ) {
+        let state = tree.state.downcast_mut::<State>();
+        operation.focusable(self.id.as_ref(), layout.bounds(), state);
+    }
+}
+
+impl<'a, Message: 'a> From<RichEditor<'a, Message>> for Element<'a, Message> {
+    fn from(editor: RichEditor<'a, Message>) -> Self {
+        Element::new(editor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SIZE: f32 = 14.0;
+
+    fn laid_out(md: &str, width: f32) -> (Content, State) {
+        let content = Content::with_text(md);
+        let mut state = State::default();
+        state.lay_out(&content, width, SIZE, "");
+        (content, state)
+    }
+
+    /// Clicking just right of where the caret is drawn puts the caret
+    /// back there, at every place: wrapped lines, list items, styles.
+    #[test]
+    fn caret_and_clicks_agree() {
+        let (_, state) = laid_out(
+            "• a first line long enough to wrap around more than once here\n\
+             second **bold** *line* and [a link](https://x.y)\n\n  1. nested",
+            160.0,
+        );
+        for (b, laid) in state.blocks.iter().enumerate() {
+            for col in 0..=laid.plain.chars().count() {
+                let at = Pos::new(b, col);
+                let (p, h) = state.caret(at, SIZE);
+                assert_eq!(state.hit(Point::new(p.x + 0.5, p.y + h / 2.0)), at);
+            }
+        }
+    }
+
+    #[test]
+    fn blocks_stack_with_gutters_and_indents() {
+        let (_, state) = laid_out("• a\nplain\n  - b", 300.0);
+        let [bullet, plain, nested] = &state.blocks[..] else {
+            panic!("three blocks");
+        };
+        assert_eq!(bullet.origin, Point::new(GUTTER, 0.0));
+        assert!(bullet.marker.is_some() && plain.marker.is_none());
+        assert_eq!(plain.origin, Point::new(0.0, bullet.height));
+        assert_eq!(nested.origin.x, INDENT + GUTTER);
+        assert_eq!(
+            state.total_height(),
+            bullet.height + plain.height + nested.height
+        );
+    }
+
+    #[test]
+    fn up_and_down_move_by_lines() {
+        let (_, state) = laid_out("one two three four five six seven eight\nnext", 90.0);
+        let lines = state.blocks[0].paragraph.buffer().layout_runs().count();
+        assert!(lines > 1, "the first block wraps");
+        let mut at = Pos::new(0, 0);
+        for _ in 1..lines {
+            let down = state.vertical(at, true, SIZE);
+            assert_eq!(down.block, 0);
+            assert!(down.col > at.col);
+            at = down;
+        }
+        assert_eq!(state.vertical(at, true, SIZE).block, 1);
+        assert_eq!(state.vertical(Pos::new(1, 2), false, SIZE).block, 0);
+        // Past the ends: the start and the end.
+        assert_eq!(state.vertical(Pos::new(0, 1), false, SIZE), Pos::new(0, 0));
+        assert_eq!(state.vertical(Pos::new(1, 0), true, SIZE), Pos::new(1, 4));
+    }
+
+    #[test]
+    fn links_are_found_under_the_pointer() {
+        let (_, state) = laid_out("see [docs](https://x.y) now", 400.0);
+        let (start, h) = state.caret(Pos::new(0, 4), SIZE);
+        let (end, _) = state.caret(Pos::new(0, 8), SIZE);
+        let mid = Point::new((start.x + end.x) / 2.0, start.y + h / 2.0);
+        assert_eq!(state.link_at(mid).as_deref(), Some("https://x.y"));
+        assert_eq!(state.link_at(Point::new(1.0, h / 2.0)), None);
+    }
+}

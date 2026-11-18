@@ -17,10 +17,10 @@
 //!   day, any day. Saved a moment after typing stops (or on moving to
 //!   another day), as one free-standing log line dated that day (replacing
 //!   its others), so it reaches the weekly summary as `log_lines`. Older
-//!   side work lines show up as lines of the notes. Basic formatting
-//!   (bold, italic, underline, bullet / dash / numbered lists) is kept as
-//!   Markdown in the text, with a toolbar in the title bar and shortcuts
-//!   (`rich_notes`).
+//!   side work lines show up as lines of the notes. Edited formatted
+//!   (`rich_editor`): bold, italic, underline, links, bullet / dash /
+//!   numbered lists, with a toolbar in the title bar and shortcuts; kept
+//!   as Markdown in the text (`rich_notes`).
 //! - **Completed**, collapsed: done tasks whose day is the shown day (as on
 //!   the Week tab), whenever they were ticked; a done task with no day shows
 //!   on the day it was ticked.
@@ -74,7 +74,7 @@ use fortnight_core::parse;
 use fortnight_core::report::ColumnLoad;
 use iced::widget::{
     Column, Row, Space, button, checkbox, column, container, mouse_area, pin, row, scrollable,
-    stack, text, text_editor, text_input, tooltip,
+    stack, text, text_input, tooltip,
 };
 use iced::{Center, Color, Element, Fill, Point, Theme, border, mouse};
 use jiff::civil::{Date, Weekday};
@@ -82,6 +82,7 @@ use jiff::tz::TimeZone;
 
 use super::NavKey;
 use super::panel::{self, load_line, load_view};
+use super::rich_editor::rich_editor;
 use super::rich_notes;
 use super::task_form::{EditForm, field, form_fields, open_form};
 use crate::theme;
@@ -91,6 +92,9 @@ pub const QUICK_ADD_ID: &str = "quick-add";
 
 /// The id of the day's notes editor, for `operation::focus`.
 pub const NOTES_ID: &str = "day-notes";
+
+/// The id of the day's notes' link prompt.
+pub const NOTES_LINK_ID: &str = "day-notes-link";
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -103,9 +107,8 @@ pub enum Message {
     /// A project picked from the list.
     PickProject(String),
     EditEstimate(String),
-    EditNotes(text_editor::Action),
-    /// A formatting shortcut in a task's notes.
-    FormatTaskNotes(rich_notes::Command),
+    /// Editing a task's notes.
+    EditNotes(rich_notes::Action),
     SetPriority(Priority),
     /// Open or close the due-date calendar.
     ToggleCalendar,
@@ -126,16 +129,8 @@ pub enum Message {
     SubmitQuickAdd,
     /// Typing in Today's Notes. Saved by `main.rs` once typing pauses
     /// ([`DayView::notes_to_save`]).
-    EditDayNotes(text_editor::Action),
-    /// A formatting button or shortcut in the day's notes.
-    FormatNotes(rich_notes::Command),
-    /// A click on the formatted notes: edit them.
-    OpenNotes,
-    /// `Escape` in the notes editor: show them formatted again.
-    LeaveNotes,
-    /// The pointer entered (`true`) or left the notes panel.
-    HoverNotes(bool),
-    /// A click on a link in the formatted notes.
+    EditDayNotes(rich_notes::Action),
+    /// A click on a link in some notes.
     OpenLink(String),
     Save,
     /// Move the open task to Deleted.
@@ -225,8 +220,9 @@ pub enum Action {
     Reorder(Vec<(TaskId, f64)>),
     /// Open the new-task dialog for this day.
     NewTask(Date),
-    /// Give the day's notes the keyboard focus (after a toolbar click).
-    FocusNotes,
+    /// Give a widget the keyboard focus: the day's notes after a toolbar
+    /// click, or a notes editor's link prompt.
+    Focus(&'static str),
     /// Open a web address from the notes in the browser.
     OpenLink(String),
 }
@@ -284,19 +280,13 @@ pub struct DayView {
     /// The expanded row's form.
     editing: Option<EditForm>,
     /// The shown day's notes.
-    notes: text_editor::Content,
+    notes: rich_notes::Content,
     /// The day `notes` belong to.
     notes_day: Option<Date>,
     /// When the notes were last typed in, while not yet saved.
     notes_edited: Option<Instant>,
     /// Another day's notes left with unsaved typing: saved straight away.
     notes_left: Option<(Date, String)>,
-    /// Whether the notes are being edited (the editor shows); otherwise
-    /// they show formatted (`rich_notes::preview`).
-    notes_open: bool,
-    /// Whether the pointer is over the notes panel, so a click elsewhere
-    /// ([`DayView::pointer_down`]) can close the editor.
-    notes_hovered: bool,
     /// The add-a-task input.
     quick_add: String,
     /// A held Tasks card.
@@ -552,16 +542,17 @@ impl DayView {
             {
                 self.notes_left = Some((day, self.notes.text().trim_end().to_string()));
             }
-            self.notes = text_editor::Content::with_text(&day_notes(&data, data.day));
+            self.notes = rich_notes::Content::with_text(&day_notes(&data, data.day));
             self.notes_day = Some(data.day);
-            self.notes_open = false;
         } else if self.notes_edited.is_none() {
             // Unsaved typing wins over what is stored. Compared trimmed at
             // both ends, as `main.rs` saves them, so an autosave of notes
             // with leading blank space doesn't rewrite the editor.
             let stored = day_notes(&data, data.day);
-            if self.notes.text().trim() != stored.trim() {
-                self.notes = text_editor::Content::with_text(&stored);
+            // (Compared as the editor writes them: Markdown is tidied.)
+            let stored = rich_notes::Content::with_text(&stored);
+            if self.notes.text().trim() != stored.text().trim() {
+                self.notes = stored;
             }
         }
         self.placement = Placement::new(&data);
@@ -656,7 +647,7 @@ impl DayView {
         if let Some(form) = self.editing.as_mut()
             && form.handle(&message, data.today)
         {
-            return Action::None;
+            return form.take_focus().map_or(Action::None, Action::Focus);
         }
         match message {
             Message::Toggle(id, done) => Action::SetStatus(
@@ -746,35 +737,18 @@ impl DayView {
                 }
             }
             Message::EditDayNotes(action) => {
-                let edit = action.is_edit();
-                if !rich_notes::intercept(&mut self.notes, &action) {
-                    self.notes.perform(action);
-                }
-                if edit {
+                let format = matches!(action, rich_notes::Action::Format(_));
+                if action.is_edit() {
                     self.notes_edited = Some(Instant::now());
                 }
-                Action::None
-            }
-            Message::FormatNotes(cmd) => {
-                if rich_notes::run(&mut self.notes, cmd) {
-                    self.notes_edited = Some(Instant::now());
+                self.notes.perform(action);
+                match self.notes.take_focus() {
+                    Some(rich_notes::Focus::LinkPrompt) => Action::Focus(NOTES_LINK_ID),
+                    // A toolbar click took the focus away.
+                    Some(rich_notes::Focus::Editor) => Action::Focus(NOTES_ID),
+                    None if format => Action::Focus(NOTES_ID),
+                    None => Action::None,
                 }
-                self.notes_open = true;
-                Action::FocusNotes
-            }
-            Message::OpenNotes => {
-                self.notes
-                    .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
-                self.notes_open = true;
-                Action::FocusNotes
-            }
-            Message::LeaveNotes => {
-                self.notes_open = false;
-                Action::None
-            }
-            Message::HoverNotes(over) => {
-                self.notes_hovered = over;
-                Action::None
             }
             Message::OpenLink(url) => Action::OpenLink(url),
             Message::Save => {
@@ -970,14 +944,6 @@ impl DayView {
         Some((self.notes_day?, self.notes.text().trim_end().to_string()))
     }
 
-    /// A mouse button went down anywhere: outside the notes panel, that
-    /// ends editing the notes (the editor has lost the focus).
-    pub fn pointer_down(&mut self) {
-        if !self.notes_hovered {
-            self.notes_open = false;
-        }
-    }
-
     /// The shown day's notes, saved as you type: "Today's Notes" on today,
     /// "Notes" on any other day. While not being edited (and not empty)
     /// they show formatted; a click edits them.
@@ -987,59 +953,26 @@ impl DayView {
         } else {
             "Notes"
         };
-        let body: Element<'a, Message> = if self.notes_open || self.notes.text().trim().is_empty() {
-            text_editor(&self.notes)
-                .id(NOTES_ID)
-                .placeholder("What's on your mind?")
-                .on_action(Message::EditDayNotes)
-                .highlight_with::<rich_notes::Notes>((), rich_notes::format)
-                .key_binding(|press| {
-                    rich_notes::key_binding(press, Message::FormatNotes, Some(Message::LeaveNotes))
-                })
-                // Grows with the text, then scrolls.
-                .min_height(120)
-                .max_height(480)
-                .padding(CARD_PADDING)
-                .size(theme::TEXT_BODY)
-                .style(theme::editor)
-                .into()
-        } else {
-            let hovered = self.notes_hovered;
-            let shown = container(row![
-                // As tall as the empty editor.
-                Space::new().height(120.0 - 2.0 * f32::from(CARD_PADDING[0])),
-                rich_notes::preview(&self.notes.text(), Message::OpenLink),
-            ])
+        let editor = rich_editor(&self.notes, Message::EditDayNotes)
+            .id(NOTES_ID)
+            .placeholder("What's on your mind?")
+            .on_link(Message::OpenLink)
+            .min_height(120.0)
             .padding(CARD_PADDING)
-            .width(Fill)
-            .style(move |t: &Theme| {
-                let status = if hovered {
-                    text_editor::Status::Hovered
-                } else {
-                    text_editor::Status::Active
-                };
-                let s = theme::editor(t, status);
-                container::Style {
-                    background: Some(s.background),
-                    border: s.border,
-                    ..container::Style::default()
-                }
-            });
-            mouse_area(shown)
-                .on_press(Message::OpenNotes)
-                .interaction(mouse::Interaction::Text)
-                .into()
-        };
+            .size(theme::TEXT_BODY);
+        let mut body = Column::new().spacing(8).push(editor);
+        if let Some(prompt) =
+            rich_notes::link_prompt(&self.notes, NOTES_LINK_ID, Message::EditDayNotes)
+        {
+            body = body.push(prompt);
+        }
         let head = row![
             panel_head(heading, None, text::default),
             Space::new().width(Fill),
-            rich_notes::toolbar(Message::FormatNotes),
+            rich_notes::toolbar(|cmd| Message::EditDayNotes(rich_notes::Action::Format(cmd))),
         ]
         .align_y(Center);
-        mouse_area(panel::panel(head.into(), Some(body)))
-            .on_enter(Message::HoverNotes(true))
-            .on_exit(Message::HoverNotes(false))
-            .into()
+        panel::panel(head.into(), Some(body.into()))
     }
 
     /// The day's panel, in the scheme of a Week column: a title bar with
@@ -1906,39 +1839,31 @@ mod tests {
         assert_eq!(view.update(Message::Save), Action::None);
     }
 
-    /// A task's notes take the Markdown shortcuts: lists carry on with
-    /// `Enter`, `⌘B` bolds the word at the cursor, `⌘K` makes a link.
+    /// A task's notes are edited formatted: `* ` starts a list, `Enter`
+    /// carries it on, `⌘B` bolds what is typed next, `⌘K` asks for an
+    /// address and focuses its prompt.
     #[test]
     fn task_notes_take_markdown_shortcuts() {
+        use rich_notes::Action as A;
         let mut t = task(4, "Notes", None);
         t.planned_for = Some(today());
         let mut view = loaded(vec![t]);
         view.update(Message::Expand(4));
-        let edit =
-            |view: &mut DayView, e| view.update(Message::EditNotes(text_editor::Action::Edit(e)));
-        edit(&mut view, text_editor::Edit::Insert('*'));
-        edit(&mut view, text_editor::Edit::Insert(' '));
-        edit(
-            &mut view,
-            text_editor::Edit::Paste(std::sync::Arc::new("call Sam".into())),
+        let mut edit = |a| view.update(Message::EditNotes(a));
+        edit(A::Insert("* call ".into()));
+        edit(A::Format(rich_notes::Command::Bold));
+        edit(A::Insert("Sam".into()));
+        edit(A::Enter);
+        edit(A::Insert("docs".into()));
+        assert_eq!(
+            edit(A::Format(rich_notes::Command::Link)),
+            Action::Focus(super::super::task_form::TASK_NOTES_LINK_ID)
         );
-        edit(&mut view, text_editor::Edit::Enter);
-        edit(
-            &mut view,
-            text_editor::Edit::Paste(std::sync::Arc::new("docs".into())),
+        edit(A::LinkInput("https://x.y".into()));
+        assert_eq!(
+            edit(A::LinkSubmit),
+            Action::Focus(super::super::task_form::TASK_NOTES_ID)
         );
-        view.update(Message::FormatTaskNotes(rich_notes::Command::Link));
-        edit(
-            &mut view,
-            text_editor::Edit::Paste(std::sync::Arc::new("https://x.y".into())),
-        );
-        view.update(Message::EditNotes(text_editor::Action::Move(
-            text_editor::Motion::DocumentStart,
-        )));
-        view.update(Message::EditNotes(text_editor::Action::Move(
-            text_editor::Motion::End,
-        )));
-        view.update(Message::FormatTaskNotes(rich_notes::Command::Bold));
         assert_eq!(
             view.editing.as_ref().unwrap().notes.text(),
             "• call **Sam**\n• [docs](https://x.y)"
@@ -1974,8 +1899,8 @@ mod tests {
         view.update(Message::AddSubtask);
         view.update(Message::ToggleSubtask(0, true));
         view.update(Message::EditNewSubtask("typed, not added".into()));
-        view.update(Message::EditNotes(text_editor::Action::Edit(
-            text_editor::Edit::Paste(std::sync::Arc::new("some notes".to_string())),
+        view.update(Message::EditNotes(rich_notes::Action::Paste(
+            "some notes".into(),
         )));
         let Action::Update(updated) = view.update(Message::Save) else {
             panic!("expected Update");
@@ -2192,8 +2117,8 @@ mod tests {
     #[test]
     fn an_autosave_does_not_rewrite_notes_with_leading_space() {
         let mut view = loaded(vec![]);
-        view.update(Message::EditDayNotes(text_editor::Action::Edit(
-            text_editor::Edit::Paste(std::sync::Arc::new("  - item".to_string())),
+        view.update(Message::EditDayNotes(rich_notes::Action::Paste(
+            "  - item".into(),
         )));
         let (day, saved) = view
             .notes_to_save(Instant::now() + NOTES_SAVE_DELAY)
@@ -2230,35 +2155,32 @@ mod tests {
         assert_eq!(updated.due_on, None);
     }
 
-    /// The notes show formatted until clicked; a click elsewhere or
-    /// `Escape` shows them formatted again, a formatting button edits.
+    /// A toolbar button formats the notes and gives them the focus back
+    /// (the click took it); `⌘K` focuses the link prompt.
     #[test]
-    fn notes_switch_between_formatted_and_editing() {
-        let mut data = data_for(today(), vec![]);
-        data.logs = vec![LogLine {
-            date: today(),
-            text: "**hi**".into(),
-        }];
-        let mut view = DayView::new();
-        view.load(data);
-        assert!(!view.notes_open);
-        assert!(matches!(
-            view.update(Message::OpenNotes),
-            Action::FocusNotes
-        ));
-        assert!(view.notes_open);
-        // A click inside the panel keeps the editor; outside closes it.
-        view.update(Message::HoverNotes(true));
-        view.pointer_down();
-        assert!(view.notes_open);
-        view.update(Message::HoverNotes(false));
-        view.pointer_down();
-        assert!(!view.notes_open);
-        view.update(Message::FormatNotes(rich_notes::Command::Bullets));
-        assert!(view.notes_open);
+    fn toolbar_formats_and_refocuses_the_notes() {
+        use rich_notes::Action as A;
+        let mut view = loaded(vec![]);
+        view.update(Message::EditDayNotes(A::Insert("hi".into())));
+        view.update(Message::EditDayNotes(A::SelectAll));
+        assert_eq!(
+            view.update(Message::EditDayNotes(A::Format(rich_notes::Command::Bold))),
+            Action::Focus(NOTES_ID)
+        );
+        assert_eq!(view.notes.text(), "**hi**");
         assert!(view.notes_pending());
-        view.update(Message::LeaveNotes);
-        assert!(!view.notes_open);
+        assert_eq!(
+            view.update(Message::EditDayNotes(A::Format(rich_notes::Command::Link))),
+            Action::Focus(NOTES_LINK_ID)
+        );
+        assert_eq!(
+            view.update(Message::EditDayNotes(A::LinkCancel)),
+            Action::Focus(NOTES_ID)
+        );
+        assert_eq!(
+            view.update(Message::OpenLink("https://x.y".into())),
+            Action::OpenLink("https://x.y".into())
+        );
     }
 
     #[test]
@@ -2279,12 +2201,13 @@ mod tests {
         assert_eq!(view.notes.text(), "helped Sam\nstandup ran long");
         assert!(!view.notes_pending());
 
-        view.update(Message::EditDayNotes(text_editor::Action::Move(
-            text_editor::Motion::DocumentEnd,
-        )));
+        view.update(Message::EditDayNotes(rich_notes::Action::Move {
+            motion: rich_notes::Motion::DocEnd,
+            select: false,
+        }));
         assert!(!view.notes_pending(), "moving the cursor is no edit");
-        view.update(Message::EditDayNotes(text_editor::Action::Edit(
-            text_editor::Edit::Insert('!'),
+        view.update(Message::EditDayNotes(rich_notes::Action::Insert(
+            "!".into(),
         )));
         assert!(view.notes_pending());
         let typed = view.notes_edited.unwrap();
@@ -2306,11 +2229,12 @@ mod tests {
         other.day = sunday;
         view.load(other);
         assert_eq!(view.notes.text(), "Sunday");
-        view.update(Message::EditDayNotes(text_editor::Action::Move(
-            text_editor::Motion::DocumentEnd,
-        )));
-        view.update(Message::EditDayNotes(text_editor::Action::Edit(
-            text_editor::Edit::Insert('?'),
+        view.update(Message::EditDayNotes(rich_notes::Action::Move {
+            motion: rich_notes::Motion::DocEnd,
+            select: false,
+        }));
+        view.update(Message::EditDayNotes(rich_notes::Action::Insert(
+            "?".into(),
         )));
         view.load(data);
         assert_eq!(view.notes.text(), "helped Sam\nstandup ran long");

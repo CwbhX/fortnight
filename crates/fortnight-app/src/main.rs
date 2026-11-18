@@ -131,9 +131,6 @@ enum Message {
     SuggestPriority(u64),
     /// The left mouse button went up anywhere: ends a card drag.
     PointerUp,
-    /// A mouse button went down anywhere (closes the notes editor when
-    /// outside it).
-    PointerDown,
     PrioritySuggested(u64, Option<Priority>),
     /// A keyboard shortcut (applied only where it makes sense).
     Key(Shortcut),
@@ -304,9 +301,6 @@ impl App {
                 iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
                     iced::mouse::Button::Left,
                 )) => Some(Message::PointerUp),
-                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(_)) => {
-                    Some(Message::PointerDown)
-                }
                 _ => None,
             }),
             keyboard::listen().filter_map(|event| {
@@ -512,12 +506,7 @@ impl Ready {
         // Pointer moves, timers, streams and replies change no form.
         let no_form_change = matches!(
             &message,
-            Message::Day(
-                day::Message::Moved(_)
-                    | day::Message::Enter(_)
-                    | day::Message::Leave(_)
-                    | day::Message::HoverNotes(_)
-            ) | Message::PointerDown
+            Message::Day(day::Message::Moved(_) | day::Message::Enter(_) | day::Message::Leave(_))
                 | Message::Week(
                     week::Message::Moved(_) | week::Message::Hover(..) | week::Message::Leave(..)
                 )
@@ -552,11 +541,6 @@ impl Ready {
                 let action = self.day_view.update(m);
                 self.local = true;
                 self.day_action(action)
-            }
-            Message::PointerDown => {
-                self.local = true;
-                self.day_view.pointer_down();
-                Task::none()
             }
             Message::PointerUp => {
                 self.local = true;

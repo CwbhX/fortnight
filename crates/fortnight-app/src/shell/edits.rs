@@ -292,7 +292,7 @@ impl Ready {
             }
             day::Action::Reorder(positions) => self.store.set_positions(&positions),
             day::Action::NewTask(day) => return self.open_new_task(day),
-            day::Action::FocusNotes => return iced::widget::operation::focus(day::NOTES_ID),
+            day::Action::Focus(id) => return iced::widget::operation::focus(id),
             day::Action::OpenLink(url) => {
                 if let Err(e) = open_link(&url) {
                     self.error = Some(e);

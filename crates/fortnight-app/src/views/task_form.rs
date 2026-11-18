@@ -10,10 +10,10 @@
 //! left to the owner of the form.
 //!
 //! Subtasks are kept in the task's notes as Markdown checklist lines
-//! (`fortnight_core::notes`). The notes take the day notes' Markdown
-//! shortcuts (`rich_notes`): `⌘B` / `⌘I` / `⌘U` (or `Ctrl`), `⌘K` for a
-//! link, and lists started with `* `, `- ` or `1. ` that carry on with
-//! `Enter`.
+//! (`fortnight_core::notes`). The notes are edited formatted, like the
+//! day's notes (`rich_editor`), without the toolbar: `⌘B` / `⌘I` / `⌘U`
+//! (or `Ctrl`), `⌘K` for a link, and lists started with `* `, `- ` or
+//! `1. ` that carry on with `Enter`.
 
 use fortnight_core::domain::{NewTask, Priority, Task, TaskId};
 use fortnight_core::notes::{Subtask, join_notes, split_notes};
@@ -21,14 +21,20 @@ use fortnight_core::parse;
 use fortnight_core::week::add_months;
 use iced::widget::overlay::menu;
 use iced::widget::{
-    Column, Row, Space, button, checkbox, column, combo_box, container, row, text, text_editor,
-    text_input,
+    Column, Row, Space, button, checkbox, column, combo_box, container, row, text, text_input,
 };
 use iced::{Center, Color, Element, Fill, Theme, border};
 use jiff::civil::{Date, Weekday};
 
 use super::day::Message;
+use super::rich_editor::rich_editor;
 use super::rich_notes;
+
+/// The id of a task form's notes editor, for `operation::focus`.
+pub const TASK_NOTES_ID: &str = "task-notes";
+
+/// The id of a task form's notes' link prompt.
+pub const TASK_NOTES_LINK_ID: &str = "task-notes-link";
 use crate::calendar::{Popup, month_picker};
 use crate::theme;
 
@@ -69,7 +75,7 @@ pub struct EditForm {
     pub(super) subtasks: Vec<Subtask>,
     pub new_subtask: String,
     /// The notes without the subtasks.
-    pub notes: text_editor::Content,
+    pub notes: rich_notes::Content,
     original_split: (Vec<Subtask>, String),
     pub error: Option<String>,
 }
@@ -95,8 +101,16 @@ impl EditForm {
             suggested: None,
             subtasks: subtasks.clone(),
             new_subtask: String::new(),
-            notes: text_editor::Content::with_text(&text),
-            original_split: (subtasks, text),
+            notes: rich_notes::Content::with_text(&text),
+            // As the editor writes them (Markdown is tidied), so untouched
+            // notes count as unchanged.
+            original_split: (
+                subtasks,
+                rich_notes::Content::with_text(&text)
+                    .text()
+                    .trim()
+                    .to_string(),
+            ),
             error: None,
         }
     }
@@ -204,6 +218,15 @@ impl EditForm {
         })
     }
 
+    /// What should get the focus after the last edit of the notes (their
+    /// link prompt, or the notes again after it), once.
+    pub fn take_focus(&mut self) -> Option<&'static str> {
+        self.notes.take_focus().map(|f| match f {
+            rich_notes::Focus::Editor => TASK_NOTES_ID,
+            rich_notes::Focus::LinkPrompt => TASK_NOTES_LINK_ID,
+        })
+    }
+
     /// Applies a message that only edits the form. Returns `false` (and
     /// does nothing) for any other message. Any edit clears the error.
     pub fn handle(&mut self, message: &Message, today: Date) -> bool {
@@ -211,14 +234,7 @@ impl EditForm {
             Message::EditTitle(s) => self.title = s.clone(),
             Message::EditProject(s) | Message::PickProject(s) => self.project = s.clone(),
             Message::EditEstimate(s) => self.estimate = s.clone(),
-            Message::EditNotes(action) => {
-                if !rich_notes::intercept(&mut self.notes, action) {
-                    self.notes.perform(action.clone());
-                }
-            }
-            Message::FormatTaskNotes(cmd) => {
-                rich_notes::run(&mut self.notes, *cmd);
-            }
+            Message::EditNotes(action) => self.notes.perform(action.clone()),
             Message::SetPriority(p) => self.priority = priority_level(*p),
             Message::ToggleCalendar => {
                 self.calendar = match self.calendar {
@@ -439,15 +455,19 @@ pub(super) fn form_fields<'a>(
     today: Date,
     title_row: Element<'a, Message>,
 ) -> Column<'a, Message> {
-    let notes = text_editor(&form.notes)
+    let editor = rich_editor(&form.notes, Message::EditNotes)
+        .id(TASK_NOTES_ID)
         .placeholder("Notes")
-        .on_action(Message::EditNotes)
-        .highlight_with::<rich_notes::Notes>((), rich_notes::format)
-        .key_binding(|press| rich_notes::key_binding(press, Message::FormatTaskNotes, None))
-        .height(96)
+        .on_link(Message::OpenLink)
+        .min_height(96.0)
         .padding(10)
-        .size(theme::TEXT_BODY)
-        .style(theme::editor);
+        .size(theme::TEXT_BODY);
+    let mut notes = Column::new().spacing(8).push(editor);
+    if let Some(prompt) =
+        rich_notes::link_prompt(&form.notes, TASK_NOTES_LINK_ID, Message::EditNotes)
+    {
+        notes = notes.push(prompt);
+    }
 
     let mut body = column![
         title_row,

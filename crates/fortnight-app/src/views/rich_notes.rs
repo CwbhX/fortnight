@@ -1,51 +1,32 @@
-//! Basic formatting for a day's notes, kept as Markdown in the text itself
-//! so it is stored as typed and reaches the model as Markdown
-//! (`fortnight_core::notes::to_markdown`).
+//! Formatted notes: the document behind the notes editors (a day's notes
+//! and a task's notes), kept as Markdown so it is stored as typed and
+//! reaches the model as Markdown (`fortnight_core::notes::to_markdown`).
 //!
-//! - `**bold**`, `*italic*` and `<u>underline</u>` (`_italic_` and
-//!   `__bold__` are understood too). The editor draws bold and italic in
-//!   Inter's bold and italic faces and the markers faint; underlined text
-//!   is drawn in the accent colour, since iced's editor cannot underline.
-//! - Lists: `• ` bullets, `- ` dashes and `1. ` numbers, at any
-//!   indentation. Typing `* ` at the start of a line makes a `•` bullet.
-//!   `Enter` in a list item starts the next item (`2.` after `1.`), on an
-//!   empty item it ends the list (or steps out one level); `Backspace`
-//!   right after a marker removes it; `Tab` / `Shift+Tab` indent and
-//!   outdent the line.
+//! The editor ([`super::rich_editor`]) shows the formatting, not the
+//! Markdown: what you see is what you get. Underneath, [`Content`] holds
+//! the notes as blocks (paragraphs and list items) of styled characters,
+//! read from Markdown ([`Content::with_text`]) and written back
+//! ([`Content::text`]):
 //!
-//! - Links: `[text](url)` (`⌘K`), and bare web addresses. Drawn in the
-//!   accent colour; in the formatted view underlined, and a click opens
-//!   them.
+//! - `**bold**`, `*italic*`, `<u>underline</u>` (`_italic_` and
+//!   `__bold__` are read too);
+//! - links `[text](url)`, and bare web addresses;
+//! - lists: `• ` bullets, `- ` dashes and `1. ` numbers (renumbered from 1
+//!   on writing), two spaces per level of indentation.
 //!
-//! While the notes are not being edited they are shown by [`preview`]:
-//! markers hidden, underline drawn as underline.
-//!
-//! The toolbar buttons and the shortcuts (`⌘B`, `⌘I`, `⌘U`, `⌘⇧8` for
-//! bullets, `⌘⇧7` for numbers) send a [`Command`]: bold, italic and
-//! underline wrap the selection (or the word at the cursor, or start an
-//! empty pair) and unwrap it when it is already formatted; the list
-//! commands mark each selected line, or unmark them when all already are
-//! that kind of list.
-//!
-//! A task's notes use the same editing ([`intercept`], [`key_binding`],
-//! the [`Notes`] highlighter) without the toolbar or the formatted view.
-//!
-//! The editing itself is plain text functions (testable without a
-//! window) returning a [`Change`]: lines to replace and where the cursor
-//! goes. [`apply`] makes it in the editor by selecting those lines and
-//! pasting over them.
+//! Editing: `⌘B` / `⌘I` / `⌘U` (or `Ctrl`) toggle the style of the
+//! selection, or of what is typed next; `⌘K` asks for a link address
+//! ([`Content::link_prompt`]); typing `* `, `- ` or `1. ` at the start of
+//! a line starts a list; `Enter` carries a list on, and on an empty item
+//! ends it (or steps out one level); `Backspace` at the start of an item
+//! takes its marker away; `Tab` / `Shift+Tab` indent. The day's notes add
+//! a [`toolbar`] with the same commands.
 
-use std::ops::Range;
 use std::sync::Arc;
 
-use iced::advanced::text::highlighter::{self, Highlighter};
-use iced::font::{Style, Weight};
-use iced::keyboard::{self, key::Named};
-use iced::widget::text_editor::{
-    Action, Binding, Content, Cursor, Edit, KeyPress, Position, Status,
-};
-use iced::widget::{Column, Space, button, container, rich_text, row, span, text, tooltip};
-use iced::{Center, Element, Font, Theme};
+use iced::font::Style as FontStyle;
+use iced::widget::{button, container, rich_text, row, span, text, text_input, tooltip};
+use iced::{Center, Element, Font};
 
 use crate::theme;
 
@@ -60,34 +41,830 @@ pub enum Command {
     Numbers,
     Indent,
     Outdent,
-    /// Make the selection (or the word at the cursor) a link, or take a
-    /// link away.
+    /// Ask for a link address for the selection (or the word at the
+    /// cursor, or the link there).
     Link,
 }
 
-// ------------------------------------------------------------------ lists
+// ------------------------------------------------------------------ model
 
-/// The three kinds of list line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    /// `• text`
+/// How a character is drawn.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Style {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    /// The address of the link the character is part of.
+    pub link: Option<Arc<str>>,
+}
+
+impl Style {
+    /// The face for this style's text.
+    pub fn font(&self) -> Font {
+        Font {
+            weight: if self.bold {
+                iced::font::Weight::Bold
+            } else {
+                iced::font::Weight::Normal
+            },
+            style: if self.italic {
+                FontStyle::Italic
+            } else {
+                FontStyle::Normal
+            },
+            ..theme::FONT
+        }
+    }
+
+    fn marks(&self) -> (bool, bool, bool) {
+        (self.underline, self.bold, self.italic)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Cell {
+    c: char,
+    style: Style,
+}
+
+/// What kind of line a block is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum List {
+    #[default]
+    None,
     Bullet,
-    /// `- text` (also `* ` and `+ `)
     Dash,
-    /// `1. text` (also `1) `)
     Number,
 }
+
+/// The deepest indentation.
+const MAX_INDENT: u8 = 6;
+
+/// A line of the notes: a paragraph or a list item.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Block {
+    pub list: List,
+    /// Levels of indentation (two spaces each in Markdown).
+    pub indent: u8,
+    cells: Vec<Cell>,
+}
+
+impl Block {
+    fn len(&self) -> usize {
+        self.cells.len()
+    }
+
+    /// The block's characters.
+    pub fn plain(&self) -> String {
+        self.cells.iter().map(|c| c.c).collect()
+    }
+
+    /// Runs of characters with the same style, in order.
+    pub fn runs(&self) -> Vec<(String, Style)> {
+        let mut out: Vec<(String, Style)> = Vec::new();
+        for cell in &self.cells {
+            match out.last_mut() {
+                Some((s, style)) if *style == cell.style => s.push(cell.c),
+                _ => out.push((cell.c.to_string(), cell.style.clone())),
+            }
+        }
+        out
+    }
+}
+
+/// A place in the notes: a block and a character in it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Pos {
+    pub block: usize,
+    pub col: usize,
+}
+
+impl Pos {
+    pub fn new(block: usize, col: usize) -> Self {
+        Pos { block, col }
+    }
+}
+
+/// A cursor movement within the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Motion {
+    Left,
+    Right,
+    WordLeft,
+    WordRight,
+    BlockStart,
+    BlockEnd,
+    DocStart,
+    DocEnd,
+}
+
+/// Something done in the editor.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    /// Put the cursor at a place (extending the selection when `select`).
+    MoveTo {
+        at: Pos,
+        select: bool,
+    },
+    Move {
+        motion: Motion,
+        select: bool,
+    },
+    /// Select the word at a place.
+    SelectWord(Pos),
+    /// Select the block at a place.
+    SelectBlock(Pos),
+    SelectAll,
+    /// Typed text.
+    Insert(String),
+    /// Pasted text, read as Markdown.
+    Paste(String),
+    Enter,
+    Backspace,
+    Delete,
+    Format(Command),
+    /// Typing in the link prompt.
+    LinkInput(String),
+    /// `Enter` in the link prompt: link (or, empty, unlink) the text.
+    LinkSubmit,
+    /// Close the link prompt.
+    LinkCancel,
+    /// The prompt's Remove: take the link away.
+    LinkRemove,
+}
+
+impl Action {
+    /// Whether the action can change the notes.
+    pub fn is_edit(&self) -> bool {
+        matches!(
+            self,
+            Action::Insert(_)
+                | Action::Paste(_)
+                | Action::Enter
+                | Action::Backspace
+                | Action::Delete
+                | Action::Format(_)
+                | Action::LinkSubmit
+                | Action::LinkRemove
+        )
+    }
+}
+
+/// What should get the keyboard focus after an action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Editor,
+    LinkPrompt,
+}
+
+/// The `⌘K` prompt: the address typed so far, and the text it links.
+#[derive(Debug, Clone, PartialEq)]
+struct LinkPrompt {
+    url: String,
+    from: Pos,
+    to: Pos,
+    /// Whether the text was a link already (the prompt offers Remove).
+    existing: bool,
+}
+
+/// The notes being edited: blocks of styled characters, the cursor and
+/// selection, and the style for what is typed next.
+#[derive(Debug, Clone)]
+pub struct Content {
+    blocks: Vec<Block>,
+    cursor: Pos,
+    /// The other end of the selection.
+    anchor: Option<Pos>,
+    /// A style toggled with nothing selected: for what is typed next.
+    pending: Option<Style>,
+    link: Option<LinkPrompt>,
+    focus: Option<Focus>,
+    /// Which content this is, and a count bumped by every change of its
+    /// blocks (for the editor's layout).
+    id: u64,
+    version: u64,
+}
+
+impl Default for Content {
+    fn default() -> Self {
+        Content::with_text("")
+    }
+}
+
+impl PartialEq for Content {
+    fn eq(&self, other: &Self) -> bool {
+        self.blocks == other.blocks
+    }
+}
+
+impl Content {
+    /// The notes in `markdown`.
+    pub fn with_text(markdown: &str) -> Self {
+        Content {
+            blocks: parse(markdown),
+            cursor: Pos::default(),
+            anchor: None,
+            pending: None,
+            link: None,
+            focus: None,
+            id: super::rich_editor::content_id(),
+            version: 0,
+        }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The notes as Markdown.
+    pub fn text(&self) -> String {
+        write(&self.blocks)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.blocks.len() == 1 && self.blocks[0].cells.is_empty()
+    }
+
+    pub fn blocks(&self) -> &[Block] {
+        &self.blocks
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub fn cursor(&self) -> Pos {
+        self.cursor
+    }
+
+    /// The selection, in order, when there is one.
+    pub fn selection(&self) -> Option<(Pos, Pos)> {
+        let a = self.anchor?;
+        (a != self.cursor).then(|| (a.min(self.cursor), a.max(self.cursor)))
+    }
+
+    /// The number shown for each numbered item (0 for other blocks):
+    /// counting from 1 through consecutive items at the same level, with
+    /// deeper lines in between.
+    pub fn numbers(&self) -> Vec<u32> {
+        numbers(&self.blocks)
+    }
+
+    /// The address being typed for a link, while `⌘K`'s prompt is open,
+    /// and whether the text is a link already.
+    pub fn link_prompt(&self) -> Option<(&str, bool)> {
+        self.link.as_ref().map(|l| (l.url.as_str(), l.existing))
+    }
+
+    /// What should get the focus after the last action, once.
+    pub fn take_focus(&mut self) -> Option<Focus> {
+        self.focus.take()
+    }
+
+    /// The selection as Markdown, for the clipboard.
+    pub fn selected_text(&self) -> Option<String> {
+        let (from, to) = self.selection()?;
+        Some(write(&self.slice(from, to)))
+    }
+
+    /// The style at the cursor: of what is typed next.
+    pub fn typing_style(&self) -> Style {
+        if let Some(p) = &self.pending {
+            return p.clone();
+        }
+        let block = &self.blocks[self.cursor.block];
+        let col = self.cursor.col;
+        let mut style = if col > 0 {
+            block.cells[col - 1].style.clone()
+        } else {
+            block
+                .cells
+                .first()
+                .map(|c| c.style.clone())
+                .unwrap_or_default()
+        };
+        // A link carries on only inside it.
+        let inside = col > 0
+            && block
+                .cells
+                .get(col)
+                .is_some_and(|c| c.style.link.is_some() && c.style.link == style.link);
+        if !inside {
+            style.link = None;
+        }
+        style
+    }
+
+    pub fn perform(&mut self, action: Action) {
+        let before = self.blocks.clone();
+        match action {
+            Action::MoveTo { at, select } => self.move_to(at, select),
+            Action::Move { motion, select } => {
+                let at = match (motion, self.selection()) {
+                    (Motion::Left, Some((from, _))) if !select => from,
+                    (Motion::Right, Some((_, to))) if !select => to,
+                    _ => self.moved(self.cursor, motion),
+                };
+                self.move_to(at, select);
+            }
+            Action::SelectWord(at) => {
+                let at = self.clamp(at);
+                let (a, b) = word_at(&self.blocks[at.block].plain(), at.col);
+                self.anchor = Some(Pos::new(at.block, a));
+                self.cursor = Pos::new(at.block, b);
+                self.pending = None;
+            }
+            Action::SelectBlock(at) => {
+                let at = self.clamp(at);
+                self.anchor = Some(Pos::new(at.block, 0));
+                self.cursor = Pos::new(at.block, self.blocks[at.block].len());
+                self.pending = None;
+            }
+            Action::SelectAll => {
+                self.anchor = Some(Pos::default());
+                let last = self.blocks.len() - 1;
+                self.cursor = Pos::new(last, self.blocks[last].len());
+                self.pending = None;
+            }
+            Action::Insert(s) => self.insert(&s),
+            Action::Paste(s) => {
+                self.delete_selection();
+                let blocks = parse(&s.replace("\r\n", "\n"));
+                self.insert_blocks(blocks);
+            }
+            Action::Enter => self.enter(),
+            Action::Backspace => self.backspace(),
+            Action::Delete => self.delete(),
+            Action::Format(cmd) => self.format(cmd),
+            Action::LinkInput(s) => {
+                if let Some(l) = &mut self.link {
+                    l.url = s;
+                }
+            }
+            Action::LinkSubmit => self.submit_link(),
+            Action::LinkRemove => {
+                if let Some(l) = &mut self.link {
+                    l.url.clear();
+                }
+                self.submit_link();
+            }
+            Action::LinkCancel => {
+                self.link = None;
+                self.focus = Some(Focus::Editor);
+            }
+        }
+        if self.blocks != before {
+            self.version += 1;
+        }
+    }
+
+    // ---- moving
+
+    fn move_to(&mut self, at: Pos, select: bool) {
+        let at = self.clamp(at);
+        if select {
+            self.anchor.get_or_insert(self.cursor);
+        } else {
+            self.anchor = None;
+        }
+        self.cursor = at;
+        self.pending = None;
+    }
+
+    fn clamp(&self, at: Pos) -> Pos {
+        let block = at.block.min(self.blocks.len() - 1);
+        Pos::new(block, at.col.min(self.blocks[block].len()))
+    }
+
+    fn moved(&self, at: Pos, motion: Motion) -> Pos {
+        let len = |b: usize| self.blocks[b].len();
+        let last = self.blocks.len() - 1;
+        let chars = |b: usize| -> Vec<char> { self.blocks[b].cells.iter().map(|c| c.c).collect() };
+        match motion {
+            Motion::Left if at.col > 0 => Pos::new(at.block, at.col - 1),
+            Motion::Left if at.block > 0 => Pos::new(at.block - 1, len(at.block - 1)),
+            Motion::Right if at.col < len(at.block) => Pos::new(at.block, at.col + 1),
+            Motion::Right if at.block < last => Pos::new(at.block + 1, 0),
+            Motion::Left | Motion::Right => at,
+            Motion::WordLeft if at.col == 0 => self.moved(at, Motion::Left),
+            Motion::WordLeft => {
+                let chars = chars(at.block);
+                let mut i = at.col;
+                while i > 0 && !is_word(chars[i - 1]) {
+                    i -= 1;
+                }
+                while i > 0 && is_word(chars[i - 1]) {
+                    i -= 1;
+                }
+                Pos::new(at.block, i)
+            }
+            Motion::WordRight if at.col == len(at.block) => self.moved(at, Motion::Right),
+            Motion::WordRight => {
+                let chars = chars(at.block);
+                let mut i = at.col;
+                while i < chars.len() && !is_word(chars[i]) {
+                    i += 1;
+                }
+                while i < chars.len() && is_word(chars[i]) {
+                    i += 1;
+                }
+                Pos::new(at.block, i)
+            }
+            Motion::BlockStart => Pos::new(at.block, 0),
+            Motion::BlockEnd => Pos::new(at.block, len(at.block)),
+            Motion::DocStart => Pos::default(),
+            Motion::DocEnd => Pos::new(last, len(last)),
+        }
+    }
+
+    // ---- editing
+
+    /// The blocks between two places, cut out as their own notes.
+    fn slice(&self, from: Pos, to: Pos) -> Vec<Block> {
+        (from.block..=to.block)
+            .map(|b| {
+                let block = &self.blocks[b];
+                let a = if b == from.block { from.col } else { 0 };
+                let z = if b == to.block { to.col } else { block.len() };
+                Block {
+                    cells: block.cells[a..z].to_vec(),
+                    ..block.clone()
+                }
+            })
+            .collect()
+    }
+
+    /// Removes the selection, if any, leaving the cursor where it was.
+    fn delete_selection(&mut self) -> bool {
+        let Some((from, to)) = self.selection() else {
+            self.anchor = None;
+            return false;
+        };
+        self.remove(from, to);
+        true
+    }
+
+    fn remove(&mut self, from: Pos, to: Pos) {
+        let tail: Vec<Cell> = self.blocks[to.block].cells[to.col..].to_vec();
+        self.blocks[from.block].cells.truncate(from.col);
+        self.blocks[from.block].cells.extend(tail);
+        self.blocks.drain(from.block + 1..=to.block);
+        self.cursor = from;
+        self.anchor = None;
+    }
+
+    fn insert(&mut self, s: &str) {
+        self.delete_selection();
+        let style = self.typing_style();
+        for (i, line) in s.split('\n').enumerate() {
+            if i > 0 {
+                self.split();
+            }
+            for c in line.chars().filter(|c| !c.is_control()) {
+                if c == ' ' && self.list_shortcut() {
+                    continue;
+                }
+                let Pos { block, col } = self.cursor;
+                self.blocks[block].cells.insert(
+                    col,
+                    Cell {
+                        c,
+                        style: style.clone(),
+                    },
+                );
+                self.cursor.col += 1;
+            }
+        }
+        self.pending = None;
+    }
+
+    /// A space after `*`, `-`, `+`, `•` or `1.` at the start of a
+    /// paragraph: make it a list item instead. Whether it did.
+    fn list_shortcut(&mut self) -> bool {
+        let Pos { block, col } = self.cursor;
+        let b = &self.blocks[block];
+        if b.list != List::None {
+            return false;
+        }
+        let typed: String = b.cells[..col].iter().map(|c| c.c).collect();
+        let list = match typed.as_str() {
+            "*" | "•" => List::Bullet,
+            "-" | "+" => List::Dash,
+            t if t.len() > 1
+                && t.len() <= 4
+                && (t.ends_with('.') || t.ends_with(')'))
+                && t[..t.len() - 1].chars().all(|c| c.is_ascii_digit()) =>
+            {
+                List::Number
+            }
+            _ => return false,
+        };
+        let b = &mut self.blocks[block];
+        b.list = list;
+        b.cells.drain(..col);
+        self.cursor.col = 0;
+        true
+    }
+
+    /// Breaks the block at the cursor; the new block takes the list and
+    /// indentation.
+    fn split(&mut self) {
+        let Pos { block, col } = self.cursor;
+        let rest = self.blocks[block].cells.split_off(col);
+        let b = &self.blocks[block];
+        let next = Block {
+            list: b.list,
+            indent: b.indent,
+            cells: rest,
+        };
+        self.blocks.insert(block + 1, next);
+        self.cursor = Pos::new(block + 1, 0);
+    }
+
+    fn insert_blocks(&mut self, mut blocks: Vec<Block>) {
+        if blocks.is_empty() {
+            return;
+        }
+        let first = blocks.remove(0);
+        let Pos { block, col } = self.cursor;
+        let tail = self.blocks[block].cells.split_off(col);
+        let here = &mut self.blocks[block];
+        if here.cells.is_empty() && here.list == List::None {
+            here.list = first.list;
+            here.indent = first.indent;
+        }
+        here.cells.extend(first.cells);
+        let mut at = Pos::new(block, here.len());
+        for (i, b) in blocks.into_iter().enumerate() {
+            self.blocks.insert(block + 1 + i, b);
+            at = Pos::new(block + 1 + i, self.blocks[block + 1 + i].len());
+        }
+        self.blocks[at.block].cells.extend(tail);
+        self.cursor = at;
+        self.anchor = None;
+    }
+
+    fn enter(&mut self) {
+        self.delete_selection();
+        let b = &mut self.blocks[self.cursor.block];
+        if b.list != List::None && b.cells.is_empty() {
+            // An empty item: out one level, or out of the list.
+            if b.indent > 0 {
+                b.indent -= 1;
+            } else {
+                b.list = List::None;
+            }
+            return;
+        }
+        self.split();
+        self.pending = None;
+    }
+
+    fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        let Pos { block, col } = self.cursor;
+        if col > 0 {
+            self.blocks[block].cells.remove(col - 1);
+            self.cursor.col -= 1;
+            return;
+        }
+        let b = &mut self.blocks[block];
+        if b.list != List::None {
+            b.list = List::None;
+        } else if b.indent > 0 {
+            b.indent -= 1;
+        } else if block > 0 {
+            let at = Pos::new(block - 1, self.blocks[block - 1].len());
+            self.remove(at, Pos::new(block, 0));
+        }
+    }
+
+    fn delete(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        let Pos { block, col } = self.cursor;
+        if col < self.blocks[block].len() {
+            self.blocks[block].cells.remove(col);
+        } else if block + 1 < self.blocks.len() {
+            self.remove(self.cursor, Pos::new(block + 1, 0));
+        }
+    }
+
+    /// The selected blocks, or the cursor's.
+    fn selected_blocks(&self) -> std::ops::RangeInclusive<usize> {
+        match self.selection() {
+            Some((from, to)) => from.block..=to.block,
+            None => self.cursor.block..=self.cursor.block,
+        }
+    }
+
+    fn format(&mut self, cmd: Command) {
+        match cmd {
+            Command::Bold => self.toggle(|s| &mut s.bold),
+            Command::Italic => self.toggle(|s| &mut s.italic),
+            Command::Underline => self.toggle(|s| &mut s.underline),
+            Command::Bullets => self.toggle_list(List::Bullet),
+            Command::Dashes => self.toggle_list(List::Dash),
+            Command::Numbers => self.toggle_list(List::Number),
+            Command::Indent | Command::Outdent => {
+                for b in self.selected_blocks() {
+                    let b = &mut self.blocks[b];
+                    b.indent = if cmd == Command::Indent {
+                        (b.indent + 1).min(MAX_INDENT)
+                    } else {
+                        b.indent.saturating_sub(1)
+                    };
+                }
+            }
+            Command::Link => self.open_link_prompt(),
+        }
+    }
+
+    /// Bold, italic or underline: the selection's characters all get it,
+    /// or (when they all have it) all lose it. With nothing selected it
+    /// is for what is typed next.
+    fn toggle(&mut self, flag: fn(&mut Style) -> &mut bool) {
+        let Some((from, to)) = self.selection() else {
+            let mut style = self.typing_style();
+            let f = flag(&mut style);
+            *f = !*f;
+            self.pending = Some(style);
+            return;
+        };
+        let mut cells = Vec::new();
+        for b in from.block..=to.block {
+            let a = if b == from.block { from.col } else { 0 };
+            let z = if b == to.block {
+                to.col
+            } else {
+                self.blocks[b].len()
+            };
+            cells.extend((a..z).map(|c| (b, c)));
+        }
+        let all = cells.iter().all(|&(b, c)| {
+            let mut s = self.blocks[b].cells[c].style.clone();
+            *flag(&mut s)
+        });
+        for (b, c) in cells {
+            *flag(&mut self.blocks[b].cells[c].style) = !all;
+        }
+    }
+
+    fn toggle_list(&mut self, list: List) {
+        let range = self.selected_blocks();
+        let all = self.blocks[range.clone()].iter().all(|b| b.list == list);
+        for b in range {
+            self.blocks[b].list = if all { List::None } else { list };
+        }
+    }
+
+    /// The link at a place: its start and end in the block.
+    fn link_at(&self, at: Pos) -> Option<(usize, usize)> {
+        let cells = &self.blocks[at.block].cells;
+        let here = cells.get(at.col).filter(|c| c.style.link.is_some());
+        let col = if here.is_some() {
+            at.col
+        } else {
+            at.col.checked_sub(1)?
+        };
+        let link = cells.get(col)?.style.link.clone()?;
+        let same = |c: &Cell| c.style.link.as_ref() == Some(&link);
+        let start = cells[..col]
+            .iter()
+            .rposition(|c| !same(c))
+            .map_or(0, |i| i + 1);
+        let end = cells[col..]
+            .iter()
+            .position(|c| !same(c))
+            .map_or(cells.len(), |i| col + i);
+        Some((start, end))
+    }
+
+    fn open_link_prompt(&mut self) {
+        let (from, to) = match self.selection() {
+            Some(sel) => sel,
+            None => {
+                let at = self.cursor;
+                let (a, b) = self
+                    .link_at(at)
+                    .unwrap_or_else(|| word_at(&self.blocks[at.block].plain(), at.col));
+                (Pos::new(at.block, a), Pos::new(at.block, b))
+            }
+        };
+        let url = (from < to)
+            .then(|| self.blocks[from.block].cells.get(from.col))
+            .flatten()
+            .and_then(|c| c.style.link.as_deref().map(str::to_string));
+        self.link = Some(LinkPrompt {
+            existing: url.is_some(),
+            url: url.unwrap_or_default(),
+            from,
+            to,
+        });
+        self.focus = Some(Focus::LinkPrompt);
+    }
+
+    fn submit_link(&mut self) {
+        let Some(prompt) = self.link.take() else {
+            return;
+        };
+        self.focus = Some(Focus::Editor);
+        let url = prompt.url.trim();
+        let link: Option<Arc<str>> = (!url.is_empty()).then(|| Arc::from(url));
+        let (from, to) = (self.clamp(prompt.from), self.clamp(prompt.to));
+        self.anchor = None;
+        if from == to {
+            // Nothing to link: the address becomes the text.
+            self.cursor = from;
+            if let Some(link) = link {
+                let style = Style {
+                    link: Some(link.clone()),
+                    ..self.typing_style()
+                };
+                let cells: Vec<Cell> = link
+                    .chars()
+                    .map(|c| Cell {
+                        c,
+                        style: style.clone(),
+                    })
+                    .collect();
+                self.cursor.col += cells.len();
+                self.blocks[from.block]
+                    .cells
+                    .splice(from.col..from.col, cells);
+            }
+            return;
+        }
+        for b in from.block..=to.block {
+            let a = if b == from.block { from.col } else { 0 };
+            let z = if b == to.block {
+                to.col
+            } else {
+                self.blocks[b].len()
+            };
+            for c in &mut self.blocks[b].cells[a..z] {
+                c.style.link = link.clone();
+            }
+        }
+        self.cursor = to;
+    }
+}
+
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '\''
+}
+
+/// The word around character `col` of `text` (letters, digits and
+/// apostrophes), as a character range; empty when there is none.
+fn word_at(text: &str, col: usize) -> (usize, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let col = col.min(chars.len());
+    let mut a = col;
+    while a > 0 && is_word(chars[a - 1]) {
+        a -= 1;
+    }
+    let mut b = col;
+    while b < chars.len() && is_word(chars[b]) {
+        b += 1;
+    }
+    (a, b)
+}
+
+fn numbers(blocks: &[Block]) -> Vec<u32> {
+    // The count so far at each indentation.
+    let mut counts = [0u32; MAX_INDENT as usize + 1];
+    blocks
+        .iter()
+        .map(|b| {
+            let level = usize::from(b.indent.min(MAX_INDENT));
+            // Deeper levels start again under a shallower line.
+            for c in &mut counts[level + 1..] {
+                *c = 0;
+            }
+            if b.list == List::Number {
+                counts[level] += 1;
+                counts[level]
+            } else {
+                counts[level] = 0;
+                0
+            }
+        })
+        .collect()
+}
+
+// ------------------------------------------------------------- reading
 
 /// A list line's marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Item {
-    kind: Kind,
+    list: List,
     /// Where the marker starts (the indentation's length), in bytes.
     indent: usize,
     /// Where the text after the marker and its space starts, in bytes.
     end: usize,
-    /// The number of a numbered item.
-    number: u32,
 }
 
 fn indent_len(line: &str) -> usize {
@@ -98,460 +875,59 @@ fn indent_len(line: &str) -> usize {
 fn item(line: &str) -> Option<Item> {
     let indent = indent_len(line);
     let rest = &line[indent..];
-    let at = |kind, len, number| {
+    let at = |list, len| {
         Some(Item {
-            kind,
+            list,
             indent,
             end: indent + len,
-            number,
         })
     };
     if rest.starts_with("• ") {
-        return at(Kind::Bullet, "• ".len(), 0);
+        return at(List::Bullet, "• ".len());
     }
     if ["- ", "* ", "+ "].iter().any(|m| rest.starts_with(m)) {
-        return at(Kind::Dash, 2, 0);
+        return at(List::Dash, 2);
     }
     let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
     if (1..=9).contains(&digits) {
         let after = &rest[digits..];
         if after.starts_with(". ") || after.starts_with(") ") {
-            return at(Kind::Number, digits + 2, rest[..digits].parse().ok()?);
+            return at(List::Number, digits + 2);
         }
     }
     None
 }
 
-fn marker(kind: Kind, number: u32) -> String {
-    match kind {
-        Kind::Bullet => "• ".into(),
-        Kind::Dash => "- ".into(),
-        Kind::Number => format!("{number}. "),
-    }
-}
-
-// ------------------------------------------------------------------ changes
-
-/// An edit to the notes: lines `first..=last` become `text` (which may
-/// hold more or fewer lines), then the cursor moves to `cursor`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Change {
-    first: usize,
-    last: usize,
-    text: String,
-    cursor: Cursor,
-}
-
-/// Replaces `del` bytes at `at` in a line with `ins`. A cursor exactly at
-/// `at` of an insertion stays before it when `stick_left`, else moves
-/// past it.
-#[derive(Debug, Clone)]
-struct Splice {
-    at: usize,
-    del: usize,
-    ins: String,
-    stick_left: bool,
-}
-
-impl Splice {
-    fn insert(at: usize, ins: impl Into<String>, stick_left: bool) -> Self {
-        Splice {
-            at,
-            del: 0,
-            ins: ins.into(),
-            stick_left,
-        }
-    }
-
-    fn delete(at: usize, del: usize) -> Self {
-        Splice {
-            at,
-            del,
-            ins: String::new(),
-            stick_left: true,
-        }
-    }
-
-    fn map(&self, col: usize) -> usize {
-        let past = if self.stick_left { 0 } else { self.ins.len() };
-        if col < self.at || (col == self.at && self.del == 0 && self.stick_left) {
-            col
-        } else if col < self.at + self.del || col == self.at {
-            self.at + past
-        } else {
-            col - self.del + self.ins.len()
-        }
-    }
-}
-
-/// The change made by `splices[i]` on line `first + i`. Each line's
-/// splices are in text order and don't overlap; two at the same place
-/// end up in that order.
-fn splice_lines(
-    lines: &[String],
-    first: usize,
-    splices: &[Vec<Splice>],
-    cursor: Cursor,
-) -> Option<Change> {
-    if splices.iter().all(Vec::is_empty) {
-        return None;
-    }
-    let last = first + splices.len() - 1;
-    let mut out = Vec::new();
-    for (i, line) in lines[first..=last].iter().enumerate() {
-        let mut line = line.clone();
-        for s in splices[i].iter().rev() {
-            line.replace_range(s.at..s.at + s.del, &s.ins);
-        }
-        out.push(line);
-    }
-    let map = |p: Position| {
-        let Some(list) = p.line.checked_sub(first).and_then(|i| splices.get(i)) else {
-            return p;
-        };
-        let column = list.iter().rev().fold(p.column, |c, s| s.map(c));
-        Position { column, ..p }
-    };
-    Some(Change {
-        first,
-        last,
-        text: out.join("\n"),
-        cursor: Cursor {
-            position: map(cursor.position),
-            selection: cursor.selection.map(map),
-        },
-    })
-}
-
-/// The selection's ends in text order (both the cursor when there is
-/// none).
-fn ends(cursor: Cursor) -> (Position, Position) {
-    let a = cursor.position;
-    let b = cursor.selection.unwrap_or(a);
-    if (a.line, a.column) <= (b.line, b.column) {
-        (a, b)
-    } else {
-        (b, a)
-    }
-}
-
-fn at(line: usize, column: usize) -> Cursor {
-    Cursor {
-        position: Position { line, column },
-        selection: None,
-    }
-}
-
-/// What a command changes in `lines` with the given cursor.
-pub fn command(lines: &[String], cursor: Cursor, cmd: Command) -> Option<Change> {
-    match cmd {
-        Command::Bold => toggle_inline(lines, cursor, Inline::Bold),
-        Command::Italic => toggle_inline(lines, cursor, Inline::Italic),
-        Command::Underline => toggle_inline(lines, cursor, Inline::Underline),
-        Command::Bullets => toggle_list(lines, cursor, Kind::Bullet),
-        Command::Dashes => toggle_list(lines, cursor, Kind::Dash),
-        Command::Numbers => toggle_list(lines, cursor, Kind::Number),
-        Command::Link => toggle_link(lines, cursor),
-        Command::Indent => indent(lines, cursor, true),
-        Command::Outdent => indent(lines, cursor, false),
-    }
-}
-
-/// The selected lines: those with text, or the cursor's line alone.
-fn selected_lines(lines: &[String], cursor: Cursor) -> (usize, usize, Vec<bool>) {
-    let (start, end) = ends(cursor);
-    let last = end.line.min(lines.len().saturating_sub(1));
-    let first = start.line.min(last);
-    let picked = (first..=last)
-        .map(|i| first == last || !lines[i].trim().is_empty())
-        .collect();
-    (first, last, picked)
-}
-
-fn toggle_list(lines: &[String], cursor: Cursor, kind: Kind) -> Option<Change> {
-    let (first, _, picked) = selected_lines(lines, cursor);
-    let all_already = picked
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| **p)
-        .all(|(i, _)| item(&lines[first + i]).is_some_and(|it| it.kind == kind));
-    // Numbers carry on from a numbered item just above.
-    let mut number = first
-        .checked_sub(1)
-        .and_then(|i| item(&lines[i]))
-        .filter(|it| it.kind == Kind::Number && it.indent == indent_len(&lines[first]))
-        .map_or(1, |it| it.number + 1);
-    let splices: Vec<Vec<Splice>> = picked
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            if !p {
-                return vec![];
-            }
-            let line = &lines[first + i];
-            let (at, del) =
-                item(line).map_or((indent_len(line), 0), |it| (it.indent, it.end - it.indent));
-            let ins = if all_already {
-                String::new()
-            } else {
-                number += 1;
-                marker(kind, number - 1)
+/// The notes in `markdown`, one block per line.
+fn parse(markdown: &str) -> Vec<Block> {
+    markdown
+        .split('\n')
+        .map(|line| {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let (list, indent, start) = match item(line) {
+                Some(it) => (it.list, it.indent, it.end),
+                None => (List::None, indent_len(line), indent_len(line)),
             };
-            vec![Splice {
-                at,
-                del,
-                ins,
-                stick_left: false,
-            }]
-        })
-        .collect();
-    splice_lines(lines, first, &splices, cursor)
-}
-
-fn indent(lines: &[String], cursor: Cursor, more: bool) -> Option<Change> {
-    let (first, _, picked) = selected_lines(lines, cursor);
-    let splices: Vec<Vec<Splice>> = picked
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let line = &lines[first + i];
-            if !p {
-                vec![]
-            } else if more {
-                vec![Splice::insert(0, "  ", false)]
-            } else if line.starts_with('\t') {
-                vec![Splice::delete(0, 1)]
-            } else {
-                let spaces = line.len() - line.trim_start_matches(' ').len();
-                match spaces.min(2) {
-                    0 => vec![],
-                    n => vec![Splice::delete(0, n)],
-                }
+            let columns: usize = line[..indent]
+                .chars()
+                .map(|c| if c == '\t' { 2 } else { 1 })
+                .sum();
+            Block {
+                list,
+                indent: (columns / 2).min(usize::from(MAX_INDENT)) as u8,
+                cells: parse_inline(&line[start..]),
             }
         })
-        .collect();
-    splice_lines(lines, first, &splices, cursor)
+        .collect()
 }
-
-// ----------------------------------------------------------------- inline
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Inline {
-    Bold,
-    Italic,
-    Underline,
-}
-
-impl Inline {
-    fn open(self) -> &'static str {
-        match self {
-            Inline::Bold => "**",
-            Inline::Italic => "*",
-            Inline::Underline => "<u>",
-        }
-    }
-
-    fn close(self) -> &'static str {
-        match self {
-            Inline::Underline => "</u>",
-            other => other.open(),
-        }
-    }
-
-    /// Whether runs of `before` and `after` emphasis characters around
-    /// some text make it this style: bold needs two or more each side,
-    /// italic an odd count (1, or 3 for bold italic).
-    fn emphasis(self, before: usize, after: usize) -> bool {
-        match self {
-            Inline::Bold => before >= 2 && after >= 2,
-            Inline::Italic => before % 2 == 1 && after % 2 == 1,
-            Inline::Underline => false,
-        }
-    }
-
-    /// How many characters of an emphasis run make this style.
-    fn width(self) -> usize {
-        match self {
-            Inline::Bold => 2,
-            _ => 1,
-        }
-    }
-}
-
-/// The markers that put `line[a..b]` in a style, to remove: `len_a`
-/// bytes at `at_a` (around `a`) and `len_b` at `at_b` (around `b`). Each
-/// may sit just outside the range or just inside it.
-#[derive(Debug, Clone, Copy)]
-struct Wrapped {
-    at_a: usize,
-    len_a: usize,
-    at_b: usize,
-    len_b: usize,
-}
-
-fn run_before(s: &str, c: char) -> usize {
-    s.chars().rev().take_while(|x| *x == c).count()
-}
-
-fn run_after(s: &str, c: char) -> usize {
-    s.chars().take_while(|x| *x == c).count()
-}
-
-fn wrapped(line: &str, a: usize, b: usize, style: Inline) -> Option<Wrapped> {
-    let (before, inside, after) = (&line[..a], &line[a..b], &line[b..]);
-    if style == Inline::Underline {
-        let (open, close) = (style.open(), style.close());
-        let at_a = if before.ends_with(open) {
-            a - open.len()
-        } else if inside.starts_with(open) {
-            a
-        } else {
-            return None;
-        };
-        let at_b = if after.starts_with(close) {
-            b
-        } else if inside.ends_with(close)
-            && inside.len() >= close.len() + (a - at_a).max(open.len())
-        {
-            b - close.len()
-        } else {
-            return None;
-        };
-        return Some(Wrapped {
-            at_a,
-            len_a: open.len(),
-            at_b,
-            len_b: close.len(),
-        });
-    }
-    // The emphasis runs at each end, outside and inside the range together.
-    let w = style.width();
-    ['*', '_'].into_iter().find_map(|c| {
-        let (out_a, in_a) = (run_before(before, c), run_after(inside, c));
-        let (in_b, out_b) = (run_before(inside, c), run_after(after, c));
-        (in_a + in_b < inside.len() && style.emphasis(out_a + in_a, in_b + out_b)).then_some(
-            Wrapped {
-                at_a: a - out_a,
-                len_a: w,
-                at_b: b + out_b - w,
-                len_b: w,
-            },
-        )
-    })
-}
-
-/// The word around byte `col` of `line` (letters, digits and
-/// apostrophes), as a byte range; empty when there is none.
-fn word_at(line: &str, col: usize) -> (usize, usize) {
-    let is_word = |c: char| c.is_alphanumeric() || c == '\'';
-    let start = line[..col]
-        .char_indices()
-        .rev()
-        .take_while(|(_, c)| is_word(*c))
-        .last()
-        .map_or(col, |(i, _)| i);
-    let end = line[col..]
-        .char_indices()
-        .find(|(_, c)| !is_word(*c))
-        .map_or(line.len(), |(i, _)| col + i);
-    (start, end)
-}
-
-fn toggle_inline(lines: &[String], cursor: Cursor, style: Inline) -> Option<Change> {
-    let (start, end) = ends(cursor);
-    if start.line >= lines.len() {
-        return None;
-    }
-    let first = start.line;
-    // Byte ranges of text to format, one per line (by line index).
-    let mut ranges: Vec<Option<(usize, usize)>> = Vec::new();
-    if start == end {
-        let line = &lines[first];
-        let col = start.column;
-        let (open, close) = (style.open(), style.close());
-        // An empty pair around the cursor: take it away again.
-        let (before, after) = (&line[..col], &line[col..]);
-        let empty_pair = match style {
-            Inline::Underline => before.ends_with(open) && after.starts_with(close),
-            _ => style.emphasis(run_before(before, '*'), run_after(after, '*')),
-        };
-        if empty_pair {
-            let (b, a) = match style {
-                Inline::Underline => (open.len(), close.len()),
-                _ => (style.width(), style.width()),
-            };
-            let splices = vec![vec![Splice::delete(col - b, b), Splice::delete(col, a)]];
-            return splice_lines(lines, first, &splices, cursor);
-        }
-        let (a, b) = word_at(line, col);
-        if a == b {
-            let splices = vec![vec![
-                Splice::insert(col, open, false),
-                Splice::insert(col, close, true),
-            ]];
-            return splice_lines(lines, first, &splices, cursor);
-        }
-        ranges.push(Some((a, b)));
-    } else {
-        for (i, line) in lines.iter().enumerate().take(end.line + 1).skip(first) {
-            let content = item(line).map_or(indent_len(line), |it| it.end);
-            let a = if i == first { start.column } else { 0 }.max(content);
-            let b = if i == end.line {
-                end.column
-            } else {
-                line.len()
-            };
-            if a >= b {
-                ranges.push(None);
-                continue;
-            }
-            let seg = &line[a..b];
-            let a = a + (seg.len() - seg.trim_start().len());
-            let b = b - (seg.len() - seg.trim_end().len());
-            ranges.push((a < b).then_some((a, b)));
-        }
-    }
-    let found: Vec<Option<Wrapped>> = ranges
-        .iter()
-        .enumerate()
-        .map(|(i, r)| r.and_then(|(a, b)| wrapped(&lines[first + i], a, b, style)))
-        .collect();
-    let any = ranges.iter().any(Option::is_some);
-    let remove = any
-        && ranges
-            .iter()
-            .zip(&found)
-            .all(|(r, f)| r.is_none() || f.is_some());
-    let splices: Vec<Vec<Splice>> = ranges
-        .iter()
-        .zip(&found)
-        .map(|(r, f)| match (*r, *f) {
-            (None, _) => vec![],
-            (Some(_), Some(w)) if remove => {
-                vec![
-                    Splice::delete(w.at_a, w.len_a),
-                    Splice::delete(w.at_b, w.len_b),
-                ]
-            }
-            (Some(_), Some(_)) => vec![],
-            (Some((a, b)), None) => vec![
-                Splice::insert(a, style.open(), false),
-                Splice::insert(b, style.close(), true),
-            ],
-        })
-        .collect();
-    splice_lines(lines, first, &splices, cursor)
-}
-
-// ------------------------------------------------------------------ links
 
 /// A link in a line: Markdown's `[text](url)`, or a bare web address
 /// (`https://…`, `http://…`, `www.…`), whose text is its address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Link {
-    whole: Range<usize>,
-    text: Range<usize>,
-    url: Range<usize>,
+    whole: std::ops::Range<usize>,
+    text: std::ops::Range<usize>,
+    url: std::ops::Range<usize>,
     bare: bool,
 }
 
@@ -562,61 +938,49 @@ fn is_address(s: &str) -> bool {
         && !s.contains(char::is_whitespace)
 }
 
-/// The links in `line`, in order.
-fn links(line: &str) -> Vec<Link> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < line.len() {
-        let rest = &line[i..];
-        if let Some(link) = markdown_link(line, i) {
-            i = link.whole.end;
-            out.push(link);
-            continue;
-        }
-        let word_start = line[..i]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !c.is_alphanumeric());
-        if word_start
-            && ["https://", "http://", "www."]
-                .iter()
-                .any(|p| rest.starts_with(p))
-        {
-            let mut end = i + rest.find(char::is_whitespace).unwrap_or(rest.len());
-            // Trailing punctuation belongs to the sentence (or is a
-            // formatting marker).
-            while end > i
-                && line[..end].ends_with(['.', ',', ';', ':', '!', '?', ')', '"', '\'', '*', '_'])
-            {
-                end -= 1;
-            }
-            if end > i {
-                out.push(Link {
-                    whole: i..end,
-                    text: i..end,
-                    url: i..end,
-                    bare: true,
-                });
-                i = end;
-                continue;
-            }
-        }
-        i += rest.chars().next().map_or(1, char::len_utf8);
+/// The link starting at byte `i` of `line`, if one does.
+fn link_at(line: &str, i: usize) -> Option<Link> {
+    if line[..i].ends_with('\\') {
+        return None;
     }
-    out
+    if let Some(link) = markdown_link(line, i) {
+        return Some(link);
+    }
+    let rest = &line[i..];
+    let word_start = line[..i]
+        .chars()
+        .next_back()
+        .is_none_or(|c| !c.is_alphanumeric());
+    if !word_start
+        || !["https://", "http://", "www."]
+            .iter()
+            .any(|p| rest.starts_with(p))
+    {
+        return None;
+    }
+    let mut end = i + rest.find(char::is_whitespace).unwrap_or(rest.len());
+    // Trailing punctuation belongs to the sentence (or is a formatting
+    // marker).
+    while end > i && line[..end].ends_with(['.', ',', ';', ':', '!', '?', ')', '"', '\'', '*', '_'])
+    {
+        end -= 1;
+    }
+    (end > i).then_some(Link {
+        whole: i..end,
+        text: i..end,
+        url: i..end,
+        bare: true,
+    })
 }
 
 /// A `[text](url)` link starting at byte `i` (the URL without spaces).
 fn markdown_link(line: &str, i: usize) -> Option<Link> {
     let rest = line[i..].strip_prefix('[')?;
     let close = i + 1 + rest.find(']')?;
-    if line[i + 1..close].contains('[') {
+    if line[i + 1..close].contains('[') || !line[close + 1..].starts_with('(') {
         return None;
     }
     let url_start = close + 2;
-    if !line[close + 1..].starts_with('(') {
-        return None;
-    }
     let url_end = url_start + line[url_start..].find(|c: char| c == ')' || c.is_whitespace())?;
     if url_end == url_start || !line[url_end..].starts_with(')') {
         return None;
@@ -639,520 +1003,406 @@ pub fn href(url: &str) -> String {
     }
 }
 
-/// `⌘K`: inside a `[text](url)` link, take the link away (keeping the
-/// text). Otherwise the selection, a bare address at the cursor, or the
-/// word at the cursor becomes `[text](|)`, the cursor where the address
-/// goes; an address becomes `[|](address)`, the cursor where its text
-/// goes. Nothing selected and no word: `[|]()`.
-fn toggle_link(lines: &[String], cursor: Cursor) -> Option<Change> {
-    let (start, end) = ends(cursor);
-    if start.line != end.line {
-        return None;
-    }
-    let n = start.line;
-    let line = lines.get(n)?;
-    let found = links(line);
-    let change = |text: String, column: usize| Change {
-        first: n,
-        last: n,
-        text,
-        cursor: at(n, column),
-    };
-    let inside = |l: &&Link| l.whole.start <= start.column && end.column <= l.whole.end;
-    if let Some(l) = found.iter().filter(|l| !l.bare).find(inside) {
-        let text = if l.text.is_empty() { &l.url } else { &l.text };
-        let text = &line[text.clone()];
-        return Some(change(
-            format!("{}{text}{}", &line[..l.whole.start], &line[l.whole.end..]),
-            l.whole.start + text.len(),
-        ));
-    }
-    let (a, b) = if let Some(l) = found.iter().filter(|l| l.bare).find(inside) {
-        (l.whole.start, l.whole.end)
-    } else if start == end {
-        word_at(line, start.column)
-    } else {
-        let seg = &line[start.column..end.column];
-        (
-            start.column + (seg.len() - seg.trim_start().len()),
-            end.column - (seg.len() - seg.trim_end().len()),
-        )
-    };
-    let (before, sel, after) = (&line[..a], &line[a..b], &line[b..]);
-    Some(if is_address(sel) {
-        change(format!("{before}[]({sel}){after}"), a + 1)
-    } else {
-        change(format!("{before}[{sel}](){after}"), a + sel.len() + 3)
-    })
+/// A piece of a line while reading it.
+#[derive(Debug, Clone)]
+enum Piece {
+    Char(Cell),
+    /// A run of `*` or `_`, `len` long: `n` of them still unused.
+    Delim {
+        c: char,
+        n: usize,
+        len: usize,
+        open: bool,
+        close: bool,
+        style: Style,
+    },
+    /// `<u>` (`true`) or `</u>`, not yet paired.
+    Under(bool, Style),
+    /// A marker used up.
+    Gone,
 }
 
-// ----------------------------------------------------------------- typing
-
-/// `Enter` in a list item: the next item, or the end of the list on an
-/// empty one (one level out when it is indented).
-fn on_enter(line: &str, n: usize, col: usize) -> Option<Change> {
-    let it = item(line)?;
-    if col < it.end {
-        return None;
-    }
-    let mark = &line[it.indent..it.end];
-    let mut rest = &line[it.end..];
-    let check =
-        it.kind == Kind::Dash && ["[ ] ", "[x] ", "[X] "].iter().any(|c| rest.starts_with(c));
-    if check {
-        rest = &rest[4..];
-    }
-    if rest.trim().is_empty() {
-        let (text, column) = if it.indent > 0 {
-            let out = if line.starts_with('\t') {
-                1
-            } else {
-                it.indent.min(2)
-            };
-            (line[out..].to_string(), col - out)
-        } else {
-            (String::new(), 0)
-        };
-        return Some(Change {
-            first: n,
-            last: n,
-            text,
-            cursor: at(n, column),
-        });
-    }
-    let next = match it.kind {
-        Kind::Number => {
-            let delim = &mark[mark.len() - 2..];
-            format!("{}{delim}", it.number + 1)
+impl Piece {
+    fn style(&mut self) -> Option<&mut Style> {
+        match self {
+            Piece::Char(cell) => Some(&mut cell.style),
+            Piece::Delim { style, .. } | Piece::Under(_, style) => Some(style),
+            Piece::Gone => None,
         }
-        _ if check => format!("{}[ ] ", &mark[..2]),
-        _ => mark.to_string(),
-    };
-    let indent = &line[..it.indent];
-    Some(Change {
-        first: n,
-        last: n,
-        text: format!(
-            "{}\n{indent}{next}{}",
-            line[..col].trim_end(),
-            line[col..].trim_start()
-        ),
-        cursor: at(n + 1, indent.len() + next.len()),
-    })
-}
-
-/// `Backspace` right after a list marker: remove the marker.
-fn on_backspace(line: &str, n: usize, col: usize) -> Option<Change> {
-    let it = item(line).filter(|it| it.end == col)?;
-    Some(Change {
-        first: n,
-        last: n,
-        text: format!("{}{}", &line[..it.indent], &line[it.end..]),
-        cursor: at(n, it.indent),
-    })
-}
-
-/// A space after a lone `*` at the start of a line: a `•` bullet.
-fn on_space(line: &str, n: usize, col: usize) -> Option<Change> {
-    let before = &line[..col];
-    let indent = indent_len(before);
-    if &before[indent..] != "*" {
-        return None;
     }
-    Some(Change {
-        first: n,
-        last: n,
-        text: format!("{}• {}", &before[..indent], &line[col..]),
-        cursor: at(n, indent + "• ".len()),
-    })
-}
 
-// ----------------------------------------------------------------- editor
-
-/// Makes a change in the editor: selects its lines, pastes the new text
-/// over them and places the cursor.
-pub fn apply(content: &mut Content, change: Change) {
-    let end = content.line(change.last).map_or(0, |l| l.text.len());
-    content.move_to(Cursor {
-        position: Position {
-            line: change.last,
-            column: end,
-        },
-        selection: Some(Position {
-            line: change.first,
-            column: 0,
-        }),
-    });
-    content.perform(Action::Edit(Edit::Paste(Arc::new(change.text))));
-    content.move_to(change.cursor);
-}
-
-fn lines(content: &Content) -> Vec<String> {
-    content.lines().map(|l| l.text.into_owned()).collect()
-}
-
-/// Runs a command on the editor. Whether it changed anything.
-pub fn run(content: &mut Content, cmd: Command) -> bool {
-    match command(&lines(content), content.cursor(), cmd) {
-        Some(change) => {
-            apply(content, change);
-            true
-        }
-        None => false,
-    }
-}
-
-/// Handles the list keys (`Enter`, `Backspace`, a space after `*`) before
-/// the editor does. Whether it did; if not, perform `action` as usual.
-pub fn intercept(content: &mut Content, action: &Action) -> bool {
-    let cursor = content.cursor();
-    if cursor.selection.is_some_and(|s| s != cursor.position) {
-        return false;
-    }
-    let Position { line: n, column } = cursor.position;
-    let Some(line) = content.line(n).map(|l| l.text.into_owned()) else {
-        return false;
-    };
-    let change = match action {
-        Action::Edit(Edit::Enter) => on_enter(&line, n, column),
-        Action::Edit(Edit::Backspace) => on_backspace(&line, n, column),
-        Action::Edit(Edit::Insert(' ')) => on_space(&line, n, column),
-        _ => None,
-    };
-    match change {
-        Some(change) => {
-            apply(content, change);
-            true
-        }
-        None => false,
-    }
-}
-
-/// The editor's keys: the formatting shortcuts (with `⌘` or `Ctrl`),
-/// `Tab` / `Shift+Tab`, and, given `leave`, `Escape`, which leaves the
-/// editor and sends it; then iced's usual bindings.
-pub fn key_binding<M>(
-    press: KeyPress,
-    on: fn(Command) -> M,
-    leave: Option<M>,
-) -> Option<Binding<M>> {
-    if !matches!(press.status, Status::Focused { .. }) {
-        return None;
-    }
-    if press.key == keyboard::Key::Named(Named::Escape)
-        && let Some(leave) = leave
-    {
-        return Some(Binding::Sequence(vec![
-            Binding::Unfocus,
-            Binding::Custom(leave),
-        ]));
-    }
-    let m = press.modifiers;
-    let cmd = if (m.command() || m.control()) && !m.alt() {
-        match (press.key.to_latin(press.physical_key), m.shift()) {
-            (Some('b'), false) => Some(Command::Bold),
-            (Some('i'), false) => Some(Command::Italic),
-            (Some('u'), false) => Some(Command::Underline),
-            (Some('k'), false) => Some(Command::Link),
-            (Some('8'), true) => Some(Command::Bullets),
-            (Some('7'), true) => Some(Command::Numbers),
+    fn delim(&self) -> Option<(char, usize)> {
+        match self {
+            Piece::Delim { c, n, .. } => Some((*c, *n)),
             _ => None,
         }
-    } else if !m.command()
-        && !m.control()
-        && !m.alt()
-        && press.key == keyboard::Key::Named(Named::Tab)
-    {
-        Some(if m.shift() {
-            Command::Outdent
-        } else {
-            Command::Indent
-        })
-    } else {
-        None
-    };
-    match cmd {
-        Some(c) => Some(Binding::Custom(on(c))),
-        None => Binding::from_key_press(press),
     }
 }
 
-// ------------------------------------------------------------ highlighting
-
-/// How a stretch of a line is drawn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Look {
-    bold: bool,
-    italic: bool,
-    underline: bool,
-    /// A formatting marker (`**`, `<u>`): faint.
-    faint: bool,
-    /// A list marker: muted.
-    list: bool,
-    /// Link text: the index of its link in the line.
-    link: Option<u16>,
+fn plain(c: char) -> Cell {
+    Cell {
+        c,
+        style: Style::default(),
+    }
 }
 
-/// The looks of a line's stretches. Unstyled text is left out.
-pub fn looks(line: &str) -> Vec<(Range<usize>, Look)> {
-    stretches(line)
-        .0
-        .into_iter()
-        .filter(|(_, look)| *look != Look::default())
-        .collect()
-}
-
-/// The looks of all of a line's stretches, in order, and the line's
-/// links (which [`Look::link`] points into).
-fn stretches(line: &str) -> (Vec<(Range<usize>, Look)>, Vec<Link>) {
-    let mut each = vec![Look::default(); line.len()];
-    let mut start = 0;
-    if let Some(it) = item(line) {
-        for l in &mut each[it.indent..it.end - 1] {
-            l.list = true;
-        }
-        start = it.end;
-    }
-    fn mark(each: &mut [Look], range: Range<usize>, f: impl Fn(&mut Look)) {
-        each[range].iter_mut().for_each(f);
-    }
-    // Links: `[` and `](url)` faint, the text a link. Addresses are left
-    // out of the emphasis below (`_` and `*` are common in them).
-    let found: Vec<Link> = links(&line[start..])
-        .into_iter()
-        .map(|l| Link {
-            whole: l.whole.start + start..l.whole.end + start,
-            text: l.text.start + start..l.text.end + start,
-            url: l.url.start + start..l.url.end + start,
-            bare: l.bare,
-        })
-        .collect();
-    let mut plain = vec![true; line.len()];
-    for (k, l) in found.iter().enumerate() {
-        let id = Some(k as u16);
-        // `[](url)` shows its address as its text.
-        let text = if l.text.is_empty() { &l.url } else { &l.text };
-        mark(&mut each, l.whole.clone(), |l| l.faint = true);
-        mark(&mut each, text.clone(), |l| {
-            l.faint = false;
-            l.link = id;
-        });
-        if l.bare {
-            plain[l.whole.clone()].fill(false);
-        } else {
-            plain[l.url.clone()].fill(false);
-        }
-    }
-    // Underline: each `<u>` with the next `</u>`.
-    let mut from = start;
-    while let Some(o) = line[from..].find("<u>").map(|i| from + i) {
-        let Some(c) = line[o + 3..].find("</u>").map(|i| o + 3 + i) else {
-            break;
-        };
-        mark(&mut each, o..o + 3, |l| l.faint = true);
-        mark(&mut each, o + 3..c, |l| l.underline = true);
-        mark(&mut each, c..c + 4, |l| l.faint = true);
-        from = c + 4;
-    }
-    // Emphasis: runs of `*` or `_`, each closing the nearest open run of
-    // the same character and length.
-    struct Run {
-        c: char,
-        at: usize,
-        len: usize,
-    }
-    let mut open: Vec<Run> = Vec::new();
-    let bytes = line.as_bytes();
-    let mut i = start;
-    while i < line.len() {
-        let c = bytes[i] as char;
-        if (c != '*' && c != '_') || !plain[i] {
-            i += 1;
+/// One line's text (after any list marker) as styled characters.
+fn parse_inline(s: &str) -> Vec<Cell> {
+    let mut pieces: Vec<Piece> = Vec::new();
+    let mut i = 0;
+    while i < s.len() {
+        let rest = &s[i..];
+        let c = rest.chars().next().unwrap_or(' ');
+        if c == '\\'
+            && let Some(next) = rest[1..].chars().next().filter(char::is_ascii_punctuation)
+        {
+            pieces.push(Piece::Char(plain(next)));
+            i += 1 + next.len_utf8();
             continue;
         }
-        let len = run_after(&line[i..], c);
-        let prev = line[..i].chars().next_back();
-        let next = line[i + len..].chars().next();
-        let mut can_open = next.is_some_and(|n| !n.is_whitespace());
-        let mut can_close = prev.is_some_and(|p| !p.is_whitespace());
-        if c == '_'
-            && prev.is_some_and(char::is_alphanumeric)
-            && next.is_some_and(char::is_alphanumeric)
-        {
-            can_open = false;
-            can_close = false;
+        if let Some(link) = link_at(s, i) {
+            let url: Arc<str> = Arc::from(&s[link.url.clone()]);
+            let cells = if link.bare {
+                s[link.text.clone()].chars().map(plain).collect()
+            } else if link.text.is_empty() {
+                s[link.url.clone()].chars().map(plain).collect()
+            } else {
+                parse_inline(&s[link.text.clone()])
+            };
+            pieces.extend(cells.into_iter().map(|mut cell| {
+                cell.style.link = Some(url.clone());
+                Piece::Char(cell)
+            }));
+            i = link.whole.end;
+            continue;
         }
-        let closes = can_close
-            .then(|| open.iter().rposition(|r| r.c == c && r.len == len))
-            .flatten();
-        if let Some(k) = closes {
-            let o = &open[k];
-            let (bold, italic) = (len >= 2, len % 2 == 1);
-            if len <= 3 {
-                // The markers take the text's face too: cosmic-text picks
-                // one face for a whole ASCII word, from its first
-                // character, so `**Yes**` is only bold if `**` is.
-                let style = |l: &mut Look| {
-                    l.bold |= bold;
-                    l.italic |= italic;
+        if rest.starts_with("<u>") || rest.starts_with("</u>") {
+            let open = rest.starts_with("<u>");
+            pieces.push(Piece::Under(open, Style::default()));
+            i += if open { 3 } else { 4 };
+            continue;
+        }
+        if c == '*' || c == '_' {
+            let n = rest.chars().take_while(|x| *x == c).count();
+            let prev = s[..i].chars().next_back();
+            let next = s[i + n..].chars().next();
+            let mut open = next.is_some_and(|x| !x.is_whitespace());
+            let mut close = prev.is_some_and(|x| !x.is_whitespace());
+            if c == '_' {
+                open &= prev.is_none_or(|x| !x.is_alphanumeric());
+                close &= next.is_none_or(|x| !x.is_alphanumeric());
+            }
+            pieces.push(Piece::Delim {
+                c,
+                n,
+                len: n,
+                open,
+                close,
+                style: Style::default(),
+            });
+            i += n;
+            continue;
+        }
+        pieces.push(Piece::Char(plain(c)));
+        i += c.len_utf8();
+    }
+
+    // Underline: each `<u>` with the next `</u>`.
+    let mut open_u = None;
+    for k in 0..pieces.len() {
+        match pieces[k] {
+            Piece::Under(true, _) if open_u.is_none() => open_u = Some(k),
+            Piece::Under(false, _) => {
+                if let Some(o) = open_u.take() {
+                    for p in &mut pieces[o + 1..k] {
+                        if let Some(s) = p.style() {
+                            s.underline = true;
+                        }
+                    }
+                    pieces[o] = Piece::Gone;
+                    pieces[k] = Piece::Gone;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Emphasis: a closing run uses up the nearest opening run of the same
+    // character, two at a time when both have two or more (bold), else
+    // one (italic).
+    let mut openers: Vec<usize> = Vec::new();
+    for k in 0..pieces.len() {
+        let Piece::Delim {
+            c,
+            open,
+            close,
+            len,
+            ..
+        } = pieces[k]
+        else {
+            continue;
+        };
+        if close {
+            loop {
+                let left = pieces[k].delim().map_or(0, |(_, n)| n);
+                if left == 0 {
+                    break;
+                }
+                // CommonMark's rule of three: a run that could open and
+                // close doesn't pair with one whose lengths add up to a
+                // multiple of three (unless both are), so `**a*b***` is
+                // bold "a*b*" with italic "b".
+                let pairs = |o: usize| match pieces[o] {
+                    Piece::Delim {
+                        c: oc,
+                        len: olen,
+                        close: oclose,
+                        ..
+                    } => {
+                        oc == c
+                            && !((open || oclose)
+                                && (olen + len) % 3 == 0
+                                && !(olen % 3 == 0 && len % 3 == 0))
+                    }
+                    _ => false,
                 };
-                mark(&mut each, o.at..o.at + len, |l| {
-                    l.faint = true;
-                    style(l);
-                });
-                mark(&mut each, o.at + len..i, style);
-                mark(&mut each, i..i + len, |l| {
-                    l.faint = true;
-                    style(l);
-                });
+                let Some(oi) = openers.iter().rposition(|&o| pairs(o)) else {
+                    break;
+                };
+                let o = openers[oi];
+                let have = pieces[o].delim().map_or(0, |(_, n)| n);
+                let used = if have >= 2 && left >= 2 { 2 } else { 1 };
+                for p in &mut pieces[o + 1..k] {
+                    if let Some(s) = p.style() {
+                        if used == 2 {
+                            s.bold = true;
+                        } else {
+                            s.italic = true;
+                        }
+                    }
+                }
+                for at in [o, k] {
+                    if let Piece::Delim { n, .. } = &mut pieces[at] {
+                        *n -= used;
+                    }
+                }
+                // Openers between the two can no longer close anything.
+                openers.truncate(oi + 1);
+                if have == used {
+                    openers.pop();
+                }
             }
-            open.truncate(k);
-        } else if can_open {
-            open.push(Run { c, at: i, len });
         }
-        i += len;
-    }
-    let mut out: Vec<(Range<usize>, Look)> = Vec::new();
-    let mut i = 0;
-    while i < each.len() {
-        let look = each[i];
-        let mut j = i + 1;
-        while j < each.len() && each[j] == look {
-            j += 1;
+        if open && pieces[k].delim().is_some_and(|(_, n)| n > 0) {
+            openers.push(k);
         }
-        out.push((i..j, look));
-        i = j;
-    }
-    (out, found)
-}
-
-/// The editor's highlighter: each line on its own, by [`looks`].
-pub struct Notes {
-    line: usize,
-}
-
-impl Highlighter for Notes {
-    type Settings = ();
-    type Highlight = Look;
-    type Iterator<'a> = std::vec::IntoIter<(Range<usize>, Look)>;
-
-    fn new(_settings: &()) -> Self {
-        Notes { line: 0 }
     }
 
-    fn update(&mut self, _settings: &()) {
-        self.line = 0;
-    }
-
-    fn change_line(&mut self, line: usize) {
-        self.line = self.line.min(line);
-    }
-
-    fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
-        self.line += 1;
-        looks(line).into_iter()
-    }
-
-    fn current_line(&self) -> usize {
-        self.line
-    }
-}
-
-/// The face for bold and italic text (`None`: the regular face).
-fn face(look: &Look) -> Option<Font> {
-    (look.bold || look.italic).then_some(Font {
-        weight: if look.bold {
-            Weight::Bold
-        } else {
-            Weight::Normal
-        },
-        style: if look.italic {
-            Style::Italic
-        } else {
-            Style::Normal
-        },
-        ..theme::FONT
-    })
-}
-
-/// How a [`Look`] is drawn.
-pub fn format(look: &Look, theme: &Theme) -> highlighter::Format<Font> {
-    let font = face(look);
-    let color = if look.faint {
-        Some(theme.palette().text.scale_alpha(0.35))
-    } else if look.list {
-        Some(theme::muted_color(theme))
-    } else if look.underline || look.link.is_some() {
-        Some(theme::accent_color())
-    } else {
-        None
-    };
-    highlighter::Format { color, font }
-}
-
-// ----------------------------------------------------------------- preview
-
-/// The notes drawn as they read, for when they are not being edited:
-/// markers hidden, bold, italic and underline drawn, list markers as `•`,
-/// `–` or the number with the item's text hanging beside it.
-/// Links are underlined in the accent colour; a click on one sends
-/// `on_link` with its address ([`href`]).
-pub fn preview<'a, M: 'a>(notes: &str, on_link: fn(String) -> M) -> Element<'a, M> {
-    Column::with_children(notes.lines().map(|line| preview_line(line, on_link))).into()
-}
-
-fn preview_line<'a, M: 'a>(line: &str, on_link: fn(String) -> M) -> Element<'a, M> {
-    let Some(it) = item(line) else {
-        return rich_line(line, 0, on_link);
-    };
-    let mark = match it.kind {
-        Kind::Bullet => "•",
-        Kind::Dash => "–",
-        Kind::Number => line[it.indent..it.end].trim_end(),
-    };
-    let depth: f32 = line[..it.indent]
-        .chars()
-        .map(|c| if c == '\t' { 4.0 } else { 1.0 })
-        .sum();
-    row![
-        Space::new().width(depth * 9.0),
-        container(
-            text(mark.to_string())
-                .size(theme::TEXT_BODY)
-                .style(theme::muted)
-        )
-        .width(24),
-        rich_line(line, it.end, on_link),
-    ]
-    .into()
-}
-
-/// `line[start..]` as rich text, without its formatting markers.
-fn rich_line<'a, M: 'a>(line: &str, start: usize, on_link: fn(String) -> M) -> Element<'a, M> {
-    let (all, found) = stretches(line);
-    let spans: Vec<_> = all
-        .into_iter()
-        .filter(|(r, look)| r.end > start && !look.faint)
-        .map(|(r, look)| {
-            let s = span::<String, Font>(line[r.start.max(start)..r.end].to_string())
-                .font_maybe(face(&look))
-                .underline(look.underline || look.link.is_some());
-            match look.link.and_then(|k| found.get(usize::from(k))) {
-                Some(l) => s
-                    .link(href(&line[l.url.clone()]))
-                    .color(theme::accent_color()),
-                None => s,
+    let mut out = Vec::new();
+    for p in pieces {
+        match p {
+            Piece::Gone => {}
+            Piece::Char(cell) => out.push(cell),
+            Piece::Delim { c, n, style, .. } => {
+                out.extend((0..n).map(|_| Cell {
+                    c,
+                    style: style.clone(),
+                }));
             }
+            Piece::Under(open, style) => {
+                let tag = if open { "<u>" } else { "</u>" };
+                out.extend(tag.chars().map(|c| Cell {
+                    c,
+                    style: style.clone(),
+                }));
+            }
+        }
+    }
+    out
+}
+
+// ------------------------------------------------------------- writing
+
+/// The notes as Markdown: a line per block.
+fn write(blocks: &[Block]) -> String {
+    let numbers = numbers(blocks);
+    blocks
+        .iter()
+        .zip(numbers)
+        .map(|(b, n)| {
+            let mut line = "  ".repeat(usize::from(b.indent));
+            match b.list {
+                List::None => {}
+                List::Bullet => line.push_str("• "),
+                List::Dash => line.push_str("- "),
+                List::Number => line.push_str(&format!("{n}. ")),
+            }
+            let text = write_inline(&b.cells);
+            // A paragraph that would read as a list item keeps its text.
+            match item(&text).map(|it| it.list) {
+                Some(List::Number) if b.list == List::None => {
+                    let dot = text.find(['.', ')']).unwrap_or(0);
+                    line.push_str(&text[..dot]);
+                    line.push('\\');
+                    line.push_str(&text[dot..]);
+                }
+                Some(List::Dash) if b.list == List::None => {
+                    line.push('\\');
+                    line.push_str(&text);
+                }
+                _ => line.push_str(&text),
+            }
+            line
         })
-        .collect();
-    if spans.is_empty() {
-        // A blank line keeps its height.
-        return text(" ").size(theme::TEXT_BODY).into();
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Characters as Markdown text, escaped where they would read as
+/// formatting.
+fn escape(chars: &[char], out: &mut String) {
+    for (i, &c) in chars.iter().enumerate() {
+        let prev = i.checked_sub(1).map(|p| chars[p]);
+        let next = chars.get(i + 1).copied();
+        let rest: String = chars[i..chars.len().min(i + 4)].iter().collect();
+        let special = match c {
+            '\\' | '*' | '[' | ']' => true,
+            '_' => {
+                !(prev.is_some_and(char::is_alphanumeric)
+                    && next.is_some_and(char::is_alphanumeric))
+            }
+            '<' => rest.starts_with("<u>") || rest.starts_with("</u>"),
+            _ => false,
+        };
+        if special {
+            out.push('\\');
+        }
+        out.push(c);
     }
-    rich_text(spans)
+}
+
+/// Closes open markers (innermost first) until `keep` are left.
+fn close_to(out: &mut String, open: &mut Vec<char>, keep: usize) {
+    while open.len() > keep {
+        match open.pop() {
+            Some('u') => out.push_str("</u>"),
+            Some('b') => out.push_str("**"),
+            Some(_) => out.push('*'),
+            None => {}
+        }
+    }
+}
+
+/// A line's characters as Markdown, the markers opened and closed where
+/// the style changes.
+fn write_inline(cells: &[Cell]) -> String {
+    // Stretches of one style; spaces lose bold and italic, whose markers
+    // may not start or end on a space.
+    let mut runs: Vec<(Vec<char>, Style)> = Vec::new();
+    for cell in cells {
+        let mut style = cell.style.clone();
+        if cell.c.is_whitespace() {
+            style.bold = false;
+            style.italic = false;
+        }
+        match runs.last_mut() {
+            Some((chars, s)) if *s == style => chars.push(cell.c),
+            _ => runs.push((vec![cell.c], style)),
+        }
+    }
+
+    let mut out = String::new();
+    // The open markers, outermost first: 'u', 'b', 'i'.
+    let mut open: Vec<char> = Vec::new();
+    let mut k = 0;
+    while k < runs.len() {
+        let link = runs[k].1.link.clone();
+        // The runs of one link, or of no link.
+        let mut end = k;
+        while end < runs.len() && runs[end].1.link == link {
+            end += 1;
+        }
+        if let Some(url) = &link {
+            close_to(&mut out, &mut open, 0);
+            let text: String = runs[k..end].iter().flat_map(|(c, _)| c.iter()).collect();
+            let unstyled = runs[k..end]
+                .iter()
+                .all(|(_, s)| s.marks() == (false, false, false));
+            if unstyled && text == **url && is_address(url) {
+                out.push_str(url);
+                k = end;
+                continue;
+            }
+            out.push('[');
+        }
+        for (chars, style) in &runs[k..end] {
+            let (u, b, i) = style.marks();
+            let want: Vec<char> = [(u, 'u'), (b, 'b'), (i, 'i')]
+                .into_iter()
+                .filter_map(|(on, m)| on.then_some(m))
+                .collect();
+            // Keep what is open and still wanted, in the same order.
+            let keep = open.iter().zip(&want).take_while(|(a, b)| a == b).count();
+            close_to(&mut out, &mut open, keep);
+            for &m in &want[keep..] {
+                out.push_str(match m {
+                    'u' => "<u>",
+                    'b' => "**",
+                    _ => "*",
+                });
+                open.push(m);
+            }
+            escape(chars, &mut out);
+        }
+        if let Some(url) = &link {
+            close_to(&mut out, &mut open, 0);
+            out.push_str("](");
+            out.push_str(url);
+            out.push(')');
+        }
+        k = end;
+    }
+    close_to(&mut out, &mut open, 0);
+    out
+}
+
+// ------------------------------------------------------------ link prompt
+
+/// `⌘K`'s prompt under an editor, while it is open: the address (with
+/// the id `id`, to focus it), Remove for a link already there, and ×.
+pub fn link_prompt<'a, M: Clone + 'a>(
+    content: &'a Content,
+    id: &'static str,
+    on: impl Fn(Action) -> M + Clone + 'a,
+) -> Option<Element<'a, M>> {
+    let (url, existing) = content.link_prompt()?;
+    let input = text_input("Paste or type a link, then Enter", url)
+        .id(id)
+        .on_input({
+            let on = on.clone();
+            move |s| on(Action::LinkInput(s))
+        })
+        .on_submit(on(Action::LinkSubmit))
         .size(theme::TEXT_BODY)
-        .on_link_click(on_link)
-        .into()
+        .padding([6, 10])
+        .style(theme::input);
+    let mut bar = row![theme::icon(theme::Icon::Link).width(16).height(16), input]
+        .spacing(8)
+        .align_y(Center);
+    if existing {
+        bar = bar.push(
+            button(text("Remove link").size(theme::TEXT_SMALL))
+                .style(theme::text_button)
+                .on_press(on(Action::LinkRemove)),
+        );
+    }
+    bar = bar.push(
+        button(theme::icon(theme::Icon::Close).width(16).height(16))
+            .padding(4)
+            .style(theme::icon_button)
+            .on_press(on(Action::LinkCancel)),
+    );
+    Some(bar.into())
 }
 
 // ----------------------------------------------------------------- toolbar
@@ -1165,8 +1415,9 @@ fn shortcut(key: &str) -> String {
     }
 }
 
-/// The formatting buttons: bold, italic, underline, then the three lists.
-pub fn toolbar<'a, M: Clone + 'a>(on: fn(Command) -> M) -> Element<'a, M> {
+/// The formatting buttons: bold, italic, underline, link, then the three
+/// lists.
+pub fn toolbar<'a, M: Clone + 'a>(on: impl Fn(Command) -> M + 'a) -> Element<'a, M> {
     let tool = |label: Element<'a, M>, tip: String, cmd: Command| -> Element<'a, M> {
         tooltip(
             button(container(label).center(22))
@@ -1182,9 +1433,9 @@ pub fn toolbar<'a, M: Clone + 'a>(on: fn(Command) -> M) -> Element<'a, M> {
     let underline: Element<'a, M> = rich_text([span::<(), _>("U").underline(true)])
         .size(theme::TEXT_BODY)
         .into();
-    let list = |which: theme::Icon| theme::icon(which).width(16).height(16).into();
+    let icon = |which: theme::Icon| theme::icon(which).width(16).height(16).into();
     let italic = Font {
-        style: Style::Italic,
+        style: FontStyle::Italic,
         ..theme::FONT
     };
     row![
@@ -1204,23 +1455,23 @@ pub fn toolbar<'a, M: Clone + 'a>(on: fn(Command) -> M) -> Element<'a, M> {
             Command::Underline
         ),
         tool(
-            list(theme::Icon::Link),
+            icon(theme::Icon::Link),
             format!("Link  {}", shortcut("K")),
             Command::Link
         ),
         container(text("")).width(6),
         tool(
-            list(theme::Icon::ListBullet),
+            icon(theme::Icon::ListBullet),
             format!("Bullet list  {}", shortcut("⇧8")),
             Command::Bullets
         ),
         tool(
-            list(theme::Icon::ListDash),
+            icon(theme::Icon::ListDash),
             "Dash list".into(),
             Command::Dashes
         ),
         tool(
-            list(theme::Icon::ListNumber),
+            icon(theme::Icon::ListNumber),
             format!("Numbered list  {}", shortcut("⇧7")),
             Command::Numbers
         ),
@@ -1234,340 +1485,274 @@ pub fn toolbar<'a, M: Clone + 'a>(on: fn(Command) -> M) -> Element<'a, M> {
 mod tests {
     use super::*;
 
-    fn lines(text: &str) -> Vec<String> {
-        text.split('\n').map(String::from).collect()
+    fn round_trip(md: &str) {
+        assert_eq!(Content::with_text(md).text(), md, "{md:?}");
     }
 
-    /// Applies a command to `text`, where `|` marks the cursor and `{` `}`
-    /// a selection (cursor at `]`), and returns the result marked the
-    /// same way.
-    fn run_on(text: &str, cmd: Command) -> String {
-        let (ls, cursor) = parse(text);
-        let change = command(&ls, cursor, cmd).expect("a change");
-        show(&ls, &change)
-    }
-
-    fn parse(text: &str) -> (Vec<String>, Cursor) {
-        let mut pos = None;
-        let mut sel = None;
-        let mut out = Vec::new();
-        for (n, line) in text.split('\n').enumerate() {
-            let mut l = String::new();
-            for ch in line.chars() {
-                match ch {
-                    '|' | '}' => {
-                        pos = Some(Position {
-                            line: n,
-                            column: l.len(),
-                        })
-                    }
-                    '{' => {
-                        sel = Some(Position {
-                            line: n,
-                            column: l.len(),
-                        })
-                    }
-                    _ => l.push(ch),
-                }
-            }
-            out.push(l);
-        }
-        let cursor = Cursor {
-            position: pos.expect("a cursor"),
-            selection: sel,
-        };
-        (out, cursor)
-    }
-
-    fn show(ls: &[String], change: &Change) -> String {
-        let mut all: Vec<String> = ls[..change.first].to_vec();
-        all.extend(lines(&change.text));
-        all.extend(ls[change.last + 1..].iter().cloned());
-        let mut marks = vec![(
-            change.cursor.position,
-            if change.cursor.selection.is_some() {
-                '}'
-            } else {
-                '|'
-            },
-        )];
-        if let Some(s) = change.cursor.selection {
-            marks.push((s, '{'));
-        }
-        marks.sort_by_key(|(p, _)| std::cmp::Reverse((p.line, p.column)));
-        for (p, m) in marks {
-            all[p.line].insert(p.column, m);
-        }
-        all.join("\n")
-    }
-
-    #[test]
-    fn bold_wraps_and_unwraps() {
-        assert_eq!(run_on("a {big} day", Command::Bold), "a **{big}** day");
-        assert_eq!(run_on("a **{big}** day", Command::Bold), "a {big} day");
-        // The markers inside the selection count too.
-        assert_eq!(run_on("a {**big**} day", Command::Bold), "a {big} day");
-        // Spaces at the selection's ends stay outside the markers.
-        assert_eq!(run_on("a{ big }day", Command::Bold), "a{ **big** }day");
-        // The word at the cursor.
-        assert_eq!(run_on("a bi|g day", Command::Bold), "a **bi|g** day");
-        assert_eq!(run_on("a **big|** day", Command::Bold), "a big| day");
-        // No word: an empty pair, and again takes it away.
-        assert_eq!(run_on("a |", Command::Bold), "a **|**");
-        assert_eq!(run_on("a **|**", Command::Bold), "a |");
-    }
-
-    #[test]
-    fn italic_and_bold_combine() {
-        assert_eq!(run_on("**{big}**", Command::Italic), "***{big}***");
-        assert_eq!(run_on("***{big}***", Command::Italic), "**{big}**");
-        assert_eq!(run_on("***{big}***", Command::Bold), "*{big}*");
-        assert_eq!(run_on("*{big}*", Command::Italic), "{big}");
-        assert_eq!(run_on("_{big}_", Command::Italic), "{big}");
-    }
-
-    #[test]
-    fn underline_uses_tags() {
-        assert_eq!(run_on("{big}", Command::Underline), "<u>{big}</u>");
-        assert_eq!(run_on("<u>{big}</u>", Command::Underline), "{big}");
-        assert_eq!(run_on("{<u>big</u>}", Command::Underline), "{big}");
-        assert_eq!(run_on("|", Command::Underline), "<u>|</u>");
-    }
-
-    #[test]
-    fn inline_over_several_lines_skips_markers_and_blanks() {
-        assert_eq!(
-            run_on("• {one\n\n• two}", Command::Bold),
-            "• **{one**\n\n• **two}**"
-        );
-        assert_eq!(
-            run_on("• **{one**\n\n• **two}**", Command::Bold),
-            "• {one\n\n• two}"
-        );
-        // Mixed: format the lines not yet formatted.
-        assert_eq!(
-            run_on("{**one**\ntwo}", Command::Bold),
-            "{**one**\n**two}**"
-        );
-    }
-
-    #[test]
-    fn lists_mark_and_unmark_lines() {
-        assert_eq!(run_on("buy |milk", Command::Bullets), "• buy |milk");
-        assert_eq!(run_on("• buy |milk", Command::Bullets), "buy |milk");
-        assert_eq!(run_on("- buy |milk", Command::Bullets), "• buy |milk");
-        assert_eq!(run_on("|", Command::Dashes), "- |");
-        assert_eq!(
-            run_on("{a\n\n  b\nc}", Command::Numbers),
-            "1. {a\n\n  2. b\n3. c}"
-        );
-        assert_eq!(run_on("1. a\n|b", Command::Numbers), "1. a\n2. |b");
-        assert_eq!(run_on("{1. a\n2. b}", Command::Numbers), "{a\nb}");
-        assert_eq!(run_on("{1. a\nb}", Command::Dashes), "- {a\n- b}");
-    }
-
-    #[test]
-    fn indent_and_outdent() {
-        assert_eq!(run_on("• a|", Command::Indent), "  • a|");
-        assert_eq!(run_on("   • a|", Command::Outdent), " • a|");
-        assert_eq!(run_on("\t• a|", Command::Outdent), "• a|");
-        assert!(command(&lines("a"), at(0, 1), Command::Outdent).is_none());
-    }
-
-    fn typed(f: fn(&str, usize, usize) -> Option<Change>, text: &str) -> Option<String> {
-        let (ls, cursor) = parse(text);
-        let n = cursor.position.line;
-        f(&ls[n], n, cursor.position.column).map(|c| show(&ls, &c))
-    }
-
-    #[test]
-    fn enter_continues_and_ends_lists() {
-        assert_eq!(typed(on_enter, "• milk|").unwrap(), "• milk\n• |");
-        assert_eq!(typed(on_enter, "  9) a|").unwrap(), "  9) a\n  10) |");
-        assert_eq!(
-            typed(on_enter, "- [x] done|").unwrap(),
-            "- [x] done\n- [ ] |"
-        );
-        // In the middle of the text: the rest moves to the new item.
-        assert_eq!(typed(on_enter, "1. buy| milk").unwrap(), "1. buy\n2. |milk");
-        // An empty item ends the list, or steps out one level.
-        assert_eq!(typed(on_enter, "a\n• |").unwrap(), "a\n|");
-        assert_eq!(typed(on_enter, "    - |").unwrap(), "  - |");
-        // Not a list, or before the marker: Enter as usual.
-        assert_eq!(typed(on_enter, "plain|"), None);
-        assert_eq!(typed(on_enter, "|• a"), None);
-    }
-
-    #[test]
-    fn backspace_and_space_shortcuts() {
-        assert_eq!(typed(on_backspace, "  • |milk").unwrap(), "  |milk");
-        assert_eq!(typed(on_backspace, "  • m|ilk"), None);
-        assert_eq!(typed(on_space, "  *|milk").unwrap(), "  • |milk");
-        assert_eq!(typed(on_space, "a*|"), None);
-    }
-
-    #[test]
-    fn list_lines() {
-        assert_eq!(
-            item("• a").map(|i| (i.kind, i.end)),
-            Some((Kind::Bullet, 4))
-        );
-        assert_eq!(
-            item("  12. a").map(|i| (i.kind, i.number, i.end)),
-            Some((Kind::Number, 12, 6))
-        );
-        for not in ["-a", "1.a", "•a", "", "1234567890. a", "**bold**"] {
-            assert_eq!(item(not), None, "{not:?}");
-        }
-    }
-
-    fn styled(line: &str) -> Vec<(&str, &'static str)> {
-        looks(line)
+    fn styled(md: &str) -> Vec<(String, &'static str)> {
+        let c = Content::with_text(md);
+        c.blocks[0]
+            .runs()
             .into_iter()
-            .map(|(r, l)| {
-                let name = match (l.bold, l.italic, l.underline, l.faint, l.list) {
-                    (_, _, _, true, _) => "faint",
-                    (_, _, _, _, true) => "list",
-                    (true, true, _, _, _) => "bold italic",
-                    (true, _, _, _, _) => "bold",
-                    (_, true, _, _, _) => "italic",
-                    (_, _, true, _, _) => "underline",
-                    _ => "?",
+            .map(|(t, s)| {
+                let name = match (s.bold, s.italic, s.underline, s.link.is_some()) {
+                    (_, _, _, true) => "link",
+                    (true, true, _, _) => "bold italic",
+                    (true, _, _, _) => "bold",
+                    (_, true, _, _) => "italic",
+                    (_, _, true, _) => "underline",
+                    _ => "plain",
                 };
-                (&line[r], name)
+                (t, name)
             })
             .collect()
     }
 
     #[test]
-    fn highlighting() {
+    fn reads_markdown_formatting() {
         assert_eq!(
-            styled("• a **b** *c* <u>d</u>"),
+            styled("a **b** *c* <u>d</u> ***e*** __f__ _g_ snake_case"),
             vec![
-                ("•", "list"),
-                ("**", "faint"),
-                ("b", "bold"),
-                ("**", "faint"),
-                ("*", "faint"),
-                ("c", "italic"),
-                ("*", "faint"),
-                ("<u>", "faint"),
-                ("d", "underline"),
-                ("</u>", "faint"),
+                ("a ".into(), "plain"),
+                ("b".into(), "bold"),
+                (" ".into(), "plain"),
+                ("c".into(), "italic"),
+                (" ".into(), "plain"),
+                ("d".into(), "underline"),
+                (" ".into(), "plain"),
+                ("e".into(), "bold italic"),
+                (" ".into(), "plain"),
+                ("f".into(), "bold"),
+                (" ".into(), "plain"),
+                ("g".into(), "italic"),
+                (" snake_case".into(), "plain"),
             ]
         );
         assert_eq!(
-            styled("***x*** __y__ snake_case_name"),
+            styled("**ab*c***"),
+            vec![("ab".into(), "bold"), ("c".into(), "bold italic")]
+        );
+        // Unclosed or spaced markers, and escapes, are text.
+        assert_eq!(
+            styled("2 * 3 * 4 **open \\*x\\*"),
+            vec![("2 * 3 * 4 **open *x*".into(), "plain")]
+        );
+        assert_eq!(
+            styled("see [the **docs**](https://x.y/a_b) or https://q.r/s_t."),
             vec![
-                ("***", "faint"),
-                ("x", "bold italic"),
-                ("***", "faint"),
-                ("__", "faint"),
-                ("y", "bold"),
-                ("__", "faint"),
+                ("see ".into(), "plain"),
+                ("the ".into(), "link"),
+                ("docs".into(), "link"),
+                (" or ".into(), "plain"),
+                ("https://q.r/s_t".into(), "link"),
+                (".".into(), "plain"),
             ]
-        );
-        // Links: the text accent, the rest faint; no emphasis in addresses.
-        let linked = |line: &str| -> Vec<(String, bool, bool)> {
-            looks(line)
-                .into_iter()
-                .map(|(r, l)| (line[r].to_string(), l.link.is_some(), l.faint))
-                .collect()
-        };
-        assert_eq!(
-            linked("[**go**](https://a_b_c) x https://d_e_f"),
-            vec![
-                ("[".into(), false, true),
-                ("**".into(), true, true),
-                ("go".into(), true, false),
-                ("**".into(), true, true),
-                ("](https://a_b_c)".into(), false, true),
-                ("https://d_e_f".into(), true, false),
-            ]
-        );
-        // Unclosed or spaced markers are plain text.
-        assert!(looks("2 * 3 * 4 and **open").is_empty());
-        assert_eq!(styled("12. x"), vec![("12.", "list")]);
-    }
-
-    #[test]
-    fn cmd_k_makes_and_removes_links() {
-        // Selection or word: the cursor goes where the address is typed.
-        assert_eq!(
-            run_on("see {the docs} now", Command::Link),
-            "see [the docs](|) now"
-        );
-        assert_eq!(run_on("see do|cs", Command::Link), "see [docs](|)");
-        assert_eq!(run_on("a |", Command::Link), "a [](|)");
-        // An address: the cursor goes where its text is typed.
-        assert_eq!(
-            run_on("at https://ex.am/p|le_x.", Command::Link),
-            "at [|](https://ex.am/ple_x)."
-        );
-        assert_eq!(run_on("{www.ex.am}", Command::Link), "[|](www.ex.am)");
-        // Inside a link: take it away, keeping the text.
-        assert_eq!(
-            run_on("see [the d|ocs](https://x.y) now", Command::Link),
-            "see the docs| now"
-        );
-        assert_eq!(run_on("[](https://x.y|)", Command::Link), "https://x.y|");
-        // Over several lines: nothing.
-        assert!(
-            command(
-                &lines("a\nb"),
-                Cursor {
-                    position: Position { line: 1, column: 1 },
-                    selection: Some(Position { line: 0, column: 0 })
-                },
-                Command::Link
-            )
-            .is_none()
         );
     }
 
     #[test]
-    fn links_in_a_line() {
-        let found = |line: &str| -> Vec<(String, String, bool)> {
-            links(line)
-                .into_iter()
-                .map(|l| (line[l.text].to_string(), line[l.url].to_string(), l.bare))
-                .collect()
-        };
+    fn reads_lists() {
+        let c = Content::with_text("• a\n  - b\n1. c\n    2) d\nplain\n  indented");
+        let kinds: Vec<(List, u8, String)> = c
+            .blocks
+            .iter()
+            .map(|b| (b.list, b.indent, b.plain()))
+            .collect();
         assert_eq!(
-            found("[a b](https://x.y/z_1) and (https://q.r/s), www.t.u!"),
+            kinds,
             vec![
-                ("a b".into(), "https://x.y/z_1".into(), false),
-                ("https://q.r/s".into(), "https://q.r/s".into(), true),
-                ("www.t.u".into(), "www.t.u".into(), true),
+                (List::Bullet, 0, "a".into()),
+                (List::Dash, 1, "b".into()),
+                (List::Number, 0, "c".into()),
+                (List::Number, 2, "d".into()),
+                (List::None, 0, "plain".into()),
+                (List::None, 1, "indented".into()),
             ]
         );
-        // Not links: a checkbox, spaces in the address, mid-word.
-        assert!(found("- [ ] task [a](b c) xhttps://no").is_empty());
-        assert_eq!(href("www.x.y"), "https://www.x.y");
-        assert_eq!(href("http://x.y"), "http://x.y");
-        assert_eq!(href("mailto:a@b.c"), "mailto:a@b.c");
     }
 
     #[test]
-    fn changes_apply_to_the_editor() {
-        let mut content = Content::with_text("buy milk\nand eggs");
-        content.move_to(Cursor {
-            position: Position { line: 1, column: 8 },
-            selection: Some(Position { line: 0, column: 0 }),
+    fn writes_what_it_reads() {
+        for md in [
+            "",
+            "plain text",
+            "**bold** and *italic* and <u>under</u>",
+            "***both*** then **b*bi***",
+            "H**ello** w*or*ld",
+            "<u>**x**</u> y",
+            "[a **link**](https://x.y) and https://bare.example/p_q",
+            "• a\n  • b\n- c\n1. d\n2. e\n  1. f\n3. g",
+            "\n\nblank lines\n\n",
+            "2 \\* 3 and \\[not a link\\] and a_b\\_ and \\<u> tag",
+            "\\- not a list\n1\\. nor this",
+        ] {
+            round_trip(md);
+        }
+        // Lists are renumbered; bullets and spaces are tidied.
+        assert_eq!(Content::with_text("3. a\n7) b").text(), "1. a\n2. b");
+        assert_eq!(Content::with_text("* a\n\t- b").text(), "- a\n  - b");
+        // Formatting across a space closes and opens around it.
+        let mut c = Content::with_text("ab cd");
+        c.perform(Action::SelectAll);
+        c.perform(Action::Format(Command::Bold));
+        assert_eq!(c.text(), "**ab** **cd**");
+    }
+
+    fn typed(c: &mut Content, s: &str) {
+        c.perform(Action::Insert(s.into()));
+    }
+
+    #[test]
+    fn typing_with_styles_and_list_shortcuts() {
+        let mut c = Content::default();
+        typed(&mut c, "* milk");
+        assert_eq!(c.text(), "• milk");
+        c.perform(Action::Enter);
+        typed(&mut c, "eggs ");
+        c.perform(Action::Format(Command::Bold));
+        typed(&mut c, "now");
+        c.perform(Action::Format(Command::Bold));
+        typed(&mut c, "!");
+        assert_eq!(c.text(), "• milk\n• eggs **now**!");
+        // Enter on an empty item ends the list (the line stays, as a
+        // paragraph); Backspace at an item's start takes the marker away,
+        // then joins the lines.
+        c.perform(Action::Enter);
+        c.perform(Action::Enter);
+        typed(&mut c, "1. one");
+        c.perform(Action::Enter);
+        typed(&mut c, "two");
+        assert_eq!(c.text(), "• milk\n• eggs **now**!\n1. one\n2. two");
+        c.perform(Action::Move {
+            motion: Motion::BlockStart,
+            select: false,
         });
-        assert!(run(&mut content, Command::Bullets));
-        assert_eq!(content.text(), "• buy milk\n• and eggs");
-        // (A plain move: `move_to` keeps an existing selection.)
-        content.perform(Action::Move(iced::widget::text_editor::Motion::DocumentEnd));
-        assert!(intercept(&mut content, &Action::Edit(Edit::Enter)));
-        assert_eq!(content.text(), "• buy milk\n• and eggs\n• ");
-        assert!(intercept(&mut content, &Action::Edit(Edit::Enter)));
-        assert_eq!(content.text(), "• buy milk\n• and eggs\n");
-        content.perform(Action::Edit(Edit::Insert('x')));
-        assert_eq!(content.text(), "• buy milk\n• and eggs\nx");
-        content.move_to(at(0, 6));
-        assert!(run(&mut content, Command::Bold));
-        assert_eq!(content.text(), "• **buy** milk\n• and eggs\nx");
-        assert_eq!(content.cursor().position, Position { line: 0, column: 8 });
+        c.perform(Action::Backspace);
+        assert_eq!(c.text(), "• milk\n• eggs **now**!\n1. one\ntwo");
+        c.perform(Action::Backspace);
+        assert_eq!(c.text(), "• milk\n• eggs **now**!\n1. onetwo");
+        // Nested items step out one level on an empty Enter.
+        let mut c = Content::with_text("• a");
+        c.perform(Action::Move {
+            motion: Motion::DocEnd,
+            select: false,
+        });
+        c.perform(Action::Enter);
+        c.perform(Action::Format(Command::Indent));
+        assert_eq!(c.text(), "• a\n  • ");
+        c.perform(Action::Enter);
+        assert_eq!(c.text(), "• a\n• ");
+    }
+
+    #[test]
+    fn formatting_a_selection() {
+        let mut c = Content::with_text("one two\nthree");
+        c.perform(Action::MoveTo {
+            at: Pos::new(0, 4),
+            select: false,
+        });
+        c.perform(Action::MoveTo {
+            at: Pos::new(1, 2),
+            select: true,
+        });
+        c.perform(Action::Format(Command::Italic));
+        assert_eq!(c.text(), "one *two*\n*th*ree");
+        c.perform(Action::Format(Command::Italic));
+        assert_eq!(c.text(), "one two\nthree");
+        c.perform(Action::Format(Command::Numbers));
+        assert_eq!(c.text(), "1. one two\n2. three");
+        c.perform(Action::Format(Command::Numbers));
+        assert_eq!(c.text(), "one two\nthree");
+        // Typing replaces the selection.
+        typed(&mut c, "X");
+        assert_eq!(c.text(), "one Xree");
+        assert_eq!(c.cursor(), Pos::new(0, 5));
+    }
+
+    #[test]
+    fn cmd_k_asks_for_an_address() {
+        let mut c = Content::with_text("see the docs");
+        c.perform(Action::MoveTo {
+            at: Pos::new(0, 10),
+            select: false,
+        });
+        c.perform(Action::Format(Command::Link));
+        assert_eq!(c.link_prompt(), Some(("", false)));
+        assert_eq!(c.take_focus(), Some(Focus::LinkPrompt));
+        c.perform(Action::LinkInput("https://x.y".into()));
+        c.perform(Action::LinkSubmit);
+        assert_eq!(c.text(), "see the [docs](https://x.y)");
+        assert_eq!(c.take_focus(), Some(Focus::Editor));
+        // In a link: the prompt has its address; empty takes it away.
+        c.perform(Action::MoveTo {
+            at: Pos::new(0, 9),
+            select: false,
+        });
+        c.perform(Action::Format(Command::Link));
+        assert_eq!(c.link_prompt(), Some(("https://x.y", true)));
+        c.perform(Action::LinkInput(String::new()));
+        c.perform(Action::LinkSubmit);
+        assert_eq!(c.text(), "see the docs");
+        // Nothing there: the address becomes the text.
+        let mut c = Content::with_text("go ");
+        c.perform(Action::Move {
+            motion: Motion::DocEnd,
+            select: false,
+        });
+        c.perform(Action::Format(Command::Link));
+        c.perform(Action::LinkInput("www.x.y".into()));
+        c.perform(Action::LinkSubmit);
+        assert_eq!(c.text(), "go www.x.y");
+        // Typing after a link doesn't extend it.
+        typed(&mut c, " ok");
+        assert_eq!(c.text(), "go www.x.y ok");
+        assert_eq!(href("www.x.y"), "https://www.x.y");
+    }
+
+    #[test]
+    fn paste_reads_markdown_and_copy_writes_it() {
+        let mut c = Content::with_text("ab");
+        c.perform(Action::MoveTo {
+            at: Pos::new(0, 1),
+            select: false,
+        });
+        c.perform(Action::Paste("**x**\n- y".into()));
+        assert_eq!(c.text(), "a**x**\n- yb");
+        c.perform(Action::MoveTo {
+            at: Pos::new(0, 0),
+            select: false,
+        });
+        c.perform(Action::MoveTo {
+            at: Pos::new(1, 1),
+            select: true,
+        });
+        assert_eq!(c.selected_text().as_deref(), Some("a**x**\n- y"));
+    }
+
+    #[test]
+    fn moving_by_words_and_blocks() {
+        let mut c = Content::with_text("one, two\nthree");
+        let mv = |c: &mut Content, motion| {
+            c.perform(Action::Move {
+                motion,
+                select: false,
+            });
+            c.cursor()
+        };
+        assert_eq!(mv(&mut c, Motion::WordRight), Pos::new(0, 3));
+        assert_eq!(mv(&mut c, Motion::WordRight), Pos::new(0, 8));
+        assert_eq!(mv(&mut c, Motion::Right), Pos::new(1, 0));
+        assert_eq!(mv(&mut c, Motion::WordLeft), Pos::new(0, 8));
+        assert_eq!(mv(&mut c, Motion::WordLeft), Pos::new(0, 5));
+        c.perform(Action::SelectWord(Pos::new(1, 2)));
+        assert_eq!(c.selection(), Some((Pos::new(1, 0), Pos::new(1, 5))));
+        // Left with a selection goes to its start.
+        assert_eq!(mv(&mut c, Motion::Left), Pos::new(1, 0));
+    }
+
+    #[test]
+    fn numbering() {
+        let c = Content::with_text("1. a\n  1. b\n  2. c\n1. d\nx\n1. e");
+        assert_eq!(c.numbers(), vec![1, 1, 2, 2, 0, 1]);
     }
 }

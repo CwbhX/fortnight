@@ -43,7 +43,10 @@ impl Ready {
         if dialog.form.handle(&message, today) {
             // The dialog is drawn from its form directly.
             self.local = true;
-            return Task::none();
+            return dialog
+                .form
+                .take_focus()
+                .map_or_else(Task::none, iced::widget::operation::focus);
         }
         match (message, dialog.task) {
             (day::Message::Save, None) => {
@@ -76,6 +79,9 @@ impl Ready {
                 self.set_status(id, TaskStatus::Dropped);
             }
             (day::Message::Close, _) => self.dialog = None,
+            (day::Message::OpenLink(url), _) => {
+                return self.day_action(day::Action::OpenLink(url));
+            }
             _ => {}
         }
         Task::none()
