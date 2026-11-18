@@ -396,21 +396,27 @@ pub fn plan_is_empty(facts: &PlanFacts) -> bool {
 /// in Settings (`Settings::plan_prompt`); `DATA_RULE` and `PLAN_FORMAT` are
 /// always added, so a custom prompt can't break the reply format.
 pub const DEFAULT_PLAN_PROMPT: &str = "\
-You pick the three tasks the user should do first today (`today`), most important first, from the tasks on today's list (`on_today_list`: planned for today, or for an earlier day and carried over) and the overdue tasks (`overdue`: due on an earlier day and still not done). Be direct and practical.
+You pick up to three tasks the user should do first today (`today`), most important first, from the tasks on today's list (`on_today_list`: planned for today, or for an earlier day and carried over) and the overdue tasks (`overdue`: due on an earlier day and still not done). Be direct and practical.
 
 - Use only the facts provided. Do not invent tasks, deadlines or estimates.
 - Do no arithmetic: every date, day count and hour figure is already computed.
 - Weigh priority, deadlines and context together. Higher `priority` comes first (2 or more high, 1 medium, 0 low). An overdue task stays a candidate every day until it is done; the longer it is overdue, the more it should rise. Among tasks of the same priority, overdue tasks and the nearest deadlines come first.
 - Use the notes, project and estimate for context: a task that unblocks others or that people are waiting on comes earlier.
 - Prefer what fits in today's `capacity_hours` (the first of `remaining_working_days`).
+- Fewer than three, or none, is right when the rest are not worth doing first today: low priority with no deadline soon. Never pad the list.
 - Each reason is a few words, such as \"due Thursday\" or \"overdue 3 days\".";
 
 /// The reply format for recommended tasks, parsed by `parse_recommendations`.
 pub(super) const PLAN_FORMAT: &str = "\
 Reply with one JSON object and nothing else (no code fences, no prose):
 {\"tasks\": [{\"id\": <a task id from the facts>, \"why\": \"<a few words>\"}]}
-List at most 3 tasks, the most important first. Use only ids that appear in the facts.
+List at most 3 tasks, the most important first, or an empty list. Use only ids that appear in the facts.
 Pick only tasks whose `on_today_list` is true or that are in `overdue`: never another task. If fewer than 3 are, list only those.";
+
+/// Replaces the last line of `PLAN_FORMAT` when overdue tasks are not to
+/// be recommended (`Settings::recommend_overdue` off).
+const PLAN_NO_OVERDUE: &str = "\
+Pick only tasks whose `on_today_list` is true and that are not in `overdue`: never another task (overdue tasks are shown separately). If fewer than 3 are, list only those.";
 
 /// The recommended-tasks prompt in use: the user's, or the built-in one.
 pub fn plan_prompt(settings: &Settings) -> &str {
@@ -421,7 +427,15 @@ pub fn plan_prompt(settings: &Settings) -> &str {
 }
 
 pub(super) fn plan_system(settings: &Settings) -> String {
-    format!("{}\n\n{DATA_RULE}\n\n{PLAN_FORMAT}", plan_prompt(settings))
+    let format = if settings.recommend_overdue {
+        PLAN_FORMAT.to_string()
+    } else {
+        let (head, _) = PLAN_FORMAT
+            .rsplit_once('\n')
+            .expect("PLAN_FORMAT has several lines");
+        format!("{head}\n{PLAN_NO_OVERDUE}")
+    };
+    format!("{}\n\n{DATA_RULE}\n\n{format}", plan_prompt(settings))
 }
 
 pub fn prepare_plan(
@@ -434,7 +448,7 @@ pub fn prepare_plan(
     let facts = plan_facts(tasks, events, week, today, settings);
     let digest_json = facts_json(&facts);
     let user = format!(
-        "Pick the three tasks I should do first today, {}. This week runs from {} to {}.\n\n<facts>\n{digest_json}\n</facts>",
+        "Pick up to three tasks I should do first today, {}. This week runs from {} to {}.\n\n<facts>\n{digest_json}\n</facts>",
         long_date(facts.today),
         long_date(facts.week_start),
         long_date(facts.week_end),
@@ -1004,6 +1018,19 @@ mod tests {
             480
         );
         assert_eq!(column_load(&both, &[sat, sun], &[]).capacity_minutes, 960);
+    }
+
+    #[test]
+    fn the_overdue_rule_follows_the_setting() {
+        let mut s = Settings::default();
+        let off = plan_system(&s);
+        assert!(off.ends_with(PLAN_NO_OVERDUE));
+        s.recommend_overdue = true;
+        let on = plan_system(&s);
+        assert!(on.ends_with(
+            "or that are in `overdue`: never another task. If fewer than 3 are, list only those."
+        ));
+        assert!(on.contains("or an empty list"));
     }
 
     #[test]

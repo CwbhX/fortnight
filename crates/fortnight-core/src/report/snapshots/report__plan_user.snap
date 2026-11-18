@@ -2,7 +2,7 @@
 source: crates/fortnight-core/src/report/plan.rs
 expression: p.request.user
 ---
-Pick the three tasks I should do first today, Wednesday 2026-11-18. This week runs from Monday 2026-11-16 to Sunday 2026-11-22.
+Pick up to three tasks I should do first today, Wednesday 2026-11-18. This week runs from Monday 2026-11-16 to Sunday 2026-11-22.
 
 <facts>
 {

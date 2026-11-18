@@ -46,10 +46,13 @@ impl Ready {
                 {
                     self.reports.note_prompt_change(ReportKind::Summary, now);
                 }
-                let plan_changed = report::plan_prompt(&s) != report::plan_prompt(&self.settings)
+                // Recommend overdue tasks changes the prompt's rules too.
+                let prompt_changed = report::plan_prompt(&s) != report::plan_prompt(&self.settings)
+                    || s.recommend_overdue != self.settings.recommend_overdue;
+                let plan_changed = prompt_changed
                     || s.llm != self.settings.llm
                     || s.decision_llm != self.settings.decision_llm;
-                if report::plan_prompt(&s) != report::plan_prompt(&self.settings) {
+                if prompt_changed {
                     self.reports.note_prompt_change(ReportKind::Plan, now);
                 }
                 match self.store.save_settings(&s) {

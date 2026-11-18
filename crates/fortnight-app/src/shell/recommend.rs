@@ -112,7 +112,8 @@ impl Ready {
     /// week's Recommended tasks report that still names an open task on
     /// the Today tab's list and not overdue, or overdue with Settings'
     /// "Recommend overdue tasks" (as the tab shows them: a chat model may
-    /// not keep to that rule). Falling back to an older version keeps the last
+    /// not keep to that rule). An empty list from the model stands: it
+    /// found nothing worth doing first. Falling back to an older version keeps the last
     /// good list on screen when the newest names none of them, e.g. while
     /// a new one is worked out.
     fn recommended_today(&mut self) -> Vec<day::Recommended> {
@@ -128,8 +129,13 @@ impl Ready {
             .iter()
             .filter(|r| r.status == ReportStatus::Ready)
             .filter_map(|r| r.text().and_then(report::parse_recommendations))
-            .map(|rec| {
-                recommended(rec)
+            .find_map(|rec| {
+                // An empty list is the model's answer: nothing is worth
+                // doing first today. Not a reason to show an older list.
+                if rec.tasks.is_empty() {
+                    return Some(Vec::new());
+                }
+                let list = recommended(rec)
                     .into_iter()
                     .filter(|r| {
                         self.task(r.id).is_some_and(|t| {
@@ -140,9 +146,10 @@ impl Ready {
                             }
                         })
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                // Names none still eligible: an older version may.
+                (!list.is_empty()).then_some(list)
             })
-            .find(|list| !list.is_empty())
             .unwrap_or_default();
         self.derived.recommended_today = Some(list.clone());
         list
