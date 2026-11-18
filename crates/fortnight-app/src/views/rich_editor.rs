@@ -3,7 +3,7 @@
 //!
 //! Each block is laid out as one iced paragraph of styled spans
 //! (`Paragraph::with_spans`), indented by its level, with its list marker
-//! (`•`, `–` or its number) drawn in a gutter beside it. The caret,
+//! (`•`, `-` or its number) drawn in a gutter beside it. The caret,
 //! selection and underlines are drawn from the paragraphs' cosmic-text
 //! layout runs (iced draws no underlines for a paragraph itself), and
 //! clicks are placed with the same layout (`Buffer::hit`).
@@ -40,8 +40,18 @@ use crate::theme;
 
 /// The indentation of one level.
 const INDENT: f32 = 18.0;
-/// The width of a list item's marker column.
-const GUTTER: f32 = 24.0;
+/// The width of a list item's marker column, at least: room for the
+/// marker and a small gap (a long number gets more).
+fn gutter(list: List) -> f32 {
+    match list {
+        List::None => 0.0,
+        List::Bullet | List::Dash => 14.0,
+        List::Number => 16.0,
+    }
+}
+
+/// The space between a list marker and its text, at least.
+const MARKER_GAP: f32 = 6.0;
 
 static NEXT_CONTENT: AtomicU64 = AtomicU64::new(1);
 
@@ -144,6 +154,8 @@ impl Focus {
 struct Laid {
     paragraph: Paragraph,
     marker: Option<Paragraph>,
+    /// The width of the marker's column.
+    gutter: f32,
     /// The text's top left, from the top left of the text area.
     origin: Point,
     height: f32,
@@ -224,11 +236,17 @@ impl State {
             .zip(numbers)
             .map(|(block, number)| {
                 let indent = f32::from(block.indent) * INDENT;
-                let gutter = if block.list == List::None {
-                    0.0
-                } else {
-                    GUTTER
-                };
+                let marker = match block.list {
+                    List::None => None,
+                    List::Bullet => Some("•".to_string()),
+                    List::Dash => Some("-".to_string()),
+                    List::Number => Some(format!("{number}.")),
+                }
+                .map(|m| Paragraph::with_text(text(m.as_str(), f32::INFINITY, size)));
+                // A number's column fits the number ("10." is wider).
+                let gutter = marker
+                    .as_ref()
+                    .map_or(0.0, |m| gutter(block.list).max(m.min_width() + MARKER_GAP));
                 let runs = block.runs();
                 let spans: Vec<Span<'_, (), Font>> = runs
                     .iter()
@@ -243,17 +261,11 @@ impl State {
                     .collect();
                 let width = (width - indent - gutter).max(1.0);
                 let paragraph = Paragraph::with_spans(text(spans.as_slice(), width, size));
-                let marker = match block.list {
-                    List::None => None,
-                    List::Bullet => Some("•".to_string()),
-                    List::Dash => Some("–".to_string()),
-                    List::Number => Some(format!("{number}.")),
-                }
-                .map(|m| Paragraph::with_text(text(m.as_str(), GUTTER, size)));
                 let height = paragraph.min_bounds().height.max(line_height(size));
                 let laid = Laid {
                     paragraph,
                     marker,
+                    gutter,
                     origin: Point::new(indent + gutter, y),
                     height,
                     plain: block.plain(),
@@ -730,7 +742,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
         let muted = theme::muted_color(theme);
         for laid in &state.blocks {
             if let Some(marker) = &laid.marker {
-                let p = at(Point::new(laid.origin.x - GUTTER, laid.origin.y));
+                let p = at(Point::new(laid.origin.x - laid.gutter, laid.origin.y));
                 renderer.fill_paragraph(marker, p, muted, text_bounds);
             }
             let origin = at(laid.origin);
@@ -869,10 +881,10 @@ mod tests {
         let [bullet, plain, nested] = &state.blocks[..] else {
             panic!("three blocks");
         };
-        assert_eq!(bullet.origin, Point::new(GUTTER, 0.0));
+        assert_eq!(bullet.origin, Point::new(gutter(List::Bullet), 0.0));
         assert!(bullet.marker.is_some() && plain.marker.is_none());
         assert_eq!(plain.origin, Point::new(0.0, bullet.height));
-        assert_eq!(nested.origin.x, INDENT + GUTTER);
+        assert_eq!(nested.origin.x, INDENT + gutter(List::Dash));
         assert_eq!(
             state.total_height(),
             bullet.height + plain.height + nested.height
