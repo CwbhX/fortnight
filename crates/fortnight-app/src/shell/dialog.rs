@@ -12,9 +12,13 @@ use jiff::civil::Date;
 impl Ready {
     /// Opens the task dialog for a new task on `day` and focuses its title.
     pub(crate) fn open_new_task(&mut self, day: Date) -> Task<Message> {
+        let mut form = task_form::EditForm::blank(&self.tasks, self.settings.schedule.week_start);
+        if self.settings.due_on_added_day {
+            form.due = Some(day);
+        }
         self.dialog = Some(TaskDialog {
             day: Some(day),
-            form: task_form::EditForm::blank(&self.tasks, self.settings.schedule.week_start),
+            form,
             task: None,
         });
         operation::focus(task_form::DIALOG_TITLE_ID)

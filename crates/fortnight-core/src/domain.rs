@@ -503,6 +503,9 @@ pub struct Settings {
     pub accent: Accent,
     /// How wide the Today tab's column is. Missing in older data: standard.
     pub today_width: TodayWidth,
+    /// New tasks get a due date by default: the day they are added to
+    /// (today, from the Today tab). Missing in older data: off.
+    pub due_on_added_day: bool,
 }
 
 /// The width of the Today tab's column, picked in Settings. The app maps
@@ -612,6 +615,7 @@ impl Default for Settings {
             app_icon: AppIcon::System,
             accent: Accent::Orange,
             today_width: TodayWidth::Standard,
+            due_on_added_day: false,
         }
     }
 }
@@ -670,6 +674,7 @@ mod tests {
     fn today_width_is_standard_in_older_data_and_round_trips() {
         let old: Settings = serde_json::from_str(r#"{"accent":"teal"}"#).unwrap();
         assert_eq!(old.today_width, TodayWidth::Standard);
+        assert!(!old.due_on_added_day);
         let wide = Settings {
             today_width: TodayWidth::ExtraWide,
             ..Settings::default()

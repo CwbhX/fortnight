@@ -345,7 +345,11 @@ impl Ready {
                 }
                 Err(e) => Err(e),
             },
-            day::Action::Add(new) => {
+            day::Action::Add(mut new) => {
+                // Quick add: no due date typed, so the setting's.
+                if self.settings.due_on_added_day && new.due_on.is_none() {
+                    new.due_on = new.planned_for;
+                }
                 self.add_task(new);
                 return Task::none();
             }

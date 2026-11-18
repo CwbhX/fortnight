@@ -1111,11 +1111,11 @@ impl DayView {
         let mut head = Column::new().spacing(6).push(
             row![
                 text(data.day.strftime("%A").to_string())
-                    .size(theme::TEXT_BODY)
+                    .size(theme::TEXT_HEADING)
                     .font(theme::FONT_BOLD)
                     .style(name_style),
                 text(data.day.strftime("%-d %b").to_string())
-                    .size(theme::TEXT_SMALL)
+                    .size(theme::TEXT_BODY)
                     .style(theme::muted),
                 Space::new().width(Fill),
                 add,

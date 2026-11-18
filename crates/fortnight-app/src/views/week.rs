@@ -351,7 +351,7 @@ fn summary_card<'a>(
     let mut head = row![
         theme::disclosure(open),
         text("Weekly Summary")
-            .size(theme::TEXT_HEADING)
+            .size(theme::TEXT_BODY)
             .font(theme::FONT_BOLD)
     ]
     .spacing(theme::SPACING / 2.0)

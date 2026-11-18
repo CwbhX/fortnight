@@ -1,6 +1,7 @@
 //! Priority suggestions: while a task form is open and a decision model is
 //! set up, its title and notes are sent to the model once typing pauses,
-//! and the suggested priority is shown on the form that asked.
+//! and the suggested priority is shown on the form that asked. A new task
+//! (the dialog's) takes it as its priority unless one was picked by hand.
 
 use crate::{Message, Ready};
 use fortnight_app::top_bar::Tab;
@@ -115,7 +116,8 @@ impl Ready {
             match self.suggest.form.as_ref().map(|(form, _, _)| *form) {
                 Some(FormKey::Dialog) => {
                     if let Some(dialog) = self.dialog.as_mut() {
-                        dialog.form.suggested = priority;
+                        let new = dialog.task.is_none();
+                        dialog.form.suggest(priority, new);
                     }
                 }
                 Some(FormKey::Inline(id)) => self.day_view.set_suggested(id, priority),

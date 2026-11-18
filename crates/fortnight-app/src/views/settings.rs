@@ -8,9 +8,10 @@
 //! in the form until the saved settings change.
 //!
 //! Order, top to bottom: Appearance (Theme and Color side by side, then App
-//! icon and Width, which sets the Today column), Model, Recommendations, Week (first day, working days and work
-//! hours), Prompts (folded shut until its heading is clicked: they are
-//! long), and the Data folder last. There are no report times: the summary's
+//! icon and Width, which sets the Today column), Model, Recommendations,
+//! Week (first day, working days, work hours, and whether new tasks are due
+//! the day they're added to), Prompts (folded shut until its heading is
+//! clicked: they are long), and the Data folder last. There are no report times: the summary's
 //! background update follows the working days (`week::due_reports`).
 //! Theme and Color apply on Save, like everything else in the form.
 //!
@@ -142,6 +143,8 @@ pub enum Message {
     Accent(Accent),
     /// How wide the Today tab's column is, applied on Save.
     TodayWidth(TodayWidth),
+    /// "New tasks are due the day they're added to", applied on Save.
+    DueOnAddedDay(bool),
 }
 
 /// Which endpoint a field, button or request is for: the main LLM, or the
@@ -465,6 +468,7 @@ impl SettingsView {
             Message::AppIcon(choice) => form.app_icon = choice,
             Message::Accent(accent) => form.accent = accent,
             Message::TodayWidth(w) => form.today_width = w,
+            Message::DueOnAddedDay(on) => form.due_on_added_day = on,
             Message::WorkingDay(i, on) => {
                 if let Some(day) = form.working_days.get_mut(i) {
                     *day = on;
@@ -717,6 +721,10 @@ impl SettingsView {
                 ),
                 column![days_label, days].spacing(theme::SPACING / 2.0),
                 hours,
+                checkbox(f.due_on_added_day)
+                    .label("New tasks are due the day they're added to")
+                    .text_size(theme::TEXT_BODY)
+                    .on_toggle(Message::DueOnAddedDay),
             ]
             .spacing(theme::SPACING * 1.25),
         )

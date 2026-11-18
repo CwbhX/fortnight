@@ -72,6 +72,8 @@ pub struct EditForm {
     /// The priority the decision model suggests for a new task, shown as
     /// a faint outline on that option. Set by `main.rs`.
     pub suggested: Option<Priority>,
+    /// A priority was picked by hand: a suggestion no longer changes it.
+    pub priority_picked: bool,
     pub(super) subtasks: Vec<Subtask>,
     pub new_subtask: String,
     /// The notes without the subtasks.
@@ -99,6 +101,7 @@ impl EditForm {
             original_estimate: estimate,
             priority: priority_level(task.priority),
             suggested: None,
+            priority_picked: false,
             subtasks: subtasks.clone(),
             new_subtask: String::new(),
             notes: rich_notes::Content::with_text(&text),
@@ -218,6 +221,19 @@ impl EditForm {
         })
     }
 
+    /// The decision model suggests `priority`. For a new task (`new`) it
+    /// is applied, unless a priority was picked by hand; for an existing
+    /// one it is only shown.
+    pub fn suggest(&mut self, priority: Option<Priority>, new: bool) {
+        self.suggested = priority;
+        if new
+            && !self.priority_picked
+            && let Some(p) = priority
+        {
+            self.priority = priority_level(p);
+        }
+    }
+
     /// What should get the focus after the last edit of the notes (their
     /// link prompt, or the notes again after it), once.
     pub fn take_focus(&mut self) -> Option<&'static str> {
@@ -235,7 +251,10 @@ impl EditForm {
             Message::EditProject(s) | Message::PickProject(s) => self.project = s.clone(),
             Message::EditEstimate(s) => self.estimate = s.clone(),
             Message::EditNotes(action) => self.notes.perform(action.clone()),
-            Message::SetPriority(p) => self.priority = priority_level(*p),
+            Message::SetPriority(p) => {
+                self.priority = priority_level(*p);
+                self.priority_picked = true;
+            }
             Message::ToggleCalendar => {
                 self.calendar = match self.calendar {
                     Some(_) => None,
@@ -592,6 +611,20 @@ mod tests {
     fn with_status(mut t: Task, status: TaskStatus) -> Task {
         t.status = status;
         t
+    }
+
+    #[test]
+    fn a_suggestion_sets_a_new_tasks_priority_until_one_is_picked() {
+        let mut form = EditForm::blank(&[], Weekday::Monday);
+        form.suggest(Some(2), true);
+        assert_eq!((form.priority, form.suggested), (2, Some(2)));
+        form.handle(&Message::SetPriority(0), date(2026, 11, 18));
+        form.suggest(Some(1), true);
+        assert_eq!((form.priority, form.suggested), (0, Some(1)));
+        // An existing task's is only shown.
+        let mut form = EditForm::blank(&[], Weekday::Monday);
+        form.suggest(Some(2), false);
+        assert_eq!((form.priority, form.suggested), (0, Some(2)));
     }
 
     #[test]
