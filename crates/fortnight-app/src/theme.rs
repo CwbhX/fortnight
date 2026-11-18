@@ -80,7 +80,7 @@
 //! - [`title_with_marks`] and [`priority_marks`]: a task title with its
 //!   priority marks.
 
-use fortnight_core::domain::{Accent, Appearance, Priority};
+use fortnight_core::domain::{Accent, Appearance, Priority, TodayWidth};
 use iced::border::{self, Border};
 use iced::theme::{Palette, palette};
 use iced::widget::{
@@ -155,6 +155,27 @@ pub const TEXT_TITLE: f32 = 26.0;
 
 /// Maximum width of a view's main column, so lines stay readable.
 pub const CONTENT_WIDTH: f32 = 760.0;
+
+/// The Today column's width (`TodayWidth`'s pixels), which `main.rs`
+/// applies with [`set_today_width`]. [`CONTENT_WIDTH`] until then.
+static TODAY_WIDTH: AtomicU32 = AtomicU32::new(760);
+
+/// Use this Today width from now on (Settings' choice).
+pub fn set_today_width(width: TodayWidth) {
+    TODAY_WIDTH.store(
+        match width {
+            TodayWidth::Standard => 760,
+            TodayWidth::Wide => 980,
+            TodayWidth::ExtraWide => 1240,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Maximum width of the Today tab's column: Settings' Today width.
+pub fn today_width() -> f32 {
+    TODAY_WIDTH.load(Ordering::Relaxed) as f32
+}
 
 const LIGHT: Palette = Palette {
     background: color!(0xfcfcfb),

@@ -501,6 +501,36 @@ pub struct Settings {
     /// The accent colour of selected tabs, primary buttons, checkboxes,
     /// badges and focus rings. Missing in older data: orange.
     pub accent: Accent,
+    /// How wide the Today tab's column is. Missing in older data: standard.
+    pub today_width: TodayWidth,
+}
+
+/// The width of the Today tab's column, picked in Settings. The app maps
+/// each to pixels (`theme::today_width`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodayWidth {
+    #[default]
+    Standard,
+    Wide,
+    ExtraWide,
+}
+
+impl TodayWidth {
+    /// Every choice, in the order Settings shows them.
+    pub const ALL: [TodayWidth; 3] = [
+        TodayWidth::Standard,
+        TodayWidth::Wide,
+        TodayWidth::ExtraWide,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TodayWidth::Standard => "Standard",
+            TodayWidth::Wide => "Wide",
+            TodayWidth::ExtraWide => "Extra wide",
+        }
+    }
 }
 
 /// The app's accent colour, picked in Settings. The app maps each to its
@@ -581,6 +611,7 @@ impl Default for Settings {
             appearance: Appearance::System,
             app_icon: AppIcon::System,
             accent: Accent::Orange,
+            today_width: TodayWidth::Standard,
         }
     }
 }
@@ -633,6 +664,20 @@ mod tests {
         assert!(json.contains(r#""app_icon":"dark""#));
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.app_icon, AppIcon::Dark);
+    }
+
+    #[test]
+    fn today_width_is_standard_in_older_data_and_round_trips() {
+        let old: Settings = serde_json::from_str(r#"{"accent":"teal"}"#).unwrap();
+        assert_eq!(old.today_width, TodayWidth::Standard);
+        let wide = Settings {
+            today_width: TodayWidth::ExtraWide,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&wide).unwrap();
+        assert!(json.contains(r#""today_width":"extra_wide""#));
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.today_width, TodayWidth::ExtraWide);
     }
 
     #[test]

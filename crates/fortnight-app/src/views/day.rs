@@ -988,7 +988,7 @@ impl DayView {
                     bottom: theme::SPACING * 2.0 - gap,
                     ..iced::Padding::new(theme::SPACING * 2.0)
                 })
-                .max_width(theme::CONTENT_WIDTH),
+                .max_width(theme::today_width()),
         )
         .center_x(Fill);
         let mut layers = stack![page];
@@ -998,7 +998,7 @@ impl DayView {
         {
             let ghost = container(card_content(task, data.today, None))
                 .padding(CARD_PADDING)
-                .width(theme::CONTENT_WIDTH - theme::SPACING * 6.0)
+                .width(theme::today_width() - theme::SPACING * 6.0)
                 .style(|t: &Theme| container::Style {
                     shadow: iced::Shadow {
                         color: Color::BLACK.scale_alpha(0.35),

@@ -381,6 +381,7 @@ impl Ready {
         let store = SqliteStore::open(&datadir::db_path(&dir)).map_err(|e| e.to_string())?;
         let settings = store.load_settings().map_err(|e| e.to_string())?;
         theme::set_accent(settings.accent);
+        theme::set_today_width(settings.today_width);
         let tasks = store.list_tasks().map_err(|e| e.to_string())?;
         let events = store
             .events_between(Timestamp::MIN, Timestamp::MAX)

@@ -8,7 +8,7 @@
 //! in the form until the saved settings change.
 //!
 //! Order, top to bottom: Appearance (Theme and Color side by side, then App
-//! icon), Model, Recommendations, Week (first day, working days and work
+//! icon and Today width), Model, Recommendations, Week (first day, working days and work
 //! hours), Prompts (folded shut until its heading is clicked: they are
 //! long), and the Data folder last. There are no report times: the summary's
 //! background update follows the working days (`week::due_reports`).
@@ -55,7 +55,7 @@
 //! selectable data-folder text (iced 0.14 has no selectable text widget),
 //! and a confirmation before closing with unsaved changes.
 
-use fortnight_core::domain::{Accent, AppIcon, Appearance, LlmSettings, Settings};
+use fortnight_core::domain::{Accent, AppIcon, Appearance, LlmSettings, Settings, TodayWidth};
 use fortnight_core::ollama::{ModelKind, OllamaModel};
 use fortnight_core::parse::parse_hours;
 use fortnight_core::report::{
@@ -140,6 +140,8 @@ pub enum Message {
     AppIcon(AppIcon),
     /// A colour swatch: the accent colour, applied on Save.
     Accent(Accent),
+    /// How wide the Today tab's column is, applied on Save.
+    TodayWidth(TodayWidth),
 }
 
 /// Which endpoint a field, button or request is for: the main LLM, or the
@@ -280,6 +282,16 @@ impl fmt::Display for ThemeChoice {
             Appearance::Light => "Light",
             Appearance::Dark => "Dark",
         })
+    }
+}
+
+/// A Today width choice with a `Display` impl, for `pick_list`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WidthChoice(TodayWidth);
+
+impl fmt::Display for WidthChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0.label())
     }
 }
 
@@ -452,6 +464,7 @@ impl SettingsView {
             Message::TogglePrompts => self.prompts_open = !self.prompts_open,
             Message::AppIcon(choice) => form.app_icon = choice,
             Message::Accent(accent) => form.accent = accent,
+            Message::TodayWidth(w) => form.today_width = w,
             Message::WorkingDay(i, on) => {
                 if let Some(day) = form.working_days.get_mut(i) {
                     *day = on;
@@ -798,9 +811,25 @@ impl SettingsView {
             labelled("Color", swatches),
         ]
         .spacing(theme::SPACING * 2.0);
+        let width = pick_list(
+            TodayWidth::ALL.map(WidthChoice),
+            Some(WidthChoice(self.form.today_width)),
+            |c: WidthChoice| Message::TodayWidth(c.0),
+        )
+        .padding(theme::DROPDOWN_PADDING)
+        .handle(pick_list::Handle::None)
+        .text_size(theme::TEXT_BODY)
+        .width(180)
+        .style(picker);
+        let lower_row = row![
+            column![text("App icon").size(theme::TEXT_SMALL), theme::dropdown(icon)]
+                .spacing(theme::SPACING / 3.0),
+            labelled("Today width", theme::dropdown(width)),
+        ]
+        .spacing(theme::SPACING * 2.0);
         section(
             "Appearance",
-            column![theme_row, labelled("App icon", theme::dropdown(icon))].spacing(theme::SPACING),
+            column![theme_row, lower_row].spacing(theme::SPACING),
         )
     }
 

@@ -55,6 +55,7 @@ impl Ready {
                 match self.store.save_settings(&s) {
                     Ok(()) => {
                         theme::set_accent(s.accent);
+                        theme::set_today_width(s.today_width);
                         // A fixed endpoint is tried again at once.
                         if s.llm != self.settings.llm
                             || s.decision_llm != self.settings.decision_llm

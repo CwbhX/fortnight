@@ -43,8 +43,8 @@ use iced::{Center, Color, Element, Fill, Point, Theme, mouse};
 use jiff::civil::{Date, Weekday};
 
 /// The shortest a day column gets, so an empty week still looks like a
-/// week: room for the title bar and about seven cards.
-const MIN_COLUMN_HEIGHT: f32 = 360.0;
+/// week: room for the title bar and about eleven cards.
+const MIN_COLUMN_HEIGHT: f32 = 560.0;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -936,7 +936,8 @@ mod tests {
             (node.size().height, heights)
         };
         assert_eq!(grid(50.0), (MIN_COLUMN_HEIGHT, vec![MIN_COLUMN_HEIGHT; 2]));
-        assert_eq!(grid(500.0), (500.0, vec![500.0; 2]));
+        let tall = MIN_COLUMN_HEIGHT + 140.0;
+        assert_eq!(grid(tall), (tall, vec![tall; 2]));
     }
     use fortnight_core::domain::ReportKind;
     use jiff::civil::date;
