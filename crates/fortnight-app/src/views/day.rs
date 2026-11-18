@@ -2,13 +2,13 @@
 //!
 //! Sections, top to bottom:
 //!
-//! - **Recommended** (today and later days): the model's top three open
-//!   tasks. On today from the Tasks list (carried-over ones included) and
-//!   the overdue tasks; on a later day only from the tasks planned for it.
-//!   Most important
-//!   first, numbered (the model's reasons aren't shown). They are left out of
-//!   the sections below.
-//! - **Tasks**: open tasks whose [`Task::day`] (the planned day) is the
+//! - **Tasks**: the day's panel. At its top, under a small "Recommended"
+//!   heading and above a hairline (today and later days, while there are
+//!   any): the model's top three open tasks. On today from the Tasks list
+//!   (carried-over ones included) and the overdue tasks; on a later day
+//!   only from the tasks planned for it. Most important first, numbered
+//!   (the model's reasons aren't shown). They are left out of the rest of
+//!   the page. Then open tasks whose [`Task::day`] (the planned day) is the
 //!   shown day, then the add-a-task input. On today this also carries over
 //!   open tasks planned for an earlier day, and takes open tasks with no
 //!   planned day (as added from the CLI without a date), whose deadline has
@@ -83,8 +83,8 @@ use fortnight_core::notes::subtask_counts;
 use fortnight_core::parse;
 use fortnight_core::report::ColumnLoad;
 use iced::widget::{
-    Column, Row, Space, button, checkbox, column, container, mouse_area, pin, row, scrollable,
-    stack, text, text_input, tooltip,
+    Column, Row, Space, button, checkbox, column, container, mouse_area, pin, row, rule,
+    scrollable, stack, text, text_input, tooltip,
 };
 use iced::{Center, Color, Element, Fill, Point, Theme, border, mouse};
 use jiff::civil::{Date, Weekday};
@@ -929,27 +929,6 @@ impl DayView {
             |panel: Element<'a, Message>| container(panel).padding(iced::Padding::ZERO.bottom(gap));
         let mut content = Column::new();
 
-        let recommended = self.placement.tasks(data, Section::Recommended);
-        let picking = recommended.is_empty() && data.recommending && data.day >= data.today;
-        let head = panel_head(
-            "Recommended",
-            (!recommended.is_empty()).then_some(recommended.len()),
-            text::default,
-        );
-        let shown = !recommended.is_empty() || picking;
-        let picking_note = text("Picking the top tasks…")
-            .size(theme::TEXT_SMALL)
-            .style(theme::muted);
-        let body = column![
-            self.rows(Section::Recommended, recommended, data, true),
-            motion::fold(picking, picking_note),
-        ];
-        content = content.push(place(
-            Section::Recommended,
-            shown,
-            panel::panel(head, Some(body.into())),
-        ));
-
         content = content.push(below(self.day_panel(data)));
 
         let overdue = self.placement.tasks(data, Section::Overdue);
@@ -1120,6 +1099,8 @@ impl DayView {
         }
 
         let day_tasks = self.placement.tasks(data, Section::Day);
+        // Recommended tasks are the day's too: no "Nothing planned" then.
+        let has_recommended = !self.placement.tasks(data, Section::Recommended).is_empty();
         let quick_add = text_input("Add a task", &self.quick_add)
             .id(QUICK_ADD_ID)
             .on_input(Message::EditQuickAdd)
@@ -1134,11 +1115,52 @@ impl DayView {
         )
         .padding(iced::Padding::ZERO.bottom(theme::SPACING / 2.0));
         let body = column![
-            motion::fold(day_tasks.is_empty(), nothing).key(day_key(data.day)),
+            self.recommended_part(data),
+            motion::fold(day_tasks.is_empty() && !has_recommended, nothing).key(day_key(data.day)),
             self.sortable_rows(day_tasks, data),
             quick_add,
         ];
         panel::panel(head.into(), Some(body.into()))
+    }
+
+    /// The top of the day's panel: the model's recommended tasks under a
+    /// small heading, numbered, with a hairline between them and the rest
+    /// of the day's tasks. Unfolds when there are any (or while they are
+    /// being picked) and folds away after the last.
+    fn recommended_part<'a>(&'a self, data: &'a DayData) -> Element<'a, Message> {
+        let recommended = self.placement.tasks(data, Section::Recommended);
+        let picking = recommended.is_empty() && data.recommending && data.day >= data.today;
+        let shown = !recommended.is_empty() || picking;
+        let mut label = row![
+            text("Recommended")
+                .size(theme::TEXT_SMALL)
+                .font(theme::FONT_BOLD)
+                .style(theme::muted)
+        ]
+        .spacing(6)
+        .align_y(Center);
+        if !recommended.is_empty() {
+            label = label.push(
+                text(recommended.len().to_string())
+                    .size(theme::TEXT_SMALL)
+                    .style(theme::muted),
+            );
+        }
+        let picking_note = text("Picking the top tasks…")
+            .size(theme::TEXT_SMALL)
+            .style(theme::muted);
+        let part = column![
+            label,
+            self.rows(Section::Recommended, recommended, data, true),
+            motion::fold(picking, picking_note),
+            // The column's spacing is above it already.
+            container(rule::horizontal(1).style(divider))
+                .padding(iced::Padding::ZERO.bottom(theme::SPACING * 0.75)),
+        ]
+        .spacing(8);
+        motion::fold(shown, part)
+            .key(day_key(data.day) * 8 + Section::Recommended as u64)
+            .into()
     }
 
     /// Shows a suggested priority on the inline form of task `id`.
@@ -1375,6 +1397,16 @@ impl DayView {
             list = list.push(self.item(section, task, left, row));
         }
         list.into()
+    }
+}
+
+/// The hairline under the day panel's recommended tasks.
+fn divider(theme: &Theme) -> rule::Style {
+    rule::Style {
+        color: theme::muted_color(theme).scale_alpha(0.25),
+        radius: 0.0.into(),
+        fill_mode: rule::FillMode::Full,
+        snap: true,
     }
 }
 
