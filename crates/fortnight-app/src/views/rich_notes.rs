@@ -13,6 +13,9 @@
 //!   right after a marker removes it; `Tab` / `Shift+Tab` indent and
 //!   outdent the line.
 //!
+//! While the notes are not being edited they are shown by [`preview`]:
+//! markers hidden, underline drawn as underline.
+//!
 //! The toolbar buttons and the shortcuts (`⌘B`, `⌘I`, `⌘U`, `⌘⇧8` for
 //! bullets, `⌘⇧7` for numbers) send a [`Command`]: bold, italic and
 //! underline wrap the selection (or the word at the cursor, or start an
@@ -34,7 +37,7 @@ use iced::keyboard::{self, key::Named};
 use iced::widget::text_editor::{
     Action, Binding, Content, Cursor, Edit, KeyPress, Position, Status,
 };
-use iced::widget::{button, container, rich_text, row, span, text, tooltip};
+use iced::widget::{Column, Space, button, container, rich_text, row, span, text, tooltip};
 use iced::{Center, Element, Font, Theme};
 
 use crate::theme;
@@ -671,11 +674,18 @@ pub fn intercept(content: &mut Content, action: &Action) -> bool {
     }
 }
 
-/// The editor's keys: the formatting shortcuts and `Tab` / `Shift+Tab`,
-/// then iced's usual bindings.
-pub fn key_binding<M>(press: KeyPress, on: fn(Command) -> M) -> Option<Binding<M>> {
+/// The editor's keys: the formatting shortcuts, `Tab` / `Shift+Tab`, and
+/// `Escape`, which leaves the editor and sends `leave`; then iced's usual
+/// bindings.
+pub fn key_binding<M>(press: KeyPress, on: fn(Command) -> M, leave: M) -> Option<Binding<M>> {
     if !matches!(press.status, Status::Focused { .. }) {
         return None;
+    }
+    if press.key == keyboard::Key::Named(Named::Escape) {
+        return Some(Binding::Sequence(vec![
+            Binding::Unfocus,
+            Binding::Custom(leave),
+        ]));
     }
     let m = press.modifiers;
     let cmd = if m.command() && !m.alt() {
@@ -718,6 +728,14 @@ pub struct Look {
 
 /// The looks of a line's stretches. Unstyled text is left out.
 pub fn looks(line: &str) -> Vec<(Range<usize>, Look)> {
+    stretches(line)
+        .into_iter()
+        .filter(|(_, look)| *look != Look::default())
+        .collect()
+}
+
+/// The looks of all of a line's stretches, in order.
+fn stretches(line: &str) -> Vec<(Range<usize>, Look)> {
     let mut each = vec![Look::default(); line.len()];
     let mut start = 0;
     if let Some(it) = item(line) {
@@ -775,12 +793,22 @@ pub fn looks(line: &str) -> Vec<(Range<usize>, Look)> {
             let o = &open[k];
             let (bold, italic) = (len >= 2, len % 2 == 1);
             if len <= 3 {
-                mark(&mut each, o.at..o.at + len, |l| l.faint = true);
-                mark(&mut each, o.at + len..i, |l| {
+                // The markers take the text's face too: cosmic-text picks
+                // one face for a whole ASCII word, from its first
+                // character, so `**Yes**` is only bold if `**` is.
+                let style = |l: &mut Look| {
                     l.bold |= bold;
                     l.italic |= italic;
+                };
+                mark(&mut each, o.at..o.at + len, |l| {
+                    l.faint = true;
+                    style(l);
                 });
-                mark(&mut each, i..i + len, |l| l.faint = true);
+                mark(&mut each, o.at + len..i, style);
+                mark(&mut each, i..i + len, |l| {
+                    l.faint = true;
+                    style(l);
+                });
             }
             open.truncate(k);
         } else if can_open {
@@ -796,9 +824,7 @@ pub fn looks(line: &str) -> Vec<(Range<usize>, Look)> {
         while j < each.len() && each[j] == look {
             j += 1;
         }
-        if look != Look::default() {
-            out.push((i..j, look));
-        }
+        out.push((i..j, look));
         i = j;
     }
     out
@@ -836,9 +862,9 @@ impl Highlighter for Notes {
     }
 }
 
-/// How a [`Look`] is drawn.
-pub fn format(look: &Look, theme: &Theme) -> highlighter::Format<Font> {
-    let font = (look.bold || look.italic).then_some(Font {
+/// The face for bold and italic text (`None`: the regular face).
+fn face(look: &Look) -> Option<Font> {
+    (look.bold || look.italic).then_some(Font {
         weight: if look.bold {
             Weight::Bold
         } else {
@@ -850,7 +876,12 @@ pub fn format(look: &Look, theme: &Theme) -> highlighter::Format<Font> {
             Style::Normal
         },
         ..theme::FONT
-    });
+    })
+}
+
+/// How a [`Look`] is drawn.
+pub fn format(look: &Look, theme: &Theme) -> highlighter::Format<Font> {
+    let font = face(look);
     let color = if look.faint {
         Some(theme.palette().text.scale_alpha(0.35))
     } else if look.list {
@@ -861,6 +892,59 @@ pub fn format(look: &Look, theme: &Theme) -> highlighter::Format<Font> {
         None
     };
     highlighter::Format { color, font }
+}
+
+// ----------------------------------------------------------------- preview
+
+/// The notes drawn as they read, for when they are not being edited:
+/// markers hidden, bold, italic and underline drawn, list markers as `•`,
+/// `–` or the number with the item's text hanging beside it.
+pub fn preview<'a, M: 'a>(notes: &str) -> Element<'a, M> {
+    Column::with_children(notes.lines().map(preview_line)).into()
+}
+
+fn preview_line<'a, M: 'a>(line: &str) -> Element<'a, M> {
+    let Some(it) = item(line) else {
+        return rich_line(line, 0);
+    };
+    let mark = match it.kind {
+        Kind::Bullet => "•",
+        Kind::Dash => "–",
+        Kind::Number => line[it.indent..it.end].trim_end(),
+    };
+    let depth: f32 = line[..it.indent]
+        .chars()
+        .map(|c| if c == '\t' { 4.0 } else { 1.0 })
+        .sum();
+    row![
+        Space::new().width(depth * 9.0),
+        container(
+            text(mark.to_string())
+                .size(theme::TEXT_BODY)
+                .style(theme::muted)
+        )
+        .width(24),
+        rich_line(line, it.end),
+    ]
+    .into()
+}
+
+/// `line[start..]` as rich text, without its formatting markers.
+fn rich_line<'a, M: 'a>(line: &str, start: usize) -> Element<'a, M> {
+    let spans: Vec<_> = stretches(line)
+        .into_iter()
+        .filter(|(r, look)| r.end > start && !look.faint)
+        .map(|(r, look)| {
+            span::<(), Font>(line[r.start.max(start)..r.end].to_string())
+                .font_maybe(face(&look))
+                .underline(look.underline)
+        })
+        .collect();
+    if spans.is_empty() {
+        // A blank line keeps its height.
+        return text(" ").size(theme::TEXT_BODY).into();
+    }
+    rich_text(spans).size(theme::TEXT_BODY).into()
 }
 
 // ----------------------------------------------------------------- toolbar

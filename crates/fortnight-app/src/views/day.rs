@@ -127,6 +127,12 @@ pub enum Message {
     EditDayNotes(text_editor::Action),
     /// A formatting button or shortcut in the day's notes.
     FormatNotes(rich_notes::Command),
+    /// A click on the formatted notes: edit them.
+    OpenNotes,
+    /// `Escape` in the notes editor: show them formatted again.
+    LeaveNotes,
+    /// The pointer entered (`true`) or left the notes panel.
+    HoverNotes(bool),
     Save,
     /// Move the open task to Deleted.
     Delete,
@@ -279,6 +285,12 @@ pub struct DayView {
     notes_edited: Option<Instant>,
     /// Another day's notes left with unsaved typing: saved straight away.
     notes_left: Option<(Date, String)>,
+    /// Whether the notes are being edited (the editor shows); otherwise
+    /// they show formatted (`rich_notes::preview`).
+    notes_open: bool,
+    /// Whether the pointer is over the notes panel, so a click elsewhere
+    /// ([`DayView::pointer_down`]) can close the editor.
+    notes_hovered: bool,
     /// The add-a-task input.
     quick_add: String,
     /// A held Tasks card.
@@ -536,6 +548,7 @@ impl DayView {
             }
             self.notes = text_editor::Content::with_text(&day_notes(&data, data.day));
             self.notes_day = Some(data.day);
+            self.notes_open = false;
         } else if self.notes_edited.is_none() {
             // Unsaved typing wins over what is stored. Compared trimmed at
             // both ends, as `main.rs` saves them, so an autosave of notes
@@ -740,7 +753,22 @@ impl DayView {
                 if rich_notes::run(&mut self.notes, cmd) {
                     self.notes_edited = Some(Instant::now());
                 }
+                self.notes_open = true;
                 Action::FocusNotes
+            }
+            Message::OpenNotes => {
+                self.notes
+                    .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+                self.notes_open = true;
+                Action::FocusNotes
+            }
+            Message::LeaveNotes => {
+                self.notes_open = false;
+                Action::None
+            }
+            Message::HoverNotes(over) => {
+                self.notes_hovered = over;
+                Action::None
             }
             Message::Save => {
                 let Some(form) = self.editing.as_mut() else {
@@ -935,33 +963,76 @@ impl DayView {
         Some((self.notes_day?, self.notes.text().trim_end().to_string()))
     }
 
+    /// A mouse button went down anywhere: outside the notes panel, that
+    /// ends editing the notes (the editor has lost the focus).
+    pub fn pointer_down(&mut self) {
+        if !self.notes_hovered {
+            self.notes_open = false;
+        }
+    }
+
     /// The shown day's notes, saved as you type: "Today's Notes" on today,
-    /// "Notes" on any other day.
+    /// "Notes" on any other day. While not being edited (and not empty)
+    /// they show formatted; a click edits them.
     fn day_notes_view<'a>(&'a self, data: &'a DayData) -> Element<'a, Message> {
         let heading = if data.day == data.today {
             "Today's Notes"
         } else {
             "Notes"
         };
-        let editor = text_editor(&self.notes)
-            .id(NOTES_ID)
-            .placeholder("What's on your mind?")
-            .on_action(Message::EditDayNotes)
-            .highlight_with::<rich_notes::Notes>((), rich_notes::format)
-            .key_binding(|press| rich_notes::key_binding(press, Message::FormatNotes))
-            // Grows with the text, then scrolls.
-            .min_height(120)
-            .max_height(480)
+        let body: Element<'a, Message> = if self.notes_open || self.notes.text().trim().is_empty() {
+            text_editor(&self.notes)
+                .id(NOTES_ID)
+                .placeholder("What's on your mind?")
+                .on_action(Message::EditDayNotes)
+                .highlight_with::<rich_notes::Notes>((), rich_notes::format)
+                .key_binding(|press| {
+                    rich_notes::key_binding(press, Message::FormatNotes, Message::LeaveNotes)
+                })
+                // Grows with the text, then scrolls.
+                .min_height(120)
+                .max_height(480)
+                .padding(CARD_PADDING)
+                .size(theme::TEXT_BODY)
+                .style(theme::editor)
+                .into()
+        } else {
+            let hovered = self.notes_hovered;
+            let shown = container(row![
+                // As tall as the empty editor.
+                Space::new().height(120.0 - 2.0 * f32::from(CARD_PADDING[0])),
+                rich_notes::preview(&self.notes.text()),
+            ])
             .padding(CARD_PADDING)
-            .size(theme::TEXT_BODY)
-            .style(theme::editor);
+            .width(Fill)
+            .style(move |t: &Theme| {
+                let status = if hovered {
+                    text_editor::Status::Hovered
+                } else {
+                    text_editor::Status::Active
+                };
+                let s = theme::editor(t, status);
+                container::Style {
+                    background: Some(s.background),
+                    border: s.border,
+                    ..container::Style::default()
+                }
+            });
+            mouse_area(shown)
+                .on_press(Message::OpenNotes)
+                .interaction(mouse::Interaction::Text)
+                .into()
+        };
         let head = row![
             panel_head(heading, None, text::default),
             Space::new().width(Fill),
             rich_notes::toolbar(Message::FormatNotes),
         ]
         .align_y(Center);
-        panel::panel(head.into(), Some(editor.into()))
+        mouse_area(panel::panel(head.into(), Some(body)))
+            .on_enter(Message::HoverNotes(true))
+            .on_exit(Message::HoverNotes(false))
+            .into()
     }
 
     /// The day's panel, in the scheme of a Week column: a title bar with
@@ -2111,6 +2182,37 @@ mod tests {
             panic!("expected Update");
         };
         assert_eq!(updated.due_on, None);
+    }
+
+    /// The notes show formatted until clicked; a click elsewhere or
+    /// `Escape` shows them formatted again, a formatting button edits.
+    #[test]
+    fn notes_switch_between_formatted_and_editing() {
+        let mut data = data_for(today(), vec![]);
+        data.logs = vec![LogLine {
+            date: today(),
+            text: "**hi**".into(),
+        }];
+        let mut view = DayView::new();
+        view.load(data);
+        assert!(!view.notes_open);
+        assert!(matches!(
+            view.update(Message::OpenNotes),
+            Action::FocusNotes
+        ));
+        assert!(view.notes_open);
+        // A click inside the panel keeps the editor; outside closes it.
+        view.update(Message::HoverNotes(true));
+        view.pointer_down();
+        assert!(view.notes_open);
+        view.update(Message::HoverNotes(false));
+        view.pointer_down();
+        assert!(!view.notes_open);
+        view.update(Message::FormatNotes(rich_notes::Command::Bullets));
+        assert!(view.notes_open);
+        assert!(view.notes_pending());
+        view.update(Message::LeaveNotes);
+        assert!(!view.notes_open);
     }
 
     #[test]
