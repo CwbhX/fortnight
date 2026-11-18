@@ -14,19 +14,15 @@
 //! and replies with the same JSON a chat model would
 //! (`report::parse_recommendations`). Each task that isn't pressing
 //! (overdue, or due today or tomorrow) is also asked about as a `noul`
-//! ("should this be done today, or can it wait?"); one the model gives less than an even chance is left out, so
+//! ("should you work on this task today?"); one the model gives less than an even chance is left out, so
 //! the list can be shorter than three, or empty, instead of padded with
 //! what can wait. A deadline a week or more away is given as a date ("due
 //! 25 Dec"), not a weekday. The reasons are written here from
 //! the facts ("overdue 2 days", "high priority, due Thursday"); the model
-//! gives none. Priority counts twice: each option starts with it ("High
-//! priority; …"), and the ranking multiplies the probabilities by 1, 2 or
-//! 4 for low, medium and high (`priority_weight`). Being overdue counts
-//! too: up to twice as much the longer it is late (`overdue_weight`); so
-//! does a near deadline: up to twice for one due today
-//! (`deadline_weight`). A task that isn't overdue or high priority, due two
-//! weeks or more away, is never offered (`can_wait`): small models need
-//! the obvious spelled out.
+//! gives none. Each option starts with the task's priority ("High
+//! priority; …") and gives its deadline; the ranking then nudges the
+//! probabilities by both, gently, since the model has weighed them
+//! already (`rank_weight`: at most about 2.3x).
 //!
 //! The Settings Test button's request (`ChatRequest::test`) sends one
 //! `noul` question and replies "OK". Any other request (a weekly summary)
@@ -276,7 +272,8 @@ struct Candidate {
     description: String,
     /// The reason shown with it if picked.
     why: String,
-    /// How much its priority counts in the ranking (`priority_weight`).
+    /// How much its priority and deadline lift it in the ranking
+    /// (`rank_weight`).
     weight: f64,
     /// Overdue, or due today or tomorrow: always worth doing today, so not
     /// asked about.
@@ -285,41 +282,22 @@ struct Candidate {
 
 /// The question asked of each task that isn't pressing, as a `noul` (yes
 /// or no, answered as the probability of yes).
-const TODAY_QUESTION: &str =
-    "Should this task be done today, or can it wait for a later day? Task: ";
+const TODAY_QUESTION: &str = "Should you work on this task today? Task: ";
 
-/// Below this probability of "done today", a task is not recommended.
+/// Below this probability of "yes", a task is not recommended.
 const TODAY_THRESHOLD: f64 = 0.5;
 
-/// Deadlines this many days away or more leave a task that isn't high
-/// priority out of the recommendations, whatever the model says.
-const FAR_DEADLINE_DAYS: i32 = 14;
-
-/// A task that clearly can wait: not overdue, not high priority, and due
-/// two weeks or more from now. Never offered, so a small model can't pick
-/// it.
-fn can_wait(task: &crate::report::PlanTask) -> bool {
-    !task.overdue
-        && task.priority < 2
-        && task.days_until_due.is_some_and(|d| d >= FAR_DEADLINE_DAYS)
+/// How much a task's priority and deadline lift the model's probability
+/// in the ranking: the cube root of `priority_weight` x `urgency_weight`.
+/// The option text already gives both and the question asks the model to
+/// weigh them, so this is only a nudge on top (at most about 2.3x, high
+/// priority and four days overdue), enough to steady a small model that
+/// is unsure without overruling a confident one.
+fn rank_weight(priority: u64, days_until_due: Option<i64>) -> f64 {
+    (priority_weight(priority) * urgency_weight(days_until_due)).cbrt()
 }
 
-/// A near deadline counts in the ranking too: 2 when due today, 1.6
-/// tomorrow, 1.3 within three days, 1.1 within the week; otherwise (no
-/// deadline, further off, or overdue, which `overdue_weight` covers) 1.
-fn deadline_weight(days_until_due: Option<i64>) -> f64 {
-    match days_until_due {
-        Some(0) => 2.0,
-        Some(1) => 1.6,
-        Some(2..=3) => 1.3,
-        Some(4..=6) => 1.1,
-        _ => 1.0,
-    }
-}
-
-/// The user's priority is a strong signal: the model's probability is
-/// multiplied by 1 (low), 2 (medium) or 4 (high) before ranking, so a lower
-/// priority task needs a much likelier answer to come first.
+/// 1 (low), 2 (medium) or 4 (high).
 fn priority_weight(priority: u64) -> f64 {
     match priority {
         0 => 1.0,
@@ -328,12 +306,19 @@ fn priority_weight(priority: u64) -> f64 {
     }
 }
 
-/// An overdue task counts more the longer it is late: 1.25 at one day
-/// overdue, up to 2 at four days or more. Not overdue: 1.
-fn overdue_weight(days_until_due: Option<i64>) -> f64 {
+/// How pressing the deadline is, rising steadily as it nears and then
+/// passes: 1 with none or a week or more away, 1.1 within the week, 1.3
+/// within three days, 1.6 tomorrow, 2 today, then 0.25 more for each day
+/// overdue, up to 3 at four days late. Never lower a day later.
+fn urgency_weight(days_until_due: Option<i64>) -> f64 {
     match days_until_due {
-        Some(d) if d < 0 => 1.0 + 0.25 * (-d).min(4) as f64,
-        _ => 1.0,
+        None => 1.0,
+        Some(d) if d < 0 => 2.0 + 0.25 * (-d).min(4) as f64,
+        Some(0) => 2.0,
+        Some(1) => 1.6,
+        Some(2..=3) => 1.3,
+        Some(4..=6) => 1.1,
+        Some(_) => 1.0,
     }
 }
 
@@ -357,9 +342,6 @@ fn plan_question(user: &str, model: &str) -> Option<Ask> {
         // Only the tasks on today's list (carried-over ones too), and
         // overdue ones until done.
         if !task.on_today_list && !task.overdue {
-            continue;
-        }
-        if can_wait(task) {
             continue;
         }
         if candidates.len() < MAX_OPTIONS && candidates.iter().all(|c| c.id != task.id) {
@@ -485,7 +467,7 @@ fn candidate(task: &crate::report::PlanTask) -> Candidate {
         key: format!("t{}", task.id),
         description: parts.join("; "),
         why,
-        weight: priority_weight(priority) * overdue_weight(days) * deadline_weight(days),
+        weight: rank_weight(priority, days),
         pressing: task.overdue || days.is_some_and(|d| d <= 1),
     }
 }
@@ -727,8 +709,9 @@ mod tests {
                 "answers": { "first": {
                     "type": "choice",
                     "choice": "t1",
-                    // 0.5 (x1); overdue 4 days: 0.3 (x2 = 0.6); 0.2 (x1).
-                    "probabilities": { "t1": 0.5, "t2": 0.3, "t3": 0.2 }
+                    // 0.42 (x1); overdue 4 days: 0.38 (x 3^(1/3) = 0.55);
+                    // due Friday: 0.2 (x 1.1^(1/3) = 0.21).
+                    "probabilities": { "t1": 0.42, "t2": 0.38, "t3": 0.2 }
                 } }
             })))
             .mount(&server)
@@ -767,12 +750,20 @@ mod tests {
     }
 
     #[test]
-    fn overdue_weight_grows_then_stops() {
-        assert_eq!(overdue_weight(None), 1.0);
-        assert_eq!(overdue_weight(Some(0)), 1.0);
-        assert_eq!(overdue_weight(Some(-1)), 1.25);
-        assert_eq!(overdue_weight(Some(-4)), 2.0);
-        assert_eq!(overdue_weight(Some(-30)), 2.0);
+    fn urgency_never_drops_as_the_deadline_nears_and_passes() {
+        assert_eq!(urgency_weight(None), 1.0);
+        let by_day: Vec<f64> = (-30..=30).rev().map(|d| urgency_weight(Some(d))).collect();
+        assert!(by_day.windows(2).all(|w| w[0] <= w[1]), "{by_day:?}");
+        assert_eq!(urgency_weight(Some(14)), 1.0);
+        assert_eq!(urgency_weight(Some(0)), 2.0);
+        // A day late counts more than due today, not less.
+        assert_eq!(urgency_weight(Some(-1)), 2.25);
+        assert_eq!(urgency_weight(Some(-4)), 3.0);
+        assert_eq!(urgency_weight(Some(-30)), 3.0);
+        // The nudge stays small: under 2.3x from the lowest to the highest.
+        assert_eq!(rank_weight(0, None), 1.0);
+        let top = rank_weight(2, Some(-4));
+        assert!(top > 2.28 && top < 2.3, "{top}");
     }
 
     /// On Monday 16 Nov: a weekday alone names this week's day; a week
@@ -829,20 +820,22 @@ mod tests {
         ));
     }
 
-    /// A task due two weeks or more away is never offered unless it is high
-    /// priority (or overdue); a near deadline lifts a task in the ranking.
+    /// A far deadline is left to the model (its "today?" answer); a near
+    /// deadline or a higher priority nudges a close call, gently.
     #[tokio::test]
-    async fn far_deadlines_are_not_offered_and_near_ones_rank_higher() {
+    async fn far_deadlines_are_up_to_the_model_and_near_ones_nudge() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/systemone"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "model": "nimble",
                 "answers": {
-                    // A small model's taste: the no-deadline task a bit
-                    // likelier than the one due tomorrow.
+                    // A close call between the first three.
                     "first": { "type": "choice", "choice": "t1",
-                        "probabilities": { "t1": 0.35, "t2": 0.3, "t4": 0.35 } }
+                        "probabilities": { "t1": 0.32, "t2": 0.3, "t3": 0.08, "t4": 0.3 } },
+                    "today_t1": { "type": "noul", "noul": 0.6 },
+                    "today_t3": { "type": "noul", "noul": 0.4 },
+                    "today_t4": { "type": "noul", "noul": 0.9 }
                 }
             })))
             .mount(&server)
@@ -857,7 +850,8 @@ mod tests {
         ];
         let reply = client(&server).chat(plan_request(&tasks)).await.unwrap();
         let rec = parse_recommendations(&reply.text).unwrap();
-        // Launch: 0.35 x 4 (high); Apply: 0.3 x 1.6 (tomorrow); Sleep: 0.35.
+        // Launch: 0.3 x 4^(1/3) = 0.48; Apply: 0.3 x 1.6^(1/3) = 0.35;
+        // Sleep: 0.32. Christmas: offered, but the model says it can wait.
         assert_eq!(
             rec.tasks.iter().map(|t| t.id).collect::<Vec<_>>(),
             [4, 2, 1]
@@ -865,9 +859,19 @@ mod tests {
         let sent: Value = server.received_requests().await.unwrap()[0]
             .body_json()
             .unwrap();
-        let criteria = sent["questions"]["first"]["criteria"].as_object().unwrap();
-        assert!(!criteria.contains_key("t3"), "{sent}");
-        assert!(criteria.contains_key("t4"), "{sent}");
+        let questions = sent["questions"].as_object().unwrap();
+        assert!(questions["first"]["criteria"].get("t3").is_some(), "{sent}");
+        assert!(
+            questions["today_t3"]["instructions"]
+                .as_str()
+                .unwrap()
+                .starts_with(
+                    "Should you work on this task today? Task: Low priority; Enjoy Christmas"
+                ),
+            "{sent}"
+        );
+        // Apply is due tomorrow: never asked.
+        assert!(!questions.contains_key("today_t2"), "{sent}");
     }
 
     /// One task is no choice: only whether it is worth doing today is
