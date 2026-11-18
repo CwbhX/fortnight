@@ -745,7 +745,7 @@ impl SettingsView {
             ]
             .spacing(theme::SPACING / 3.0)
         };
-        // Folds like Today's No date section.
+        // Folds like Today's Completed section.
         let heading = button(
             row![
                 theme::disclosure(self.prompts_open),

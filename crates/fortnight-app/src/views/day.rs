@@ -10,7 +10,9 @@
 //!   the sections below.
 //! - **Tasks**: open tasks whose [`Task::day`] (the planned day) is the
 //!   shown day, then the add-a-task input. On today this also carries over
-//!   open tasks planned for an earlier day whose deadline has not passed.
+//!   open tasks planned for an earlier day, and takes open tasks with no
+//!   planned day (as added from the CLI without a date), whose deadline has
+//!   not passed.
 //! - **Overdue** (only when the shown day is today, and only if any): open
 //!   tasks whose deadline has passed.
 //! - **Notes** ("Today's Notes" on today): a free-text box for the shown
@@ -24,9 +26,6 @@
 //! - **Completed**, collapsed: done tasks whose day is the shown day (as on
 //!   the Week tab), whenever they were ticked; a done task with no day shows
 //!   on the day it was ticked.
-//! - **No date** (only if any), collapsed: open tasks with no planned day
-//!   (the inbox), except, on today, those whose deadline has passed
-//!   (Overdue).
 //! - **Deleted**, collapsed: every deleted task, newest first, each a quiet
 //!   card with Restore and Delete forever, and Delete all in the header
 //!   when open. Delete moves a task here (status `Dropped`); only Delete
@@ -37,8 +36,8 @@
 //! cards. The day's own panel is laid out like its Week column: the weekday
 //! (accent on today) and date, a `+` for the new-task dialog, and the same
 //! load bar. The collapsed sections are panels whose title bar opens them;
-//! Completed and Deleted stay even when empty, so the page doesn't jump as
-//! tasks come and go.
+//! they stay even when empty, so the page doesn't jump as tasks come and
+//! go.
 //!
 //! The date navigation lives in the top bar.
 //!
@@ -157,7 +156,6 @@ pub enum Message {
     /// for all); `update` ignores it.
     DeleteAll,
     ToggleShowDone,
-    ToggleShowNoDate,
     ToggleShowDeleted,
     /// The mouse went down on a Tasks card.
     Press(TaskId),
@@ -284,7 +282,6 @@ pub struct DayView {
     /// Where `data`'s tasks are shown, worked out in `load`.
     placement: Placement,
     show_done: bool,
-    show_no_date: bool,
     show_deleted: bool,
     /// The keyboard selection highlight.
     selected: Option<TaskId>,
@@ -353,18 +350,16 @@ enum Section {
     Day,
     Overdue,
     Done,
-    NoDate,
     Deleted,
 }
 
 impl Section {
     /// Display order of the task sections.
-    const ALL: [Section; 6] = [
+    const ALL: [Section; 5] = [
         Section::Recommended,
         Section::Day,
         Section::Overdue,
         Section::Done,
-        Section::NoDate,
         Section::Deleted,
     ];
 }
@@ -392,12 +387,14 @@ fn section_of(task: &Task, day: Date, today: Date, tz: &TimeZone) -> Option<Sect
         if task.is_overdue(today) {
             return Some(Section::Overdue);
         }
-        if task.on_today_list(today) {
+        // With no planned day it is on today's list too.
+        if task.on_today_list(today) || task.day().is_none() {
             return Some(Section::Day);
         }
     }
     match task.day() {
-        None => Some(Section::NoDate),
+        // No planned day: on today's list (above), nowhere else.
+        None => None,
         Some(d) if d == day => Some(Section::Day),
         Some(_) => None,
     }
@@ -450,7 +447,7 @@ impl Placement {
     /// Places every task. Recommended: [`recommended_tasks`], in the
     /// model's order, and left out of the other sections; the rest by
     /// [`section_of`]. Overdue: oldest deadline first, then [`open_order`].
-    /// The day: manual order (`position`). No date: [`open_order`].
+    /// The day: manual order (`position`).
     /// Completed: most recently finished first. Deleted: most recently
     /// deleted first.
     fn new(data: &DayData) -> Self {
@@ -486,7 +483,6 @@ impl Placement {
                     let (a, b) = (t(a), t(b));
                     a.position.total_cmp(&b.position).then(a.id.cmp(&b.id))
                 }),
-                Section::NoDate => list.sort_by(|a, b| open_order(t(a), t(b))),
                 Section::Done | Section::Deleted => list.sort_by(|a, b| {
                     let (a, b) = (t(a), t(b));
                     let when = |t: &Task| t.completed_at.unwrap_or(t.updated_at);
@@ -516,12 +512,11 @@ impl Placement {
 
     /// The rows the keyboard moves through, top to bottom, skipping
     /// collapsed sections and Deleted.
-    fn visible_rows(&self, data: &DayData, show_done: bool, show_no_date: bool) -> Vec<TaskId> {
+    fn visible_rows(&self, data: &DayData, show_done: bool) -> Vec<TaskId> {
         Section::ALL
             .into_iter()
             .filter(|s| match s {
                 Section::Done => show_done,
-                Section::NoDate => show_no_date,
                 Section::Deleted => false,
                 _ => true,
             })
@@ -621,7 +616,6 @@ impl DayView {
             match self.section_of_id(form.id) {
                 None | Some(Section::Deleted) => self.editing = None,
                 Some(Section::Done) => self.show_done = true,
-                Some(Section::NoDate) => self.show_no_date = true,
                 Some(_) => {}
             }
         }
@@ -889,10 +883,6 @@ impl DayView {
                 self.show_done = !self.show_done;
                 Action::None
             }
-            Message::ToggleShowNoDate => {
-                self.show_no_date = !self.show_no_date;
-                Action::None
-            }
             Message::ToggleShowDeleted => {
                 self.show_deleted = !self.show_deleted;
                 Action::None
@@ -913,10 +903,7 @@ impl DayView {
     fn visible(&self) -> Vec<TaskId> {
         self.data
             .as_ref()
-            .map(|d| {
-                self.placement
-                    .visible_rows(d, self.show_done, self.show_no_date)
-            })
+            .map(|d| self.placement.visible_rows(d, self.show_done))
             .unwrap_or_default()
     }
 
@@ -985,28 +972,17 @@ impl DayView {
                 Message::ToggleShowDone,
             ),
             (
-                Section::NoDate,
-                "No date",
-                self.show_no_date,
-                Message::ToggleShowNoDate,
-            ),
-            (
                 Section::Deleted,
                 "Deleted",
                 self.show_deleted,
                 Message::ToggleShowDeleted,
             ),
         ];
-        // Completed and Deleted are always there, even empty: a footer that
-        // comes and goes would jolt the page each time a first task lands in
-        // it or a last one leaves. No date is rare (tasks added without a
-        // day, as from the CLI), so it shows only while it has any.
+        // Always there, even empty: a footer that comes and goes would jolt
+        // the page each time a first task lands in it or a last one leaves.
         for (section, label, open, toggle) in collapsibles {
             let tasks = self.placement.tasks(data, section);
-            let shown = section != Section::NoDate || !tasks.is_empty();
-            content = content.push(place(
-                section,
-                shown,
+            content = content.push(below(
                 self.collapsible(section, label, open, toggle, tasks, data),
             ));
         }
@@ -1357,10 +1333,9 @@ impl DayView {
         .size(theme::TEXT_SMALL)
         .style(theme::muted);
         // Swaps with the last task leaving as its gap closes, like the
-        // day's "Nothing planned". (No date folds away instead.)
-        let note = empty && section != Section::NoDate;
+        // day's "Nothing planned".
         let body = column![
-            motion::fold(note, nothing).key(day_key(data.day) * 8 + section as u64),
+            motion::fold(empty, nothing).key(day_key(data.day) * 8 + section as u64),
             list,
         ];
         panel::folding_panel(head.into(), open, body.into(), section as u64)
@@ -1789,8 +1764,8 @@ mod tests {
         Placement::new(data).tasks(data, section)
     }
 
-    fn visible_rows(data: &DayData, show_done: bool, show_no_date: bool) -> Vec<TaskId> {
-        Placement::new(data).visible_rows(data, show_done, show_no_date)
+    fn visible_rows(data: &DayData, show_done: bool) -> Vec<TaskId> {
+        Placement::new(data).visible_rows(data, show_done)
     }
 
     fn ids(tasks: &[&Task]) -> Vec<TaskId> {
@@ -1978,10 +1953,10 @@ mod tests {
     fn sections_for_today() {
         let data = data_for(today(), mixed());
         assert_eq!(ids(&section_tasks(&data, Section::Overdue)), vec![4, 1]);
-        // Doing is a plain open task now. Manual order (position = id here).
-        assert_eq!(ids(&section_tasks(&data, Section::Day)), vec![2, 3, 12]);
+        // Doing is a plain open task now, and one with no planned day is on
+        // today's list. Manual order (position = id here).
+        assert_eq!(ids(&section_tasks(&data, Section::Day)), vec![2, 3, 7, 12]);
         assert_eq!(ids(&section_tasks(&data, Section::Done)), vec![5]);
-        assert_eq!(ids(&section_tasks(&data, Section::NoDate)), vec![7]);
         assert_eq!(ids(&section_tasks(&data, Section::Deleted)), vec![6]);
         for id in [8, 9, 10, 11] {
             let t = data.tasks.iter().find(|t| t.id == id).unwrap();
@@ -2022,7 +1997,10 @@ mod tests {
         assert!(section_tasks(&data, Section::Overdue).is_empty());
         assert_eq!(ids(&section_tasks(&data, Section::Day)), vec![8, 11]);
         assert_eq!(ids(&section_tasks(&data, Section::Done)), vec![9]);
-        assert_eq!(ids(&section_tasks(&data, Section::NoDate)), vec![7]);
+        // A task with no planned day is on today's list only.
+        let inbox = data.tasks.iter().find(|t| t.id == 7).unwrap();
+        assert_eq!(inbox.day(), None);
+        assert_eq!(section_of(inbox, wed, today(), &TimeZone::UTC), None);
         // Deleted shows on every day.
         assert_eq!(ids(&section_tasks(&data, Section::Deleted)), vec![6]);
     }
@@ -2051,11 +2029,9 @@ mod tests {
     fn visible_rows_skip_collapsed_sections_and_deleted() {
         let data = data_for(today(), mixed());
         // The day's tasks, then Overdue under them.
-        assert_eq!(visible_rows(&data, false, false), vec![2, 3, 12, 4, 1]);
-        let all = visible_rows(&data, true, true);
-        assert_eq!(all.len(), 7);
-        assert_eq!(all.last(), Some(&7));
-        assert!(!all.contains(&6));
+        assert_eq!(visible_rows(&data, false), vec![2, 3, 7, 12, 4, 1]);
+        // Then Completed when open; never Deleted.
+        assert_eq!(visible_rows(&data, true), vec![2, 3, 7, 12, 4, 1, 5]);
     }
 
     #[test]
@@ -2237,12 +2213,12 @@ mod tests {
         assert_eq!(updated.due_on, Some(date(2026, 11, 18)));
         assert_eq!(updated.planned_for, Some(date(2026, 11, 17)));
 
-        // An inbox task stays in the inbox with a deadline.
+        // A task with no planned day stays on today's list with a deadline.
         let mut inbox = task(2, "inbox", None);
         inbox.due_on = Some(date(2026, 11, 18));
         assert_eq!(
-            section_of(&inbox, date(2026, 11, 18), today(), &TimeZone::UTC),
-            Some(Section::NoDate)
+            section_of(&inbox, today(), today(), &TimeZone::UTC),
+            Some(Section::Day)
         );
     }
 
@@ -2280,7 +2256,7 @@ mod tests {
         }
         assert_eq!(ids(&data, Section::Recommended), [4, 2, 1]);
         assert_eq!(ids(&data, Section::Day), [3, 5]);
-        assert_eq!(visible_rows(&data, false, false), [4, 2, 1, 3, 5]);
+        assert_eq!(visible_rows(&data, false), [4, 2, 1, 3, 5]);
 
         // A past day: no recommendations. A later one shows its own (as
         // `main.rs` gives them), only those planned for it.
@@ -2330,14 +2306,14 @@ mod tests {
             section_of(&inbox, today(), today(), &TimeZone::UTC),
             Some(Section::Overdue)
         );
-        // On another day it stays in No date.
+        // Not on another day.
         assert_eq!(
             section_of(&inbox, date(2026, 11, 18), today(), &TimeZone::UTC),
-            Some(Section::NoDate)
+            None
         );
         let data = data_for(today(), vec![inbox]);
         assert_eq!(ids(&section_tasks(&data, Section::Overdue)), [1]);
-        assert!(section_tasks(&data, Section::NoDate).is_empty());
+        assert!(section_tasks(&data, Section::Day).is_empty());
     }
 
     #[test]
@@ -2577,7 +2553,6 @@ mod tests {
         let _ = view.view();
         view.load(data.clone());
         view.update(Message::ToggleShowDone);
-        view.update(Message::ToggleShowNoDate);
         view.update(Message::ToggleShowDeleted);
         for id in [1, 12, 5, 7] {
             view.update(Message::Expand(id));
