@@ -574,6 +574,7 @@ pub fn disclosure<'a>(open: bool) -> svg::Svg<'a, Theme> {
 /// A pick list with the app's chevron as its arrow: `list` is built with
 /// `pick_list::Handle::None` and [`DROPDOWN_PADDING`], and the chevron is
 /// drawn over its right end (it takes no clicks, so they reach the list).
+/// Its menu opens below it whenever it fits there ([`crate::open_below`]).
 /// iced's own arrow is a small font glyph that doesn't match the other
 /// chevrons.
 pub fn dropdown<'a, M: 'a>(list: impl Into<Element<'a, M>>) -> Element<'a, M> {
@@ -583,14 +584,13 @@ pub fn dropdown<'a, M: 'a>(list: impl Into<Element<'a, M>>) -> Element<'a, M> {
         .style(|theme: &Theme, _| svg::Style {
             color: Some(muted_color(theme)),
         });
-    stack![
+    crate::open_below::open_below(stack![
         list.into(),
         container(chevron)
             .align_right(iced::Fill)
             .center_y(iced::Fill)
             .padding(Padding::ZERO.right(12))
-    ]
-    .into()
+    ])
 }
 
 /// Padding for a pick list shown with [`dropdown`]: room at the right for

@@ -390,13 +390,15 @@ fn subtasks_view(form: &EditForm) -> Element<'_, Message> {
 /// tasks, listed when the field is clicked.
 fn project_field(form: &EditForm) -> Element<'_, Message> {
     let current = (!form.project.is_empty()).then_some(&form.project);
-    combo_box(&form.projects, &form.project, current, Message::PickProject)
-        .on_input(Message::EditProject)
-        .padding([8, 10])
-        .size(theme::TEXT_BODY)
-        .input_style(theme::input)
-        .menu_style(project_menu)
-        .into()
+    // Its list opens below the field whenever it fits there.
+    crate::open_below::open_below(
+        combo_box(&form.projects, &form.project, current, Message::PickProject)
+            .on_input(Message::EditProject)
+            .padding([8, 10])
+            .size(theme::TEXT_BODY)
+            .input_style(theme::input)
+            .menu_style(project_menu),
+    )
 }
 
 /// The project list: a raised panel like the calendar.
