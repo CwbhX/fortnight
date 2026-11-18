@@ -668,27 +668,51 @@ pub struct Cell {
     pub outside: bool,
 }
 
-/// A Month grid cell: a soft fill (weaker on weekends, none outside the
-/// month), with an accent ring on today.
+/// How strong a Month cell's fill is (a [`tint`] amount): working days
+/// stand out from weekends, a little more in light mode, where the soft
+/// card fill is faint; days outside the month have none.
+pub fn calendar_cell_tint(theme: &Theme, cell: Cell) -> f32 {
+    if cell.outside {
+        0.0
+    } else if cell.weekend {
+        0.02
+    } else if theme.extended_palette().is_dark {
+        0.04
+    } else {
+        0.065
+    }
+}
+
+/// A Month grid cell: its [`calendar_cell_tint`] fill, with an accent
+/// ring on today.
 pub fn calendar_cell(cell: Cell) -> impl Fn(&Theme) -> container::Style {
     move |theme| {
-        let fill = if cell.outside {
-            None
-        } else if cell.weekend {
-            Some(tint(theme, 0.02))
-        } else {
-            Some(soft_fill(theme))
-        };
+        let fill = (!cell.outside).then(|| tint(theme, calendar_cell_tint(theme, cell)));
         container::Style {
             background: fill.map(Background::Color),
             text_color: (cell.outside || cell.weekend).then(|| muted_color(theme)),
             border: Border {
                 radius: (RADIUS - 2.0).into(),
-                width: if cell.today { 1.5 } else { 0.0 },
+                width: if cell.today { CELL_RING } else { 0.0 },
                 color: accent_color(),
             },
             ..container::Style::default()
         }
+    }
+}
+
+/// Width of today's accent ring on a Month cell.
+pub const CELL_RING: f32 = 1.5;
+
+/// The band across the top of a Month cell holding the date and the
+/// completion badge: a shade darker than the cell, rounded at the top
+/// only (`radius`). None outside the month, where the cell has no fill.
+pub fn calendar_cell_band(cell: Cell, radius: f32) -> impl Fn(&Theme) -> container::Style {
+    move |theme| container::Style {
+        background: (!cell.outside)
+            .then(|| tint(theme, calendar_cell_tint(theme, cell) + 0.035).into()),
+        border: border::rounded(border::top(radius)),
+        ..container::Style::default()
     }
 }
 

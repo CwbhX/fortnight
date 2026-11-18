@@ -175,7 +175,7 @@ const LINE_HEIGHT: f32 = TITLE_SIZE * LINE + PILL_PAD_Y * 2.0 + LINE_GAP;
 
 /// Height of a cell that shows the date and `lines` title lines.
 fn cell_height(lines: usize) -> f32 {
-    CELL_PAD_Y * 2.0 + DATE_SIZE * LINE + DATE_GAP + lines as f32 * LINE_HEIGHT
+    CELL_PAD_Y * 3.0 + DATE_SIZE * LINE + DATE_GAP + lines as f32 * LINE_HEIGHT
 }
 
 /// How many title lines (including a "+N more" line) fit in a row of
@@ -349,7 +349,7 @@ fn day_cell<'a>(
 
     let mut cards = Column::new().spacing(LINE_GAP);
     for t in &content.titles {
-        cards = cards.push(task_pill(t, max_width));
+        cards = cards.push(task_pill(t, max_width, kind));
     }
     if content.more > 0 {
         cards = cards.push(
@@ -363,11 +363,20 @@ fn day_cell<'a>(
             .padding([PILL_PAD_Y, PILL_PAD_X]),
         );
     }
-    let col = column![top, cards].spacing(DATE_GAP);
+    // The date and badge sit in a shaded band, inset by today's ring so the
+    // ring stays visible around it.
+    let ring = if kind.today { theme::CELL_RING } else { 0.0 };
+    let band = container(top)
+        .padding([CELL_PAD_Y, CELL_PAD_X])
+        .width(Fill)
+        .style(theme::calendar_cell_band(kind, theme::RADIUS - 2.0 - ring));
+    let cards = container(cards)
+        .padding(iced::Padding::from([0.0, CELL_PAD_X]).top(CELL_PAD_Y + DATE_GAP))
+        .width(Fill);
 
     button(
-        container(col)
-            .padding([CELL_PAD_Y, CELL_PAD_X])
+        container(column![band, cards])
+            .padding(ring)
             .width(Fill)
             .height(Fill)
             .clip(true),
@@ -383,7 +392,7 @@ fn day_cell<'a>(
 /// One task as a small card, like the Week tab's: the title, then the
 /// priority `!` in its colour. Overdue is red on a red tint; done or dropped is
 /// faint and struck through on a fainter fill.
-fn task_pill<'a>(t: &TitleLine, max_width: f32) -> Element<'a, Message> {
+fn task_pill<'a>(t: &TitleLine, max_width: f32, cell: theme::Cell) -> Element<'a, Message> {
     let (done, overdue) = (t.done, t.overdue);
     let priority = if done { 0 } else { t.priority };
     // The marks keep their own measured width; the title gets the rest.
@@ -415,7 +424,10 @@ fn task_pill<'a>(t: &TitleLine, max_width: f32) -> Element<'a, Message> {
             let fill = if overdue {
                 theme::danger_color(theme).scale_alpha(0.14)
             } else {
-                theme::tint(theme, if done { 0.06 } else { 0.11 })
+                theme::tint(
+                    theme,
+                    theme::calendar_cell_tint(theme, cell) + if done { 0.02 } else { 0.07 },
+                )
             };
             container::Style {
                 background: Some(fill.into()),
@@ -506,6 +518,8 @@ fn due_dropdown<'a>(due: Vec<&Task>, today: Date) -> Element<'a, Message> {
         list = list.push(task_pill(
             &line,
             DROPDOWN_WIDTH - 20.0 - PILL_PAD_X * 2.0 + TITLE_OVERHANG,
+            // Cards in the dropdown look like a working day's.
+            theme::Cell::default(),
         ));
     }
     container(list.width(Fill))
