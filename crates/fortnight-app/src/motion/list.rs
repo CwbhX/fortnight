@@ -677,4 +677,21 @@ mod tests {
         assert!(!stage.frame(t0 + ms(3000)));
         assert_eq!(poses(&stage, &[1])[0], Pose::STILL);
     }
+
+    #[test]
+    fn an_item_arriving_in_a_folded_list_is_there_when_it_opens() {
+        let folded = |open: bool, keys: &[(u64, bool)]| -> El<'_> {
+            super::super::fold(open, items(1, keys)).into()
+        };
+        let mut stage = Stage::new(folded(false, &[(1, false)]));
+        let t0 = Instant::now();
+        stage.frame(t0);
+        stage.set(folded(false, &[(1, false), (2, false)]));
+        stage.frame(t0 + ms(1000));
+        stage.frame(t0 + ms(1000) + ENTER);
+        // Opened later: nothing left to play.
+        stage.set(folded(true, &[(1, false), (2, false)]));
+        let list = stage.tree.children[0].state.downcast_ref::<State>();
+        assert_eq!(list.pose(2), Pose::STILL);
+    }
 }

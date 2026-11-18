@@ -847,8 +847,9 @@ pub fn unfold<'a, M, T, R>(
 
 /// A folded section's body: nothing while closed, unfolding when `open`
 /// turns true and folding away again when it turns false. Give it the body
-/// either way: it is laid out but neither drawn nor sent anything while
-/// closed, and drawn shrinking away as it closes.
+/// either way: it is laid out but not drawn while closed, and sent only
+/// the frames (so its own animations run on, unseen), and drawn shrinking
+/// away as it closes.
 pub fn fold<'a, M, T, R>(open: bool, body: impl Into<Element<'a, M, T, R>>) -> Unfold<'a, M, T, R> {
     Unfold {
         hide: true,
@@ -968,7 +969,10 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Unfold<'_, M, T, R> {
         shell: &mut Shell<'_, M>,
         viewport: &Rectangle,
     ) {
-        if !self.hidden()
+        // Folded away, its content still gets the frames (and nothing
+        // else), so what moves in it (a task arriving in a closed section)
+        // gets there unseen instead of waiting to play when it opens.
+        if (!self.hidden() || frame_time(event).is_some())
             && let Some(content) = layout.children().next()
         {
             self.content.as_widget_mut().update(
