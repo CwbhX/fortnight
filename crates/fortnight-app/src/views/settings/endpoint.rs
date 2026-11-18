@@ -277,11 +277,14 @@ impl SettingsView {
         let picker_list = pick_list(Provider::ALL, Some(f.provider), move |p| {
             Message::Provider(which, p)
         })
-        .padding([8, 12])
+        .padding(theme::DROPDOWN_PADDING)
+        .handle(pick_list::Handle::None)
         .text_size(theme::TEXT_BODY)
         .width(240)
         .style(picker);
-        let mut provider = row![picker_list].spacing(theme::SPACING).align_y(Center);
+        let mut provider = row![theme::dropdown(picker_list)]
+            .spacing(theme::SPACING)
+            .align_y(Center);
         if f.provider == Provider::Ollama && is_local_ollama(&f.base_url) {
             provider = provider.push(match &self.ollama {
                 Some(Ok(_)) => text("Running").size(theme::TEXT_SMALL).style(success),
@@ -375,12 +378,14 @@ impl SettingsView {
             Message::PickModel(which, c.0.name)
         })
         .placeholder(placeholder)
-        .padding([8, 12])
+        .padding(theme::DROPDOWN_PADDING)
+        .handle(pick_list::Handle::None)
         .text_size(theme::TEXT_BODY)
         .width(Fill)
         .style(picker);
+        let list = theme::dropdown(list);
         let Some(e) = error else {
-            return list.into();
+            return list;
         };
         let retry = button(text("Retry").size(theme::TEXT_BODY))
             .padding([8, 14])

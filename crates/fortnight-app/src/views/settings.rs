@@ -765,7 +765,8 @@ impl SettingsView {
             Some(IconChoice(self.form.app_icon)),
             |c: IconChoice| Message::AppIcon(c.0),
         )
-        .padding([8, 12])
+        .padding(theme::DROPDOWN_PADDING)
+        .handle(pick_list::Handle::None)
         .text_size(theme::TEXT_BODY)
         .width(180)
         .style(picker);
@@ -779,18 +780,20 @@ impl SettingsView {
             Some(ThemeChoice(self.form.appearance)),
             |c: ThemeChoice| Message::Appearance(c.0),
         )
-        .padding([8, 12])
+        .padding(theme::DROPDOWN_PADDING)
+        .handle(pick_list::Handle::None)
         .text_size(theme::TEXT_BODY)
         .width(180)
         .style(picker);
         let theme_row = row![
-            column![text("Theme").size(theme::TEXT_SMALL), mode].spacing(theme::SPACING / 3.0),
+            column![text("Theme").size(theme::TEXT_SMALL), theme::dropdown(mode)]
+                .spacing(theme::SPACING / 3.0),
             labelled("Color", swatches),
         ]
         .spacing(theme::SPACING * 2.0);
         section(
             "Appearance",
-            column![theme_row, labelled("App icon", icon)].spacing(theme::SPACING),
+            column![theme_row, labelled("App icon", theme::dropdown(icon))].spacing(theme::SPACING),
         )
     }
 
@@ -884,14 +887,15 @@ fn input<'a>(placeholder: &str, value: &str) -> text_input::TextInput<'a, Messag
 }
 
 fn day_picker<'a>(day: Weekday, on_select: fn(Weekday) -> Message) -> Element<'a, Message> {
-    pick_list(WEEKDAYS.map(Day), Some(Day(day)), move |d: Day| {
+    let list = pick_list(WEEKDAYS.map(Day), Some(Day(day)), move |d: Day| {
         on_select(d.0)
     })
-    .padding([8, 12])
+    .padding(theme::DROPDOWN_PADDING)
+    .handle(pick_list::Handle::None)
     .text_size(theme::TEXT_BODY)
     .width(150)
-    .style(picker)
-    .into()
+    .style(picker);
+    theme::dropdown(list)
 }
 
 fn primary<'a>(label: &'a str, message: Message) -> Element<'a, Message> {

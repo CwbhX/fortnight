@@ -571,6 +571,37 @@ pub fn disclosure<'a>(open: bool) -> svg::Svg<'a, Theme> {
     .height(16)
 }
 
+/// A pick list with the app's chevron as its arrow: `list` is built with
+/// `pick_list::Handle::None` and [`DROPDOWN_PADDING`], and the chevron is
+/// drawn over its right end (it takes no clicks, so they reach the list).
+/// iced's own arrow is a small font glyph that doesn't match the other
+/// chevrons.
+pub fn dropdown<'a, M: 'a>(list: impl Into<Element<'a, M>>) -> Element<'a, M> {
+    let chevron = icon(Icon::ChevronDown)
+        .width(16)
+        .height(16)
+        .style(|theme: &Theme, _| svg::Style {
+            color: Some(muted_color(theme)),
+        });
+    stack![
+        list.into(),
+        container(chevron)
+            .align_right(iced::Fill)
+            .center_y(iced::Fill)
+            .padding(Padding::ZERO.right(12))
+    ]
+    .into()
+}
+
+/// Padding for a pick list shown with [`dropdown`]: room at the right for
+/// the chevron.
+pub const DROPDOWN_PADDING: Padding = Padding {
+    top: 8.0,
+    right: 36.0,
+    bottom: 8.0,
+    left: 12.0,
+};
+
 /// A square icon button: no fill until hovered.
 pub fn icon_button(theme: &Theme, status: button::Status) -> button::Style {
     let base = button_base(None, muted_color(theme));
