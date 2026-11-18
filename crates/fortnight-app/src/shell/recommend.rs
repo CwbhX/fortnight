@@ -110,9 +110,8 @@ impl Ready {
 
     /// Today's recommended tasks: the newest ready version of the current
     /// week's Recommended tasks report that still names an open task on
-    /// the Today tab's list or overdue (as the tab shows them: a chat model
-    /// may not keep to that rule). An overdue task stays eligible until it
-    /// is done or deleted. Falling back to an older version keeps the last
+    /// the Today tab's list and not overdue (as the tab shows them: a chat
+    /// model may not keep to that rule; overdue tasks have their own place). Falling back to an older version keeps the last
     /// good list on screen when the newest names none of them, e.g. while
     /// a new one is worked out.
     fn recommended_today(&mut self) -> Vec<day::Recommended> {
@@ -133,7 +132,7 @@ impl Ready {
                     .into_iter()
                     .filter(|r| {
                         self.task(r.id)
-                            .is_some_and(|t| t.on_today_list(today) || t.is_overdue(today))
+                            .is_some_and(|t| t.on_today_list(today) && !t.is_overdue(today))
                     })
                     .collect::<Vec<_>>()
             })

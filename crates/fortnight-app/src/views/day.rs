@@ -5,16 +5,16 @@
 //! - **Tasks**: the day's panel. At its top, under a small "Recommended"
 //!   heading and above a hairline (today and later days, while there are
 //!   any): the model's top three open tasks. On today from the Tasks list
-//!   (carried-over ones included) and the overdue tasks; on a later day
-//!   only from the tasks planned for it. Most important first, numbered
+//!   (carried-over ones included, overdue ones never); on a later day only
+//!   from the tasks planned for it. Most important first, numbered
 //!   (the model's reasons aren't shown). They are left out of the rest of
 //!   the page. Then open tasks whose [`Task::day`] (the planned day) is the
 //!   shown day, then the add-a-task input. On today this also carries over
 //!   open tasks planned for an earlier day, and takes open tasks with no
 //!   planned day (as added from the CLI without a date), whose deadline has
-//!   not passed.
-//! - **Overdue** (only when the shown day is today, and only if any): open
-//!   tasks whose deadline has passed.
+//!   not passed. At its bottom, below the input and a hairline, under a
+//!   small red "Overdue" heading (only when the shown day is today, and
+//!   only if any): open tasks whose deadline has passed.
 //! - **Notes** ("Today's Notes" on today): a free-text box for the shown
 //!   day, any day. Saved a moment after typing stops (or on moving to
 //!   another day), as one free-standing log line dated that day (replacing
@@ -417,10 +417,10 @@ fn open_order(a: &Task, b: &Task) -> Ordering {
 const MAX_RECOMMENDED: usize = 3;
 
 /// The recommended tasks shown: on today and later days (not past ones),
-/// those still on the shown day's list (its Tasks or Overdue section), at
-/// most [`MAX_RECOMMENDED`], in the model's order. `main.rs` works them out
-/// for the shown day: on today from today's list and the overdue tasks, on
-/// a later day from the tasks planned for it.
+/// those still on the shown day's list (its Tasks section; an overdue task
+/// is never recommended, it is in Overdue), at most [`MAX_RECOMMENDED`], in
+/// the model's order. `main.rs` works them out for the shown day: on today
+/// from today's list, on a later day from the tasks planned for it.
 fn recommended_tasks(data: &DayData) -> Vec<&Task> {
     if data.day < data.today {
         return Vec::new();
@@ -431,7 +431,7 @@ fn recommended_tasks(data: &DayData) -> Vec<&Task> {
         .filter(|t| {
             matches!(
                 section_of(t, data.day, data.today, &data.tz),
-                Some(Section::Day | Section::Overdue)
+                Some(Section::Day)
             )
         })
         .take(MAX_RECOMMENDED)
@@ -928,35 +928,13 @@ impl DayView {
         let Some(data) = &self.data else {
             return text("Loading…").style(theme::muted).into();
         };
-        // Each section has its place whether it shows or not, so it can
-        // unfold when it gets its first task and fold away after its last.
-        // The gap under a panel is inside its place, to fold away with it.
+        // The gap under each panel.
         let gap = theme::SPACING * 1.5;
-        let key = day_key(data.day) * 8;
-        let place = |section: Section, shown: bool, panel: Element<'a, Message>| {
-            // Its last task fades away before it folds.
-            motion::fold(
-                shown,
-                container(panel).padding(iced::Padding::ZERO.bottom(gap)),
-            )
-            .close_after(motion::FADED)
-            .key(key + section as u64)
-        };
         let below =
             |panel: Element<'a, Message>| container(panel).padding(iced::Padding::ZERO.bottom(gap));
         let mut content = Column::new();
 
         content = content.push(below(self.day_panel(data)));
-
-        let overdue = self.placement.tasks(data, Section::Overdue);
-        let shown = !overdue.is_empty();
-        let head = panel_head("Overdue", shown.then_some(overdue.len()), theme::danger);
-        let body = self.rows(Section::Overdue, overdue, data, false);
-        content = content.push(place(
-            Section::Overdue,
-            shown,
-            panel::panel(head, Some(body)),
-        ));
 
         content = content.push(below(self.day_notes_view(data)));
 
@@ -1148,6 +1126,7 @@ impl DayView {
             motion::fold(day_tasks.is_empty() && !has_recommended, nothing).key(day_key(data.day)),
             self.sortable_rows(day_tasks, data),
             quick_add,
+            self.overdue_part(data),
         ];
         panel::panel(head.into(), Some(body.into()))
     }
@@ -1191,6 +1170,41 @@ impl DayView {
         motion::fold(shown, part)
             .close_after(motion::FADED)
             .key(day_key(data.day) * 8 + Section::Recommended as u64)
+            .into()
+    }
+
+    /// The bottom of the day's panel (today only): the overdue tasks under
+    /// a small red heading, below a hairline. Unfolds when there are any
+    /// and folds away after the last.
+    fn overdue_part<'a>(&'a self, data: &'a DayData) -> Element<'a, Message> {
+        let overdue = self.placement.tasks(data, Section::Overdue);
+        let shown = !overdue.is_empty();
+        let mut label = row![
+            text("Overdue")
+                .size(theme::TEXT_SMALL)
+                .font(theme::FONT_BOLD)
+                .style(theme::danger)
+        ]
+        .spacing(6)
+        .align_y(Center);
+        if shown {
+            label = label.push(
+                text(overdue.len().to_string())
+                    .size(theme::TEXT_SMALL)
+                    .style(theme::muted),
+            );
+        }
+        let part = column![
+            container(rule::horizontal(1).style(divider))
+                .padding(iced::Padding::ZERO.top(theme::SPACING)),
+            label,
+            self.rows(Section::Overdue, overdue, data, false),
+        ]
+        .spacing(8);
+        // Its last task fades away before it folds.
+        motion::fold(shown, part)
+            .close_after(motion::FADED)
+            .key(day_key(data.day) * 8 + Section::Overdue as u64)
             .into()
     }
 
@@ -2357,12 +2371,13 @@ mod tests {
             .collect();
         assert_eq!(ids(&section_tasks(&data, Section::Recommended)), [2, 4]);
         assert_eq!(ids(&section_tasks(&data, Section::Done)), [1]);
-        // Today: an overdue inbox task can be recommended.
+        // Today: an overdue task is never recommended; it stays in Overdue.
         let mut inbox = task(5, "inbox", None);
         inbox.due_on = Some(date(2026, 11, 13));
         let mut data = data_for(today(), vec![inbox, task(6, "other day", Some(tue))]);
         data.recommended = vec![Recommended { id: 6 }, Recommended { id: 5 }];
-        assert_eq!(ids(&section_tasks(&data, Section::Recommended)), [5]);
+        assert!(section_tasks(&data, Section::Recommended).is_empty());
+        assert_eq!(ids(&section_tasks(&data, Section::Overdue)), [5]);
     }
 
     #[test]
