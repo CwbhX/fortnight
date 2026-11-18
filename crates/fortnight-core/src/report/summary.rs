@@ -526,7 +526,7 @@ pub fn summary_facts_markdown(facts: &SummaryFacts) -> String {
 
     section(&mut md, "Log", facts.log_lines.len(), "No other log lines.");
     for l in &facts.log_lines {
-        let _ = writeln!(md, "- {}: {}", short_date(l.date), l.text);
+        let _ = writeln!(md, "- {}: {}", short_date(l.date), indent_rest(&l.text, 2));
     }
 
     if !facts.completed_by_project.is_empty() {
@@ -817,6 +817,24 @@ mod tests {
         let mut d = task(1, "Done");
         d.status = TaskStatus::Done;
         assert!(summary_of(&[d], &events).progressed.is_empty());
+    }
+
+    /// A day's notes keep their lines and formatting, with `•` bullets as
+    /// Markdown dashes, and are not cut at a task's notes length.
+    #[test]
+    fn day_notes_reach_the_facts_as_markdown() {
+        let long = "x".repeat(NOTES_MAX_CHARS * 2);
+        let notes = format!("**Standup** ran long\n• one\n  • nested\n1. first\n{long}");
+        let events = vec![log(1, None, "2026-11-10T10:00:00Z", &notes)];
+        let f = summary_of(&[], &events);
+        assert_eq!(
+            f.log_lines[0].text,
+            format!("**Standup** ran long\n- one\n  - nested\n1. first\n{long}")
+        );
+        let md = summary_facts_markdown(&f);
+        assert!(
+            md.contains("- Tue 10 Nov: **Standup** ran long\n  - one\n    - nested\n  1. first\n")
+        );
     }
 
     #[test]

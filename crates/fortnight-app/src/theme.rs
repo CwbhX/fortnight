@@ -524,6 +524,9 @@ pub enum Icon {
     Copy,
     Check,
     Trash,
+    ListBullet,
+    ListDash,
+    ListNumber,
 }
 
 impl Icon {
@@ -541,6 +544,9 @@ impl Icon {
             Icon::Copy => include_bytes!("../../../assets/icons/copy.svg"),
             Icon::Check => include_bytes!("../../../assets/icons/check.svg"),
             Icon::Trash => include_bytes!("../../../assets/icons/trash.svg"),
+            Icon::ListBullet => include_bytes!("../../../assets/icons/list-bullet.svg"),
+            Icon::ListDash => include_bytes!("../../../assets/icons/list-dash.svg"),
+            Icon::ListNumber => include_bytes!("../../../assets/icons/list-number.svg"),
         }
     }
 }

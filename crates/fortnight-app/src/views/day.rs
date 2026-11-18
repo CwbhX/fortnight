@@ -17,7 +17,10 @@
 //!   day, any day. Saved a moment after typing stops (or on moving to
 //!   another day), as one free-standing log line dated that day (replacing
 //!   its others), so it reaches the weekly summary as `log_lines`. Older
-//!   side work lines show up as lines of the notes.
+//!   side work lines show up as lines of the notes. Basic formatting
+//!   (bold, italic, underline, bullet / dash / numbered lists) is kept as
+//!   Markdown in the text, with a toolbar in the title bar and shortcuts
+//!   (`rich_notes`).
 //! - **Completed**, collapsed: done tasks whose day is the shown day (as on
 //!   the Week tab), whenever they were ticked; a done task with no day shows
 //!   on the day it was ticked.
@@ -79,11 +82,15 @@ use jiff::tz::TimeZone;
 
 use super::NavKey;
 use super::panel::{self, load_line, load_view};
+use super::rich_notes;
 use super::task_form::{EditForm, field, form_fields, open_form};
 use crate::theme;
 
 /// The id of the add-a-task input, for `operation::focus`.
 pub const QUICK_ADD_ID: &str = "quick-add";
+
+/// The id of the day's notes editor, for `operation::focus`.
+pub const NOTES_ID: &str = "day-notes";
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -118,6 +125,8 @@ pub enum Message {
     /// Typing in Today's Notes. Saved by `main.rs` once typing pauses
     /// ([`DayView::notes_to_save`]).
     EditDayNotes(text_editor::Action),
+    /// A formatting button or shortcut in the day's notes.
+    FormatNotes(rich_notes::Command),
     Save,
     /// Move the open task to Deleted.
     Delete,
@@ -206,6 +215,8 @@ pub enum Action {
     Reorder(Vec<(TaskId, f64)>),
     /// Open the new-task dialog for this day.
     NewTask(Date),
+    /// Give the day's notes the keyboard focus (after a toolbar click).
+    FocusNotes,
 }
 
 /// A task the model recommends doing on the shown day.
@@ -717,11 +728,19 @@ impl DayView {
             }
             Message::EditDayNotes(action) => {
                 let edit = action.is_edit();
-                self.notes.perform(action);
+                if !rich_notes::intercept(&mut self.notes, &action) {
+                    self.notes.perform(action);
+                }
                 if edit {
                     self.notes_edited = Some(Instant::now());
                 }
                 Action::None
+            }
+            Message::FormatNotes(cmd) => {
+                if rich_notes::run(&mut self.notes, cmd) {
+                    self.notes_edited = Some(Instant::now());
+                }
+                Action::FocusNotes
             }
             Message::Save => {
                 let Some(form) = self.editing.as_mut() else {
@@ -925,18 +944,24 @@ impl DayView {
             "Notes"
         };
         let editor = text_editor(&self.notes)
+            .id(NOTES_ID)
             .placeholder("What's on your mind?")
             .on_action(Message::EditDayNotes)
+            .highlight_with::<rich_notes::Notes>((), rich_notes::format)
+            .key_binding(|press| rich_notes::key_binding(press, Message::FormatNotes))
             // Grows with the text, then scrolls.
             .min_height(120)
             .max_height(480)
             .padding(CARD_PADDING)
             .size(theme::TEXT_BODY)
             .style(theme::editor);
-        panel::panel(
+        let head = row![
             panel_head(heading, None, text::default),
-            Some(editor.into()),
-        )
+            Space::new().width(Fill),
+            rich_notes::toolbar(Message::FormatNotes),
+        ]
+        .align_y(Center);
+        panel::panel(head.into(), Some(editor.into()))
     }
 
     /// The day's panel, in the scheme of a Week column: a title bar with

@@ -6,9 +6,12 @@ use jiff::civil::{Date, Weekday};
 use serde::{Deserialize, Deserializer};
 use std::fmt::Write as _;
 
-/// Notes and log lines longer than this (in characters) are cut and end
-/// in "…".
+/// Task notes longer than this (in characters) are cut and end in "…".
 pub(super) const NOTES_MAX_CHARS: usize = 280;
+
+/// The same for log lines. A day's notes are one log line, so they get
+/// more room than a task's notes.
+pub(super) const LOG_MAX_CHARS: usize = 2000;
 
 /// Minutes as hours, rounded to one decimal (90 → 1.5).
 pub(super) fn hours(minutes: u32) -> f64 {
@@ -137,17 +140,38 @@ pub(super) fn clean_title(title: &str) -> String {
 }
 
 pub(super) fn trim_notes(notes: &str) -> String {
-    let notes = notes.trim();
-    if notes.chars().count() <= NOTES_MAX_CHARS {
-        return notes.to_string();
+    cut_text(notes, NOTES_MAX_CHARS)
+}
+
+/// A log line for the facts: its Markdown kept line by line
+/// ([`crate::notes::to_markdown`]), cut at [`LOG_MAX_CHARS`].
+pub(super) fn log_text(text: &str) -> String {
+    cut_text(&crate::notes::to_markdown(text), LOG_MAX_CHARS)
+}
+
+fn cut_text(text: &str, max: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max {
+        return text.to_string();
     }
-    let cut: String = notes.chars().take(NOTES_MAX_CHARS).collect();
+    let cut: String = text.chars().take(max).collect();
     format!("{}…", cut.trim_end())
+}
+
+/// Lines after the first indented by `spaces`, so a several-line log
+/// line stays inside its Markdown bullet.
+pub(super) fn indent_rest(text: &str, spaces: usize) -> String {
+    text.replace('\n', &format!("\n{}", " ".repeat(spaces)))
 }
 
 pub(super) fn log_bullets(md: &mut String, logs: &[LogEntry]) {
     for l in logs {
-        let _ = writeln!(md, "  - {}: {}", short_date(l.date), l.text);
+        let _ = writeln!(
+            md,
+            "  - {}: {}",
+            short_date(l.date),
+            indent_rest(&l.text, 4)
+        );
     }
 }
 

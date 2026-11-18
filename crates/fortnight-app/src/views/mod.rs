@@ -6,6 +6,7 @@ pub mod day;
 pub mod month;
 pub mod panel;
 pub mod report_panel;
+pub mod rich_notes;
 pub mod settings;
 pub mod task_form;
 pub mod unlock;

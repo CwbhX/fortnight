@@ -292,6 +292,7 @@ impl Ready {
             }
             day::Action::Reorder(positions) => self.store.set_positions(&positions),
             day::Action::NewTask(day) => return self.open_new_task(day),
+            day::Action::FocusNotes => return iced::widget::operation::focus(day::NOTES_ID),
         };
         if let Err(e) = result {
             self.error = Some(e.to_string());

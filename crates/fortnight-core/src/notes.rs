@@ -5,6 +5,10 @@
 //! subtasks; every other line is free text. The task form edits the two
 //! parts separately and writes them back with [`join_notes`]: the text, a
 //! blank line, then the checklist.
+//!
+//! A day's notes (the Today tab's notes box) are Markdown typed by hand:
+//! `**bold**`, `*italic*`, `<u>underline</u>`, and lists marked `• `,
+//! `- ` or `1. `. [`to_markdown`] tidies them for the model.
 
 /// A checklist item kept in the notes as `- [ ] text` or `- [x] text`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +69,31 @@ pub fn subtask_counts(notes: &str) -> (usize, usize) {
         .fold((0, 0), |(d, t), s| (d + usize::from(s.done), t + 1))
 }
 
+/// Notes as Markdown for the model: each line keeps its indentation (so
+/// lists and nested lists survive), `• ` bullets become `- `, runs of
+/// spaces within a line shrink to one, and runs of blank lines to one.
+/// Trimmed.
+pub fn to_markdown(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() && out.last().is_none_or(|l| l.is_empty()) {
+            continue;
+        }
+        let body = line.trim_start();
+        let indent = &line[..line.len() - body.len()];
+        let body = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        out.push(match body.strip_prefix("• ") {
+            Some(rest) => format!("{indent}- {rest}"),
+            None => format!("{indent}{body}"),
+        });
+    }
+    while out.last().is_some_and(|l| l.is_empty()) {
+        out.pop();
+    }
+    out.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,5 +132,16 @@ mod tests {
         let notes = "intro\n\n- [ ] a\n- [x] b";
         let (subs, text) = split_notes(notes);
         assert_eq!(join_notes(&subs, &text), notes);
+    }
+
+    #[test]
+    fn markdown_keeps_lines_and_turns_bullets_into_dashes() {
+        let notes =
+            "\n**Standup**  ran long  \n\n\n• one\n  • nested\n- dash\n1. first\n•not a bullet\n\n";
+        assert_eq!(
+            to_markdown(notes),
+            "**Standup** ran long\n\n- one\n  - nested\n- dash\n1. first\n•not a bullet"
+        );
+        assert_eq!(to_markdown("  \n \n"), "");
     }
 }

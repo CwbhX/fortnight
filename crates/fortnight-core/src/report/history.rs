@@ -73,7 +73,7 @@ impl LocalWeek<'_> {
     }
 
     pub(super) fn log_entry(&self, e: &Event) -> Option<LogEntry> {
-        let text = trim_notes(&clean_title(e.log_text()?));
+        let text = log_text(e.log_text()?);
         if text.is_empty() {
             return None;
         }
