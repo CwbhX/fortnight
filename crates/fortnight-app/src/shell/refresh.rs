@@ -55,6 +55,9 @@ impl Ready {
             Tab::Today => {
                 let (recommended, recommending) = self.day_recommendations(today);
                 let logs = self.logs();
+                let day_loads =
+                    report::day_loads(&self.tasks, self.week_of(self.selected), &self.settings);
+                let load = report::column_load(&self.tasks, &[self.selected], &day_loads);
                 self.day_view.load(DayData {
                     day: self.selected,
                     today,
@@ -64,6 +67,7 @@ impl Ready {
                     recommended,
                     recommending,
                     logs,
+                    load: Some(load),
                 });
             }
             Tab::Week => {

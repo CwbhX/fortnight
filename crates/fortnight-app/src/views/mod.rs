@@ -4,6 +4,7 @@
 
 pub mod day;
 pub mod month;
+pub mod panel;
 pub mod report_panel;
 pub mod settings;
 pub mod task_form;

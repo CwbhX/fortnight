@@ -28,7 +28,11 @@
 //!   when open. Delete moves a task here (status `Dropped`); only Delete
 //!   forever (or Delete all) removes it.
 //!
-//! Section titles show the count only (no estimate totals).
+//! Each section is a panel in the Week tab's scheme (`panel`): a tinted
+//! title bar with the name in bold and the count muted, over Week-style
+//! cards. The day's own panel is laid out like its Week column: the weekday
+//! (accent on today) and date, a `+` for the new-task dialog, and the same
+//! load bar. The collapsed sections are panels whose title bar opens them.
 //!
 //! The date navigation lives in the top bar.
 //!
@@ -64,15 +68,17 @@ use std::time::{Duration, Instant};
 use fortnight_core::domain::{NewTask, Priority, Task, TaskId, TaskStatus};
 use fortnight_core::notes::subtask_counts;
 use fortnight_core::parse;
+use fortnight_core::report::ColumnLoad;
 use iced::widget::{
     Column, Row, Space, button, checkbox, column, container, mouse_area, pin, row, scrollable,
-    stack, text, text_editor, text_input,
+    stack, text, text_editor, text_input, tooltip,
 };
 use iced::{Center, Color, Element, Fill, Point, Theme, border, mouse};
 use jiff::civil::{Date, Weekday};
 use jiff::tz::TimeZone;
 
 use super::NavKey;
+use super::panel::{self, load_line, load_view};
 use super::task_form::{EditForm, field, form_fields, open_form};
 use crate::theme;
 
@@ -104,6 +110,8 @@ pub enum Message {
     RemoveSubtask(usize),
     EditNewSubtask(String),
     AddSubtask,
+    /// The `+` in the day's title bar: the new-task dialog for the day.
+    AddTask,
     /// The add-a-task input under the day's tasks.
     EditQuickAdd(String),
     SubmitQuickAdd,
@@ -196,6 +204,8 @@ pub enum Action {
     Add(NewTask),
     /// The Tasks section was rearranged: set each task's position.
     Reorder(Vec<(TaskId, f64)>),
+    /// Open the new-task dialog for this day.
+    NewTask(Date),
 }
 
 /// A task the model recommends doing on the shown day.
@@ -233,6 +243,9 @@ pub struct DayData {
     pub recommending: bool,
     /// Every free-standing log line, oldest first.
     pub logs: Vec<LogLine>,
+    /// The shown day's load, as its Week column's bar shows it (`None`:
+    /// no bar).
+    pub load: Option<ColumnLoad>,
 }
 
 #[derive(Debug, Default)]
@@ -676,6 +689,7 @@ impl DayView {
                 _ => Action::None,
             },
             Message::Remove(id) => Action::SetStatus(id, TaskStatus::Dropped),
+            Message::AddTask => Action::NewTask(data.day),
             Message::Expand(id) => {
                 // The card is replaced by the form (or back) with no exit event.
                 self.hovered = None;
@@ -791,45 +805,26 @@ impl DayView {
         let Some(data) = &self.data else {
             return text("Loading…").style(theme::muted).into();
         };
-        let mut content = Column::new().spacing(theme::SPACING * 2.0);
+        let mut content = Column::new().spacing(theme::SPACING * 1.5);
 
         let recommended = self.placement.tasks(data, Section::Recommended);
         if !recommended.is_empty() {
-            let heading = section_title(&recommended, "Recommended Task", text::default);
-            content = content.push(self.group(heading, recommended, data, true));
+            let head = panel_head("Recommended", Some(recommended.len()), text::default);
+            content = content.push(panel::panel(head, Some(self.rows(recommended, data, true))));
         } else if data.recommending && data.day >= data.today {
-            content = content.push(
-                column![
-                    text("Recommended Tasks").size(theme::TEXT_HEADING),
-                    text("Picking the top tasks…")
-                        .size(theme::TEXT_BODY)
-                        .style(theme::muted),
-                ]
-                .spacing(theme::SPACING / 2.0),
-            );
+            let head = panel_head("Recommended", None, text::default);
+            let body = text("Picking the top tasks…")
+                .size(theme::TEXT_SMALL)
+                .style(theme::muted);
+            content = content.push(panel::panel(head, Some(body.into())));
         }
 
-        // The day's tasks, then the add-a-task input as the last card.
-        let day_tasks = self.placement.tasks(data, Section::Day);
-        let quick_add = text_input("Add a task", &self.quick_add)
-            .id(QUICK_ADD_ID)
-            .on_input(Message::EditQuickAdd)
-            .on_submit(Message::SubmitQuickAdd)
-            .padding([11, 14])
-            .size(theme::TEXT_BODY)
-            .style(theme::input);
-        let heading = section_title(&day_tasks, "Task", text::default);
-        let day_group = if day_tasks.is_empty() {
-            column![heading]
-        } else {
-            column![heading, self.sortable_rows(day_tasks, data)]
-        };
-        content = content.push(day_group.push(quick_add).spacing(theme::SPACING / 2.0));
+        content = content.push(self.day_panel(data));
 
         let overdue = self.placement.tasks(data, Section::Overdue);
         if !overdue.is_empty() {
-            let heading = section_title(&overdue, "Overdue Task", theme::danger);
-            content = content.push(self.group(heading, overdue, data, false));
+            let head = panel_head("Overdue", Some(overdue.len()), theme::danger);
+            content = content.push(panel::panel(head, Some(self.rows(overdue, data, false))));
         }
 
         content = content.push(self.day_notes_view(data));
@@ -873,8 +868,8 @@ impl DayView {
             && let Some(task) = data.tasks.iter().find(|t| t.id == drag.id)
         {
             let ghost = container(card_content(task, data.today, None))
-                .padding([11, 14])
-                .width(theme::CONTENT_WIDTH - theme::SPACING * 4.0)
+                .padding(CARD_PADDING)
+                .width(theme::CONTENT_WIDTH - theme::SPACING * 6.0)
                 .style(|t: &Theme| container::Style {
                     shadow: iced::Shadow {
                         color: Color::BLACK.scale_alpha(0.35),
@@ -935,12 +930,72 @@ impl DayView {
             // Grows with the text, then scrolls.
             .min_height(120)
             .max_height(480)
-            .padding([11, 14])
+            .padding(CARD_PADDING)
             .size(theme::TEXT_BODY)
             .style(theme::editor);
-        column![text(heading).size(theme::TEXT_HEADING), editor]
-            .spacing(theme::SPACING / 2.0)
+        panel::panel(
+            panel_head(heading, None, text::default),
+            Some(editor.into()),
+        )
+    }
+
+    /// The day's panel, in the scheme of a Week column: a title bar with
+    /// the weekday (accent on today), the date, the `+` and the load bar;
+    /// under it the day's cards (or "Nothing planned") and the add-a-task
+    /// input.
+    fn day_panel<'a>(&'a self, data: &'a DayData) -> Element<'a, Message> {
+        let name_style: fn(&Theme) -> text::Style = if data.day == data.today {
+            theme::accent
+        } else {
+            text::default
+        };
+        let add = tooltip(
+            button(theme::icon(theme::Icon::Plus))
+                .padding(2)
+                .style(theme::icon_button)
+                .on_press(Message::AddTask),
+            theme::tip("Add a task"),
+            tooltip::Position::Bottom,
+        );
+        let mut head = Column::new().spacing(6).push(
+            row![
+                text(data.day.strftime("%A").to_string())
+                    .size(theme::TEXT_BODY)
+                    .font(theme::FONT_BOLD)
+                    .style(name_style),
+                text(data.day.strftime("%-d %b").to_string())
+                    .size(theme::TEXT_SMALL)
+                    .style(theme::muted),
+                Space::new().width(Fill),
+                add,
+            ]
+            .spacing(6)
+            .align_y(Center),
+        );
+        if let Some(load) = &data.load {
+            head = head.push(load_view(&load_line(load)));
+        }
+
+        let day_tasks = self.placement.tasks(data, Section::Day);
+        let quick_add = text_input("Add a task", &self.quick_add)
+            .id(QUICK_ADD_ID)
+            .on_input(Message::EditQuickAdd)
+            .on_submit(Message::SubmitQuickAdd)
+            .padding(CARD_PADDING)
+            .size(theme::TEXT_BODY)
+            .style(theme::input);
+        let list: Element<'a, Message> = if day_tasks.is_empty() {
+            container(
+                text("Nothing planned")
+                    .size(theme::TEXT_SMALL)
+                    .style(theme::muted),
+            )
+            .padding(iced::Padding::ZERO.bottom(theme::SPACING / 2.0))
             .into()
+        } else {
+            self.sortable_rows(day_tasks, data)
+        };
+        panel::panel(head.into(), Some(column![list, quick_add].into()))
     }
 
     /// Shows a suggested priority on the inline form of task `id`.
@@ -975,7 +1030,7 @@ impl DayView {
             let held = dragging.is_some_and(|d| d.id == id);
             let line = !held && over == Some(Spot::Before(id));
             let card = container(card_content(task, data.today, None))
-                .padding([11, 14])
+                .padding(CARD_PADDING)
                 .width(Fill)
                 .style(card_box(
                     held || (dragging.is_none() && self.hovered == Some(id)),
@@ -1008,18 +1063,8 @@ impl DayView {
         list.push(end).into()
     }
 
-    fn group<'a>(
-        &'a self,
-        heading: Element<'a, Message>,
-        tasks: Vec<&'a Task>,
-        data: &'a DayData,
-        ranked: bool,
-    ) -> Element<'a, Message> {
-        column![heading, self.rows(tasks, data, ranked)]
-            .spacing(theme::SPACING / 2.0)
-            .into()
-    }
-
+    /// A collapsed section: a panel whose title bar opens it (arrow, name,
+    /// count), with Delete all at the right of Deleted's when open.
     fn collapsible<'a>(
         &'a self,
         section: Section,
@@ -1030,32 +1075,38 @@ impl DayView {
         data: &'a DayData,
     ) -> Element<'a, Message> {
         let arrow = if open { "▾" } else { "▸" };
-        let toggle =
-            button(text(format!("{arrow}  {label}  {}", tasks.len())).size(theme::TEXT_SMALL))
-                .padding([4, 0])
-                .style(theme::text_button)
-                .on_press(toggle);
-        let mut header = row![toggle].align_y(Center);
+        let toggle = button(
+            row![
+                text(arrow).size(theme::TEXT_SMALL),
+                text(label).size(theme::TEXT_BODY).font(theme::FONT_BOLD),
+                text(tasks.len().to_string()).size(theme::TEXT_SMALL),
+            ]
+            .spacing(8)
+            .align_y(Center),
+        )
+        .padding(0)
+        .width(Fill)
+        .style(theme::text_button)
+        .on_press(toggle);
+        let mut head = row![toggle].align_y(Center);
         if open && section == Section::Deleted {
-            header = header.push(Space::new().width(Fill)).push(
+            head = head.push(
                 button(text("Delete all").size(theme::TEXT_SMALL))
-                    .padding([4, 10])
+                    .padding([2, 10])
                     .style(theme::danger_button)
                     .on_press(Message::DeleteAll),
             );
-            // Lines Delete all up with the cards' Delete forever.
-            header = header.padding(iced::Padding::ZERO.right(14));
         }
-        let mut group = column![header].spacing(theme::SPACING / 2.0);
-        if open {
+        let body = open.then(|| {
             if section == Section::Deleted {
-                group = group
-                    .push(Column::with_children(tasks.into_iter().map(deleted_row)).spacing(6));
+                Column::with_children(tasks.into_iter().map(deleted_row))
+                    .spacing(6)
+                    .into()
             } else {
-                group = group.push(self.rows(tasks, data, false));
+                self.rows(tasks, data, false)
             }
-        }
-        group.into()
+        });
+        panel::panel(head.into(), body)
     }
 
     /// The rows of a section. `ranked` (the Recommended section only)
@@ -1083,27 +1134,29 @@ impl DayView {
     }
 }
 
-/// A section title: the count and what they are (`5 Tasks`, `1 Overdue
-/// Task`) in the heading size.
-fn section_title<'a>(
-    tasks: &[&Task],
-    noun: &str,
+/// A panel's heading, as a Week column's: the name in bold (in `style`),
+/// then the count, muted.
+fn panel_head<'a>(
+    name: &'a str,
+    count: Option<usize>,
     style: fn(&Theme) -> text::Style,
 ) -> Element<'a, Message> {
-    text(count_label(tasks.len(), noun))
-        .size(theme::TEXT_HEADING)
-        .style(style)
-        .into()
-}
-
-/// `No Tasks`, `1 Task`, `5 Tasks`: a count and a noun, plural unless the
-/// count is 1.
-fn count_label(n: usize, noun: &str) -> String {
-    match n {
-        0 => format!("No {noun}s"),
-        1 => format!("1 {noun}"),
-        _ => format!("{n} {noun}s"),
+    let mut head = row![
+        text(name)
+            .size(theme::TEXT_BODY)
+            .font(theme::FONT_BOLD)
+            .style(style)
+    ]
+    .spacing(8)
+    .align_y(Center);
+    if let Some(n) = count {
+        head = head.push(
+            text(n.to_string())
+                .size(theme::TEXT_SMALL)
+                .style(theme::muted),
+        );
     }
+    head.into()
 }
 
 /// A day's notes: the free-standing log lines dated `day`, oldest first,
@@ -1121,25 +1174,24 @@ fn day_notes(data: &DayData, day: Date) -> String {
 /// How long typing must pause before Today's Notes are saved.
 const NOTES_SAVE_DELAY: Duration = Duration::from_millis(1200);
 
+/// Padding inside a task card (and the inputs that sit with them).
+const CARD_PADDING: [u16; 2] = [10, 12];
+
 /// A task card, as in the Week tab: a raised fill, lighter on hover,
 /// quieter when done, with an accent ring when selected.
 fn task_card_style(done: bool, selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
         let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-        let amount = match (done, hovered || selected) {
-            (true, false) => 0.035,
-            (true, true) => 0.06,
-            (false, false) => 0.065,
-            (false, true) => 0.095,
-        };
         button::Style {
-            background: Some(theme::tint(theme, amount).into()),
+            background: Some(panel::card_fill(theme, done, hovered || selected).into()),
             text_color: theme.palette().text,
-            border: border::rounded(theme::RADIUS).width(1).color(if selected {
-                theme::accent_color().scale_alpha(0.7)
-            } else {
-                Color::TRANSPARENT
-            }),
+            border: border::rounded(panel::CARD_RADIUS)
+                .width(1)
+                .color(if selected {
+                    theme::accent_color().scale_alpha(0.7)
+                } else {
+                    Color::TRANSPARENT
+                }),
             ..button::Style::default()
         }
     }
@@ -1170,8 +1222,13 @@ fn card_content(task: &Task, today: Date, rank: Option<usize>) -> Row<'_, Messag
         style,
         |t| t.size(theme::TEXT_BODY),
     ));
+    // The project, muted, as on a Week card.
     if let Some(project) = &task.project {
-        line = line.push(project_chip(project));
+        line = line.push(
+            text(format!("#{project}"))
+                .size(theme::TEXT_SMALL)
+                .style(theme::muted),
+        );
     }
     line = line.push(Space::new().width(Fill));
     let mut details: Vec<Element<'_, Message>> = Vec::new();
@@ -1239,7 +1296,7 @@ fn task_row<'a>(
 ) -> Element<'a, Message> {
     button(card_content(task, today, rank))
         .width(Fill)
-        .padding([11, 14])
+        .padding(CARD_PADDING)
         .style(task_card_style(!task.status.is_open(), selected))
         .on_press(Message::Expand(task.id))
         .into()
@@ -1352,17 +1409,6 @@ fn deleted_row(task: &Task) -> Element<'_, Message> {
         .into()
 }
 
-fn project_chip(project: &str) -> Element<'_, Message> {
-    // `theme::chip`, a step lighter so it shows on a task card.
-    container(text(format!("#{project}")).size(theme::TEXT_SMALL))
-        .padding(theme::chip_padding())
-        .style(|theme: &Theme| container::Style {
-            background: Some(theme::tint(theme, 0.13).into()),
-            ..theme::chip(theme)
-        })
-        .into()
-}
-
 fn edit_card<'a>(task: &'a Task, form: &'a EditForm, today: Date) -> Element<'a, Message> {
     let id = task.id;
     let title = row![
@@ -1400,7 +1446,11 @@ fn edit_card<'a>(task: &'a Task, form: &'a EditForm, today: Date) -> Element<'a,
         container(body)
             .padding(theme::SPACING * 1.25)
             .width(Fill)
-            .style(theme::card),
+            .style(|theme: &Theme| container::Style {
+                background: Some(panel::card_fill(theme, false, false).into()),
+                border: border::rounded(panel::CARD_RADIUS),
+                ..container::Style::default()
+            }),
     )
     .padding([theme::SPACING / 2.0, 0.0])
     .into()
@@ -1455,6 +1505,7 @@ mod tests {
             recommended: Vec::new(),
             recommending: false,
             logs: Vec::new(),
+            load: None,
         }
     }
 
@@ -2009,10 +2060,9 @@ mod tests {
     }
 
     #[test]
-    fn count_labels_are_plural_unless_one() {
-        assert_eq!(count_label(1, "Task"), "1 Task");
-        assert_eq!(count_label(3, "Recommended Task"), "3 Recommended Tasks");
-        assert_eq!(count_label(0, "Task"), "No Tasks");
+    fn the_plus_opens_the_new_task_dialog_for_the_shown_day() {
+        let mut view = loaded(Vec::new());
+        assert_eq!(view.update(Message::AddTask), Action::NewTask(today()));
     }
 
     #[test]

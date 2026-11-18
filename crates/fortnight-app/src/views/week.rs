@@ -29,13 +29,14 @@
 //! Skipped on purpose: deleted tasks (the Today tab has them).
 
 use crate::theme;
+use crate::views::panel::{self, LoadLine, load_line, load_view, title_bar};
 use crate::views::report_panel::{self, ReportPanel, ReportPanelData};
 use fortnight_core::domain::{ReportKind, Task, TaskId, TaskStatus, WeekRef};
-use fortnight_core::report::{self, ColumnLoad, DayLoad, fmt_hours};
+use fortnight_core::report::{self, DayLoad, fmt_hours};
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Column, Row, button, checkbox, column, container, mouse_area, pin, progress_bar, row,
-    scrollable, space, stack, text, tooltip,
+    Column, Row, button, checkbox, column, container, mouse_area, pin, row, scrollable, space,
+    stack, text, tooltip,
 };
 use iced::{Center, Color, Element, Fill, Point, Theme, mouse};
 use jiff::civil::{Date, Weekday};
@@ -364,26 +365,6 @@ fn summary_card<'a>(
     .into()
 }
 
-/// A title bar (the Work Summary's and each day column's): a stronger fill
-/// than the card, rounded at the top only (`radius`), with a hairline under
-/// it.
-fn title_bar(radius: f32) -> impl Fn(&Theme) -> container::Style {
-    move |theme| title_bar_style(theme, radius)
-}
-
-fn title_bar_style(theme: &Theme, radius: f32) -> container::Style {
-    container::Style {
-        background: Some(theme::tint(theme, 0.08).into()),
-        border: iced::border::rounded(iced::border::top(radius)),
-        shadow: iced::Shadow {
-            color: theme::tint(theme, 0.16),
-            offset: iced::Vector::new(0.0, 1.0),
-            blur_radius: 0.0,
-        },
-        ..container::Style::default()
-    }
-}
-
 /// What `view` shows, worked out once per `load` rather than on every
 /// frame (`view` runs on every pointer move while dragging, and
 /// `WeekData::tasks` holds every task there is).
@@ -691,87 +672,6 @@ fn card_list<'a>(
 /// inside it.
 const COLUMN_RING: f32 = 1.5;
 
-/// The load bar in a column's title bar. The track is the day's capacity.
-/// Tasks with an estimate take their estimate; tasks without one share
-/// what is left of the day evenly (none left: they take nothing). Done
-/// tasks' parts are the accent.
-#[derive(Debug, Clone, PartialEq)]
-struct LoadLine {
-    /// Everything planned (open and done) over capacity, 0–1.
-    fraction: f32,
-    /// The done part over capacity, 0–1 (at most `fraction`).
-    done_fraction: f32,
-    /// Estimates booked beyond capacity, when there are any.
-    over_by: Option<u32>,
-    /// The figures for the bar's tooltip, e.g. "4h of 8h estimated · 2
-    /// without a time: 2h each · 3h done".
-    figures: String,
-}
-
-/// The bar's figures for a column's load.
-fn load_line(load: &ColumnLoad) -> LoadLine {
-    let mut figures = vec![format!(
-        "{} of {} estimated",
-        fmt_hours(load.estimated_minutes),
-        fmt_hours(load.capacity_minutes)
-    )];
-    if load.untimed > 0 {
-        let each = if load.untimed_share >= 1.0 {
-            format!("{} each", fmt_hours(load.untimed_share.round() as u32))
-        } else {
-            "no time left".to_string()
-        };
-        figures.push(format!("{} without a time: {each}", load.untimed));
-    }
-    if load.done_minutes > 0.0 {
-        figures.push(format!(
-            "{} done",
-            fmt_hours(load.done_minutes.round() as u32)
-        ));
-    }
-    if let Some(over) = load.over_by {
-        figures.push(format!("over by {}", fmt_hours(over)));
-    }
-    LoadLine {
-        fraction: load.fraction(),
-        done_fraction: load.done_fraction(),
-        over_by: load.over_by,
-        figures: figures.join(" · "),
-    }
-}
-
-/// The load bar in a column's title bar, with the figures in its tooltip
-/// and a warning sign after it when over capacity.
-fn load_view<'a>(line: &LoadLine) -> Element<'a, Message> {
-    // The track with the whole share, then the done part on top.
-    let bar = stack![
-        progress_bar(0.0..=1.0, line.fraction)
-            .girth(6)
-            .style(theme::load_bar),
-        progress_bar(0.0..=1.0, line.done_fraction)
-            .girth(6)
-            .style(theme::load_bar_done),
-    ];
-    let mut row = row![tooltip(
-        bar,
-        theme::tip(line.figures.clone()),
-        tooltip::Position::Bottom
-    )]
-    .spacing(6)
-    .align_y(Center);
-    if line.over_by.is_some() {
-        row = row.push(
-            theme::icon(theme::Icon::Warning)
-                .width(14)
-                .height(14)
-                .style(|theme: &Theme, _| iced::widget::svg::Style {
-                    color: Some(theme.palette().warning),
-                }),
-        );
-    }
-    row.into()
-}
-
 /// A task card in a day column: draggable when open. `dragging` is `None`
 /// when nothing is being dragged, else whether this is the dragged card
 /// (shown faded). While dragging, an open card is a drop target: the
@@ -946,14 +846,14 @@ fn task_card<'a>(task: &'a Task, day: Date, today: Date, faded: bool) -> Element
 /// A raised, rounded card; quieter when done, see-through while dragged.
 fn card_style(theme: &Theme, done: bool, faded: bool) -> container::Style {
     let p = theme.palette();
-    let mut fill = theme::tint(theme, if done { 0.05 } else { 0.1 });
+    let mut fill = panel::card_fill(theme, done, false);
     if faded {
         fill = fill.scale_alpha(0.35);
     }
     container::Style {
         background: Some(fill.into()),
         text_color: faded.then(|| p.text.scale_alpha(0.4)),
-        border: iced::border::rounded(6),
+        border: iced::border::rounded(panel::CARD_RADIUS),
         ..container::Style::default()
     }
 }

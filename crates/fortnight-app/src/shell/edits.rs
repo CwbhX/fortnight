@@ -291,6 +291,7 @@ impl Ready {
                 return Task::none();
             }
             day::Action::Reorder(positions) => self.store.set_positions(&positions),
+            day::Action::NewTask(day) => return self.open_new_task(day),
         };
         if let Err(e) = result {
             self.error = Some(e.to_string());
