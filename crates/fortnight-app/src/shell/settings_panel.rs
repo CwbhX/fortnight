@@ -46,6 +46,9 @@ impl Ready {
                 {
                     self.reports.note_prompt_change(ReportKind::Summary, now);
                 }
+                let plan_changed = report::plan_prompt(&s) != report::plan_prompt(&self.settings)
+                    || s.llm != self.settings.llm
+                    || s.decision_llm != self.settings.decision_llm;
                 if report::plan_prompt(&s) != report::plan_prompt(&self.settings) {
                     self.reports.note_prompt_change(ReportKind::Plan, now);
                 }
@@ -59,6 +62,11 @@ impl Ready {
                             self.reset_backoff();
                         }
                         self.settings = s;
+                        if plan_changed {
+                            // Later days' lists are redone with the new
+                            // prompt or model.
+                            self.later_days.forget_all();
+                        }
                         self.invalidate();
                         self.hide_settings();
                     }

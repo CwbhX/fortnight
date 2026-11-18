@@ -237,7 +237,9 @@ impl Ready {
     /// holding `notes` (none if it is empty), stamped when the first of
     /// them was, else now on today, else noon on that day. Nothing is
     /// written when they already say the same.
-    pub(crate) fn save_notes(&mut self, day: Date, notes: &str) {
+    /// Saves `day`'s notes; `false` if the store refused them (the error
+    /// is shown).
+    pub(crate) fn save_notes(&mut self, day: Date, notes: &str) -> bool {
         let old: Vec<(EventId, Timestamp, &str)> = self
             .events
             .iter()
@@ -259,14 +261,19 @@ impl Ready {
             .collect::<Vec<_>>()
             .join("\n");
         if same == notes {
-            return;
+            return true;
         }
         let ids: Vec<EventId> = old.iter().map(|(id, _, _)| *id).collect();
         let text = (!notes.is_empty()).then_some(notes);
-        if let Err(e) = self.store.replace_logs(&ids, text, at) {
-            self.error = Some(format!("Could not save the notes: {e}"));
-        }
+        let saved = match self.store.replace_logs(&ids, text, at) {
+            Ok(_) => true,
+            Err(e) => {
+                self.error = Some(format!("Could not save the notes: {e}"));
+                false
+            }
+        };
         self.reload_tasks();
+        saved
     }
 
     /// Removes every deleted task for good (Delete all on the Today tab's

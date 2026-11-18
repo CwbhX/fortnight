@@ -623,8 +623,11 @@ impl Ready {
             Message::NotesTick => {
                 // Saving reloads (and so refreshes); otherwise nothing changed.
                 self.local = true;
-                if let Some((day, notes)) = self.day_view.notes_to_save(std::time::Instant::now()) {
-                    self.save_notes(day, &notes);
+                if let Some((day, notes)) = self.day_view.notes_to_save(std::time::Instant::now())
+                    && !self.save_notes(day, &notes)
+                {
+                    // Kept for another try.
+                    self.day_view.notes_unsaved(day, notes);
                 }
                 Task::none()
             }

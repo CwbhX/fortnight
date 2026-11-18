@@ -295,8 +295,9 @@ pub struct DayView {
     notes_day: Option<Date>,
     /// When the notes were last typed in, while not yet saved.
     notes_edited: Option<Instant>,
-    /// Another day's notes left with unsaved typing: saved straight away.
-    notes_left: Option<(Date, String)>,
+    /// Other days' notes left with unsaved typing, one per day, oldest
+    /// first: saved straight away, one per tick.
+    notes_left: Vec<(Date, String)>,
     /// The add-a-task input.
     quick_add: String,
     /// A held Tasks card.
@@ -585,9 +586,19 @@ impl DayView {
             if self.notes_edited.take().is_some()
                 && let Some(day) = self.notes_day
             {
-                self.notes_left = Some((day, self.notes.text().trim_end().to_string()));
+                let text = self.notes.text().trim_end().to_string();
+                self.notes_left.retain(|(d, _)| *d != day);
+                self.notes_left.push((day, text));
             }
-            self.notes = rich_notes::Content::with_text(&day_notes(&data, data.day));
+            // Back on a day left before its notes were saved: what was
+            // typed, still to be saved.
+            if let Some(i) = self.notes_left.iter().position(|(d, _)| *d == data.day) {
+                let (_, text) = self.notes_left.remove(i);
+                self.notes = rich_notes::Content::with_text(&text);
+                self.notes_edited = Some(Instant::now());
+            } else {
+                self.notes = rich_notes::Content::with_text(&day_notes(&data, data.day));
+            }
             self.notes_day = Some(data.day);
         } else if self.notes_edited.is_none() {
             // Unsaved typing wins over what is stored. Compared trimmed at
@@ -1016,15 +1027,15 @@ impl DayView {
     /// Whether some day's notes have unsaved typing (`main.rs` then checks
     /// [`Self::notes_to_save`] every so often).
     pub fn notes_pending(&self) -> bool {
-        self.notes_edited.is_some() || self.notes_left.is_some()
+        self.notes_edited.is_some() || !self.notes_left.is_empty()
     }
 
     /// A day's notes to save: those of a day left with unsaved typing
     /// straight away, the shown day's once typing has paused for
     /// [`NOTES_SAVE_DELAY`] (then they count as saved).
     pub fn notes_to_save(&mut self, now: Instant) -> Option<(Date, String)> {
-        if let Some(left) = self.notes_left.take() {
-            return Some(left);
+        if !self.notes_left.is_empty() {
+            return Some(self.notes_left.remove(0));
         }
         let edited = self.notes_edited?;
         if now.saturating_duration_since(edited) < NOTES_SAVE_DELAY {
@@ -1032,6 +1043,17 @@ impl DayView {
         }
         self.notes_edited = None;
         Some((self.notes_day?, self.notes.text().trim_end().to_string()))
+    }
+
+    /// Notes from [`Self::notes_to_save`] that could not be saved: kept to
+    /// try again, unless newer typing for that day is waiting already.
+    pub fn notes_unsaved(&mut self, day: Date, text: String) {
+        if self.notes_day == Some(day) {
+            // The editor holds them (or newer typing): save it again.
+            self.notes_edited.get_or_insert_with(Instant::now);
+        } else if !self.notes_left.iter().any(|(d, _)| *d == day) {
+            self.notes_left.insert(0, (day, text));
+        }
     }
 
     /// The shown day's notes, saved as you type: "Today's Notes" on today,
@@ -2581,6 +2603,50 @@ mod tests {
             Some((sunday, "Sunday?".to_string()))
         );
         assert!(!view.notes_pending());
+    }
+
+    #[test]
+    fn notes_left_on_several_days_are_all_kept_until_saved() {
+        let on = |day: Date| data_for(day, vec![]);
+        let type_ = |view: &mut DayView, text: &str| {
+            view.update(Message::EditDayNotes(rich_notes::Action::Insert(
+                text.into(),
+            )));
+        };
+        let (mon, tue, wed) = (today(), date(2026, 11, 17), date(2026, 11, 18));
+        let mut view = DayView::new();
+        view.load(on(mon));
+        type_(&mut view, "a");
+        // On to Tuesday, type, on to Wednesday before a save: both kept.
+        view.load(on(tue));
+        type_(&mut view, "b");
+        view.load(on(wed));
+        assert_eq!(
+            view.notes_to_save(Instant::now()),
+            Some((mon, "a".to_string()))
+        );
+        // Monday's save fails: tried again.
+        view.notes_unsaved(mon, "a".into());
+        assert_eq!(
+            view.notes_to_save(Instant::now()),
+            Some((mon, "a".to_string()))
+        );
+        // Back on Tuesday before its save: what was typed shows, and is
+        // saved once typing pauses.
+        view.load(on(tue));
+        assert_eq!(view.notes.text(), "b");
+        assert!(view.notes_pending());
+        assert_eq!(
+            view.notes_to_save(Instant::now() + NOTES_SAVE_DELAY),
+            Some((tue, "b".to_string()))
+        );
+        assert!(!view.notes_pending());
+        // A failed save of the shown day's notes is tried again.
+        view.notes_unsaved(tue, "b".into());
+        assert_eq!(
+            view.notes_to_save(Instant::now() + NOTES_SAVE_DELAY),
+            Some((tue, "b".to_string()))
+        );
     }
 
     #[test]

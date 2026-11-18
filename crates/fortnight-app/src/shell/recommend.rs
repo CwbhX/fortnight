@@ -46,6 +46,17 @@ impl LaterDays {
         });
     }
 
+    /// What they are worked out with changed (the prompt, a model):
+    /// forgets every later day's list and failures, and aborts the
+    /// requests on their way (a reply to the old prompt is dropped).
+    pub(crate) fn forget_all(&mut self) {
+        self.recs.clear();
+        self.failures.clear();
+        for (_, (_, handle)) in self.pending.drain() {
+            handle.abort();
+        }
+    }
+
     /// Aborts the requests for days other than `selected`; whether any was.
     pub(super) fn abort_other_days(&mut self, selected: Date) -> bool {
         let mut aborted = false;
