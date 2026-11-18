@@ -10,8 +10,9 @@
 //! Models: two blocks of label/field rows, Model (everything) and
 //! Recommendations (off unless "Use a different model" is ticked; then it
 //! is `Settings::decision_llm`). Each block has Provider (Ollama, which is
-//! keyless; OpenAI-compatible; Anthropic), URL, Model with a Load/Choose
-//! list, API key (not for Ollama) and Test. No help text, by request.
+//! keyless; OpenAI-compatible; Anthropic), URL, Model (a list the endpoint
+//! fills; never typed, except for an endpoint that can't list its models),
+//! API key (not for Ollama) and Test. No help text, by request.
 //!
 //! The API key controls act immediately and are not part of Save. Each
 //! block has its own key; Save (or Enter) asks for a password in a small
@@ -25,11 +26,15 @@
 //! built-in changes. Round 2's "summary instructions" are shown folded into
 //! the summary prompt and are folded in for good once that prompt is saved.
 //!
-//! Picking a provider fills in its default URL (unless one was typed);
-//! Ollama also loads its model list. Ollama on this machine is checked at
+//! Picking a provider fills in its default URL (unless one was typed).
+//! Each block's model list loads by itself: when Settings opens, on picking
+//! a provider, a moment after the URL is edited, and when a key is saved or
+//! unlocked (`Message::LoadModels`, sent by `main.rs` for the last two). A
+//! provider that needs a key loads nothing until one is saved. The saved
+//! model shows even when the list doesn't have it. Ollama on this machine is checked at
 //! launch and when Settings opens (`SettingsData::ollama`): an Ollama block
 //! on the default address shows Running / Not running and lists its models
-//! without Load, tagged "thinking" or "decision". Decision models (Ollama's
+//! from that check, tagged "thinking" or "decision". Decision models (Ollama's
 //! Jev-style `/v1/systemone`) are offered only for Recommendations; picking
 //! one saves that block as `Protocol::OllamaDecision`. On a first run with
 //! Ollama running, Model starts on Ollama with its first chat model. Reasoning models (DeepSeek-R1, Qwen3,
@@ -85,8 +90,12 @@ pub enum Message {
     Provider(Which, Provider),
     BaseUrl(Which, String),
     Model(Which, String),
-    /// Ask the endpoint for its model list.
+    /// Ask the endpoint for its model list (nothing happens if it can't
+    /// be asked yet: no URL, or no key for a provider that needs one).
     LoadModels(Which),
+    /// A while after a URL edit: loads that block's models if the URL is
+    /// still this.
+    UrlSettled(Which, String),
     /// A model picked from the listed ones.
     PickModel(Which, String),
     /// "Use a different model" for recommendations: off empties it.
@@ -133,6 +142,44 @@ pub enum Which {
     Decision,
 }
 
+impl Which {
+    pub const BOTH: [Which; 2] = [Which::Main, Which::Decision];
+}
+
+/// One value for each block.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PerBlock<T> {
+    pub main: T,
+    pub decision: T,
+}
+
+impl<T> PerBlock<T> {
+    pub fn get(&self, which: Which) -> &T {
+        match which {
+            Which::Main => &self.main,
+            Which::Decision => &self.decision,
+        }
+    }
+
+    pub fn get_mut(&mut self, which: Which) -> &mut T {
+        match which {
+            Which::Main => &mut self.main,
+            Which::Decision => &mut self.decision,
+        }
+    }
+}
+
+/// One block's model list: the last fetch's result and whether a fetch is
+/// in flight.
+#[derive(Debug, Clone, Default)]
+pub struct ModelList {
+    /// `Ok(models)` (may be empty when the endpoint can't say) or
+    /// `Err(message)`. Only Ollama says what kind each model is; others
+    /// list `Chat`.
+    pub result: Option<Result<Vec<OllamaModel>, String>>,
+    pub loading: bool,
+}
+
 /// What `main.rs` must do.
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -162,6 +209,8 @@ pub enum Action {
     ShowUnlock,
     /// The password pop-up opened: focus its field (`PASSWORD_INPUT_ID`).
     FocusPassword,
+    /// Send this message back a moment from now (`Message::UrlSettled`).
+    Later(Message),
 }
 
 /// Everything the view shows, supplied by `main.rs`.
@@ -179,12 +228,8 @@ pub struct SettingsData {
     /// Why the last key operation (saving or removing a key) failed, such
     /// as a wrong password; shown near the key controls.
     pub key_message: Option<String>,
-    /// Result of the last model-list fetch: `Ok(models)` (may be empty when
-    /// the endpoint can't say; fall back to free text) or `Err(message)`.
-    /// Only Ollama says what kind each model is; others list `Chat`.
-    pub models: Option<Result<Vec<OllamaModel>, String>>,
-    /// A model-list fetch is in flight.
-    pub listing_models: bool,
+    /// Each block's model list.
+    pub models: PerBlock<ModelList>,
     /// The Ollama on this machine: its models, or why it didn't answer;
     /// `None` until checked.
     pub ollama: Option<Result<Vec<OllamaModel>, String>>,
@@ -241,11 +286,10 @@ pub struct SettingsView {
     key_target: Which,
     /// Local validation error for the key forms.
     key_error: Option<String>,
-    models: Option<Result<Vec<OllamaModel>, String>>,
-    listing_models: bool,
-    /// The endpoint of the last "Load models" request, to hide a list that
-    /// belongs to an endpoint the form no longer names.
-    listed_for: Option<(Which, Provider, String)>,
+    models: PerBlock<ModelList>,
+    /// The endpoint of each block's last model-list request, to hide a list
+    /// that belongs to an endpoint the form no longer names.
+    listed_for: PerBlock<Option<(Provider, String)>>,
     /// "Use a different model" for recommendations is ticked.
     decision_on: bool,
     ollama: Option<Result<Vec<OllamaModel>, String>>,
@@ -282,9 +326,8 @@ impl Default for SettingsView {
             decision_key_state: KeyState::NoKey,
             key_target: Which::Main,
             key_error: None,
-            models: None,
-            listing_models: false,
-            listed_for: None,
+            models: PerBlock::default(),
+            listed_for: PerBlock::default(),
             decision_on: false,
             ollama: None,
             ollama_prefilled: false,
@@ -324,7 +367,6 @@ impl SettingsView {
         self.testing = data.testing;
         self.key_message = data.key_message;
         self.models = data.models;
-        self.listing_models = data.listing_models;
         self.ollama = data.ollama;
         self.prefill_ollama();
     }
@@ -334,9 +376,7 @@ impl SettingsView {
         match message {
             Message::Provider(w, p) => {
                 form.endpoint_mut(w).set_provider(p);
-                if p == Provider::Ollama {
-                    return self.update(Message::LoadModels(w));
-                }
+                return self.update(Message::LoadModels(w));
             }
             Message::Separate(on) => {
                 self.decision_on = on;
@@ -346,7 +386,15 @@ impl SettingsView {
                     return self.update(Message::Provider(Which::Decision, Provider::Ollama));
                 }
             }
-            Message::BaseUrl(w, s) => form.endpoint_mut(w).base_url = s,
+            Message::BaseUrl(w, s) => {
+                form.endpoint_mut(w).base_url = s.clone();
+                return Action::Later(Message::UrlSettled(w, s));
+            }
+            Message::UrlSettled(w, s) => {
+                if self.form.endpoint(w).base_url == s {
+                    return self.update(Message::LoadModels(w));
+                }
+            }
             Message::Model(w, s) | Message::PickModel(w, s) => {
                 // Only a model the list calls a decision model counts as one.
                 let decision =
@@ -360,7 +408,7 @@ impl SettingsView {
                 if self.can_list_models(w) {
                     let llm = self.form.endpoint(w).llm();
                     let provider = self.form.endpoint(w).provider;
-                    self.listed_for = Some((w, provider, llm.base_url.clone()));
+                    *self.listed_for.get_mut(w) = Some((provider, llm.base_url.clone()));
                     return Action::ListModels(llm, w);
                 }
             }
@@ -897,8 +945,7 @@ mod test_util {
             test_result: None,
             testing: false,
             key_message: None,
-            models: None,
-            listing_models: false,
+            models: PerBlock::default(),
             ollama: None,
         }
     }

@@ -114,7 +114,6 @@ impl Ready {
                 key_message: self.key_message.clone(),
                 models: self.models.clone(),
                 ollama: self.ollama.clone(),
-                listing_models: self.listing_models,
             });
         }
     }

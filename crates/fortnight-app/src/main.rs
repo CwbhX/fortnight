@@ -73,7 +73,7 @@ use shell::keys::{Keys, SavedKey};
 use shell::recommend::LaterDays;
 use shell::refresh::Derived;
 use shell::reports::Reports;
-use shell::settings_panel::detect_ollama;
+use shell::settings_panel::{detect_ollama, load_models};
 use shell::shortcuts::{Shortcut, shortcut_for};
 use shell::suggest::Suggestions;
 use std::path::PathBuf;
@@ -120,7 +120,7 @@ enum Message {
     /// The stream for this report ended (after `Done` or an error, or early).
     StreamEnded(ReportKey, u64),
     Tested(Result<String, String>),
-    Models(Result<Vec<OllamaModel>, String>),
+    Models(settings::Which, Result<Vec<OllamaModel>, String>),
     /// The local Ollama check: its models, or why it didn't answer.
     OllamaDetected(Result<Vec<OllamaModel>, String>),
     /// Typing in a new task's dialog paused: ask the decision model for a
@@ -183,11 +183,14 @@ struct Ready {
     test_result: Option<Result<String, String>>,
     /// Why the last key save or removal failed.
     key_message: Option<String>,
-    models: Option<Result<Vec<OllamaModel>, String>>,
+    /// Each Settings block's model list.
+    models: settings::PerBlock<settings::ModelList>,
+    /// Each block's model-list request in flight: a newer one, and Lock,
+    /// abort it.
+    model_requests: settings::PerBlock<Option<iced::task::Handle>>,
     /// The local Ollama (`ollama::DEFAULT_BASE_URL`): its models, or why it
     /// didn't answer. Checked at launch and when Settings opens.
     ollama: Option<Result<Vec<OllamaModel>, String>>,
-    listing_models: bool,
     error: Option<String>,
     /// A short, dismissable message (the lock warning).
     notice: Option<String>,
@@ -211,7 +214,7 @@ struct Ready {
     /// Data the views show changed (set by `invalidate` and when a request
     /// starts or stops): refresh even after a `local` message.
     must_refresh: bool,
-    /// Test connection / Load models requests in flight, aborted on Lock.
+    /// Test connection requests in flight, aborted on Lock.
     key_requests: Vec<iced::task::Handle>,
     /// The app icon last shown (`Some(true)` = dark), `None` before any.
     icon_dark: Option<bool>,
@@ -234,11 +237,19 @@ impl App {
                 // of date (e.g. recommendations from an older prompt).
                 let start = ready.catch_up();
                 ready.refresh();
+                // Settings open from the start (`FORTNIGHT_PAGE`) loads its
+                // model lists as opening it would.
+                let models = if ready.settings_open {
+                    load_models()
+                } else {
+                    Task::none()
+                };
                 let tasks = Task::batch([
                     iced::system::theme().map(Message::ThemeMode),
                     operation::focus(day::QUICK_ADD_ID),
                     start,
                     detect_ollama(),
+                    models,
                     shoot_after_delay(),
                 ]);
                 let mut app = App::Ready(ready, forced_theme());
@@ -419,9 +430,9 @@ impl Ready {
             testing: false,
             test_result: None,
             key_message: None,
-            models: None,
+            models: settings::PerBlock::default(),
+            model_requests: settings::PerBlock::default(),
             ollama: None,
-            listing_models: false,
             error: None,
             notice,
             undo: UndoStack::default(),
@@ -646,7 +657,7 @@ impl Ready {
                 Task::none()
             }
             Message::OllamaDetected(result) => self.ollama_detected(result),
-            Message::Models(result) => self.models_listed(result),
+            Message::Models(which, result) => self.models_listed(which, result),
             Message::Key(shortcut) => self.shortcut(shortcut),
             Message::DismissNotice => {
                 self.local = true;

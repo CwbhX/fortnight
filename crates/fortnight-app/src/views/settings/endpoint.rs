@@ -3,17 +3,20 @@
 
 use fortnight_core::domain::{LlmSettings, Protocol};
 use fortnight_core::ollama::{self, DEFAULT_BASE_URL as OLLAMA_BASE_URL, ModelKind, OllamaModel};
+use fortnight_core::secure;
 use iced::widget::{button, column, pick_list, row, text};
 use iced::{Center, Element, Fill, Theme};
 use std::fmt;
 
-use super::{Message, SettingsView, Which, error_text, field_row, input, picker};
+use super::{KeyState, Message, SettingsView, Which, error_text, field_row, input, picker};
 use crate::theme;
 
 /// What the model-list area shows.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ModelsState<'a> {
     Hidden,
+    /// The provider needs an API key and none is saved: nothing to ask.
+    NeedsKey,
     Busy,
     /// The endpoint answered but listed no models.
     Empty,
@@ -198,13 +201,28 @@ impl SettingsView {
             && self.tested_llm.as_ref() == Some(&self.form.endpoint(which).llm())
     }
 
+    /// A request in flight doesn't stop another: `main.rs` drops the older
+    /// one.
     pub(super) fn can_list_models(&self, which: Which) -> bool {
-        !self.form.endpoint(which).base_url.trim().is_empty() && !self.listing_models
+        !self.form.endpoint(which).base_url.trim().is_empty() && !self.needs_key(which)
     }
 
-    /// The models this block can pick from: the last Load for it, or the
-    /// local Ollama check when the block is on Ollama's default address. A
-    /// list for the other block or another endpoint isn't shown.
+    /// The block's endpoint takes a saved key and there is none it could
+    /// use. The recommendations block may borrow the main key
+    /// (`fallback::decision_config`).
+    fn needs_key(&self, which: Which) -> bool {
+        let none = match which {
+            Which::Main => self.key_state == KeyState::NoKey,
+            Which::Decision => {
+                self.decision_key_state == KeyState::NoKey && self.key_state == KeyState::NoKey
+            }
+        };
+        none && secure::needs_saved_key(&self.form.endpoint(which).llm())
+    }
+
+    /// The models this block can pick from: its last fetch, or the local
+    /// Ollama check when the block is on Ollama's default address. A list
+    /// for another endpoint isn't shown.
     pub(super) fn models_state(&self, which: Which) -> ModelsState<'_> {
         let e = self.form.endpoint(which);
         let usable = |models: &[OllamaModel]| -> Vec<OllamaModel> {
@@ -214,14 +232,17 @@ impl SettingsView {
                 .cloned()
                 .collect()
         };
-        let listed_here = self.listed_for.as_ref().is_some_and(|(w, provider, url)| {
-            *w == which && *provider == e.provider && *url == e.base_url.trim()
-        });
+        let listed_here = self
+            .listed_for
+            .get(which)
+            .as_ref()
+            .is_some_and(|(provider, url)| *provider == e.provider && *url == e.base_url.trim());
+        let list = self.models.get(which);
         if listed_here {
-            if self.listing_models {
+            if list.loading {
                 return ModelsState::Busy;
             }
-            match &self.models {
+            match &list.result {
                 Some(Ok(models)) => {
                     let list = usable(models);
                     return if list.is_empty() {
@@ -242,6 +263,9 @@ impl SettingsView {
             if !list.is_empty() {
                 return ModelsState::List(list);
             }
+        }
+        if self.needs_key(which) {
+            return ModelsState::NeedsKey;
         }
         ModelsState::Hidden
     }
@@ -272,48 +296,7 @@ impl SettingsView {
         let url = input(&f.provider.default_url(), &f.base_url)
             .on_input(move |s| Message::BaseUrl(which, s));
 
-        let model_input = input("Model name", &f.model).on_input(move |s| Message::Model(which, s));
-        let state = self.models_state(which);
-        let error = match &state {
-            ModelsState::Error(e) => Some(shorten(e, 120)),
-            _ => None,
-        };
-        let pick: Element<'_, Message> = match state {
-            ModelsState::List(models) => {
-                let choices: Vec<ModelChoice> = models.into_iter().map(ModelChoice).collect();
-                let selected = choices.iter().find(|c| c.0.name == f.model.trim()).cloned();
-                pick_list(choices, selected, move |c: ModelChoice| {
-                    Message::PickModel(which, c.0.name)
-                })
-                .placeholder("Choose")
-                .padding([8, 12])
-                .text_size(theme::TEXT_BODY)
-                .width(200)
-                .style(picker)
-                .into()
-            }
-            ModelsState::Busy => button(text("Loading…").size(theme::TEXT_BODY))
-                .padding([8, 14])
-                .style(theme::secondary_button)
-                .into(),
-            _ => button(text("Load").size(theme::TEXT_BODY))
-                .padding([8, 14])
-                .style(theme::secondary_button)
-                .on_press_maybe(
-                    self.can_list_models(which)
-                        .then_some(Message::LoadModels(which)),
-                )
-                .into(),
-        };
-        let mut model = column![
-            row![model_input, pick]
-                .spacing(theme::SPACING / 2.0)
-                .align_y(Center)
-        ]
-        .spacing(theme::SPACING / 3.0);
-        if let Some(e) = error {
-            model = model.push(error_text(e));
-        }
+        let model = self.model_field(which);
 
         let testing_here = self.testing && self.tested == which;
         let test =
@@ -347,6 +330,73 @@ impl SettingsView {
             grid = grid.push(field_row("API key", self.key_controls(which)));
         }
         grid.push(field_row("", test_row)).into()
+    }
+
+    /// The Model field: a list the endpoint fills, with the chosen model in
+    /// it even when the endpoint doesn't list it. Only an endpoint that
+    /// lists no models gets a text field.
+    fn model_field(&self, which: Which) -> Element<'_, Message> {
+        let f = self.form.endpoint(which);
+        let state = self.models_state(which);
+        if state == ModelsState::Empty {
+            return input("Model name", &f.model)
+                .on_input(move |s| Message::Model(which, s))
+                .into();
+        }
+        let placeholder = match &state {
+            ModelsState::Busy => "Loading…",
+            ModelsState::NeedsKey => "Needs an API key",
+            _ => "Choose",
+        };
+        let error = match &state {
+            ModelsState::Error(e) => Some(shorten(e, 120)),
+            _ => None,
+        };
+        let mut choices: Vec<ModelChoice> = match state {
+            ModelsState::List(models) => models.into_iter().map(ModelChoice).collect(),
+            _ => Vec::new(),
+        };
+        let current = f.model.trim();
+        if !current.is_empty() && !choices.iter().any(|c| c.0.name == current) {
+            choices.insert(
+                0,
+                ModelChoice(OllamaModel {
+                    name: current.to_string(),
+                    kind: if f.decision {
+                        ModelKind::Decision
+                    } else {
+                        ModelKind::Chat
+                    },
+                }),
+            );
+        }
+        let selected = choices.iter().find(|c| c.0.name == current).cloned();
+        let list = pick_list(choices, selected, move |c: ModelChoice| {
+            Message::PickModel(which, c.0.name)
+        })
+        .placeholder(placeholder)
+        .padding([8, 12])
+        .text_size(theme::TEXT_BODY)
+        .width(Fill)
+        .style(picker);
+        let Some(e) = error else {
+            return list.into();
+        };
+        let retry = button(text("Retry").size(theme::TEXT_BODY))
+            .padding([8, 14])
+            .style(theme::secondary_button)
+            .on_press_maybe(
+                self.can_list_models(which)
+                    .then_some(Message::LoadModels(which)),
+            );
+        column![
+            row![list, retry]
+                .spacing(theme::SPACING / 2.0)
+                .align_y(Center),
+            error_text(e),
+        ]
+        .spacing(theme::SPACING / 3.0)
+        .into()
     }
 }
 
@@ -468,8 +518,9 @@ mod tests {
         };
         assert!(v.decision_on);
         assert_eq!(llm.base_url, ollama::local_base_url());
-        // The list belongs to the recommendations block only.
-        assert_eq!(v.models_state(Which::Main), ModelsState::Hidden);
+        // The list belongs to the recommendations block only (Model, on
+        // OpenAI with no key, has nothing to list).
+        assert_eq!(v.models_state(Which::Main), ModelsState::NeedsKey);
         v.update(Message::PickModel(Which::Decision, "deepseek-r1:8b".into()));
         let Action::Test(llm, Which::Decision) = v.update(Message::Test(Which::Decision)) else {
             panic!("expected Test for the recommendations model");
@@ -517,6 +568,13 @@ mod tests {
         assert!(matches!(v.update(Message::Test(Which::Main)), Action::None));
     }
 
+    /// Settings data whose main block's list is `models`.
+    fn listed(models: Result<Vec<OllamaModel>, String>) -> SettingsData {
+        let mut d = data(Settings::default(), KeyState::NoKey);
+        d.models.main.result = Some(models);
+        d
+    }
+
     #[test]
     fn list_models_carries_current_fields() {
         let mut v = loaded(KeyState::NoKey);
@@ -525,28 +583,65 @@ mod tests {
             v.update(Message::LoadModels(Which::Main)),
             Action::None
         ));
-        v.update(Message::Provider(Which::Main, Provider::Anthropic));
-        v.update(Message::BaseUrl(
-            Which::Main,
-            " https://api.anthropic.com ".into(),
+        // Picking a provider loads its list, once there is a key for it.
+        assert!(matches!(
+            v.update(Message::Provider(Which::Main, Provider::Anthropic)),
+            Action::None
         ));
-        v.update(Message::Model(Which::Main, "typed".into()));
-        let Action::ListModels(llm, Which::Main) = v.update(Message::LoadModels(Which::Main))
+        assert_eq!(v.models_state(Which::Main), ModelsState::NeedsKey);
+        v.load(data(Settings::default(), KeyState::Unlocked));
+        assert_eq!(v.models_state(Which::Main), ModelsState::Hidden);
+        let Action::ListModels(llm, Which::Main) =
+            v.update(Message::Provider(Which::Main, Provider::Anthropic))
         else {
             panic!("expected ListModels");
         };
         assert_eq!(llm.protocol, Protocol::Anthropic);
         assert_eq!(llm.base_url, "https://api.anthropic.com");
-        assert_eq!(llm.model, "typed");
-        // Not while a fetch is in flight.
-        let mut d = data(Settings::default(), KeyState::NoKey);
-        d.listing_models = true;
+        // A fetch in flight shows as busy and doesn't stop another.
+        let mut d = data(Settings::default(), KeyState::Unlocked);
+        d.models.main.loading = true;
         v.load(d);
         assert_eq!(v.models_state(Which::Main), ModelsState::Busy);
         assert!(matches!(
             v.update(Message::LoadModels(Which::Main)),
-            Action::None
+            Action::ListModels(_, Which::Main)
         ));
+    }
+
+    #[test]
+    fn a_url_edit_loads_models_once_it_settles() {
+        let mut v = loaded(KeyState::NoKey);
+        let Action::Later(first) = v.update(Message::BaseUrl(
+            Which::Main,
+            "http://localhost:8080".into(),
+        )) else {
+            panic!("expected Later");
+        };
+        let Action::Later(second) = v.update(Message::BaseUrl(
+            Which::Main,
+            "http://localhost:8080/v1".into(),
+        )) else {
+            panic!("expected Later");
+        };
+        // The earlier edit was overtaken.
+        assert!(matches!(v.update(first), Action::None));
+        let Action::ListModels(llm, Which::Main) = v.update(second) else {
+            panic!("expected ListModels");
+        };
+        assert_eq!(llm.base_url, "http://localhost:8080/v1");
+    }
+
+    #[test]
+    fn recommendations_can_list_with_the_main_key() {
+        let mut v = loaded(KeyState::Locked);
+        v.update(Message::Separate(true));
+        v.update(Message::Provider(Which::Decision, Provider::OpenAi));
+        assert!(v.can_list_models(Which::Decision));
+        let mut v = loaded(KeyState::NoKey);
+        v.update(Message::Separate(true));
+        v.update(Message::Provider(Which::Decision, Provider::OpenAi));
+        assert_eq!(v.models_state(Which::Decision), ModelsState::NeedsKey);
     }
 
     #[test]
@@ -560,38 +655,41 @@ mod tests {
         assert_eq!(v.models_state(Which::Main), ModelsState::Hidden);
         v.update(Message::LoadModels(Which::Main));
 
-        let with = |models| {
-            let mut d = data(Settings::default(), KeyState::NoKey);
-            d.models = Some(models);
-            d
-        };
-        v.load(with(Ok(vec![])));
+        v.load(listed(Ok(vec![])));
         assert_eq!(v.models_state(Which::Main), ModelsState::Empty);
 
-        v.load(with(Err("404 Not Found".into())));
+        v.load(listed(Err("404 Not Found".into())));
         assert_eq!(
             v.models_state(Which::Main),
             ModelsState::Error("404 Not Found")
         );
 
         let ids = vec![chat("llama3.2"), chat("qwen3")];
-        v.load(with(Ok(ids.clone())));
+        v.load(listed(Ok(ids.clone())));
         assert_eq!(v.models_state(Which::Main), ModelsState::List(ids.clone()));
         v.update(Message::PickModel(Which::Main, "qwen3".into()));
         assert_eq!(v.form.main.model, "qwen3");
-        // Free text still works after picking.
-        v.update(Message::Model(Which::Main, "qwen3:8b".into()));
-        assert_eq!(v.form.main.model, "qwen3:8b");
         let Action::Save(s) = v.update(Message::Save) else {
             panic!("expected Save");
         };
-        assert_eq!(s.llm.model, "qwen3:8b");
+        assert_eq!(s.llm.model, "qwen3");
+
+        // The other block's list isn't this one's.
+        v.update(Message::Separate(true));
+        v.update(Message::BaseUrl(
+            Which::Decision,
+            "http://localhost:8080/v1".into(),
+        ));
+        assert_eq!(v.models_state(Which::Decision), ModelsState::Hidden);
 
         // A list for another endpoint is hidden.
-        v.update(Message::Provider(Which::Main, Provider::Anthropic));
+        v.update(Message::BaseUrl(
+            Which::Main,
+            "http://localhost:9090/v1".into(),
+        ));
         assert_eq!(v.models_state(Which::Main), ModelsState::Hidden);
-        v.update(Message::Provider(Which::Main, Provider::OpenAi));
-        assert_eq!(v.models_state(Which::Main), ModelsState::List(ids));
+        // Rendering works either way.
+        let _ = v.view();
     }
 
     #[test]

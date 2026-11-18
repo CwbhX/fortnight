@@ -3,6 +3,7 @@
 //! clients built from them, and Lock and unlock (including saving and
 //! removing a key from Settings).
 
+use super::settings_panel::load_models;
 use crate::{Message, Ready};
 use fortnight_app::views::settings::{self, KeyState};
 use fortnight_core::decision::DecisionClient;
@@ -163,8 +164,8 @@ impl Ready {
         }
         self.later_days.abort_all();
         self.suggest.cancel();
+        self.abort_model_requests();
         self.testing = false;
-        self.listing_models = false;
         self.key_message = None;
     }
 
@@ -208,6 +209,7 @@ impl Ready {
                 self.key_message = None;
                 // What failed while locked out may work now.
                 self.reset_backoff();
+                return Task::batch([self.catch_up(), load_models()]);
             }
             // A check that ends after the prompt was cancelled says nothing.
             Err(e) if self.unlocking => self.unlock_view.set_error(e.to_string()),
@@ -238,6 +240,7 @@ impl Ready {
                 self.key_message = None;
                 // A new key may fix what failed.
                 self.reset_backoff();
+                return Task::batch([self.catch_up(), load_models()]);
             }
             // Only the check against the other key can say this.
             Err(VaultError::WrongPassword) => {
@@ -302,6 +305,7 @@ impl Ready {
                 *exists = false;
                 *key = None;
                 self.key_message = None;
+                return load_models();
             }
             Err(e) => self.key_message = Some(e.to_string()),
         }

@@ -6,21 +6,23 @@
 use crate::{Message, Ready};
 use fortnight_app::theme;
 use fortnight_app::views::settings::{self, UnlockView};
-use fortnight_core::domain::{Protocol, ReportKind};
-use fortnight_core::llm::ChatRequest;
+use fortnight_core::domain::{LlmSettings, Protocol, ReportKind};
+use fortnight_core::llm::{ChatRequest, LlmClient};
 use fortnight_core::ollama::{self, ModelKind, OllamaModel};
 use fortnight_core::report;
 use fortnight_core::store::Store;
 use iced::Task;
 use iced::widget::operation;
 use jiff::Timestamp;
+use std::sync::Arc;
 use std::time::Duration;
 
 impl Ready {
-    /// Opens Settings and checks for a local Ollama.
+    /// Opens Settings, checks for a local Ollama and loads both blocks'
+    /// model lists.
     pub(crate) fn open_settings(&mut self) -> Task<Message> {
         self.settings_open = true;
-        detect_ollama()
+        Task::batch([detect_ollama(), load_models()])
     }
 
     /// Hides Settings, by any route: typed secrets are wiped
@@ -87,59 +89,12 @@ impl Ready {
                     Task::none()
                 }
             },
-            // Ollama (keyless, or a decision model): ask it directly, which
-            // also says what each model can do.
-            // A keyless server that isn't Ollama (LM Studio) answers the
-            // endpoint's own model list instead.
-            settings::Action::ListModels(llm, which)
-                if llm.keyless || llm.protocol == Protocol::OllamaDecision =>
-            {
-                self.listing_models = true;
-                self.models = None;
-                let fallback = (llm.protocol != Protocol::OllamaDecision)
-                    .then(|| self.settings_client(&llm, which).ok())
-                    .flatten()
-                    .map(|(client, _)| client);
-                Task::perform(
-                    async move {
-                        match ollama::detect(&llm.base_url, Duration::from_secs(10)).await {
-                            Ok(models) => Ok(models),
-                            Err(e) => match fallback {
-                                Some(client) => client
-                                    .list_models()
-                                    .await
-                                    .map(chat_models)
-                                    .map_err(|e| e.to_string()),
-                                None => Err(e.to_string()),
-                            },
-                        }
-                    },
-                    Message::Models,
-                )
+            settings::Action::ListModels(llm, which) => self.list_models(llm, which),
+            settings::Action::Later(m) => {
+                Task::perform(tokio::time::sleep(Duration::from_millis(600)), move |_| {
+                    Message::Settings(m)
+                })
             }
-            settings::Action::ListModels(llm, which) => match self.settings_client(&llm, which) {
-                Ok((client, _)) => {
-                    self.listing_models = true;
-                    self.models = None;
-                    let (task, handle) = Task::perform(
-                        async move {
-                            client
-                                .list_models()
-                                .await
-                                .map(chat_models)
-                                .map_err(|e| e.to_string())
-                        },
-                        Message::Models,
-                    )
-                    .abortable();
-                    self.key_requests.push(handle);
-                    task
-                }
-                Err(e) => {
-                    self.models = Some(Err(e));
-                    Task::none()
-                }
-            },
             settings::Action::SetKey {
                 api_key,
                 password,
@@ -154,12 +109,65 @@ impl Ready {
         }
     }
 
+    /// Fetches one block's model list (`Message::Models`), dropping the
+    /// request it replaces.
+    fn list_models(&mut self, llm: LlmSettings, which: settings::Which) -> Task<Message> {
+        if let Some(old) = self.model_requests.get_mut(which).take() {
+            old.abort();
+        }
+        // Ollama (keyless, or a decision model): ask it directly, which
+        // also says what each model can do. A keyless server that isn't
+        // Ollama (LM Studio) answers the endpoint's own model list instead.
+        let ollama = llm.keyless || llm.protocol == Protocol::OllamaDecision;
+        let client = if llm.protocol == Protocol::OllamaDecision {
+            None
+        } else {
+            match self.settings_client(&llm, which) {
+                Ok((client, _)) => Some(client),
+                Err(e) if !ollama => {
+                    let list = self.models.get_mut(which);
+                    list.result = Some(Err(e));
+                    list.loading = false;
+                    return Task::none();
+                }
+                Err(_) => None,
+            }
+        };
+        let list = self.models.get_mut(which);
+        list.result = None;
+        list.loading = true;
+        let from_endpoint = |client: Arc<dyn LlmClient>| async move {
+            client
+                .list_models()
+                .await
+                .map(chat_models)
+                .map_err(|e| e.to_string())
+        };
+        let (task, handle) = Task::perform(
+            async move {
+                if !ollama {
+                    let client = client.expect("a client unless Ollama");
+                    return from_endpoint(client).await;
+                }
+                match ollama::detect(&llm.base_url, Duration::from_secs(10)).await {
+                    Ok(models) => Ok(models),
+                    Err(e) => match client {
+                        Some(client) => from_endpoint(client).await,
+                        None => Err(e.to_string()),
+                    },
+                }
+            },
+            move |result| Message::Models(which, result),
+        )
+        .abortable();
+        *self.model_requests.get_mut(which) = Some(handle);
+        task
+    }
+
     /// A Test connection request answered (`Message::Tested`).
     pub(crate) fn tested(&mut self, result: Result<String, String>) -> Task<Message> {
         self.testing = false;
-        if !self.listing_models {
-            self.key_requests.clear();
-        }
+        self.key_requests.clear();
         self.test_result = Some(result);
         Task::none()
     }
@@ -173,22 +181,65 @@ impl Ready {
         Task::none()
     }
 
-    /// A Load models request answered (`Message::Models`).
+    /// A model-list request answered (`Message::Models`).
     pub(crate) fn models_listed(
         &mut self,
+        which: settings::Which,
         result: Result<Vec<OllamaModel>, String>,
     ) -> Task<Message> {
-        self.listing_models = false;
-        if !self.testing {
-            self.key_requests.clear();
-        }
-        self.models = Some(result);
+        *self.model_requests.get_mut(which) = None;
+        let list = self.models.get_mut(which);
+        list.loading = false;
+        list.result = Some(result);
         Task::none()
+    }
+
+    /// Lock: stops the model-list requests (they hold the key).
+    pub(crate) fn abort_model_requests(&mut self) {
+        for which in settings::Which::BOTH {
+            if let Some(handle) = self.model_requests.get_mut(which).take() {
+                handle.abort();
+            }
+            self.models.get_mut(which).loading = false;
+        }
     }
 }
 
-/// Model ids from an endpoint's model list, as chat models.
+/// Asks both Settings blocks to load their model lists (each does if it
+/// can): when Settings opens and when a key is saved or unlocked.
+pub(crate) fn load_models() -> Task<Message> {
+    Task::batch(
+        settings::Which::BOTH
+            .map(|w| Task::done(Message::Settings(settings::Message::LoadModels(w)))),
+    )
+}
+
+/// Model ids from an endpoint's model list, as chat models: sorted, without
+/// the ones that can't chat (embeddings, speech, images, moderation, the
+/// old completion models), which OpenAI's list is mostly made of.
 fn chat_models(ids: Vec<String>) -> Vec<OllamaModel> {
+    const NOT_CHAT: [&str; 12] = [
+        "embed",
+        "whisper",
+        "tts",
+        "dall-e",
+        "moderation",
+        "transcribe",
+        "gpt-image",
+        "davinci",
+        "babbage",
+        "sora",
+        "realtime",
+        "audio",
+    ];
+    let mut ids: Vec<String> = ids
+        .into_iter()
+        .filter(|id| {
+            let id = id.to_ascii_lowercase();
+            !NOT_CHAT.iter().any(|word| id.contains(word))
+        })
+        .collect();
+    ids.sort();
     ids.into_iter()
         .map(|name| OllamaModel {
             name,
@@ -207,4 +258,28 @@ pub(crate) fn detect_ollama() -> Task<Message> {
         },
         Message::OllamaDetected,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_models_drops_what_cannot_chat_and_sorts() {
+        let ids = [
+            "gpt-4o",
+            "text-embedding-3-small",
+            "whisper-1",
+            "dall-e-3",
+            "gpt-4o-mini-tts",
+            "omni-moderation-latest",
+            "babbage-002",
+            "gpt-4.1",
+        ];
+        let names: Vec<String> = chat_models(ids.map(String::from).to_vec())
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        assert_eq!(names, ["gpt-4.1", "gpt-4o"]);
+    }
 }
