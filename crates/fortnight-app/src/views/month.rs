@@ -382,7 +382,7 @@ fn day_cell<'a>(
 
 /// One task as a small card, like the Week tab's: the title, then the
 /// priority `!` in its colour. Overdue is red on a red tint; done or dropped is
-/// faint on a fainter fill.
+/// faint and struck through on a fainter fill.
 fn task_pill<'a>(t: &TitleLine, max_width: f32) -> Element<'a, Message> {
     let (done, overdue) = (t.done, t.overdue);
     let priority = if done { 0 } else { t.priority };
@@ -391,6 +391,7 @@ fn task_pill<'a>(t: &TitleLine, max_width: f32) -> Element<'a, Message> {
     let line = theme::title_with_marks(
         fit_cached(&t.title, max_width - marks),
         priority,
+        done,
         move |theme: &Theme| text::Style {
             color: Some(if overdue {
                 theme::danger_color(theme)

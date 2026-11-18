@@ -757,21 +757,27 @@ pub fn priority_marks(priority: Priority) -> String {
 /// and both colours here come from the theme, so two copies of the same
 /// text are stacked (same text, same layout): one draws the title with the
 /// marks hidden, the other only the marks. `build` sets size, width,
-/// wrapping and so on, alike for both.
+/// wrapping and so on, alike for both. `struck` draws a line through the
+/// title (not the marks), in the title's colour.
 pub fn title_with_marks<'a, M: 'a>(
     title: impl text::IntoFragment<'a>,
     priority: Priority,
+    struck: bool,
     title_style: impl Fn(&Theme) -> text::Style + Clone + 'a,
     build: impl Fn(text::Rich<'a, (), M>) -> text::Rich<'a, (), M>,
 ) -> Element<'a, M> {
     let title = title.into_fragment();
     let marks = priority_marks(priority);
     if marks.is_empty() {
-        return build(rich_text([span(title)]).style(title_style)).into();
+        let title = span(title).strikethrough(struck);
+        return build(rich_text([title]).style(title_style)).into();
     }
     let hidden = Some(Color::TRANSPARENT);
-    let title_layer = rich_text([span(title.clone()), span(marks.clone()).color_maybe(hidden)])
-        .style(title_style);
+    let title_layer = rich_text([
+        span(title.clone()).strikethrough(struck),
+        span(marks.clone()).color_maybe(hidden),
+    ])
+    .style(title_style);
     let marks_layer =
         rich_text([span(title).color_maybe(hidden), span(marks)]).style(move |_: &Theme| {
             text::Style {

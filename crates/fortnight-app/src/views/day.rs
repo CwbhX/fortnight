@@ -1495,6 +1495,7 @@ fn card_content(task: &Task, today: Date, rank: Option<usize>) -> Row<'_, Messag
     line = line.push(theme::title_with_marks(
         task.title.as_str(),
         priority,
+        false,
         style,
         |t| t.size(theme::TEXT_BODY),
     ));

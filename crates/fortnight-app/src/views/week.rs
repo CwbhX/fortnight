@@ -789,6 +789,7 @@ fn task_card<'a>(task: &'a Task, day: Date, today: Date, faded: bool) -> Element
     let title = Row::new().spacing(4).push(theme::title_with_marks(
         task.title.as_str(),
         if done { 0 } else { task.priority },
+        false,
         title_style,
         |t| {
             t.size(theme::TEXT_SMALL)
