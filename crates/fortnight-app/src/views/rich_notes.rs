@@ -358,7 +358,11 @@ impl Content {
     }
 
     pub fn perform(&mut self, action: Action) {
-        let before = self.blocks.clone();
+        // The editor lays out again when this changes (only the lines
+        // that changed).
+        if action.is_edit() {
+            self.version += 1;
+        }
         match action {
             Action::MoveTo { at, select } => self.move_to(at, select),
             Action::Move { motion, select } => {
@@ -414,9 +418,6 @@ impl Content {
                 self.link = None;
                 self.focus = Some(Focus::Editor);
             }
-        }
-        if self.blocks != before {
-            self.version += 1;
         }
     }
 

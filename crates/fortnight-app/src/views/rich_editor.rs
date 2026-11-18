@@ -40,7 +40,7 @@ use iced::{
     window,
 };
 
-use super::rich_notes::{Action, Command, Content, List, Motion, Pos, href};
+use super::rich_notes::{Action, Block, Command, Content, List, Motion, Pos, href};
 use crate::theme;
 
 /// The indentation of one level.
@@ -155,8 +155,11 @@ impl Focus {
 }
 
 /// One block, laid out.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Laid {
+    /// What it was laid out from: the block, its number, the text area's
+    /// width and the text size.
+    source: (Block, u32, f32, f32),
     paragraph: Paragraph,
     marker: Option<Paragraph>,
     /// The width of the marker's column.
@@ -170,6 +173,56 @@ struct Laid {
     spans: Vec<(bool, Option<Arc<str>>)>,
 }
 
+impl Laid {
+    fn new(block: &Block, number: u32, width: f32, size: f32) -> Self {
+        let indent = f32::from(block.indent) * INDENT;
+        let marker = match block.list {
+            List::None => None,
+            List::Bullet => Some("•".to_string()),
+            List::Dash => Some("-".to_string()),
+            List::Number => Some(format!("{number}.")),
+        }
+        .map(|m| Paragraph::with_text(text(m.as_str(), f32::INFINITY, size)));
+        // A number's column fits the number ("10." is wider).
+        let gutter = marker
+            .as_ref()
+            .map_or(0.0, |m| gutter(block.list).max(m.min_width() + MARKER_GAP));
+        let runs = block.runs();
+        let spans: Vec<Span<'_, (), Font>> = runs
+            .iter()
+            .map(|(t, style)| {
+                let span = Span::new(t.as_str()).font(style.font());
+                if style.link.is_some() {
+                    span.color(theme::accent_color())
+                } else {
+                    span
+                }
+            })
+            .collect();
+        let text_width = (width - indent - gutter).max(1.0);
+        let paragraph = Paragraph::with_spans(text(spans.as_slice(), text_width, size));
+        let height = paragraph.min_bounds().height.max(line_height(size));
+        Laid {
+            source: (block.clone(), number, width, size),
+            paragraph,
+            marker,
+            gutter,
+            origin: Point::new(indent + gutter, 0.0),
+            height,
+            plain: block.plain(),
+            spans: runs
+                .into_iter()
+                .map(|(_, s)| (s.underline || s.link.is_some(), s.link))
+                .collect(),
+        }
+    }
+
+    fn made_for(&self, block: &Block, number: u32, width: f32, size: f32) -> bool {
+        let (b, n, w, s) = &self.source;
+        b == block && *n == number && *w == width && *s == size
+    }
+}
+
 #[derive(Debug, Default)]
 struct State {
     focus: Option<Focus>,
@@ -181,6 +234,11 @@ struct State {
     made_for: Option<(u64, u64, f32, f32)>,
     blocks: Vec<Laid>,
     placeholder: Paragraph,
+    /// What the placeholder was laid out from: its text, width and size.
+    placeholder_for: Option<(String, f32, f32)>,
+    /// The look last drawn, to redraw when hovering or focus changes it
+    /// (iced only redraws when asked).
+    last_status: Option<Status>,
     /// The popup over a clicked link.
     menu: Option<Menu>,
 }
@@ -199,6 +257,8 @@ struct Menu {
     shown_url: Paragraph,
     open: Paragraph,
     edit: Paragraph,
+    /// The button under the pointer: Open (`true`) or Edit.
+    hovered: Option<bool>,
 }
 
 impl Menu {
@@ -222,6 +282,7 @@ impl Menu {
             at,
             anchor,
             line_height,
+            hovered: None,
         }
     }
 
@@ -312,58 +373,44 @@ fn col_of(plain: &str, byte: usize) -> usize {
 }
 
 impl State {
+    /// Lays the content out at `width`. Lines that haven't changed (the
+    /// same at the start and at the end) keep their layout, so typing
+    /// lays out only the line typed in.
     fn lay_out(&mut self, content: &Content, width: f32, size: f32, placeholder: &str) {
+        let blocks = content.blocks();
         let numbers = content.numbers();
-        let mut y = 0.0;
-        self.blocks = content
-            .blocks()
-            .iter()
-            .zip(numbers)
-            .map(|(block, number)| {
-                let indent = f32::from(block.indent) * INDENT;
-                let marker = match block.list {
-                    List::None => None,
-                    List::Bullet => Some("•".to_string()),
-                    List::Dash => Some("-".to_string()),
-                    List::Number => Some(format!("{number}.")),
-                }
-                .map(|m| Paragraph::with_text(text(m.as_str(), f32::INFINITY, size)));
-                // A number's column fits the number ("10." is wider).
-                let gutter = marker
-                    .as_ref()
-                    .map_or(0.0, |m| gutter(block.list).max(m.min_width() + MARKER_GAP));
-                let runs = block.runs();
-                let spans: Vec<Span<'_, (), Font>> = runs
-                    .iter()
-                    .map(|(t, style)| {
-                        let span = Span::new(t.as_str()).font(style.font());
-                        if style.link.is_some() {
-                            span.color(theme::accent_color())
-                        } else {
-                            span
-                        }
-                    })
-                    .collect();
-                let width = (width - indent - gutter).max(1.0);
-                let paragraph = Paragraph::with_spans(text(spans.as_slice(), width, size));
-                let height = paragraph.min_bounds().height.max(line_height(size));
-                let laid = Laid {
-                    paragraph,
-                    marker,
-                    gutter,
-                    origin: Point::new(indent + gutter, y),
-                    height,
-                    plain: block.plain(),
-                    spans: runs
-                        .into_iter()
-                        .map(|(_, s)| (s.underline || s.link.is_some(), s.link))
-                        .collect(),
-                };
-                y += height;
-                laid
-            })
+        let mut old: Vec<Option<Laid>> = std::mem::take(&mut self.blocks)
+            .into_iter()
+            .map(Some)
             .collect();
-        self.placeholder = Paragraph::with_text(text(placeholder, width, size));
+        let same = |laid: &Option<Laid>, i: usize| {
+            laid.as_ref()
+                .is_some_and(|l| l.made_for(&blocks[i], numbers[i], width, size))
+        };
+        let (n, m) = (blocks.len(), old.len());
+        let start = (0..n.min(m)).take_while(|&i| same(&old[i], i)).count();
+        let end = (0..(n - start).min(m - start))
+            .take_while(|&k| same(&old[m - 1 - k], n - 1 - k))
+            .count();
+        let mut y = 0.0;
+        for i in 0..n {
+            let kept = if i < start {
+                old[i].take()
+            } else if i >= n - end {
+                old[m - (n - i)].take()
+            } else {
+                None
+            };
+            let mut laid = kept.unwrap_or_else(|| Laid::new(&blocks[i], numbers[i], width, size));
+            laid.origin.y = y;
+            y += laid.height;
+            self.blocks.push(laid);
+        }
+        let wanted = (placeholder.to_string(), width, size);
+        if self.placeholder_for.as_ref() != Some(&wanted) {
+            self.placeholder = Paragraph::with_text(text(placeholder, width, size));
+            self.placeholder_for = Some(wanted);
+        }
     }
 
     fn total_height(&self) -> f32 {
@@ -466,6 +513,16 @@ impl State {
     }
 }
 
+/// The editor's look for its focus and the pointer.
+fn status(state: &State, cursor: mouse::Cursor, bounds: Rectangle) -> Status {
+    let is_hovered = cursor.is_over(bounds);
+    match &state.focus {
+        Some(_) => Status::Focused { is_hovered },
+        None if is_hovered => Status::Hovered,
+        None => Status::Active,
+    }
+}
+
 // ----------------------------------------------------------------- widget
 
 impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message> {
@@ -518,6 +575,14 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
         let publish =
             |shell: &mut Shell<'_, Message>, action| shell.publish((self.on_action)(action));
 
+        // iced redraws only when asked: ask when the look changes.
+        let status = status(state, cursor, bounds);
+        if matches!(event, Event::Window(window::Event::RedrawRequested(_))) {
+            state.last_status = Some(status);
+        } else if state.last_status != Some(status) {
+            shell.request_redraw();
+        }
+
         match event {
             Event::Window(window::Event::Unfocused) => {
                 if let Some(f) = &mut state.focus {
@@ -567,11 +632,14 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 // Any click closes the link popup (its own buttons act
                 // before this).
-                state.menu = None;
+                if state.menu.take().is_some() {
+                    shell.request_redraw();
+                }
                 let Some(p) = cursor.position_over(bounds) else {
                     if state.focus.is_some() {
                         state.focus = None;
                         state.dragging = false;
+                        shell.request_redraw();
                     }
                     return;
                 };
@@ -703,6 +771,8 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
                     keyboard::Key::Named(Named::Escape) => {
                         state.focus = None;
                         state.dragging = false;
+                        state.menu = None;
+                        shell.request_redraw();
                         // Not captured: Escape also does what it does
                         // around the editor.
                         return;
@@ -776,14 +846,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
 
         let state = tree.state.downcast_ref::<State>();
         let bounds = layout.bounds();
-        let status = match &state.focus {
-            Some(_) => Status::Focused {
-                is_hovered: cursor.is_over(bounds),
-            },
-            None if cursor.is_over(bounds) => Status::Hovered,
-            None => Status::Active,
-        };
-        let style = theme::editor(theme, status);
+        let style = theme::editor(theme, status(state, cursor, bounds));
         renderer.fill_quad(
             renderer::Quad {
                 bounds,
@@ -1000,7 +1063,7 @@ impl<Message> overlay::Overlay<Message, Theme, iced::Renderer> for LinkMenu<'_, 
         theme: &Theme,
         _style: &renderer::Style,
         layout: Layout<'_>,
-        cursor: mouse::Cursor,
+        _cursor: mouse::Cursor,
     ) {
         use iced::advanced::Renderer as _;
 
@@ -1026,8 +1089,8 @@ impl<Message> overlay::Overlay<Message, Theme, iced::Renderer> for LinkMenu<'_, 
             theme.palette().background,
         );
         let (open, edit) = menu.buttons(bounds);
-        for b in [open, edit] {
-            if cursor.is_over(b) {
+        for (b, which) in [(open, true), (edit, false)] {
+            if menu.hovered == Some(which) {
                 renderer.fill_quad(
                     renderer::Quad {
                         bounds: b.shrink(3.0),
@@ -1071,10 +1134,27 @@ impl<Message> overlay::Overlay<Message, Theme, iced::Renderer> for LinkMenu<'_, 
         _clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
     ) {
+        let bounds = layout.bounds();
+        if let Event::Mouse(mouse::Event::CursorMoved { .. }) = event
+            && let Some(menu) = self.menu.as_mut()
+        {
+            let (open, edit) = menu.buttons(bounds);
+            let hovered = if cursor.is_over(open) {
+                Some(true)
+            } else if cursor.is_over(edit) {
+                Some(false)
+            } else {
+                None
+            };
+            if hovered != menu.hovered {
+                menu.hovered = hovered;
+                shell.request_redraw();
+            }
+            return;
+        }
         let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event else {
             return;
         };
-        let bounds = layout.bounds();
         if !cursor.is_over(bounds) {
             // The editor closes the popup on this click.
             return;
@@ -1162,6 +1242,45 @@ mod tests {
             state.total_height(),
             bullet.height + plain.height + nested.height
         );
+    }
+
+    /// Laying out again after an edit keeps the unchanged lines and puts
+    /// every line in its place.
+    #[test]
+    fn layout_follows_edits() {
+        let mut content = Content::with_text("a\nb\nc");
+        let mut state = State::default();
+        state.lay_out(&content, 300.0, SIZE, "");
+        let check = |state: &State, content: &Content| {
+            let plain: Vec<String> = state.blocks.iter().map(|b| b.plain.clone()).collect();
+            let want: Vec<String> = content.blocks().iter().map(|b| b.plain()).collect();
+            assert_eq!(plain, want);
+            let mut y = 0.0;
+            for b in &state.blocks {
+                assert_eq!(b.origin.y, y);
+                y += b.height;
+            }
+        };
+        content.perform(Action::MoveTo {
+            at: Pos::new(0, 1),
+            select: false,
+        });
+        for action in [
+            Action::Enter,
+            Action::Insert("new".into()),
+            Action::Insert("\nmore".into()),
+            Action::Backspace,
+            Action::SelectAll,
+            Action::Delete,
+            Action::Paste("x\n• y\nz".into()),
+        ] {
+            content.perform(action);
+            state.lay_out(&content, 300.0, SIZE, "");
+            check(&state, &content);
+        }
+        // Another width lays every line out again.
+        state.lay_out(&content, 120.0, SIZE, "");
+        assert!(state.blocks.iter().all(|b| b.source.2 == 120.0));
     }
 
     #[test]
