@@ -517,11 +517,13 @@ pub enum Icon {
     Unlock,
     ChevronLeft,
     ChevronRight,
+    ChevronDown,
     Close,
     Plus,
     Warning,
     Copy,
     Check,
+    Trash,
 }
 
 impl Icon {
@@ -532,11 +534,13 @@ impl Icon {
             Icon::Unlock => include_bytes!("../../../assets/icons/unlock.svg"),
             Icon::ChevronLeft => include_bytes!("../../../assets/icons/chevron-left.svg"),
             Icon::ChevronRight => include_bytes!("../../../assets/icons/chevron-right.svg"),
+            Icon::ChevronDown => include_bytes!("../../../assets/icons/chevron-down.svg"),
             Icon::Close => include_bytes!("../../../assets/icons/close.svg"),
             Icon::Plus => include_bytes!("../../../assets/icons/plus.svg"),
             Icon::Warning => include_bytes!("../../../assets/icons/warning.svg"),
             Icon::Copy => include_bytes!("../../../assets/icons/copy.svg"),
             Icon::Check => include_bytes!("../../../assets/icons/check.svg"),
+            Icon::Trash => include_bytes!("../../../assets/icons/trash.svg"),
         }
     }
 }
@@ -553,6 +557,18 @@ pub fn icon<'a>(which: Icon) -> svg::Svg<'a, Theme> {
                 svg::Status::Idle => muted_color(theme),
             }),
         })
+}
+
+/// The arrow of a section that folds: a chevron pointing right when
+/// closed, down when open, in the colour of the text around it.
+pub fn disclosure<'a>(open: bool) -> svg::Svg<'a, Theme> {
+    icon(if open {
+        Icon::ChevronDown
+    } else {
+        Icon::ChevronRight
+    })
+    .width(16)
+    .height(16)
 }
 
 /// A square icon button: no fill until hovered.

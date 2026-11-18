@@ -735,11 +735,17 @@ impl SettingsView {
             .spacing(theme::SPACING / 3.0)
         };
         // Folds like Today's No date section.
-        let arrow = if self.prompts_open { "▾" } else { "▸" };
-        let heading = button(text(format!("{arrow}  Prompts")).size(theme::TEXT_SMALL))
-            .padding([4, 0])
-            .style(theme::text_button)
-            .on_press(Message::TogglePrompts);
+        let heading = button(
+            row![
+                theme::disclosure(self.prompts_open),
+                text("Prompts").size(theme::TEXT_SMALL)
+            ]
+            .spacing(6)
+            .align_y(Center),
+        )
+        .padding([4, 0])
+        .style(theme::text_button)
+        .on_press(Message::TogglePrompts);
         let mut body = column![heading].spacing(theme::SPACING);
         if self.prompts_open {
             body = body.push(

@@ -1074,10 +1074,9 @@ impl DayView {
         tasks: Vec<&'a Task>,
         data: &'a DayData,
     ) -> Element<'a, Message> {
-        let arrow = if open { "▾" } else { "▸" };
         let toggle = button(
             row![
-                text(arrow).size(theme::TEXT_SMALL),
+                theme::disclosure(open),
                 text(label).size(theme::TEXT_BODY).font(theme::FONT_BOLD),
                 text(tasks.len().to_string()).size(theme::TEXT_SMALL),
             ]
@@ -1090,12 +1089,19 @@ impl DayView {
         .on_press(toggle);
         let mut head = row![toggle].align_y(Center);
         if open && section == Section::Deleted {
-            head = head.push(
-                button(text("Delete all").size(theme::TEXT_SMALL))
-                    .padding([2, 10])
+            let trash = theme::icon(theme::Icon::Trash).style(|theme: &Theme, _| {
+                iced::widget::svg::Style {
+                    color: Some(theme::danger_color(theme)),
+                }
+            });
+            head = head.push(tooltip(
+                button(trash)
+                    .padding(2)
                     .style(theme::danger_button)
                     .on_press(Message::DeleteAll),
-            );
+                theme::tip("Delete all"),
+                tooltip::Position::Bottom,
+            ));
         }
         let body = open.then(|| {
             if section == Section::Deleted {
