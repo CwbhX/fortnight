@@ -12,9 +12,9 @@
 //! done, wherever they sit; never other days' tasks) as one `choice`
 //! question ("which first?"), ranks them by probability
 //! and replies with the same JSON a chat model would
-//! (`report::parse_recommendations`). Each task that isn't overdue is also
-//! asked about as a `noul` ("should this be done today, or can it
-//! wait?"); one the model gives less than an even chance is left out, so
+//! (`report::parse_recommendations`). Each task that isn't pressing
+//! (overdue, or due today or tomorrow) is also asked about as a `noul`
+//! ("should this be done today, or can it wait?"); one the model gives less than an even chance is left out, so
 //! the list can be shorter than three, or empty, instead of padded with
 //! what can wait. A deadline a week or more away is given as a date ("due
 //! 25 Dec"), not a weekday. The reasons are written here from
@@ -259,7 +259,7 @@ fn status_error(status: u16, body: &str, model: &str, key: Option<&SecretString>
 
 /// What to do for a recommended-tasks request.
 enum Ask {
-    /// Nothing to ask (no task, or only one and overdue): this is the reply.
+    /// Nothing to ask (no task, or only one and pressing): this is the reply.
     Answer(String),
     Question {
         body: Value,
@@ -278,11 +278,12 @@ struct Candidate {
     why: String,
     /// How much its priority counts in the ranking (`priority_weight`).
     weight: f64,
-    /// Overdue: always worth doing today, so not asked about.
-    overdue: bool,
+    /// Overdue, or due today or tomorrow: always worth doing today, so not
+    /// asked about.
+    pressing: bool,
 }
 
-/// The question asked of each task that isn't overdue, as a `noul` (yes
+/// The question asked of each task that isn't pressing, as a `noul` (yes
 /// or no, answered as the probability of yes).
 const TODAY_QUESTION: &str =
     "Should this task be done today, or can it wait for a later day? Task: ";
@@ -365,7 +366,7 @@ fn plan_question(user: &str, model: &str) -> Option<Ask> {
             candidates.push(candidate(task));
         }
     }
-    if candidates.is_empty() || (candidates.len() == 1 && candidates[0].overdue) {
+    if candidates.is_empty() || (candidates.len() == 1 && candidates[0].pressing) {
         return Some(Ask::Answer(reply_json(
             &candidates.iter().collect::<Vec<_>>(),
         )));
@@ -402,7 +403,7 @@ fn plan_question(user: &str, model: &str) -> Option<Ask> {
     }
     // Whether each is worth doing today at all: the list may be shorter
     // than three, or empty, rather than padded with what can wait.
-    for c in candidates.iter().filter(|c| !c.overdue) {
+    for c in candidates.iter().filter(|c| !c.pressing) {
         questions.insert(
             today_key(c),
             json!({
@@ -485,7 +486,7 @@ fn candidate(task: &crate::report::PlanTask) -> Candidate {
         description: parts.join("; "),
         why,
         weight: priority_weight(priority) * overdue_weight(days) * deadline_weight(days),
-        overdue: task.overdue,
+        pressing: task.overdue || days.is_some_and(|d| d <= 1),
     }
 }
 
@@ -530,10 +531,10 @@ fn plan_reply(answers: &Value, candidates: &[Candidate]) -> Result<String, LlmEr
             "the decision model's answer named none of the tasks".into(),
         ));
     }
-    // Only what is worth doing today (overdue tasks always are). A task
-    // with no answer stays.
+    // Only what is worth doing today (overdue tasks and those due today or
+    // tomorrow always are). A task with no answer stays.
     picks.retain(|c| {
-        c.overdue
+        c.pressing
             || answers
                 .get(today_key(c))
                 .and_then(|a| a.get("noul"))
@@ -913,7 +914,7 @@ mod tests {
                 "model": "nimble",
                 "answers": {
                     "first": { "type": "choice", "choice": "t3",
-                        "probabilities": { "t1": 0.2, "t2": 0.1, "t3": 0.7 } },
+                        "probabilities": { "t1": 0.2, "t2": 0.1, "t3": 0.65, "t5": 0.05 } },
                     "today_t1": { "type": "noul", "noul": 0.9 },
                     "today_t3": { "type": "noul", "noul": 0.41 }
                 }
@@ -921,20 +922,26 @@ mod tests {
             .mount(&server)
             .await;
         let tasks = [
-            task(1, "Email Omid", Some(date(2026, 11, 16))),
+            task(1, "Email Omid", Some(date(2026, 11, 20))),
             task(2, "Fix the build", Some(date(2026, 11, 13))),
             task(3, "Plan the offsite", Some(date(2026, 11, 26))),
+            // Due tomorrow: pressing, never asked about, kept.
+            task(5, "Apply to Apple", Some(date(2026, 11, 17))),
         ];
         let reply = client(&server).chat(plan_request(&tasks)).await.unwrap();
         let rec = parse_recommendations(&reply.text).unwrap();
-        // 2 is overdue (weighted up, kept); 3 can wait.
-        assert_eq!(rec.tasks.iter().map(|t| t.id).collect::<Vec<_>>(), [1, 2]);
+        // 2 is overdue (weighted up, kept); 3 can wait; 5 is due tomorrow.
+        assert_eq!(
+            rec.tasks.iter().map(|t| t.id).collect::<Vec<_>>(),
+            [1, 2, 5]
+        );
         let sent: Value = server.received_requests().await.unwrap()[0]
             .body_json()
             .unwrap();
         let questions = sent["questions"].as_object().unwrap();
         assert!(questions.contains_key("today_t1") && questions.contains_key("today_t3"));
         assert!(!questions.contains_key("today_t2"), "{sent}");
+        assert!(!questions.contains_key("today_t5"), "{sent}");
         assert!(
             questions["today_t3"]["instructions"]
                 .as_str()
