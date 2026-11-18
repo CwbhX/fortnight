@@ -20,7 +20,8 @@
 //! Tasks are small cards. An open task's card can be dragged: a copy follows
 //! the pointer, the day under it is highlighted, and an accent line shows
 //! where it will land. Dropping on a card puts the task before it; dropping
-//! on a column's free space puts it after that day's open tasks. Another day
+//! on a column's free space or a done card puts it after that day's open
+//! tasks. Another day
 //! becomes the task's planned day (its deadline stays as it is); within a
 //! day only the order (`Task::position`) changes. Dropping on the weekend
 //! column's free space uses its first day; letting go anywhere else cancels.
@@ -674,6 +675,12 @@ fn card_list<'a>(
             list = list.push(theme::section_heading(day.strftime("%a %-d").to_string()));
         }
         let open = tasks.iter().filter(|t| t.status.is_open()).count();
+        // Done cards are targets for "after the open tasks" too, so that
+        // drop isn't left to the thin gap above them.
+        let at_end = shows_line(*day, &tasks, None)
+            || tasks[open..]
+                .iter()
+                .any(|t| shows_line(*day, &tasks, Some(t.id)));
         for (i, task) in tasks.iter().enumerate() {
             any = true;
             list = list.push(task_row(
@@ -681,10 +688,10 @@ fn card_list<'a>(
                 *day,
                 data.today,
                 dragged.is_some().then_some(dragged == Some(task.id)),
-                shows_line(*day, &tasks, Some(task.id)),
+                i < open && shows_line(*day, &tasks, Some(task.id)),
             ));
             if i + 1 == open {
-                list = list.push(slot(shows_line(*day, &tasks, None)));
+                list = list.push(slot(at_end));
             }
         }
     }
@@ -718,10 +725,20 @@ fn task_row<'a>(
         task_card(task, day, today, dragging == Some(true))
     ];
     if !task.status.is_open() {
-        return mouse_area(card)
+        let mut area = mouse_area(card)
             .on_press(Message::Edit(task.id))
-            .interaction(mouse::Interaction::Pointer)
-            .into();
+            .interaction(mouse::Interaction::Pointer);
+        if dragging.is_some() {
+            // Dropping here means after the day's open tasks
+            // (`drop_position` puts a `before` that isn't open at the end).
+            // Its own target, not the column's: entering it and leaving the
+            // free space may arrive in either order.
+            area = area
+                .on_enter(Message::Hover(day, Some(task.id)))
+                .on_exit(Message::Leave(day, Some(task.id)))
+                .on_release(Message::DropOn(day, Some(task.id)));
+        }
+        return area.into();
     }
     // The slot above belongs to the card: hovering the gap means "before
     // this card" too.
@@ -1242,6 +1259,9 @@ mod tests {
         assert_eq!(drop_at(&tasks, 3, tue, Some(2)), Some(1.5));
         // To the end of the open ones.
         assert_eq!(drop_at(&tasks, 1, tue, None), Some(4.0));
+        // On a done card: the same.
+        assert_eq!(drop_at(&tasks, 1, tue, Some(4)), Some(4.0));
+        assert_eq!(drop_at(&tasks, 3, tue, Some(4)), None);
         // Already there: nothing.
         assert_eq!(drop_at(&tasks, 3, tue, None), None);
         assert_eq!(drop_at(&tasks, 2, tue, Some(3)), None);
