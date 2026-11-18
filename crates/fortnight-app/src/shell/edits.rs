@@ -185,25 +185,21 @@ impl Ready {
         let today = self.today();
         let replan = self
             .task(id)
-            .filter(|t| plans_today_when_done(t, status, self.selected, today));
-        let Some(task) = replan.cloned() else {
+            .is_some_and(|t| plans_today_when_done(t, status, self.selected, today));
+        if !replan {
             self.set_status(id, status);
             return;
-        };
-        let undo = self.snapshot(id, true);
-        let result = self
-            .store
-            .update_task(&CoreTask {
-                planned_for: Some(today),
-                ..task
-            })
-            .and_then(|()| self.store.set_status(id, status));
-        match result {
-            Ok(()) => {
-                if let Some(undo) = undo {
-                    self.undo.remember(undo);
-                }
-            }
+        }
+        let last_event = self.events.iter().map(|e| e.id).max().unwrap_or(0);
+        // One write of just the day and the status, so an edit made
+        // elsewhere since the last reload is kept; undo puts back the task
+        // as the store had it.
+        match self.store.complete_on(id, today) {
+            Ok(before) => self.undo.remember(Undo::Changed {
+                before: Box::new(before),
+                last_event,
+                keep_position: true,
+            }),
             Err(e) => self.error = Some(e.to_string()),
         }
         self.reload_tasks();

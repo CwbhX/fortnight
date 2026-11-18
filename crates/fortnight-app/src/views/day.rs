@@ -921,10 +921,12 @@ impl DayView {
         let gap = theme::SPACING * 1.5;
         let key = day_key(data.day) * 8;
         let place = |section: Section, shown: bool, panel: Element<'a, Message>| {
+            // Its last task fades away before it folds.
             motion::fold(
                 shown,
                 container(panel).padding(iced::Padding::ZERO.bottom(gap)),
             )
+            .close_after(motion::FADED)
             .key(key + section as u64)
         };
         let below =
@@ -1160,7 +1162,9 @@ impl DayView {
                 .padding(iced::Padding::ZERO.bottom(theme::SPACING * 0.75)),
         ]
         .spacing(8);
+        // Its last task fades away before it folds.
         motion::fold(shown, part)
+            .close_after(motion::FADED)
             .key(day_key(data.day) * 8 + Section::Recommended as u64)
             .into()
     }
@@ -2717,5 +2721,23 @@ mod tests {
             let between = hs.iter().filter(|&&h| h < before - 1.0 && h > last).count();
             assert!(between >= 3, "{others} other(s): not smooth: {hs:?}");
         }
+    }
+
+    #[test]
+    fn the_last_overdue_task_ticked_fades_before_its_panel_folds() {
+        let mut tasks = vec![task(1, "late", Some(date(2026, 11, 13)))];
+        let mut view = loaded(tasks.clone());
+        let before = heights_after(&mut view, data_for(today(), tasks.clone()), 20, 1)[0];
+        tasks[0] = done_on(tasks[0].clone(), date(2026, 11, 13));
+        let hs = heights_after(&mut view, data_for(today(), tasks), 20, 40);
+        // Held while the card holds its beat (its own gap closes from
+        // about 150 ms; the panel folds once it has faded, about 270 ms).
+        assert!(hs[..7].iter().all(|&h| h >= before - 1.0), "{hs:?}");
+        let last = *hs.last().unwrap();
+        assert!(last < before - 40.0, "{hs:?}");
+        assert!(
+            hs.iter().filter(|&&h| h < before - 1.0 && h > last).count() >= 3,
+            "{hs:?}"
+        );
     }
 }

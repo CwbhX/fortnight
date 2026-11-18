@@ -50,7 +50,7 @@ use iced::{Color, Element, Event, Length, Rectangle, Shadow, Size, Vector, mouse
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 mod list;
-pub use list::{Item, List, list};
+pub use list::{FADED, Item, List, list};
 
 /// How long a page (the open tab) takes to fade in.
 const PAGE: Duration = Duration::from_millis(170);
@@ -141,6 +141,8 @@ struct Run {
     now: Option<Instant>,
     /// Jump to the end.
     skipped: bool,
+    /// How long it holds still at the start before it moves.
+    delay: Duration,
 }
 
 impl Run {
@@ -154,8 +156,25 @@ impl Run {
 
     /// Begin again at the next frame.
     fn restart(&mut self) {
+        self.restart_after(Duration::ZERO);
+    }
+
+    /// Begin again at the next frame, holding still for `delay` first.
+    fn restart_after(&mut self, delay: Duration) {
         self.start = None;
         self.skipped = false;
+        self.delay = delay;
+    }
+
+    /// Still holding before it moves (begun or about to begin).
+    fn waiting(&self) -> bool {
+        if self.skipped || !enabled() || held().is_some() {
+            return false;
+        }
+        match (self.start, self.now) {
+            (Some(start), Some(now)) => now.saturating_duration_since(start) < self.delay,
+            _ => !self.delay.is_zero(),
+        }
     }
 
     fn skip(&mut self) {
@@ -166,7 +185,7 @@ impl Run {
     fn frame(&mut self, now: Instant, duration: Duration) -> bool {
         self.start.get_or_insert(now);
         self.now = Some(now);
-        self.progress(duration) < 1.0
+        self.waiting() || self.progress(duration) < 1.0
     }
 
     /// How far along it is at the latest frame, 0–1 (not eased).
@@ -178,11 +197,26 @@ impl Run {
             return 1.0;
         }
         match (self.start, self.now) {
-            (Some(start), Some(now)) => (now.saturating_duration_since(start).as_secs_f32()
-                / duration.as_secs_f32())
-            .min(1.0),
+            (Some(start), Some(now)) => {
+                let moving = now
+                    .saturating_duration_since(start)
+                    .saturating_sub(self.delay);
+                (moving.as_secs_f32() / duration.as_secs_f32()).min(1.0)
+            }
             _ => 0.0,
         }
+    }
+}
+
+/// `cursor` as seen by content showing only within `visible`: elsewhere
+/// it is not over the content at all. Content partly shown (part open,
+/// coming in) is laid out at full size over whatever follows; this keeps a
+/// click or hover there for what is drawn there.
+fn shown_cursor(cursor: mouse::Cursor, visible: Rectangle) -> mouse::Cursor {
+    if cursor.is_over(visible) {
+        cursor
+    } else {
+        mouse::Cursor::Unavailable
     }
 }
 
@@ -842,6 +876,7 @@ pub fn unfold<'a, M, T, R>(
         open,
         key: 0,
         hide: false,
+        close_after: Duration::ZERO,
     }
 }
 
@@ -864,6 +899,8 @@ pub struct Unfold<'a, M, T, R> {
     key: u64,
     /// Closed, it takes no room and its content is hidden ([`fold`]).
     hide: bool,
+    /// How long it stays as it is before it starts to close.
+    close_after: Duration,
 }
 
 impl<M, T, R> Unfold<'_, M, T, R> {
@@ -872,6 +909,14 @@ impl<M, T, R> Unfold<'_, M, T, R> {
     /// a flourish it didn't earn.
     pub fn key(mut self, key: u64) -> Self {
         self.key = key;
+        self
+    }
+
+    /// When it closes, it first stays as it is (at its content's height)
+    /// for `delay`: a section whose last item is leaving folds away once
+    /// the item has gone, rather than cutting it off.
+    pub fn close_after(mut self, delay: Duration) -> Self {
+        self.close_after = delay;
         self
     }
 
@@ -925,7 +970,11 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Unfold<'_, M, T, R> {
             state.run.skip();
         } else if self.open != state.open {
             state.from = state.height;
-            state.run.restart();
+            if self.open {
+                state.run.restart();
+            } else {
+                state.run.restart_after(self.close_after);
+            }
             state.settled = false;
         }
         state.open = self.open;
@@ -948,6 +997,10 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Unfold<'_, M, T, R> {
         let full = content.size();
         let target = if self.hidden() { 0.0 } else { full.height };
         let state = tree.state.downcast_mut::<UnfoldState>();
+        if state.run.waiting() {
+            // Holding before it closes: as tall as what it shows now.
+            state.from = full.height;
+        }
         let t = ease_out(state.run.progress(UNFOLD));
         // Whole pixels, so what follows it stays sharp as it moves.
         state.height = if t < 1.0 {
@@ -975,6 +1028,7 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Unfold<'_, M, T, R> {
         if (!self.hidden() || frame_time(event).is_some())
             && let Some(content) = layout.children().next()
         {
+            let cursor = shown_cursor(cursor, layout.bounds());
             self.content.as_widget_mut().update(
                 &mut tree.children[0],
                 event,
@@ -1066,7 +1120,7 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Unfold<'_, M, T, R> {
             Some(content) => self.content.as_widget().mouse_interaction(
                 &tree.children[0],
                 content,
-                cursor,
+                shown_cursor(cursor, layout.bounds()),
                 viewport,
                 renderer,
             ),
@@ -1480,6 +1534,32 @@ mod tests {
         assert_eq!(stage.node.size().height, 120.0);
         assert!(!stage.frame(Instant::now()));
         assert_eq!(stage.layouts, 0);
+    }
+
+    #[test]
+    fn a_section_closing_after_a_delay_holds_then_folds() {
+        let delayed = |open: bool| -> El<'_> {
+            fold(open, space().width(200).height(120))
+                .close_after(ms(100))
+                .into()
+        };
+        let mut stage = Stage::new(delayed(true));
+        let t0 = Instant::now();
+        stage.frame(t0);
+        stage.set(delayed(false));
+        assert!(stage.frame(t0 + ms(1000)));
+        assert!(stage.frame(t0 + ms(1050)));
+        assert_eq!(stage.node.size().height, 120.0, "held");
+        assert!(stage.frame(t0 + ms(1100) + UNFOLD / 2));
+        let h = stage.node.size().height;
+        assert!(h > 0.0 && h < 120.0, "{h}");
+        assert!(!stage.frame(t0 + ms(1100) + UNFOLD));
+        assert_eq!(stage.node.size().height, 0.0);
+        // Opening is not delayed.
+        stage.set(delayed(true));
+        assert!(stage.frame(t0 + ms(2000)));
+        assert!(stage.frame(t0 + ms(2000) + UNFOLD / 2));
+        assert!(stage.node.size().height > 0.0);
     }
 
     /// A list item: 40 tall closed, 200 open.

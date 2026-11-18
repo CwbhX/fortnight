@@ -722,6 +722,50 @@ impl Store for SqliteStore {
         tx.commit().map_err(db)
     }
 
+    fn complete_on(&self, id: TaskId, day: Date) -> StoreResult<Task> {
+        let tx = self.write_tx()?;
+        let old = query_task(&tx, id)?.ok_or(StoreError::TaskNotFound(id))?;
+        let mut events = Vec::new();
+        if old.planned_for != Some(day) {
+            events.push(EventKind::PlannedChanged {
+                from: old.planned_for,
+                to: Some(day),
+            });
+        }
+        if old.status != TaskStatus::Done {
+            events.push(EventKind::StatusChanged {
+                from: old.status,
+                to: TaskStatus::Done,
+            });
+        }
+        if events.is_empty() {
+            return Ok(old);
+        }
+        let now = ts_to_sql(Timestamp::now());
+        // A task already done keeps when it was done.
+        let completed_at = match old.completed_at {
+            Some(at) if old.status == TaskStatus::Done => ts_to_sql(at),
+            _ => now.clone(),
+        };
+        tx.execute(
+            "UPDATE tasks SET planned_for = ?2, status = ?3, completed_at = ?4, updated_at = ?5
+             WHERE id = ?1",
+            params![
+                id,
+                date_to_sql(day),
+                TaskStatus::Done.as_str(),
+                completed_at,
+                now
+            ],
+        )
+        .map_err(db)?;
+        for kind in &events {
+            insert_event(&tx, Some(id), &now, kind)?;
+        }
+        tx.commit().map_err(db)?;
+        Ok(old)
+    }
+
     fn delete_task(&self, id: TaskId) -> StoreResult<DeletedTask> {
         let tx = self.write_tx()?;
         let task = query_task(&tx, id)?.ok_or(StoreError::TaskNotFound(id))?;
@@ -1985,6 +2029,51 @@ mod tests {
         );
         assert_eq!(Some(ev[2].at), done.completed_at);
         assert_eq!(ev[3].at, dropped.updated_at);
+    }
+
+    #[test]
+    fn complete_on_plans_and_completes_in_one_go_and_keeps_other_edits() {
+        let s = store();
+        let monday = jiff::civil::date(2026, 11, 16);
+        let wednesday = jiff::civil::date(2026, 11, 18);
+        let t = s
+            .add_task(NewTask {
+                planned_for: Some(monday),
+                ..new_task("t")
+            })
+            .unwrap();
+        // Edited elsewhere since: kept.
+        s.update_task(&Task {
+            title: "renamed".into(),
+            ..t.clone()
+        })
+        .unwrap();
+
+        let before = s.complete_on(t.id, wednesday).unwrap();
+        assert_eq!((before.title.as_str(), before.status), ("renamed", Todo));
+        let done = s.get_task(t.id).unwrap().unwrap();
+        assert_eq!(done.title, "renamed");
+        assert_eq!((done.status, done.planned_for), (Done, Some(wednesday)));
+        assert_eq!(done.completed_at, Some(done.updated_at));
+        let ev = s.task_events(t.id).unwrap();
+        assert_eq!(
+            kinds(&ev)[2..],
+            [
+                EventKind::PlannedChanged {
+                    from: Some(monday),
+                    to: Some(wednesday),
+                },
+                status(Todo, Done),
+            ]
+        );
+
+        // Again: nothing changes.
+        s.complete_on(t.id, wednesday).unwrap();
+        assert_eq!(s.get_task(t.id).unwrap(), Some(done));
+        assert!(matches!(
+            s.complete_on(999, wednesday),
+            Err(StoreError::TaskNotFound(999))
+        ));
     }
 
     #[test]

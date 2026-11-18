@@ -65,6 +65,14 @@ pub trait Store {
     /// unless the status is already `status` (then it does nothing).
     fn set_status(&self, id: TaskId, status: TaskStatus) -> StoreResult<()>;
 
+    /// Marks the task done and plans it for `day`, in one transaction,
+    /// touching no other field: a task ticked off on a day it was carried
+    /// over to. Writes a `PlannedChanged` event if the day changes and a
+    /// `StatusChanged` one if it was not done; returns the task as it was
+    /// before (for undo). Errors with `TaskNotFound` if the id does not
+    /// exist.
+    fn complete_on(&self, id: TaskId, day: Date) -> StoreResult<Task>;
+
     /// Sets the manual ordering (`Task::position`; lower sorts first). No
     /// event and no `updated_at` change: order isn't history. (Round 3, for
     /// dragging cards within a day.)

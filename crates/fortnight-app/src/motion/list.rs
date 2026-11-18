@@ -1,6 +1,6 @@
 //! [`list`]: a column of keyed items that come and go smoothly.
 
-use super::{Behind, Run, ease_out, frame_time, lerp};
+use super::{Behind, Run, ease_out, frame_time, lerp, shown_cursor};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Shell, Widget, overlay, renderer};
@@ -13,6 +13,10 @@ const ENTER: Duration = Duration::from_millis(300);
 /// How long an item takes to go: a beat to show what changed (a ticked
 /// box), then it fades and shrinks away, and the gap closes.
 const LEAVE: Duration = Duration::from_millis(380);
+/// How long a leaving item takes to fade away (its gap is still closing
+/// then): a section folding away after its last item waits this long
+/// ([`Unfold::close_after`](super::Unfold::close_after)). See `Motion::pose`.
+pub const FADED: Duration = Duration::from_millis(LEAVE.as_millis() as u64 * 7 / 10);
 /// How far an item drifts as it comes or goes, in logical pixels.
 const DRIFT: f32 = 10.0;
 /// How small an item is at the start of coming in or the end of going.
@@ -137,6 +141,15 @@ impl Pose {
         scale: 1.0,
         drift: 0.0,
     };
+
+    /// The part of an item laid out at `bounds` that takes room, from its
+    /// top: what it is drawn in.
+    fn room_of(&self, bounds: Rectangle) -> Rectangle {
+        Rectangle {
+            height: (bounds.height * self.room).round(),
+            ..bounds
+        }
+    }
 }
 
 /// `t` (0–1) of the way from `start` to `end`, clamped.
@@ -336,13 +349,17 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for List<'_, M, T, R> {
         shell: &mut Shell<'_, M>,
         viewport: &Rectangle,
     ) {
-        for ((item, child), layout) in self
+        let state = tree.state.downcast_ref::<State>();
+        let poses: Vec<Pose> = self.items.iter().map(|item| state.pose(item.key)).collect();
+        for (((item, child), layout), pose) in self
             .items
             .iter_mut()
             .zip(&mut tree.children)
             .zip(layout.children())
+            .zip(&poses)
         {
             if !item.leaving {
+                let cursor = shown_cursor(cursor, pose.room_of(layout.bounds()));
                 item.content.as_widget_mut().update(
                     child, event, layout, cursor, renderer, clipboard, shell, viewport,
                 );
@@ -390,10 +407,7 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for List<'_, M, T, R> {
                 continue;
             }
             let bounds = layout.bounds();
-            let room = Rectangle {
-                height: (bounds.height * pose.room).round(),
-                ..bounds
-            };
+            let room = pose.room_of(bounds);
             let Some(clip) = room.intersection(viewport) else {
                 continue;
             };
@@ -460,15 +474,21 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for List<'_, M, T, R> {
         viewport: &Rectangle,
         renderer: &R,
     ) -> mouse::Interaction {
+        let state = tree.state.downcast_ref::<State>();
         self.items
             .iter()
             .zip(&tree.children)
             .zip(layout.children())
             .filter(|((item, _), _)| !item.leaving)
             .map(|((item, child), layout)| {
-                item.content
-                    .as_widget()
-                    .mouse_interaction(child, layout, cursor, viewport, renderer)
+                let room = state.pose(item.key).room_of(layout.bounds());
+                item.content.as_widget().mouse_interaction(
+                    child,
+                    layout,
+                    shown_cursor(cursor, room),
+                    viewport,
+                    renderer,
+                )
             })
             .max()
             .unwrap_or_default()
@@ -693,5 +713,42 @@ mod tests {
         stage.set(folded(true, &[(1, false), (2, false)]));
         let list = stage.tree.children[0].state.downcast_ref::<State>();
         assert_eq!(list.pose(2), Pose::STILL);
+    }
+
+    #[test]
+    fn a_click_goes_only_to_the_item_drawn_under_it() {
+        use iced::advanced::{Shell, clipboard};
+        use iced::widget::checkbox;
+        use iced::{Event, Point, Rectangle};
+        // Checkboxes: each sends a message when pressed, even when another
+        // widget has taken the click already.
+        let pressable = |keys: &[u64]| -> El<'_> {
+            let mut list = list().spacing(10.0).key(1);
+            for &key in keys {
+                let tick = checkbox(false).size(40).on_toggle(|_| ());
+                list = list.push(Item::new(key, tick).from(1.0));
+            }
+            list.into()
+        };
+        let mut stage = Stage::new(pressable(&[2]));
+        let t0 = Instant::now();
+        stage.frame(t0);
+        // 1 arrives above 2: it takes no room yet, but is laid out at its
+        // full height over 2.
+        stage.set(pressable(&[1, 2]));
+        stage.frame(t0 + ms(1000));
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        stage.element.as_widget_mut().update(
+            &mut stage.tree,
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Layout::new(&stage.node),
+            mouse::Cursor::Available(Point::new(20.0, 20.0)),
+            &(),
+            &mut clipboard::Null,
+            &mut shell,
+            &Rectangle::with_size(Size::new(400.0, 300.0)),
+        );
+        assert_eq!(messages.len(), 1, "one click, one item");
     }
 }
