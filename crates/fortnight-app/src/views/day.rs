@@ -5,8 +5,9 @@
 //! - **Tasks**: the day's panel. At its top, under a small "Recommended"
 //!   heading and above a hairline (today and later days, while there are
 //!   any): the model's top three open tasks. On today from the Tasks list
-//!   (carried-over ones included, overdue ones never); on a later day only
-//!   from the tasks planned for it. Most important first, numbered
+//!   (carried-over ones included; overdue ones only with Settings'
+//!   "Recommend overdue tasks", and then not in Overdue); on a later day
+//!   only from the tasks planned for it. Most important first, numbered
 //!   (the model's reasons aren't shown). They are left out of the rest of
 //!   the page. Then open tasks whose [`Task::day`] (the planned day) is the
 //!   shown day, then the add-a-task input. On today this also carries over
@@ -273,6 +274,9 @@ pub struct DayData {
     pub recommending: bool,
     /// Every free-standing log line, oldest first.
     pub logs: Vec<LogLine>,
+    /// Overdue tasks can be recommended (Settings); off, they stay in
+    /// Overdue.
+    pub recommend_overdue: bool,
     /// The shown day's load, as its Week column's bar shows it (`None`:
     /// no bar).
     pub load: Option<ColumnLoad>,
@@ -417,10 +421,11 @@ fn open_order(a: &Task, b: &Task) -> Ordering {
 const MAX_RECOMMENDED: usize = 3;
 
 /// The recommended tasks shown: on today and later days (not past ones),
-/// those still on the shown day's list (its Tasks section; an overdue task
-/// is never recommended, it is in Overdue), at most [`MAX_RECOMMENDED`], in
-/// the model's order. `main.rs` works them out for the shown day: on today
-/// from today's list, on a later day from the tasks planned for it.
+/// those still on the shown day's list (its Tasks section, and Overdue when
+/// `DayData::recommend_overdue`), at most [`MAX_RECOMMENDED`], in the
+/// model's order. `main.rs` works them out for the shown day: on today from
+/// today's list (and the overdue tasks, with that setting), on a later day
+/// from the tasks planned for it.
 fn recommended_tasks(data: &DayData) -> Vec<&Task> {
     if data.day < data.today {
         return Vec::new();
@@ -428,11 +433,10 @@ fn recommended_tasks(data: &DayData) -> Vec<&Task> {
     data.recommended
         .iter()
         .filter_map(|r| data.tasks.iter().find(|t| t.id == r.id))
-        .filter(|t| {
-            matches!(
-                section_of(t, data.day, data.today, &data.tz),
-                Some(Section::Day)
-            )
+        .filter(|t| match section_of(t, data.day, data.today, &data.tz) {
+            Some(Section::Day) => true,
+            Some(Section::Overdue) => data.recommend_overdue,
+            _ => false,
         })
         .take(MAX_RECOMMENDED)
         .collect()
@@ -1831,6 +1835,7 @@ mod tests {
             recommended: Vec::new(),
             recommending: false,
             logs: Vec::new(),
+            recommend_overdue: false,
             load: None,
         }
     }
@@ -2378,6 +2383,10 @@ mod tests {
         data.recommended = vec![Recommended { id: 6 }, Recommended { id: 5 }];
         assert!(section_tasks(&data, Section::Recommended).is_empty());
         assert_eq!(ids(&section_tasks(&data, Section::Overdue)), [5]);
+        // With the setting it can be, and then leaves Overdue.
+        data.recommend_overdue = true;
+        assert_eq!(ids(&section_tasks(&data, Section::Recommended)), [5]);
+        assert!(section_tasks(&data, Section::Overdue).is_empty());
     }
 
     #[test]

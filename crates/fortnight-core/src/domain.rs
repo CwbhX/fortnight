@@ -506,6 +506,9 @@ pub struct Settings {
     /// New tasks get a due date by default: the day they are added to
     /// (today, from the Today tab). Missing in older data: off.
     pub due_on_added_day: bool,
+    /// Overdue tasks can be recommended (and then show in Recommended
+    /// rather than Overdue). Missing in older data: off.
+    pub recommend_overdue: bool,
 }
 
 /// The width of the Today tab's column, picked in Settings. The app maps
@@ -616,6 +619,7 @@ impl Default for Settings {
             accent: Accent::Orange,
             today_width: TodayWidth::Standard,
             due_on_added_day: false,
+            recommend_overdue: false,
         }
     }
 }
@@ -675,6 +679,7 @@ mod tests {
         let old: Settings = serde_json::from_str(r#"{"accent":"teal"}"#).unwrap();
         assert_eq!(old.today_width, TodayWidth::Standard);
         assert!(!old.due_on_added_day);
+        assert!(!old.recommend_overdue);
         let wide = Settings {
             today_width: TodayWidth::ExtraWide,
             ..Settings::default()

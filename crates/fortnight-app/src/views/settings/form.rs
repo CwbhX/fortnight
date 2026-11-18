@@ -22,6 +22,7 @@ pub(super) struct Form {
     pub(super) accent: Accent,
     pub(super) today_width: TodayWidth,
     pub(super) due_on_added_day: bool,
+    pub(super) recommend_overdue: bool,
     /// The prompts as shown and edited.
     pub(super) summary_prompt: String,
     pub(super) plan_prompt: String,
@@ -60,6 +61,7 @@ impl Form {
             accent: s.accent,
             today_width: s.today_width,
             due_on_added_day: s.due_on_added_day,
+            recommend_overdue: s.recommend_overdue,
             summary_prompt: summary_shown.clone(),
             plan_prompt: match s.plan_prompt.trim() {
                 "" => DEFAULT_PLAN_PROMPT.to_string(),
@@ -103,6 +105,7 @@ impl Form {
             accent: self.accent,
             today_width: self.today_width,
             due_on_added_day: self.due_on_added_day,
+            recommend_overdue: self.recommend_overdue,
             summary_prompt,
             plan_prompt: stored_prompt(&self.plan_prompt, DEFAULT_PLAN_PROMPT),
         })
@@ -228,6 +231,18 @@ mod tests {
             panic!("expected Save");
         };
         assert_eq!(s.accent, Accent::Purple);
+    }
+
+    #[test]
+    fn recommend_overdue_saves() {
+        let mut v = loaded(KeyState::NoKey);
+        assert!(!v.form.recommend_overdue);
+        v.update(Message::RecommendOverdue(true));
+        assert!(v.is_dirty());
+        let Action::Save(s) = v.update(Message::Save) else {
+            panic!("expected Save");
+        };
+        assert!(s.recommend_overdue);
     }
 
     #[test]

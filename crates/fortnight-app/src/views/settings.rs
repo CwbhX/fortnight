@@ -145,6 +145,8 @@ pub enum Message {
     TodayWidth(TodayWidth),
     /// "New tasks are due the day they're added to", applied on Save.
     DueOnAddedDay(bool),
+    /// "Recommend overdue tasks", applied on Save.
+    RecommendOverdue(bool),
 }
 
 /// Which endpoint a field, button or request is for: the main LLM, or the
@@ -469,6 +471,7 @@ impl SettingsView {
             Message::Accent(accent) => form.accent = accent,
             Message::TodayWidth(w) => form.today_width = w,
             Message::DueOnAddedDay(on) => form.due_on_added_day = on,
+            Message::RecommendOverdue(on) => form.recommend_overdue = on,
             Message::WorkingDay(i, on) => {
                 if let Some(day) = form.working_days.get_mut(i) {
                     *day = on;
@@ -657,7 +660,11 @@ impl SettingsView {
             .label("Use a different model")
             .text_size(theme::TEXT_BODY)
             .on_toggle(Message::Separate);
-        let mut body = column![toggle].spacing(theme::SPACING);
+        let overdue = checkbox(self.form.recommend_overdue)
+            .label("Recommend overdue tasks")
+            .text_size(theme::TEXT_BODY)
+            .on_toggle(Message::RecommendOverdue);
+        let mut body = column![overdue, toggle].spacing(theme::SPACING);
         if self.decision_on {
             body = body.push(self.endpoint_grid(Which::Decision));
         }

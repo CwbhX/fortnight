@@ -67,6 +67,7 @@ impl Ready {
                     recommended,
                     recommending,
                     logs,
+                    recommend_overdue: self.settings.recommend_overdue,
                     load: Some(load),
                 });
             }
