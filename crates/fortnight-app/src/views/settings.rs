@@ -9,8 +9,8 @@
 //!
 //! Order, top to bottom: Appearance (Theme and Color side by side, then App
 //! icon), Model, Recommendations, Week (first day, working days and work
-//! hours), Data folder, and Prompts last, folded shut until its heading is
-//! clicked (they are long). There are no report times: the summary's
+//! hours), Prompts (folded shut until its heading is clicked: they are
+//! long), and the Data folder last. There are no report times: the summary's
 //! background update follows the working days (`week::due_reports`).
 //! Theme and Color apply on Save, like everything else in the form.
 //!
@@ -590,8 +590,8 @@ impl SettingsView {
             self.model_section(),
             self.recommendations_section(),
             self.week_section(),
-            self.data_section(),
             self.prompts_section(),
+            self.data_section(),
         ]
         .spacing(theme::SPACING * 2.5)
         .padding(iced::Padding {

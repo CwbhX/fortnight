@@ -64,7 +64,7 @@ Your data goes in a `fortnight-data` folder beside the program, here `target/rel
 - A local Ollama is detected at launch and when Settings opens, at `http://localhost:11434/v1` or the address in `OLLAMA_HOST`. Its models are listed with a thinking or decision tag. A decision model needs Ollama 0.35 or later and uses `/v1/systemone`. It answers with choices and probabilities, and is offered only for Recommendations. It also suggests task priorities. If it fails, Recommendations falls back to the Model endpoint.
 - An endpoint that needs no key, such as Ollama, has no key controls and never asks for a password.
 - Each API key is stored encrypted under one password. Click the lock icon in the top bar to unlock the keys into memory; click again to lock, which wipes them and stops any request that holds one. The app works while locked; only the LLM features wait.
-- Settings sets the first day of the week (Sunday by default), the working days and the work hours per day (8 by default). The load bars use the last two. Settings also holds the theme (match the system, light or dark), the accent colour, the app icon and, folded at the bottom, the prompts.
+- Settings sets the first day of the week (Sunday by default), the working days and the work hours per day (8 by default). The load bars use the last two. Settings also holds the theme (match the system, light or dark), the accent colour, the app icon and the prompts, which start folded.
 - Cmd+Z or Ctrl+Z undoes the last add, status change, edit or delete.
 - `fortnight-cli export` writes tasks, history and reports to Markdown or JSON.
 
