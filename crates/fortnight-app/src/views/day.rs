@@ -548,11 +548,13 @@ impl DayView {
             // Unsaved typing wins over what is stored. Compared trimmed at
             // both ends, as `main.rs` saves them, so an autosave of notes
             // with leading blank space doesn't rewrite the editor.
+            // Either as stored (an empty `1. ` item at the end is saved
+            // as `1.`) or as the editor writes them (old Markdown tidied).
             let stored = day_notes(&data, data.day);
-            // (Compared as the editor writes them: Markdown is tidied.)
-            let stored = rich_notes::Content::with_text(&stored);
-            if self.notes.text().trim() != stored.text().trim() {
-                self.notes = stored;
+            let shown = self.notes.text();
+            let tidied = rich_notes::Content::with_text(&stored);
+            if shown.trim() != stored.trim() && shown.trim() != tidied.text().trim() {
+                self.notes = tidied;
             }
         }
         self.placement = Placement::new(&data);
@@ -2181,6 +2183,26 @@ mod tests {
             view.update(Message::OpenLink("https://x.y".into())),
             Action::OpenLink("https://x.y".into())
         );
+    }
+
+    /// An empty list item saved (trimmed to `1.`) and reloaded stays a
+    /// list item in the editor.
+    #[test]
+    fn an_autosave_keeps_an_empty_list_item() {
+        let mut view = loaded(vec![]);
+        view.update(Message::EditDayNotes(rich_notes::Action::Format(
+            rich_notes::Command::Numbers,
+        )));
+        let (day, saved) = view
+            .notes_to_save(Instant::now() + NOTES_SAVE_DELAY)
+            .unwrap();
+        let mut data = data_for(today(), vec![]);
+        data.logs = vec![LogLine {
+            date: day,
+            text: saved.trim().to_string(),
+        }];
+        view.load(data);
+        assert_eq!(view.notes.text(), "1. ");
     }
 
     #[test]

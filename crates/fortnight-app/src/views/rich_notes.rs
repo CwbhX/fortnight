@@ -281,8 +281,10 @@ impl Content {
         write(&self.blocks)
     }
 
+    /// Whether the notes are blank: one line, with no text, list marker
+    /// or indentation (the editor then shows its placeholder).
     pub fn is_empty(&self) -> bool {
-        self.blocks.len() == 1 && self.blocks[0].cells.is_empty()
+        matches!(&self.blocks[..], [b] if b.cells.is_empty() && b.list == List::None && b.indent == 0)
     }
 
     pub fn blocks(&self) -> &[Block] {
@@ -1748,6 +1750,20 @@ mod tests {
         assert_eq!(c.selection(), Some((Pos::new(1, 0), Pos::new(1, 5))));
         // Left with a selection goes to its start.
         assert_eq!(mv(&mut c, Motion::Left), Pos::new(1, 0));
+    }
+
+    /// An empty list item is not blank: the placeholder would cover its
+    /// marker.
+    #[test]
+    fn a_list_marker_alone_is_not_empty() {
+        let mut c = Content::default();
+        assert!(c.is_empty());
+        c.perform(Action::Format(Command::Numbers));
+        assert!(!c.is_empty());
+        assert_eq!(c.text(), "1. ");
+        c.perform(Action::Format(Command::Numbers));
+        c.perform(Action::Format(Command::Indent));
+        assert!(!c.is_empty());
     }
 
     #[test]
