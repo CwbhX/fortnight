@@ -822,8 +822,11 @@ impl SettingsView {
         .width(180)
         .style(picker);
         let lower_row = row![
-            column![text("App icon").size(theme::TEXT_SMALL), theme::dropdown(icon)]
-                .spacing(theme::SPACING / 3.0),
+            column![
+                text("App icon").size(theme::TEXT_SMALL),
+                theme::dropdown(icon)
+            ]
+            .spacing(theme::SPACING / 3.0),
             labelled("Today width", theme::dropdown(width)),
         ]
         .spacing(theme::SPACING * 2.0);
