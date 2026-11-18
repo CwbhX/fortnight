@@ -22,8 +22,17 @@ fn wednesday() -> Date {
     date(2026, 11, 18)
 }
 
+/// The tests' weeks start on Monday (the default is Sunday).
+fn monday_settings() -> fortnight_core::domain::Settings {
+    let mut settings = fortnight_core::domain::Settings::default();
+    settings.schedule.week_start = Weekday::Monday;
+    settings
+}
+
 fn store() -> SqliteStore {
-    SqliteStore::open_in_memory().unwrap()
+    let s = SqliteStore::open_in_memory().unwrap();
+    s.save_settings(&monday_settings()).unwrap();
+    s
 }
 
 fn words(s: &str) -> Vec<String> {
@@ -338,7 +347,7 @@ fn week_arguments() {
 
 #[test]
 fn default_weeks() {
-    let settings = fortnight_core::domain::Settings::default();
+    let settings = monday_settings();
     let r = |kind, day: Date| {
         commands::resolve_week(kind, None, &now(day), &settings)
             .unwrap()
@@ -634,18 +643,18 @@ async fn unconfigured_llm_is_exit_2_and_stores_nothing() {
 async fn run_due_generates_what_is_due_once() {
     let s = seeded();
     let mock = Arc::new(MockClient::new(PLAN_REPLY));
-    // End of Friday 20th: summary and plan for the week of the 16th are due.
+    // End of Friday 20th: the summary for the week of the 16th is due.
+    // Recommendations never are: the app makes them when Today shows them.
     let when = now(date(2026, 11, 20));
     let mut out = Vec::new();
     commands::run_due(&s, &when, &|_| Ok(handle(&mock)), &mut out)
         .await
         .unwrap();
     let out = text(out);
-    assert_eq!(out.lines().count(), 2, "{out}");
+    assert_eq!(out.lines().count(), 1, "{out}");
     assert!(out.contains("summary 2026-11-16: ready"));
-    assert!(out.contains("plan 2026-11-16: ready"));
-    assert_eq!(s.ready_report_keys().unwrap().len(), 2);
-    assert_eq!(mock.requests.lock().unwrap().len(), 2);
+    assert_eq!(s.ready_report_keys().unwrap().len(), 1);
+    assert_eq!(mock.requests.lock().unwrap().len(), 1);
 
     // Nothing more to do: succeeds without building a client.
     let mut out = Vec::new();
@@ -670,12 +679,12 @@ async fn run_due_fails_non_zero_when_a_report_fails() {
     .await
     .unwrap_err();
     assert_eq!(err.code, 1);
+    assert_eq!(err.message, "1 of 1 reports failed");
     let out = text(out);
-    assert_eq!(out.lines().count(), 2, "{out}");
-    assert!(out.contains("FAILED"));
-    assert!(out.contains("ready"));
-    // The failed one stays due.
-    assert_eq!(s.ready_report_keys().unwrap().len(), 1);
+    assert_eq!(out.lines().count(), 1, "{out}");
+    assert!(out.contains("summary 2026-11-16: FAILED"));
+    // It stays due.
+    assert!(s.ready_report_keys().unwrap().is_empty());
     let failed = s.all_reports().unwrap();
     assert!(failed.iter().any(|r| r.status == ReportStatus::Failed));
 }
@@ -793,9 +802,7 @@ async fn only_recommendations_ask_for_the_decision_model() {
 }
 
 #[tokio::test]
-async fn run_due_without_a_plan_does_not_ask_for_the_decision_model() {
-    // The task is done: the week has something to summarise (its log
-    // line) but nothing to recommend.
+async fn run_due_does_not_ask_for_the_decision_model() {
     let s = seeded();
     s.set_status(1, TaskStatus::Done).unwrap();
     let mock = Arc::new(MockClient::new("generated"));
@@ -809,11 +816,7 @@ async fn run_due_without_a_plan_does_not_ask_for_the_decision_model() {
         .await
         .unwrap();
     let out = text(out);
-    assert!(
-        out.contains("plan 2026-11-16: nothing to recommend"),
-        "{out}"
-    );
-    assert!(out.contains("summary 2026-11-16: ready"), "{out}");
+    assert_eq!(out, "summary 2026-11-16: ready (report 1)\n");
     assert_eq!(*asked.borrow(), [false]);
     assert_eq!(mock.requests.lock().unwrap().len(), 1);
 }
@@ -862,10 +865,7 @@ async fn empty_facts_call_nothing_and_store_nothing() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        text(out),
-        "summary 2026-11-16: nothing to summarise\nplan 2026-11-16: nothing to recommend\n"
-    );
+    assert_eq!(text(out), "summary 2026-11-16: nothing to summarise\n");
     assert!(s.all_reports().unwrap().is_empty());
 }
 
@@ -910,6 +910,6 @@ async fn run_due_reports_connect_errors_that_are_not_not_configured() {
     )
     .await
     .unwrap();
-    assert!(text(out).contains("2 due. No LLM endpoint is configured"));
+    assert!(text(out).contains("1 due. No LLM endpoint is configured"));
     assert!(s.all_reports().unwrap().is_empty());
 }

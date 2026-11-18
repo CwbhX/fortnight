@@ -1331,7 +1331,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.llm.base_url = "http://localhost:11434/v1".into();
         settings.llm.model = "llama".into();
-        settings.schedule.summary_day = jiff::civil::Weekday::Thursday;
+        settings.schedule.week_start = jiff::civil::Weekday::Monday;
         settings.schedule.working_days.pop();
         settings.summary_instructions = "short".into();
         s.save_settings(&settings).unwrap();

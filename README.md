@@ -59,12 +59,12 @@ Your data goes in a `fortnight-data` folder beside the program, here `target/rel
 - Every change to a task is recorded. The weekly summary uses that history and your notes to say what you finished, what progressed, which deadlines moved and what is overdue. It is shown as Work Summary, with a copy icon in its header.
 - Recommended tasks are the top three open tasks, numbered, at the top of Today. Rust does the counting; the model picks the order. On today the list covers the day's tasks and all overdue tasks. On a later day it covers only the tasks planned for that day. Priority and lateness raise a task's rank. The list updates when tasks change.
 - The Work Summary updates on its own: when you open the Week tab, anything changed since the last update is sent once. After you edit on the Week tab, the summary reruns after 30 seconds. The previous result stays on screen until the new one is done. Both system prompts can be changed in Settings.
-- From Friday at 16:00 the summary is also kept up to date in the background. Fortnight checks at launch and every minute. A dot on the Week tab says when a background update is ready.
+- From 16:00 on your last working day (Friday by default) the summary is also kept up to date in the background. Fortnight checks at launch and every minute. A dot on the Week tab says when a background update is ready.
 - Settings has a Model block and a Recommendations block. Recommendations uses the Model block unless you tick Use a different model. Each block has a provider, a URL, a model and, except for Ollama, an API key. The provider is Ollama, OpenAI-compatible or Anthropic. Test checks the connection.
 - A local Ollama is detected at launch and when Settings opens, at `http://localhost:11434/v1` or the address in `OLLAMA_HOST`. Its models are listed with a thinking or decision tag. A decision model needs Ollama 0.35 or later and uses `/v1/systemone`. It answers with choices and probabilities, and is offered only for Recommendations. It also suggests task priorities. If it fails, Recommendations falls back to the Model endpoint.
 - An endpoint that needs no key, such as Ollama, has no key controls and never asks for a password.
 - Each API key is stored encrypted under one password. Click the lock icon in the top bar to unlock the keys into memory; click again to lock, which wipes them and stops any request that holds one. The app works while locked; only the LLM features wait.
-- Settings also sets work hours per day, 8 by default, and the working days. The load bars use both. Settings also holds the schedules, the prompts, the accent colour and the app icon, which follows the system or stays light or dark.
+- Settings sets the first day of the week (Sunday by default), the working days and the work hours per day (8 by default). The load bars use the last two. Settings also holds the theme (match the system, light or dark), the accent colour, the app icon and, folded at the bottom, the prompts.
 - Cmd+Z or Ctrl+Z undoes the last add, status change, edit or delete.
 - `fortnight-cli export` writes tasks, history and reports to Markdown or JSON.
 
@@ -175,14 +175,14 @@ fortnight-cli done <id>... [--undo]             # mark tasks done, or reopen the
 fortnight-cli log [--task <id>] <words...>      # add a note for today (the Today tab's Notes), or a log line on a task
 fortnight-cli summary [--week this|last|YYYY-MM-DD] [--facts]   # the weekly summary, streamed
 fortnight-cli plan [--facts]                    # recommended tasks for today
-fortnight-cli run-due                           # generate whatever is due, then exit
+fortnight-cli run-due                           # bring the week's summary up to date, then exit
 fortnight-cli export [--format md|json] [--out <path>]           # everything, to stdout or a file
 ```
 
 - `summary` covers the latest week whose summary is due unless you pass `--week`.
 - `--facts` prints the facts and never calls the LLM. When there is nothing to summarise or recommend, the LLM isn't called and nothing is stored.
 - `summary`, `plan` and `run-due` take `--protocol openai|anthropic`, `--base-url`, `--model`, `--keyless` and `--password-stdin`. A different base URL is assumed to need a key unless you also pass `--keyless`.
-- For the key, the CLI uses `FORTNIGHT_LLM_API_KEY` if it is set. Otherwise, if a key file exists and the endpoint isn't local or keyless, it reads the password from `--password-stdin` or asks for it. `plan`, and `run-due` when recommendations are due, use the saved Recommendations model, with `FORTNIGHT_DECISION_API_KEY` or `llm-key-decision` for its key.
+- For the key, the CLI uses `FORTNIGHT_LLM_API_KEY` if it is set. Otherwise, if a key file exists and the endpoint isn't local or keyless, it reads the password from `--password-stdin` or asks for it. `plan` uses the saved Recommendations model, with `FORTNIGHT_DECISION_API_KEY` or `llm-key-decision` for its key.
 - The CLI stores each report it generates, so the app shows it too.
 - Exit code 0 means success. 1 means a report failed, a task wasn't found, the data folder has no database, the endpoint couldn't be used, or a file couldn't be read or written. 2 means bad arguments, or no endpoint configured for `summary` or `plan`. `run-due` with no endpoint generates nothing and exits 0.
 
@@ -196,6 +196,6 @@ cargo test
 
 ## Not included
 
-- Registering with the OS scheduler, such as launchd, systemd or Task Scheduler. It would be the only thing Fortnight writes outside its folder, and a scheduled job can't type the password for an encrypted key. You can run `fortnight-cli run-due` from your own scheduler against an endpoint that needs no key, or with `FORTNIGHT_LLM_API_KEY` and `FORTNIGHT_DECISION_API_KEY` set. A Recommendations model with a saved key needs the password only when recommendations are due. Otherwise reports are made the next time you open and unlock the app.
+- Registering with the OS scheduler, such as launchd, systemd or Task Scheduler. It would be the only thing Fortnight writes outside its folder, and a scheduled job can't type the password for an encrypted key. You can run `fortnight-cli run-due` from your own scheduler against an endpoint that needs no key, or with `FORTNIGHT_LLM_API_KEY` set. Otherwise the summary is made the next time you open and unlock the app.
 - Code signing. A build you make yourself isn't flagged, but a downloaded archive shows a one-time Gatekeeper or SmartScreen warning on each machine.
 - Notifications. Fortnight doesn't send any.

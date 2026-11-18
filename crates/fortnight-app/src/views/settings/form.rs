@@ -1,7 +1,7 @@
 //! The editable copy of the non-secret settings, and its validation.
 
 use fortnight_core::domain::{Accent, AppIcon, Appearance, Schedule, Settings};
-use fortnight_core::parse::{format_hours, format_time, parse_hours, parse_time};
+use fortnight_core::parse::{format_hours, parse_hours};
 use fortnight_core::report::{DEFAULT_PLAN_PROMPT, DEFAULT_SUMMARY_PROMPT, WEEKDAYS};
 use jiff::civil::Weekday;
 
@@ -13,10 +13,6 @@ pub(super) struct Form {
     pub(super) main: Endpoint,
     pub(super) decision: Endpoint,
     pub(super) week_start: Weekday,
-    pub(super) summary_day: Weekday,
-    pub(super) summary_time: String,
-    pub(super) plan_day: Weekday,
-    pub(super) plan_time: String,
     /// Indexed Monday = 0.
     pub(super) working_days: [bool; 7],
     /// Decimal hours as typed, e.g. `5.5`.
@@ -55,10 +51,6 @@ impl Form {
             main: Endpoint::from_llm(&s.llm),
             decision: Endpoint::from_llm(&s.decision_llm),
             week_start: sched.week_start,
-            summary_day: sched.summary_day,
-            summary_time: format_time(sched.summary_time),
-            plan_day: sched.plan_day,
-            plan_time: format_time(sched.plan_time),
             working_days: WEEKDAYS.map(|d| sched.working_days.contains(&d)),
             focus_hours: format_hours(s.focus_minutes_per_day),
             appearance: s.appearance,
@@ -93,10 +85,6 @@ impl Form {
             decision_llm: self.decision.llm(),
             schedule: Schedule {
                 week_start: self.week_start,
-                summary_day: self.summary_day,
-                summary_time: parse_time(&self.summary_time)?,
-                plan_day: self.plan_day,
-                plan_time: parse_time(&self.plan_time)?,
                 working_days: WEEKDAYS
                     .iter()
                     .zip(self.working_days)
@@ -191,19 +179,16 @@ mod tests {
     use super::super::test_util::*;
     use super::super::*;
     use fortnight_core::domain::{DEFAULT_FOCUS_MINUTES, Protocol};
-    use jiff::civil::Time;
 
     #[test]
-    fn save_emits_full_settings_with_parsed_times() {
+    fn save_emits_full_settings() {
         let mut v = loaded(KeyState::NoKey);
         v.update(Message::BaseUrl(
             Which::Main,
             " https://api.openai.com/v1 ".into(),
         ));
         v.update(Message::Model(Which::Main, "gpt-4o".into()));
-        v.update(Message::SummaryDay(Weekday::Thursday));
-        v.update(Message::SummaryTime("9:30".into()));
-        v.update(Message::PlanTime("07:05".into()));
+        v.update(Message::WeekStart(Weekday::Monday));
         v.update(Message::WorkingDay(4, false));
         v.update(Message::WorkingDay(5, true));
         v.update(Message::ResetPrompt(PromptKind::Plan));
@@ -212,9 +197,6 @@ mod tests {
         };
         assert_eq!(s.llm.base_url, "https://api.openai.com/v1");
         assert_eq!(s.llm.model, "gpt-4o");
-        assert_eq!(s.schedule.summary_day, Weekday::Thursday);
-        assert_eq!(s.schedule.summary_time, Time::constant(9, 30, 0, 0));
-        assert_eq!(s.schedule.plan_time, Time::constant(7, 5, 0, 0));
         assert_eq!(s.schedule.week_start, Weekday::Monday);
         assert_eq!(
             s.schedule.working_days,
@@ -270,18 +252,6 @@ mod tests {
     fn save_does_nothing_when_unchanged() {
         let mut v = loaded(KeyState::NoKey);
         assert!(matches!(v.update(Message::Save), Action::None));
-    }
-
-    #[test]
-    fn invalid_time_blocks_save() {
-        let mut v = loaded(KeyState::NoKey);
-        v.update(Message::Model(Which::Main, "m".into()));
-        v.update(Message::PlanTime("25:00".into()));
-        assert!(matches!(v.update(Message::Save), Action::None));
-        v.update(Message::PlanTime("8am".into()));
-        assert!(matches!(v.update(Message::Save), Action::None));
-        v.update(Message::PlanTime("08:00".into()));
-        assert!(matches!(v.update(Message::Save), Action::Save(_)));
     }
 
     #[test]
@@ -409,7 +379,6 @@ mod tests {
     fn edits_that_parse_to_the_loaded_settings_are_not_unsaved() {
         let mut v = loaded(KeyState::NoKey);
         v.update(Message::FocusHours("8.0".into()));
-        v.update(Message::PlanTime("8:00".into()));
         assert!(!v.is_dirty());
         assert!(v.savable().is_none());
         assert!(matches!(v.update(Message::Save), Action::None));

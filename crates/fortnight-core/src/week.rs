@@ -57,38 +57,50 @@ pub struct ReportJob {
     pub week: WeekRef,
 }
 
-/// Which reports should be generated now (PLAN.md section 8).
+/// The time of day the week's summary falls due, on the last working day.
+pub const SUMMARY_DUE_TIME: Time = Time::constant(16, 0, 0, 0);
+
+/// Which reports should be generated now in the background (PLAN.md
+/// section 8). Only the Work summary is: recommended tasks are made when the
+/// Today tab shows them.
 ///
-/// - The summary for week W is due from W's `summary_day` at `summary_time`
-///   (local, in `now`'s time zone) until a ready report exists for W.
-/// - The plan for week W is due from W's `plan_day` at `plan_time` until one
-///   exists.
+/// - The summary for week W is due from 16:00 ([`SUMMARY_DUE_TIME`], local,
+///   in `now`'s time zone) on W's last working day until a ready report
+///   exists for W. With no working days, the week's last day.
 /// - Catch-up: only the most recent week whose due time has passed is
-///   considered, per kind. Older missed weeks are never returned.
+///   considered. Older missed weeks are never returned.
 pub fn due_reports(
     now: &ZonedDateTime,
     schedule: &Schedule,
     existing: &[ReportKey],
 ) -> Vec<ReportJob> {
-    let kinds = [
-        (
-            ReportKind::Summary,
-            schedule.summary_day,
-            schedule.summary_time,
-        ),
-        (ReportKind::Plan, schedule.plan_day, schedule.plan_time),
-    ];
-    kinds
-        .into_iter()
-        .filter_map(|(kind, day, time)| {
-            let week = latest_due_week(now, schedule.week_start, day, time)?;
-            let key = ReportKey {
-                kind,
-                week_start: week.start,
-            };
-            (!existing.contains(&key)).then_some(ReportJob { kind, week })
-        })
-        .collect()
+    let day = last_working_day(schedule);
+    let Some(week) = latest_due_week(now, schedule.week_start, day, SUMMARY_DUE_TIME) else {
+        return Vec::new();
+    };
+    let key = ReportKey {
+        kind: ReportKind::Summary,
+        week_start: week.start,
+    };
+    if existing.contains(&key) {
+        return Vec::new();
+    }
+    vec![ReportJob {
+        kind: ReportKind::Summary,
+        week,
+    }]
+}
+
+/// The working day that comes last in the week (counting from its first
+/// day), or the week's last day when none is ticked.
+fn last_working_day(schedule: &Schedule) -> Weekday {
+    let start = schedule.week_start;
+    schedule
+        .working_days
+        .iter()
+        .copied()
+        .max_by_key(|day| start.until(*day))
+        .unwrap_or(start.previous())
 }
 
 /// The most recent week whose due moment (`day` at `time`, local) is at or
@@ -171,10 +183,11 @@ mod tests {
         }
     }
 
-    fn plan(w: WeekRef) -> ReportJob {
-        ReportJob {
-            kind: ReportKind::Plan,
-            week: w,
+    /// Monday-start weeks, Monday to Friday.
+    fn monday_weeks() -> Schedule {
+        Schedule {
+            week_start: Weekday::Monday,
+            ..Schedule::default()
         }
     }
 
@@ -226,128 +239,137 @@ mod tests {
     }
 
     #[test]
-    fn due_reports_default_schedule() {
-        let s = Schedule::default();
+    fn summary_is_due_from_16_00_on_the_last_working_day() {
+        let s = monday_weeks();
         let this = week(2026, 11, 16);
         let last = this.prev();
-        let cases: Vec<(&str, Vec<ReportJob>)> = vec![
-            // Monday 07:59: neither this week's plan nor summary yet.
-            ("2026-11-16T07:59:00[UTC]", vec![summary(last), plan(last)]),
-            // Monday 08:00: this week's plan is due.
-            ("2026-11-16T08:00:00[UTC]", vec![summary(last), plan(this)]),
-            // Friday 15:59: summary still last week's.
-            ("2026-11-20T15:59:59[UTC]", vec![summary(last), plan(this)]),
-            // Friday 16:00: this week's summary.
-            ("2026-11-20T16:00:00[UTC]", vec![summary(this), plan(this)]),
+        let cases = [
+            ("2026-11-16T08:00:00[UTC]", last),
+            // Friday 15:59: still last week's.
+            ("2026-11-20T15:59:59[UTC]", last),
+            // Friday 16:00: this week's.
+            ("2026-11-20T16:00:00[UTC]", this),
             // Sunday night, still this week.
-            ("2026-11-22T23:59:00[UTC]", vec![summary(this), plan(this)]),
+            ("2026-11-22T23:59:00[UTC]", this),
         ];
         for (now, want) in cases {
-            assert_eq!(due_reports(&zoned(now), &s, &[]), want, "now {now}");
+            assert_eq!(
+                due_reports(&zoned(now), &s, &[]),
+                vec![summary(want)],
+                "now {now}"
+            );
         }
     }
 
     #[test]
-    fn existing_reports_suppress_jobs() {
+    fn the_due_day_follows_the_week_shape() {
+        use Weekday::*;
+        let due = |week_start, working_days: Vec<Weekday>| {
+            last_working_day(&Schedule {
+                week_start,
+                working_days,
+            })
+        };
+        // The default: Sunday-start weeks, Monday to Friday.
+        assert_eq!(last_working_day(&Schedule::default()), Friday);
+        assert_eq!(
+            due(Monday, vec![Monday, Tuesday, Wednesday, Thursday]),
+            Thursday
+        );
+        // Saturday-start weeks working Saturday to Wednesday: Wednesday,
+        // although Saturday is the latest weekday by number.
+        assert_eq!(
+            due(Saturday, vec![Monday, Tuesday, Wednesday, Saturday, Sunday]),
+            Wednesday
+        );
+        // No working day: the week's last day.
+        assert_eq!(due(Sunday, vec![]), Saturday);
+        assert_eq!(due(Monday, vec![]), Sunday);
+    }
+
+    #[test]
+    fn sunday_start_weeks() {
         let s = Schedule::default();
+        let this = week(2026, 11, 15);
+        assert_eq!(
+            due_reports(&zoned("2026-11-20T15:59:00[UTC]"), &s, &[]),
+            vec![summary(this.prev())]
+        );
+        assert_eq!(
+            due_reports(&zoned("2026-11-20T16:00:00[UTC]"), &s, &[]),
+            vec![summary(this)]
+        );
+        // Saturday is still the same week.
+        assert_eq!(
+            due_reports(&zoned("2026-11-21T23:00:00[UTC]"), &s, &[]),
+            vec![summary(this)]
+        );
+    }
+
+    #[test]
+    fn an_existing_summary_suppresses_the_job() {
+        let s = monday_weeks();
         let this = week(2026, 11, 16);
         let now = zoned("2026-11-20T17:00:00[UTC]");
-        let have_summary = ReportKey {
+        let have = ReportKey {
             kind: ReportKind::Summary,
             week_start: this.start,
         };
-        assert_eq!(due_reports(&now, &s, &[have_summary]), vec![plan(this)]);
-
-        let have_plan = ReportKey {
-            kind: ReportKind::Plan,
-            week_start: this.start,
-        };
-        assert_eq!(due_reports(&now, &s, &[have_summary, have_plan]), vec![]);
-
-        // A report for another week does not count.
+        assert_eq!(due_reports(&now, &s, &[have]), vec![]);
+        // A report for another week, or recommendations, do not count.
         let old = ReportKey {
             kind: ReportKind::Summary,
             week_start: this.prev().start,
         };
-        assert_eq!(
-            due_reports(&now, &s, &[old]),
-            vec![summary(this), plan(this)]
-        );
+        let plan = ReportKey {
+            kind: ReportKind::Plan,
+            week_start: this.start,
+        };
+        assert_eq!(due_reports(&now, &s, &[old, plan]), vec![summary(this)]);
     }
 
     #[test]
-    fn catch_up_returns_only_most_recent_week() {
-        // App closed for three weeks; nothing exists. Only the latest weeks
-        // whose moments have passed are returned, once per kind.
-        let s = Schedule::default();
+    fn catch_up_returns_only_the_most_recent_week() {
+        // App closed for three weeks; nothing exists. Only last week's
+        // summary is returned; older missing ones are not.
+        let s = monday_weeks();
         let now = zoned("2026-11-18T12:00:00[UTC]"); // Wednesday
-        assert_eq!(
-            due_reports(&now, &s, &[]),
-            vec![summary(week(2026, 11, 9)), plan(week(2026, 11, 16))]
-        );
-        // Last week's summary exists; older ones are missing but not returned.
+        assert_eq!(due_reports(&now, &s, &[]), vec![summary(week(2026, 11, 9))]);
         let existing = [ReportKey {
             kind: ReportKind::Summary,
             week_start: date(2026, 11, 9),
         }];
-        assert_eq!(
-            due_reports(&now, &s, &existing),
-            vec![plan(week(2026, 11, 16))]
-        );
+        assert_eq!(due_reports(&now, &s, &existing), vec![]);
     }
 
     #[test]
     fn due_moment_is_local_time_across_dst() {
-        let s = Schedule::default();
+        let s = monday_weeks();
         let ny = "America/New_York";
         // DST began Sunday 2026-03-08. Friday 16:00 EDT is 20:00 UTC.
         let this = week(2026, 3, 9);
         let before = utc_in("2026-03-13T19:59:00Z", ny);
         let after = utc_in("2026-03-13T20:00:00Z", ny);
-        assert_eq!(due_reports(&before, &s, &[])[0], summary(this.prev()));
-        assert_eq!(due_reports(&after, &s, &[])[0], summary(this));
+        assert_eq!(due_reports(&before, &s, &[]), vec![summary(this.prev())]);
+        assert_eq!(due_reports(&after, &s, &[]), vec![summary(this)]);
 
         // The week before DST: Friday 16:00 EST is 21:00 UTC.
         let prev = week(2026, 3, 2);
         let before = utc_in("2026-03-06T20:59:00Z", ny);
         let after = utc_in("2026-03-06T21:00:00Z", ny);
-        assert_eq!(due_reports(&before, &s, &[])[0], summary(prev.prev()));
-        assert_eq!(due_reports(&after, &s, &[])[0], summary(prev));
-
-        // DST ended Sunday 2026-11-01: Monday 08:00 EST is 13:00 UTC.
-        let nov2 = week(2026, 11, 2);
-        let before = utc_in("2026-11-02T12:59:00Z", ny);
-        let after = utc_in("2026-11-02T13:00:00Z", ny);
-        assert_eq!(due_reports(&before, &s, &[])[1], plan(nov2.prev()));
-        assert_eq!(due_reports(&after, &s, &[])[1], plan(nov2));
-    }
-
-    #[test]
-    fn nonexistent_local_time_resolves_forward() {
-        // Plan due Sunday 02:30, which does not exist on 2026-03-08 in New
-        // York (clocks jump 02:00 → 03:00). It resolves to 03:30 EDT.
-        let s = Schedule {
-            plan_day: Weekday::Sunday,
-            plan_time: Time::constant(2, 30, 0, 0),
-            ..Schedule::default()
-        };
-        let w = week(2026, 3, 2); // Monday-start week holding Sunday Mar 8.
-        let ny = "America/New_York";
-        let before = zoned(&format!("2026-03-08T03:29:00-04:00[{ny}]"));
-        let after = zoned(&format!("2026-03-08T03:30:00-04:00[{ny}]"));
-        assert_eq!(due_reports(&before, &s, &[])[1], plan(w.prev()));
-        assert_eq!(due_reports(&after, &s, &[])[1], plan(w));
+        assert_eq!(due_reports(&before, &s, &[]), vec![summary(prev.prev())]);
+        assert_eq!(due_reports(&after, &s, &[]), vec![summary(prev)]);
     }
 
     #[test]
     fn local_date_decides_the_week() {
         // Sunday 23:00 in New York is Monday 04:00 UTC, but the local date
         // (Sunday) decides the week: still the one starting Nov 16.
-        let s = Schedule::default();
+        let s = monday_weeks();
         let now = zoned("2026-11-22T23:00:00-05:00[America/New_York]");
         assert_eq!(
             due_reports(&now, &s, &[]),
-            vec![summary(week(2026, 11, 16)), plan(week(2026, 11, 16))]
+            vec![summary(week(2026, 11, 16))]
         );
     }
 }

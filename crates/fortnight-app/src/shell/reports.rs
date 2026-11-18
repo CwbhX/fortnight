@@ -412,10 +412,10 @@ impl Ready {
     }
 
     /// The schedule (PLAN.md section 8), at launch and every minute: from
-    /// its day and time the summary is kept up to date (generated when
-    /// stale: out of date, or its newest attempt failed); Recommended tasks
-    /// are generated when there is no ready version (otherwise only while
-    /// the Today tab shows today). Waits quietly while locked or
+    /// 16:00 on the week's last working day the summary is kept up to date
+    /// in the background (generated when stale: out of date, or its newest
+    /// attempt failed). Recommended tasks aren't scheduled: the Today tab
+    /// makes them when it shows them. Waits quietly while locked or
     /// unconfigured; failures back off.
     fn run_due(&mut self) -> Task<Message> {
         if self.blocked().is_some() || self.tasks.is_empty() {
@@ -430,12 +430,7 @@ impl Ready {
             };
             let versions = self.versions(key);
             let (empty, stale) = self.freshness(job.kind, job.week, &versions);
-            let missing = !versions.iter().any(|r| r.status == ReportStatus::Ready);
-            let wanted = match job.kind {
-                ReportKind::Summary => stale,
-                ReportKind::Plan => missing,
-            };
-            if wanted && !empty && !self.reports.backing_off(key) {
+            if stale && !empty && !self.reports.backing_off(key) {
                 tasks.push(self.generate(job.kind, job.week, true));
             }
         }

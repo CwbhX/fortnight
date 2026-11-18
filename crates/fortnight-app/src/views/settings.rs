@@ -3,13 +3,15 @@
 //! Settings opens as an overlay panel over the current tab. It is one
 //! scrollable column under a fixed header that holds the title, the single
 //! Save button (it saves the whole form: appearance, endpoint and protocol,
-//! schedule, capacity and the two prompts) and a close button. Closing with unsaved
+//! week, and the two prompts) and a close button. Closing with unsaved
 //! changes is allowed: the header says "Unsaved changes", and the edits stay
 //! in the form until the saved settings change.
 //!
 //! Order, top to bottom: Appearance (Theme and Color side by side, then App
-//! icon), Model, Recommendations, Schedule, Capacity, Data folder, and
-//! Prompts last, folded shut until its heading is clicked (they are long).
+//! icon), Model, Recommendations, Week (first day, working days and work
+//! hours), Data folder, and Prompts last, folded shut until its heading is
+//! clicked (they are long). There are no report times: the summary's
+//! background update follows the working days (`week::due_reports`).
 //! Theme and Color apply on Save, like everything else in the form.
 //!
 //! Models: two blocks of label/field rows, Model (everything) and
@@ -55,7 +57,7 @@
 
 use fortnight_core::domain::{Accent, AppIcon, Appearance, LlmSettings, Settings};
 use fortnight_core::ollama::{ModelKind, OllamaModel};
-use fortnight_core::parse::{parse_hours, parse_time};
+use fortnight_core::parse::parse_hours;
 use fortnight_core::report::{
     DEFAULT_PLAN_PROMPT, DEFAULT_SUMMARY_PROMPT, WEEKDAYS, short_weekday, weekday_name,
 };
@@ -110,10 +112,6 @@ pub enum Message {
     Save,
     Test(Which),
     WeekStart(Weekday),
-    SummaryDay(Weekday),
-    SummaryTime(String),
-    PlanDay(Weekday),
-    PlanTime(String),
     /// Monday-based index (0 = Monday) and the new value.
     WorkingDay(usize, bool),
     Prompt(PromptKind, text_editor::Action),
@@ -453,10 +451,6 @@ impl SettingsView {
             Message::TogglePrompts => self.prompts_open = !self.prompts_open,
             Message::AppIcon(choice) => form.app_icon = choice,
             Message::Accent(accent) => form.accent = accent,
-            Message::SummaryDay(d) => form.summary_day = d,
-            Message::SummaryTime(s) => form.summary_time = s,
-            Message::PlanDay(d) => form.plan_day = d,
-            Message::PlanTime(s) => form.plan_time = s,
             Message::WorkingDay(i, on) => {
                 if let Some(day) = form.working_days.get_mut(i) {
                     *day = on;
@@ -595,8 +589,7 @@ impl SettingsView {
             self.appearance_section(),
             self.model_section(),
             self.recommendations_section(),
-            self.schedule_section(),
-            self.capacity_section(),
+            self.week_section(),
             self.data_section(),
             self.prompts_section(),
         ]
@@ -643,33 +636,7 @@ impl SettingsView {
         section("Recommendations", body)
     }
 
-    fn schedule_section(&self) -> Element<'_, Message> {
-        let f = &self.form;
-        let week_start = labelled(
-            "Week starts on",
-            day_picker(f.week_start, Message::WeekStart),
-        );
-        let summary = labelled_when(
-            "Weekly summary",
-            day_picker(f.summary_day, Message::SummaryDay),
-            &f.summary_time,
-            Message::SummaryTime,
-        );
-        let plan = labelled_when(
-            "Recommended tasks",
-            day_picker(f.plan_day, Message::PlanDay),
-            &f.plan_time,
-            Message::PlanTime,
-        );
-
-        section(
-            "Schedule",
-            column![week_start, row![summary, plan].spacing(theme::SPACING)]
-                .spacing(theme::SPACING * 1.25),
-        )
-    }
-
-    fn capacity_section(&self) -> Element<'_, Message> {
+    fn week_section(&self) -> Element<'_, Message> {
         let f = &self.form;
         let mut days = row![].spacing(theme::SPACING * 1.25);
         let ticked = f.working_days.iter().filter(|on| **on).count();
@@ -718,8 +685,12 @@ impl SettingsView {
             );
         }
         section(
-            "Capacity",
+            "Week",
             column![
+                labelled(
+                    "Week starts on",
+                    day_picker(f.week_start, Message::WeekStart)
+                ),
                 column![days_label, days].spacing(theme::SPACING / 2.0),
                 hours,
             ]
@@ -897,30 +868,6 @@ fn labelled<'a>(label: &'a str, field: impl Into<Element<'a, Message>>) -> Eleme
         .spacing(theme::SPACING / 3.0)
         .width(Fill)
         .into()
-}
-
-/// A day picker and a time field, with an inline error for a bad time.
-fn labelled_when<'a>(
-    label: &'a str,
-    day: Element<'a, Message>,
-    time: &'a str,
-    on_time: fn(String) -> Message,
-) -> Element<'a, Message> {
-    let time_input = input("HH:MM", time).on_input(on_time).width(90);
-    let mut col = column![
-        text(label).size(theme::TEXT_SMALL),
-        row![day, time_input].spacing(theme::SPACING / 2.0)
-    ]
-    .spacing(theme::SPACING / 3.0)
-    .width(Fill);
-    if parse_time(time).is_none() {
-        col = col.push(
-            text("Use 24-hour time, such as 16:00.")
-                .size(theme::TEXT_SMALL)
-                .style(theme::danger),
-        );
-    }
-    col.into()
 }
 
 fn input<'a>(placeholder: &str, value: &str) -> text_input::TextInput<'a, Message> {

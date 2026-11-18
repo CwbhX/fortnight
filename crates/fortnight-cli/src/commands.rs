@@ -461,9 +461,11 @@ pub async fn report_command(
     }
 }
 
-/// `run-due`: generates whatever is due. Prints one line per report. A due
-/// report with nothing in it is skipped, as the app does. `make_client`'s
-/// argument says whether a recommendations report is to be made.
+/// `run-due`: generates whatever is due (`week::due_reports`: the week's
+/// summary, from 16:00 on its last working day). Prints one line per
+/// report. A due report with nothing in it is skipped, as the app does.
+/// `make_client`'s argument says whether a recommendations report is to be
+/// made (none is scheduled now, so always `false`).
 pub async fn run_due(
     store: &dyn Store,
     now: &ZonedDateTime,

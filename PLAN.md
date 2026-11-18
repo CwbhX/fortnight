@@ -224,7 +224,7 @@ This one tab replaces the earlier This-week and Review tabs: paging back through
 
 **Settings** (the gear; opens over the current view)
 - LLM: protocol, base URL, model, API key, and a **Test connection** button. Key controls: set, change password, remove.
-- Schedule: week start day, summary day and time (default Friday 16:00), plan day and time (default Monday 08:00).
+- Schedule: week start day, summary day and time (default Friday 16:00), plan day and time (default Monday 08:00). *(Later replaced: only the week start day remains, Sunday by default; the summary is due from 16:00 on the last working day, and recommendations are not scheduled.)*
 - Capacity: working days and focus hours per day.
 - Summary style: length, tone, and free-form extra instructions.
 - Data folder path.
@@ -433,6 +433,7 @@ fn due_reports(now: Zoned, settings: &Schedule, existing: &[ReportKey]) -> Vec<R
 
 - **Summary** for week *W* is due from the configured time (default Friday 16:00 local) and remains due until one exists for *W*.
 - **Plan** for week *W* is due from the configured time (default Monday 08:00) until one exists.
+- *(Later: the times are no longer settings. The summary is due from 16:00 on the week's last working day, and the plan is not scheduled, since the Today tab makes it whenever it shows it.)*
 - The function is evaluated at launch and once a minute while the app runs. That covers waking from sleep.
 - **Catch-up**: if the app was closed at the scheduled time, the report is generated on next launch. Only the most recent missed week is generated automatically; older weeks have a manual Generate button.
 - Generation is idempotent per (kind, week). A failed job is marked `failed` and retried with backoff, with a visible Retry.

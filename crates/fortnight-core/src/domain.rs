@@ -7,7 +7,7 @@
 //! - Moments are UTC timestamps (`jiff::Timestamp`).
 //! - Nothing here depends on the machine's time zone.
 
-use jiff::civil::{Date, Time, Weekday};
+use jiff::civil::{Date, Weekday};
 use jiff::{Timestamp, ToSpan};
 use serde::{Deserialize, Serialize};
 
@@ -406,19 +406,17 @@ impl LlmSettings {
     }
 }
 
-/// When reports are due. Times are local wall-clock times.
+/// The shape of the week: its first day and the working days. When the
+/// background summary is due follows from these (`week::due_reports`).
+/// Older data also holds `summary_day`, `summary_time`, `plan_day` and
+/// `plan_time`; they are ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Schedule {
     #[serde(with = "weekday_serde")]
     pub week_start: Weekday,
-    #[serde(with = "weekday_serde")]
-    pub summary_day: Weekday,
-    pub summary_time: Time,
-    #[serde(with = "weekday_serde")]
-    pub plan_day: Weekday,
-    pub plan_time: Time,
-    /// Working days, used by the plan facts.
+    /// Working days: the plan facts, the capacity, and the summary's due
+    /// day (the last of them).
     #[serde(with = "weekdays_serde")]
     pub working_days: Vec<Weekday>,
 }
@@ -458,11 +456,7 @@ mod weekdays_serde {
 impl Default for Schedule {
     fn default() -> Self {
         Schedule {
-            week_start: Weekday::Monday,
-            summary_day: Weekday::Friday,
-            summary_time: Time::constant(16, 0, 0, 0),
-            plan_day: Weekday::Monday,
-            plan_time: Time::constant(8, 0, 0, 0),
+            week_start: Weekday::Sunday,
             working_days: vec![
                 Weekday::Monday,
                 Weekday::Tuesday,
@@ -642,6 +636,13 @@ mod tests {
     }
 
     #[test]
+    fn weeks_start_on_sunday_unless_saved_otherwise() {
+        assert_eq!(Settings::default().schedule.week_start, Weekday::Sunday);
+        let old: Settings = serde_json::from_str(r#"{"accent":"teal"}"#).unwrap();
+        assert_eq!(old.schedule.week_start, Weekday::Sunday);
+    }
+
+    #[test]
     fn appearance_defaults_to_system_and_round_trips() {
         let old: Settings = serde_json::from_str(r#"{"accent":"teal"}"#).unwrap();
         assert_eq!(old.appearance, Appearance::System);
@@ -688,6 +689,8 @@ mod tests {
         assert_eq!(s.llm.protocol, Protocol::OpenAi);
         assert_eq!(s.llm.base_url, "http://x/v1");
         assert_eq!(s.schedule.working_days.len(), 4);
+        // The old day and time fields are ignored; a saved week start stays.
+        assert_eq!(s.schedule.week_start, Weekday::Monday);
         assert_eq!(s.summary_instructions, "short");
         assert_eq!(s.focus_minutes_per_day, DEFAULT_FOCUS_MINUTES);
         assert!(!s.decision_llm.is_configured());
