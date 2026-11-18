@@ -11,8 +11,10 @@
 //! The widget only reports what was done as [`Action`]s, through
 //! `on_action`; the owner applies them to the content
 //! ([`Content::perform`]), as with iced's `text_editor`. Copy, cut and
-//! paste go through the clipboard as Markdown. A click on a link opens it
-//! (`on_link`) when the editor isn't focused, or with `⌘` held.
+//! paste go through the clipboard as Markdown. A click on a link with
+//! `Ctrl` or `⌘` held opens it (`on_link`); a plain click puts the caret
+//! there and shows a popup above it with the address, Open and Edit
+//! (which opens `⌘K`'s prompt).
 //!
 //! The widget works with iced's own renderer only, whose paragraphs are
 //! cosmic-text buffers.
@@ -28,12 +30,15 @@ use iced::advanced::text::{
     Alignment, LineHeight, Paragraph as _, Renderer as _, Shaping, Span, Text, Wrapping,
 };
 use iced::advanced::widget::{self, Id, Widget, operation, tree};
-use iced::advanced::{Clipboard, Shell, clipboard, mouse, renderer};
+use iced::advanced::{Clipboard, Shell, clipboard, mouse, overlay, renderer};
 use iced::alignment::Vertical;
 use iced::keyboard::{self, key::Named};
 use iced::time::{Duration, Instant};
 use iced::widget::text_editor::Status;
-use iced::{Element, Event, Font, Length, Padding, Pixels, Point, Rectangle, Size, Theme, window};
+use iced::{
+    Border, Element, Event, Font, Length, Padding, Pixels, Point, Rectangle, Size, Theme, Vector,
+    window,
+};
 
 use super::rich_notes::{Action, Command, Content, List, Motion, Pos, href};
 use crate::theme;
@@ -176,7 +181,87 @@ struct State {
     made_for: Option<(u64, u64, f32, f32)>,
     blocks: Vec<Laid>,
     placeholder: Paragraph,
+    /// The popup over a clicked link.
+    menu: Option<Menu>,
 }
+
+/// The popup over a link clicked without `Ctrl`/`⌘`: Open or Edit.
+#[derive(Debug)]
+struct Menu {
+    url: Arc<str>,
+    /// Where the link was clicked.
+    at: Pos,
+    /// The top of the clicked line at the click, in the text area.
+    anchor: Point,
+    line_height: f32,
+    /// Its texts, kept here: iced draws a paragraph after the frame is
+    /// built, through a weak reference.
+    shown_url: Paragraph,
+    open: Paragraph,
+    edit: Paragraph,
+}
+
+impl Menu {
+    fn new(url: Arc<str>, at: Pos, anchor: Point, line_height: f32) -> Self {
+        let shown: String = if url.chars().count() > 40 {
+            url.chars().take(39).chain(['…']).collect()
+        } else {
+            url.to_string()
+        };
+        let label = |s: &str, font| {
+            Paragraph::with_text(Text {
+                font,
+                ..text(s, f32::INFINITY, theme::TEXT_SMALL)
+            })
+        };
+        Menu {
+            shown_url: label(&shown, theme::FONT),
+            open: label("Open", theme::FONT_BOLD),
+            edit: label("Edit", theme::FONT_BOLD),
+            url,
+            at,
+            anchor,
+            line_height,
+        }
+    }
+
+    /// The Open and Edit buttons' areas within the popup's bounds.
+    fn buttons(&self, bounds: Rectangle) -> (Rectangle, Rectangle) {
+        let h = bounds.height;
+        let open_x = bounds.x + MENU_PAD + self.shown_url.min_width() + MENU_GAP / 2.0;
+        let open_w = self.open.min_width() + MENU_GAP;
+        let edit_w = self.edit.min_width() + MENU_GAP;
+        (
+            Rectangle::new(Point::new(open_x, bounds.y), Size::new(open_w, h)),
+            Rectangle::new(Point::new(open_x + open_w, bounds.y), Size::new(edit_w, h)),
+        )
+    }
+
+    /// Where the popup goes in a window of size `window`, the text area
+    /// at `text`: above the clicked line, starting at the click, kept
+    /// inside the window (under the line when there is no room above).
+    fn place(&self, text: Point, window: Size) -> Rectangle {
+        let height = self.shown_url.min_height() + 2.0 * MENU_PAD;
+        let width = MENU_PAD * 2.0
+            + self.shown_url.min_width()
+            + self.open.min_width()
+            + self.edit.min_width()
+            + MENU_GAP * 2.0;
+        let x = (text.x + self.anchor.x - MENU_PAD)
+            .min(window.width - width - 4.0)
+            .max(4.0);
+        let top = text.y + self.anchor.y;
+        let y = if top - height - 4.0 >= 0.0 {
+            top - height - 4.0
+        } else {
+            top + self.line_height + 4.0
+        };
+        Rectangle::new(Point::new(x, y), Size::new(width, height))
+    }
+}
+
+const MENU_PAD: f32 = 8.0;
+const MENU_GAP: f32 = 14.0;
 
 impl operation::Focusable for State {
     fn is_focused(&self) -> bool {
@@ -467,7 +552,22 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
                 shell.request_input_method::<&str>(&ime);
             }
             Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => state.modifiers = *m,
+            // `Ctrl`-click on a Mac can arrive as a right click.
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right))
+                if state.modifiers.control() =>
+            {
+                if let (Some(on_link), Some(p)) = (&self.on_link, cursor.position_over(bounds))
+                    && let Some(url) = state.link_at(local(p))
+                {
+                    state.menu = None;
+                    shell.publish(on_link(href(&url)));
+                    shell.capture_event();
+                }
+            }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                // Any click closes the link popup (its own buttons act
+                // before this).
+                state.menu = None;
                 let Some(p) = cursor.position_over(bounds) else {
                     if state.focus.is_some() {
                         state.focus = None;
@@ -476,15 +576,25 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
                     return;
                 };
                 let p = local(p);
-                if let Some(on_link) = &self.on_link
-                    && (state.focus.is_none() || state.modifiers.command())
-                    && let Some(url) = state.link_at(p)
+                let link = self
+                    .on_link
+                    .as_ref()
+                    .and_then(|on| Some((on, state.link_at(p)?)));
+                if let Some((on_link, url)) = &link
+                    && (state.modifiers.command() || state.modifiers.control())
                 {
-                    shell.publish(on_link(href(&url)));
+                    // `Ctrl`/`⌘`-click: open it.
+                    shell.publish(on_link(href(url)));
                     shell.capture_event();
                     return;
                 }
                 let at = state.hit(p);
+                if let Some((_, url)) = link {
+                    // A plain click: the caret goes there, and the popup
+                    // offers Open and Edit.
+                    let (caret, line_height) = state.caret(at, self.size);
+                    state.menu = Some(Menu::new(url, at, Point::new(p.x, caret.y), line_height));
+                }
                 let click = mouse::Click::new(p, mouse::Button::Left, state.last_click);
                 let action = match click.kind() {
                     mouse::click::Kind::Single => {
@@ -642,6 +752,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
                 if let Some(f) = &mut state.focus {
                     f.updated_at = Instant::now();
                 }
+                state.menu = None;
                 for action in actions {
                     publish(shell, action);
                 }
@@ -818,12 +929,31 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
         };
         let text_bounds = bounds.shrink(self.padding);
         let p = Point::new(p.x - text_bounds.x, p.y - text_bounds.y);
-        let opens = self.on_link.is_some() && (state.focus.is_none() || state.modifiers.command());
-        if opens && state.link_at(p).is_some() {
+        if self.on_link.is_some() && state.link_at(p).is_some() {
             mouse::Interaction::Pointer
         } else {
             mouse::Interaction::Text
         }
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut widget::Tree,
+        layout: Layout<'b>,
+        _renderer: &iced::Renderer,
+        _viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, Theme, iced::Renderer>> {
+        let state = tree.state.downcast_mut::<State>();
+        state.menu.as_ref()?;
+        let on_link = self.on_link.as_deref()?;
+        let text = layout.bounds().shrink(self.padding).position() + translation;
+        Some(overlay::Element::new(Box::new(LinkMenu {
+            menu: &mut state.menu,
+            text,
+            on_link,
+            on_action: &*self.on_action,
+        })))
     }
 
     fn operate(
@@ -841,6 +971,149 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
 impl<'a, Message: 'a> From<RichEditor<'a, Message>> for Element<'a, Message> {
     fn from(editor: RichEditor<'a, Message>) -> Self {
         Element::new(editor)
+    }
+}
+
+// --------------------------------------------------------------- link menu
+
+/// The popup over a clicked link (the editor's [`Menu`]), as an overlay.
+struct LinkMenu<'b, Message> {
+    menu: &'b mut Option<Menu>,
+    /// The text area's top left, in the window.
+    text: Point,
+    on_link: &'b dyn Fn(String) -> Message,
+    on_action: &'b dyn Fn(Action) -> Message,
+}
+
+impl<Message> overlay::Overlay<Message, Theme, iced::Renderer> for LinkMenu<'_, Message> {
+    fn layout(&mut self, _renderer: &iced::Renderer, window: Size) -> layout::Node {
+        let Some(menu) = self.menu.as_ref() else {
+            return layout::Node::new(Size::ZERO);
+        };
+        let place = menu.place(self.text, window);
+        layout::Node::new(place.size()).move_to(place.position())
+    }
+
+    fn draw(
+        &self,
+        renderer: &mut iced::Renderer,
+        theme: &Theme,
+        _style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+    ) {
+        use iced::advanced::Renderer as _;
+
+        let Some(menu) = self.menu.as_ref() else {
+            return;
+        };
+        let bounds = layout.bounds();
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds,
+                border: Border {
+                    radius: 6.0.into(),
+                    width: 1.0,
+                    color: theme::tint(theme, 0.16),
+                },
+                shadow: iced::Shadow {
+                    color: iced::Color::BLACK.scale_alpha(0.25),
+                    offset: Vector::new(0.0, 2.0),
+                    blur_radius: 8.0,
+                },
+                ..renderer::Quad::default()
+            },
+            theme.palette().background,
+        );
+        let (open, edit) = menu.buttons(bounds);
+        for b in [open, edit] {
+            if cursor.is_over(b) {
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: b.shrink(3.0),
+                        border: Border {
+                            radius: 4.0.into(),
+                            ..Border::default()
+                        },
+                        ..renderer::Quad::default()
+                    },
+                    theme::tint(theme, 0.08),
+                );
+            }
+        }
+        let y = bounds.y + MENU_PAD;
+        renderer.fill_paragraph(
+            &menu.shown_url,
+            Point::new(bounds.x + MENU_PAD, y),
+            theme::muted_color(theme),
+            bounds,
+        );
+        renderer.fill_paragraph(
+            &menu.open,
+            Point::new(open.x + MENU_GAP / 2.0, y),
+            theme::accent_color(),
+            bounds,
+        );
+        renderer.fill_paragraph(
+            &menu.edit,
+            Point::new(edit.x + MENU_GAP / 2.0, y),
+            theme.palette().text,
+            bounds,
+        );
+    }
+
+    fn update(
+        &mut self,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        _renderer: &iced::Renderer,
+        _clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event else {
+            return;
+        };
+        let bounds = layout.bounds();
+        if !cursor.is_over(bounds) {
+            // The editor closes the popup on this click.
+            return;
+        }
+        let Some(menu) = self.menu.as_ref() else {
+            return;
+        };
+        let (open, edit) = menu.buttons(bounds);
+        if cursor.is_over(open) {
+            shell.publish((self.on_link)(href(&menu.url)));
+            *self.menu = None;
+        } else if cursor.is_over(edit) {
+            shell.publish((self.on_action)(Action::MoveTo {
+                at: menu.at,
+                select: false,
+            }));
+            shell.publish((self.on_action)(Action::Format(Command::Link)));
+            *self.menu = None;
+        }
+        shell.capture_event();
+    }
+
+    fn mouse_interaction(
+        &self,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        _renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        let Some(menu) = self.menu.as_ref() else {
+            return mouse::Interaction::None;
+        };
+        let (open, edit) = menu.buttons(layout.bounds());
+        if cursor.is_over(open) || cursor.is_over(edit) {
+            mouse::Interaction::Pointer
+        } else if cursor.is_over(layout.bounds()) {
+            mouse::Interaction::Idle
+        } else {
+            mouse::Interaction::None
+        }
     }
 }
 
@@ -908,6 +1181,29 @@ mod tests {
         // Past the ends: the start and the end.
         assert_eq!(state.vertical(Pos::new(0, 1), false, SIZE), Pos::new(0, 0));
         assert_eq!(state.vertical(Pos::new(1, 0), true, SIZE), Pos::new(1, 4));
+    }
+
+    /// The link popup sits above the clicked line, inside the window, or
+    /// under the line at the top of the window; Open and Edit sit side by
+    /// side inside it.
+    #[test]
+    fn the_link_popup_stays_in_the_window() {
+        let menu = |x: f32, y: f32| {
+            Menu::new(
+                Arc::from("https://example.com/a/long/address"),
+                Pos::default(),
+                Point::new(x, y),
+                18.0,
+            )
+        };
+        let window = Size::new(800.0, 600.0);
+        let m = menu(100.0, 200.0);
+        let at = m.place(Point::new(20.0, 30.0), window);
+        assert!(at.y + at.height <= 230.0 && at.x >= 100.0);
+        let (o, e) = m.buttons(at);
+        assert!(o.x + o.width <= e.x + 0.01 && e.x + e.width <= at.x + at.width + 0.01);
+        let at = menu(790.0, 0.0).place(Point::new(0.0, 4.0), window);
+        assert!(at.x + at.width <= 800.0 && at.y >= 4.0 + 18.0);
     }
 
     #[test]
