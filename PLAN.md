@@ -201,7 +201,7 @@ The quick-add bar is always visible. `Write Q4 report fri #work ~2h !` creates a
 
 **Today**
 - Overdue (only if there is any), then the day's tasks, then done items collapsed.
-- **No date** sits collapsed at the bottom with a count. It is the inbox: tasks you haven't scheduled.
+- Tasks with no planned day (the inbox) sit on today's Tasks list; there is no separate No date section.
 - Each row: checkbox, title, project chip, due label. Selecting a row expands it in place for notes, due date, estimate and its log.
 - A **log line** records work that isn't a checkbox ("helped Sam debug the deploy"), attached to a task or free-standing.
 - Nothing else is on screen. This is the view the app opens on.
