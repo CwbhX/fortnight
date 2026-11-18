@@ -175,6 +175,40 @@ impl Ready {
         self.reload_tasks();
     }
 
+    /// [`set_status`](Self::set_status) from the Today tab. A task ticked
+    /// off today's list while it shows today, carried over from an earlier
+    /// day or overdue (planned for another day), was done today: it is
+    /// planned for today too, so it lands in today's Completed instead of
+    /// going to the day it was planned for (out of sight). One undo puts
+    /// both back.
+    fn set_status_from_today(&mut self, id: TaskId, status: TaskStatus) {
+        let today = self.today();
+        let replan = self
+            .task(id)
+            .filter(|t| plans_today_when_done(t, status, self.selected, today));
+        let Some(task) = replan.cloned() else {
+            self.set_status(id, status);
+            return;
+        };
+        let undo = self.snapshot(id, true);
+        let result = self
+            .store
+            .update_task(&CoreTask {
+                planned_for: Some(today),
+                ..task
+            })
+            .and_then(|()| self.store.set_status(id, status));
+        match result {
+            Ok(()) => {
+                if let Some(undo) = undo {
+                    self.undo.remember(undo);
+                }
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+        self.reload_tasks();
+    }
+
     /// Moves task `id` to `day` at `position` (a Week-tab drop): plans it
     /// on that day if it was elsewhere. Undo puts both back.
     pub(crate) fn move_task(&mut self, id: TaskId, day: Date, position: f64) {
@@ -268,7 +302,7 @@ impl Ready {
         let result = match action {
             day::Action::None => return Task::none(),
             day::Action::SetStatus(id, status) => {
-                self.set_status(id, status);
+                self.set_status_from_today(id, status);
                 return Task::none();
             }
             day::Action::Update(task) => {
@@ -333,10 +367,57 @@ fn open_link(url: &str) -> Result<(), String> {
         .map_err(|e| format!("Could not open {url}: {e}"))
 }
 
+/// Whether `task`, moved to `status` on the Today tab showing `shown`,
+/// is planned for `today` too: see [`Ready::set_status_from_today`]. A
+/// task with no planned day stays so (it shows on the day it was done).
+fn plans_today_when_done(task: &CoreTask, status: TaskStatus, shown: Date, today: Date) -> bool {
+    status == TaskStatus::Done
+        && shown == today
+        && task.day().is_some_and(|d| d != today)
+        && (task.on_today_list(today) || task.is_overdue(today))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use fortnight_core::sqlite::SqliteStore;
+
+    #[test]
+    fn ticked_off_today_a_carried_over_or_overdue_task_is_planned_today() {
+        use jiff::civil::date;
+        let today = date(2026, 11, 18);
+        let task = |planned: Option<Date>, due: Option<Date>| CoreTask {
+            planned_for: planned,
+            due_on: due,
+            ..CoreTask::default()
+        };
+        let done = |t: &CoreTask| plans_today_when_done(t, TaskStatus::Done, today, today);
+        // Carried over from Monday.
+        assert!(done(&task(Some(date(2026, 11, 16)), None)));
+        // Planned for Friday but overdue.
+        assert!(done(&task(
+            Some(date(2026, 11, 20)),
+            Some(date(2026, 11, 17))
+        )));
+        // Already today's, planned later and not overdue, or undated.
+        assert!(!done(&task(Some(today), None)));
+        assert!(!done(&task(Some(date(2026, 11, 20)), None)));
+        assert!(!done(&task(None, Some(date(2026, 11, 17)))));
+        // Only on ticking, only with today shown.
+        let carried = task(Some(date(2026, 11, 16)), None);
+        assert!(!plans_today_when_done(
+            &carried,
+            TaskStatus::Todo,
+            today,
+            today
+        ));
+        assert!(!plans_today_when_done(
+            &carried,
+            TaskStatus::Done,
+            date(2026, 11, 16),
+            today
+        ));
+    }
 
     #[test]
     fn undoing_an_edit_keeps_a_later_drag() {

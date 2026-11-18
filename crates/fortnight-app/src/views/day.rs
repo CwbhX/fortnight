@@ -25,7 +25,9 @@
 //!   as Markdown in the text (`rich_notes`).
 //! - **Completed**, collapsed: done tasks whose day is the shown day (as on
 //!   the Week tab), whenever they were ticked; a done task with no day shows
-//!   on the day it was ticked.
+//!   on the day it was ticked. Ticking a carried-over or overdue task here
+//!   while today shows plans it for today first (`main.rs`), so it lands in
+//!   today's Completed rather than out of sight on its old day.
 //! - **Deleted**, collapsed: every deleted task, newest first, each a quiet
 //!   card with Restore and Delete forever, and Delete all in the header
 //!   when open. Delete moves a task here (status `Dropped`); only Delete
@@ -1275,9 +1277,6 @@ impl DayView {
             };
             list = list.push(self.item(Section::Day, task, left, row));
         }
-        if !any {
-            return list.into();
-        }
         let mut end = mouse_area(
             column![drop_line(over == Some(Spot::End))]
                 .height(12)
@@ -1288,7 +1287,12 @@ impl DayView {
                 .on_enter(Message::Enter(Spot::End))
                 .on_release(Message::DropOn(Spot::End));
         }
-        column![list, end].spacing(3).into()
+        // Always the same shape, the strip folding away with no cards: a
+        // list given a new place in the tree starts afresh, and a fresh
+        // list shows what is leaving as gone, so the last card ticked
+        // would vanish at once.
+        let end = container(end).padding(iced::Padding::ZERO.top(3));
+        column![list, motion::fold(any, end).key(day_key(data.day))].into()
     }
 
     /// A collapsed section: a panel whose title bar opens it (arrow, name,
@@ -2595,5 +2599,123 @@ mod tests {
         data.day = date(2026, 11, 20);
         view.load(data);
         let _ = view.view();
+    }
+
+    /// The height of the page's content after each frame, `step` apart,
+    /// once `change` is loaded into `view`: the view shown and settled
+    /// first, then driven as iced drives it, with a software renderer.
+    fn heights_after(view: &mut DayView, change: DayData, step: u64, frames: u64) -> Vec<f32> {
+        use iced::advanced::layout::{self, Layout};
+        use iced::advanced::widget::Tree;
+        use iced::advanced::{Shell, clipboard};
+        use iced::{Event, Rectangle, Size, window};
+
+        const WINDOW: Size = Size::new(700.0, 4000.0);
+        let mut renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+            iced::Font::default(),
+            iced::Pixels(14.0),
+        ));
+        let limits = layout::Limits::new(Size::ZERO, WINDOW);
+        // The scrollable's content: the first node down with siblings'
+        // parent, i.e. below the single-child wrappers.
+        fn content(node: &layout::Node) -> f32 {
+            let mut n = node;
+            while let [only] = n.children() {
+                n = only;
+            }
+            n.size().height
+        }
+        fn frame(
+            element: &mut Element<'_, Message>,
+            tree: &mut Tree,
+            node: &mut layout::Node,
+            renderer: &mut iced::Renderer,
+            limits: &layout::Limits,
+            now: Instant,
+        ) {
+            // As iced does: lay out again when asked, and send the frame
+            // once more.
+            for _ in 0..3 {
+                let mut messages = Vec::new();
+                let mut shell = Shell::new(&mut messages);
+                element.as_widget_mut().update(
+                    tree,
+                    &Event::Window(window::Event::RedrawRequested(now)),
+                    Layout::new(node),
+                    mouse::Cursor::Unavailable,
+                    renderer,
+                    &mut clipboard::Null,
+                    &mut shell,
+                    &Rectangle::with_size(WINDOW),
+                );
+                if !shell.is_layout_invalid() {
+                    break;
+                }
+                *node = element.as_widget_mut().layout(tree, renderer, limits);
+            }
+        }
+        let t0 = Instant::now();
+        let mut tree;
+        {
+            let mut element = view.view();
+            tree = Tree::new(&element);
+            let mut node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            frame(
+                &mut element,
+                &mut tree,
+                &mut node,
+                &mut renderer,
+                &limits,
+                t0,
+            );
+        }
+        view.load(change);
+        let mut element = view.view();
+        tree.diff(&element);
+        let mut node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        (1..=frames)
+            .map(|i| {
+                let now = t0 + Duration::from_millis(1000 + step * i);
+                frame(
+                    &mut element,
+                    &mut tree,
+                    &mut node,
+                    &mut renderer,
+                    &limits,
+                    now,
+                );
+                content(&node)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_last_task_ticked_goes_smoothly_too() {
+        // One task on the day, or two: ticking the last one left must not
+        // make it vanish at once.
+        for others in [0, 1] {
+            let mut tasks = vec![task(1, "one", Some(today()))];
+            if others == 1 {
+                tasks.push(task(2, "two", Some(today())));
+            }
+            let mut view = loaded(tasks.clone());
+            let before = heights_after(&mut view, data_for(today(), tasks.clone()), 20, 1)[0];
+            tasks[0] = done_on(tasks[0].clone(), today());
+            let hs = heights_after(&mut view, data_for(today(), tasks), 20, 40);
+            let last = *hs.last().unwrap();
+            assert!(last < before - 20.0, "{hs:?}");
+            // Still there a frame in (it holds a beat), then its gap
+            // closes over several frames.
+            assert!(
+                hs[0] >= before - 1.0,
+                "{others} other(s): gone at once: {hs:?}"
+            );
+            let between = hs.iter().filter(|&&h| h < before - 1.0 && h > last).count();
+            assert!(between >= 3, "{others} other(s): not smooth: {hs:?}");
+        }
     }
 }

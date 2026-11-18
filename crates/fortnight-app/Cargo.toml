@@ -21,3 +21,7 @@ resvg.workspace = true
 objc2.workspace = true
 objc2-app-kit.workspace = true
 objc2-foundation.workspace = true
+
+[dev-dependencies]
+# A real (software) `iced::Renderer`, to drive whole views in tests.
+iced_tiny_skia = "0.14"
