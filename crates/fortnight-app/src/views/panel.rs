@@ -7,7 +7,7 @@ use fortnight_core::report::{ColumnLoad, fmt_hours};
 use iced::widget::{column, container, progress_bar, row, stack, tooltip};
 use iced::{Center, Element, Fill, Theme};
 
-/// A title bar (the Work Summary's, each day column's, each Today panel's):
+/// A title bar (the Weekly Summary's, each day column's, each Today panel's):
 /// a stronger fill than the card, rounded at the top only (`radius`), with
 /// a hairline under it.
 pub fn title_bar(radius: f32) -> impl Fn(&Theme) -> container::Style {

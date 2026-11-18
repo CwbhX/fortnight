@@ -1,5 +1,5 @@
 //! Report generation and scheduling: which reports the shown tab and the
-//! schedule need (freshness, the retry backoff, the Work summary's wait
+//! schedule need (freshness, the retry backoff, the Weekly Summary's wait
 //! after an edit), streaming a report and storing it when it ends, the Week
 //! tab's report panel, and catching up after anything that may make a
 //! report due.
@@ -23,7 +23,7 @@ use std::collections::HashMap;
 const RETRY_AFTER_MINUTES: i64 = 10;
 const RETRY_MAX_MINUTES: i64 = 24 * 60;
 
-/// After a change on the Week tab, the Work summary waits this long for
+/// After a change on the Week tab, the Weekly Summary waits this long for
 /// more changes (each one restarts the wait) before it is redone.
 const SUMMARY_WAIT_SECS: i64 = 30;
 
@@ -56,7 +56,7 @@ pub(crate) struct Reports {
     /// Identifies a generation, so a late message from an earlier stream for
     /// the same report can't finish a newer one.
     next_generation: u64,
-    /// The Work summary isn't redone before this: set by each change made
+    /// The Weekly Summary isn't redone before this: set by each change made
     /// on the Week tab (`SUMMARY_WAIT_SECS`), so a run of edits makes one
     /// new summary, not one each.
     summary_wait: Option<Timestamp>,
@@ -80,17 +80,17 @@ impl Reports {
         self.prompt_changed.insert(kind, at);
     }
 
-    /// Whether the Work summary has a wait after an edit set.
+    /// Whether the Weekly Summary has a wait after an edit set.
     pub(crate) fn has_summary_wait(&self) -> bool {
         self.summary_wait.is_some()
     }
 
-    /// Starts (or restarts) the Work summary's wait after an edit.
+    /// Starts (or restarts) the Weekly Summary's wait after an edit.
     pub(crate) fn start_summary_wait(&mut self) {
         self.summary_wait = Some(Timestamp::now() + SignedDuration::from_secs(SUMMARY_WAIT_SECS));
     }
 
-    /// Whether the Work summary is still waiting after a Week-tab change.
+    /// Whether the Weekly Summary is still waiting after a Week-tab change.
     fn summary_waiting(&self) -> bool {
         self.summary_wait.is_some_and(|at| Timestamp::now() < at)
     }
@@ -458,7 +458,7 @@ impl Ready {
         }
     }
 
-    /// The Work summary's wait after an edit may be over
+    /// The Weekly Summary's wait after an edit may be over
     /// (`Message::SummaryWait`): if so, catches up what the tab shows.
     pub(crate) fn summary_wait_over(&mut self) -> Task<Message> {
         if self.reports.summary_waiting() {

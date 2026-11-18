@@ -12,7 +12,7 @@
 //! and the view. The rest of the shell is in `shell/`, mostly as further
 //! `impl Ready` blocks:
 //! - `reports`: report generation and scheduling, and the Week tab's
-//!   report panel. The Work summary and the Today tab's Recommended tasks
+//!   report panel. The Weekly Summary and the Today tab's Recommended tasks
 //!   update on their own; an edited summary is never regenerated.
 //! - `recommend`: today's and later days' recommended tasks, and the plan
 //!   route.
@@ -110,7 +110,7 @@ enum Message {
     /// The task dialog (the Week tab's `+`, or a click on a card).
     Dialog(day::Message),
     Tick,
-    /// Checks whether the Work summary's wait after an edit is over.
+    /// Checks whether the Weekly Summary's wait after an edit is over.
     SummaryWait,
     /// While a day's notes have unsaved typing: save them once it pauses.
     NotesTick,
@@ -691,7 +691,7 @@ impl Ready {
             self.refresh();
         }
         if std::mem::take(&mut self.tasks_changed) {
-            // The Work summary follows changes on the Week tab, once they
+            // The Weekly Summary follows changes on the Week tab, once they
             // pause for `SUMMARY_WAIT_SECS`.
             if self.tab == Tab::Week {
                 self.reports.start_summary_wait();

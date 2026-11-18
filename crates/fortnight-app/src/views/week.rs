@@ -14,8 +14,8 @@
 //! week are on the Today tab only. The whole tab scrolls.
 //!
 //! The AI part comes from the report panel and is generated automatically
-//! (see `report_panel`): the Work summary card. (Recommended tasks are on
-//! the Today tab.)
+//! (see `report_panel`): the Weekly Summary card, folded until its title
+//! bar is clicked. (Recommended tasks are on the Today tab.)
 //!
 //! Tasks are small cards. An open task's card can be dragged: a copy follows
 //! the pointer, the day under it is highlighted, and an accent line shows
@@ -28,21 +28,23 @@
 //!
 //! Skipped on purpose: deleted tasks (the Today tab has them).
 
+use crate::motion;
 use crate::theme;
-use crate::views::panel::{self, LoadLine, load_line, load_view, title_bar};
+use crate::views::panel::{self, LoadLine, load_line, load_view, title_bar, title_bar_alone};
 use crate::views::report_panel::{self, ReportPanel, ReportPanelData};
 use fortnight_core::domain::{ReportKind, Task, TaskId, TaskStatus, WeekRef};
 use fortnight_core::report::{self, DayLoad, fmt_hours};
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Column, Row, button, checkbox, column, container, mouse_area, pin, row, scrollable, space,
-    stack, text, tooltip,
+    Column, Row, Stack, button, checkbox, column, container, mouse_area, pin, row, scrollable,
+    space, stack, text, tooltip,
 };
 use iced::{Center, Color, Element, Fill, Point, Theme, mouse};
 use jiff::civil::{Date, Weekday};
 
-/// The shortest a day column gets, so an empty week still looks like a week.
-const MIN_COLUMN_HEIGHT: f32 = 220.0;
+/// The shortest a day column gets, so an empty week still looks like a
+/// week: room for the title bar and about seven cards.
+const MIN_COLUMN_HEIGHT: f32 = 360.0;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -70,6 +72,8 @@ pub enum Message {
     /// A click on a done task's card (open cards report clicks through
     /// `Press` then `EndDrag` without a drag).
     Edit(TaskId),
+    /// The Weekly Summary's title bar: fold or unfold it.
+    ToggleSummary,
 }
 
 impl Message {
@@ -146,6 +150,8 @@ pub struct WeekView {
     layout: Layout,
     panel: ReportPanel,
     drag: Option<Drag>,
+    /// Whether the Weekly Summary is unfolded (it starts folded).
+    summary_open: bool,
 }
 
 impl WeekView {
@@ -179,6 +185,10 @@ impl WeekView {
             Message::OpenDay(day) => Action::OpenDay(day),
             Message::AddTask(day) => Action::NewTask(day),
             Message::Edit(id) => Action::Edit(id),
+            Message::ToggleSummary => {
+                self.summary_open = !self.summary_open;
+                Action::None
+            }
             Message::Panel(m) => match self.panel.update(m) {
                 report_panel::Action::None => Action::None,
                 action => Action::Panel(action),
@@ -282,15 +292,12 @@ impl WeekView {
             backgrounds = backgrounds.push(free);
             contents = contents.push(day_column(data, &self.layout, column, dragging, held));
         }
-        let base = row![
-            space().width(0).height(MIN_COLUMN_HEIGHT),
-            contents.width(Fill)
-        ];
-        let grid = stack![base].push_under(backgrounds).width(Fill);
+        let grid = column_grid(contents, backgrounds);
 
         let mut body = Column::new().spacing(theme::SPACING * 2.0).push(grid);
         if self.panel.slot(ReportKind::Summary).is_some() {
             body = body.push(summary_card(
+                self.summary_open,
                 self.panel.summary_tools().map(|e| e.map(Message::Panel)),
                 self.panel
                     .status_view(ReportKind::Summary)
@@ -328,16 +335,19 @@ impl WeekView {
     }
 }
 
-/// The Work summary card. Its heading sits in a tinted bar of its own, in
+/// The Weekly Summary card. Its heading sits in a tinted bar of its own, in
 /// bold with a copy icon beside it and the status at the right, so it
-/// doesn't read as one more heading of the Markdown below it.
+/// doesn't read as one more heading of the Markdown below it. The bar
+/// folds and unfolds the body (`open`); the copy icon works either way.
 fn summary_card<'a>(
+    open: bool,
     tools: Option<Element<'a, Message>>,
     status: Option<Element<'a, Message>>,
     body: Element<'a, Message>,
 ) -> Element<'a, Message> {
     let mut head = row![
-        text("Work Summary")
+        theme::disclosure(open),
+        text("Weekly Summary")
             .size(theme::TEXT_HEADING)
             .font(theme::FONT_BOLD)
     ]
@@ -349,20 +359,40 @@ fn summary_card<'a>(
     if let Some(status) = status {
         head = head.push(space::horizontal()).push(status);
     }
-    let bar = container(head)
-        .padding(
-            iced::Padding::from([theme::SPACING * 0.75, theme::SPACING * 1.5])
-                .right(theme::SPACING),
-        )
+    let bar = container(head).padding(
+        iced::Padding::from([theme::SPACING * 0.75, theme::SPACING * 1.5]).right(theme::SPACING),
+    );
+    let bar = if open {
+        bar.width(Fill).style(title_bar(theme::RADIUS))
+    } else {
+        bar.width(Fill).style(title_bar_alone(theme::RADIUS))
+    };
+    // The copy icon takes its own clicks; the rest of the bar toggles.
+    let bar = mouse_area(bar)
+        .on_press(Message::ToggleSummary)
+        .interaction(mouse::Interaction::Pointer);
+    let body = container(body).padding(theme::SPACING * 1.5).width(Fill);
+    container(column![bar, motion::fold(open, body)])
         .width(Fill)
-        .style(title_bar(theme::RADIUS));
-    container(column![
-        bar,
-        container(body).padding(theme::SPACING * 1.5).width(Fill)
-    ])
-    .width(Fill)
-    .style(theme::card)
-    .into()
+        .style(theme::card)
+        .into()
+}
+
+/// The day columns' contents over their backgrounds, at least
+/// `MIN_COLUMN_HEIGHT` tall: the backgrounds stretch to the taller of that
+/// and the tallest column. The height comes from a 1 px strut at the left
+/// of each row (iced's `Row::push` drops anything 0 px wide), so contents
+/// and backgrounds stay lined up.
+fn column_grid<'a, M: 'a, R: iced::advanced::Renderer + 'a>(
+    contents: Row<'a, M, Theme, R>,
+    backgrounds: Row<'a, M, Theme, R>,
+) -> Stack<'a, M, Theme, R> {
+    let base = row![
+        space().width(1).height(MIN_COLUMN_HEIGHT),
+        contents.width(Fill)
+    ];
+    let under = row![space().width(1), backgrounds.width(Fill)];
+    stack![base].push_under(under).width(Fill)
 }
 
 /// What `view` shows, worked out once per `load` rather than on every
@@ -599,7 +629,7 @@ fn column_title<'a>(column: &DayColumn) -> Element<'a, Message> {
         theme::tip("Add a task"),
         tooltip::Position::Bottom,
     );
-    // The heading sits in a title bar like the Work Summary's, inset by
+    // The heading sits in a title bar like the Weekly Summary's, inset by
     // today's ring so the ring stays visible around it.
     let bar = Column::new()
         .spacing(6)
@@ -882,6 +912,32 @@ fn drop_target(is_today: bool, over: bool) -> impl Fn(&Theme) -> container::Styl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A week with little planned still gets tall columns, and a column
+    /// taller than that stretches every background to it.
+    #[test]
+    fn columns_have_a_minimum_height() {
+        use iced::advanced::layout::Limits;
+        use iced::advanced::widget::Tree;
+        let grid = |content: f32| {
+            let contents: Row<'_, (), Theme, ()> = Row::new()
+                .push(container(space().height(content)).width(Fill))
+                .push(container(space().height(10)).width(Fill));
+            let backgrounds = Row::new()
+                .push(container(space()).width(Fill).height(Fill))
+                .push(container(space()).width(Fill).height(Fill));
+            let mut el: iced::Element<'_, (), Theme, ()> =
+                column_grid(contents, backgrounds).into();
+            let mut tree = Tree::new(&el);
+            let limits = Limits::new(iced::Size::ZERO, iced::Size::new(1000.0, f32::INFINITY));
+            let node = el.as_widget_mut().layout(&mut tree, &(), &limits);
+            let under = &node.children()[0].children()[1];
+            let heights: Vec<f32> = under.children().iter().map(|c| c.size().height).collect();
+            (node.size().height, heights)
+        };
+        assert_eq!(grid(50.0), (MIN_COLUMN_HEIGHT, vec![MIN_COLUMN_HEIGHT; 2]));
+        assert_eq!(grid(500.0), (500.0, vec![500.0; 2]));
+    }
     use fortnight_core::domain::ReportKind;
     use jiff::civil::date;
 

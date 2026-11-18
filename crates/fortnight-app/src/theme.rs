@@ -437,7 +437,7 @@ pub fn editor(theme: &Theme, status: text_editor::Status) -> text_editor::Style 
 // ------------------------------------------------------- round 2: navigation
 
 /// The slim bar across the top, in the scheme of the Week tab's title
-/// bars (the Work Summary's and each day column's): a stronger fill than
+/// bars (the Weekly Summary's and each day column's): a stronger fill than
 /// the page, a hairline below.
 pub fn top_bar(theme: &Theme) -> container::Style {
     container::Style {
