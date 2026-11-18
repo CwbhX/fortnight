@@ -254,7 +254,7 @@ pub fn tint(theme: &Theme, amount: f32) -> Color {
 }
 
 /// Fill for cards and hovered rows.
-fn soft_fill(theme: &Theme) -> Color {
+pub fn soft_fill(theme: &Theme) -> Color {
     tint(theme, 0.04)
 }
 

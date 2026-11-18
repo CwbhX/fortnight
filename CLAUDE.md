@@ -26,7 +26,7 @@ cargo test
   - jiff 1.0: `Zoned` is now `jiff::ZonedDateTime`; `civil::Weekday` has no serde impl.
 - Old data folders must keep opening with nothing lost: the database migrates on open, and settings JSON may lack newer fields. `crates/fortnight-core/tests/fixtures/round1.db` is a real schema-version-1 database used by the tests.
 - LLM client tests run against `wiremock` mock servers, never a real endpoint or key.
-- Animations are widgets that animate themselves (`crates/fortnight-app/src/motion.rs`): no app state, no timers. Its module doc explains how fades and drawing order work in iced 0.14.
+- Animations are widgets that animate themselves (`crates/fortnight-app/src/motion.rs`): no app state, no timers. Its module doc explains how fades and drawing order work in iced 0.14. The one exception is data, not timing: to draw something leaving, the view must keep giving it for a moment (the Today tab's `Departure`s feed `motion::list`).
 
 ## Seeing the GUI without a screen
 

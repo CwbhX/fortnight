@@ -15,12 +15,17 @@
 //! - [`unfold`] and [`fold`]: something that opens (a folded section, a
 //!   task opening into its form) growing to its open height, and shrinking
 //!   back when it closes.
+//! - [`list`]: a column of keyed items (tasks) that grow, fade and zoom in
+//!   when they arrive and fade, zoom out and fold away when they leave.
 //!
 //! Whatever plays on the way in plays back on the way out where the widget
 //! can still draw what is leaving: the dark layer fades out, folds shrink
-//! (a [`fold`] keeps its body for that, hidden while closed). A dialog's
-//! panel can't sink back out: once the view drops it there is nothing left
-//! to draw, so it goes at once while its dark layer fades.
+//! (a [`fold`] keeps its body for that, hidden while closed), and a list
+//! draws an item the view still gives it, marked [`Item::leaving`] (the
+//! Today tab keeps a task that just left a section for a moment for that:
+//! data to draw, not timing). A dialog's panel can't sink back out: once
+//! the view drops it there is nothing left to draw, so it goes at once
+//! while its dark layer fades.
 //!
 //! iced 0.14 can't draw a widget tree at part opacity, so a fade here is a
 //! "veil": a rectangle in the colour behind the content, drawn over it and
@@ -43,6 +48,9 @@ use iced::advanced::{Clipboard, Shell, Widget, overlay, renderer};
 use iced::time::{Duration, Instant};
 use iced::{Color, Element, Event, Length, Rectangle, Shadow, Size, Vector, mouse, window};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+mod list;
+pub use list::{Item, List, list};
 
 /// How long a page (the open tab) takes to fade in.
 const PAGE: Duration = Duration::from_millis(170);
@@ -1109,16 +1117,16 @@ mod tests {
 
     /// A widget laid out in a 400 x 300 window, as iced keeps it between
     /// views: its state lives on while `set` swaps in a new view of it.
-    struct Stage<'a> {
-        element: El<'a>,
-        tree: Tree,
-        node: layout::Node,
+    pub(super) struct Stage<'a> {
+        pub element: El<'a>,
+        pub tree: Tree,
+        pub node: layout::Node,
         /// How many times a frame asked for a new layout.
-        layouts: usize,
+        pub layouts: usize,
     }
 
     impl<'a> Stage<'a> {
-        fn new(element: El<'a>) -> Self {
+        pub fn new(element: El<'a>) -> Self {
             let mut stage = Stage {
                 tree: Tree::new(&element),
                 element,
@@ -1138,14 +1146,14 @@ mod tests {
         }
 
         /// A new view of the same widget.
-        fn set(&mut self, element: El<'a>) {
+        pub fn set(&mut self, element: El<'a>) {
             self.element = element;
             self.tree.diff(&self.element);
             self.lay_out();
         }
 
         /// The frame at `now`; whether the widget asked for another.
-        fn frame(&mut self, now: Instant) -> bool {
+        pub fn frame(&mut self, now: Instant) -> bool {
             let mut messages = Vec::new();
             let mut shell = Shell::new(&mut messages);
             self.element.as_widget_mut().update(
@@ -1183,7 +1191,7 @@ mod tests {
             again
         }
 
-        fn state<S: 'static>(&self) -> &S {
+        pub fn state<S: 'static>(&self) -> &S {
             self.tree.state.downcast_ref::<S>()
         }
     }

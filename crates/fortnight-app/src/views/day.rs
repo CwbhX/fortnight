@@ -61,6 +61,14 @@
 //! 3, …). A press let go without moving is a click (it opens the card).
 //! The other sections keep their own order and don't drag.
 //!
+//! Tasks move between sections smoothly (`motion::list`): one that leaves a
+//! section (ticked, deleted, picked by the model) holds a beat, then fades
+//! and zooms out, drifting the way it went, and the gap closes; it fades
+//! and zooms into the section it lands in, from the side it came from. For
+//! that the view keeps a task that just left a section for a moment
+//! ([`Departure`]), to draw it going. A section's panel unfolds when it
+//! gets its first task and folds away after its last.
+//!
 //! Skipped for the prototype: undo for a drag, strikethrough on done tasks
 //! (iced text has none), undo for the notes, and saving notes typed in the
 //! last moment before quitting.
@@ -293,6 +301,43 @@ pub struct DayView {
     drag: Option<Drag>,
     /// The Tasks card under the pointer.
     hovered: Option<TaskId>,
+    /// Tasks that just left a section of the shown day, oldest first.
+    departures: Vec<Departure>,
+}
+
+/// A task that just left a section of the shown day, kept for a moment so
+/// its card can be drawn going where it was (`motion::Item::leaving`). The
+/// widget times that; this only holds what to draw. Dropped at the first
+/// new data after [`LINGER`], by when it is long gone, or when the task is
+/// back.
+#[derive(Debug, Clone)]
+struct Departure {
+    /// As it is now (ticked, say), or as it was if it is gone for good.
+    task: Task,
+    from: Section,
+    /// Its place in `from`.
+    index: usize,
+    /// Where it went, if it is still on screen.
+    to: Option<Section>,
+    at: Instant,
+}
+
+/// How long a [`Departure`] is kept: longer than it takes to go.
+const LINGER: Duration = Duration::from_secs(1);
+
+/// Up (-1) or down (1) the page from section `from` to `to`.
+fn towards(from: Section, to: Option<Section>) -> f32 {
+    match to {
+        Some(to) if to < from => -1.0,
+        Some(to) if to > from => 1.0,
+        _ => 0.0,
+    }
+}
+
+/// A number for the day shown: lists and panels play nothing when it
+/// changes (another day is simply there).
+fn day_key(day: Date) -> u64 {
+    (i64::from(day.year()) * 372 + i64::from(day.month()) * 31 + i64::from(day.day())) as u64
 }
 
 /// Where a task is shown on the Today tab.
@@ -557,7 +602,9 @@ impl DayView {
                 self.notes = tidied;
             }
         }
-        self.placement = Placement::new(&data);
+        let placement = Placement::new(&data);
+        self.note_departures(&data, &placement, Instant::now());
+        self.placement = placement;
         self.data = Some(data);
 
         // A card that left the Tasks section sends no exit event.
@@ -588,6 +635,47 @@ impl DayView {
                 });
             }
         }
+    }
+
+    /// Notes the tasks that left a section between the data shown and
+    /// `data`, and forgets those long gone or back. Another day: none.
+    fn note_departures(&mut self, data: &DayData, placement: &Placement, now: Instant) {
+        let Some(old) = self
+            .data
+            .as_ref()
+            .filter(|old| (old.day, old.today) == (data.day, data.today))
+        else {
+            self.departures.clear();
+            return;
+        };
+        let now_in: std::collections::HashMap<TaskId, Section> = Section::ALL
+            .into_iter()
+            .flat_map(|s| placement.tasks(data, s).into_iter().map(move |t| (t.id, s)))
+            .collect();
+        let mut left = Vec::new();
+        for from in Section::ALL {
+            for (index, task) in self.placement.tasks(old, from).into_iter().enumerate() {
+                let to = now_in.get(&task.id).copied();
+                if to != Some(from) {
+                    let task = data.tasks.iter().find(|t| t.id == task.id).unwrap_or(task);
+                    left.push(Departure {
+                        task: task.clone(),
+                        from,
+                        index,
+                        to,
+                        at: now,
+                    });
+                }
+            }
+        }
+        self.departures.retain(|d| {
+            now.saturating_duration_since(d.at) < LINGER
+                && now_in.get(&d.task.id) != Some(&d.from)
+                && !left
+                    .iter()
+                    .any(|n| (n.task.id, n.from) == (d.task.id, d.from))
+        });
+        self.departures.extend(left);
     }
 
     /// A key pressed while no text field has focus (PLAN.md 4.4: ↑ ↓ move
@@ -831,33 +919,60 @@ impl DayView {
 
     // ------------------------------------------------------------- view
 
-    pub fn view(&self) -> Element<'_, Message> {
+    pub fn view<'a>(&'a self) -> Element<'a, Message> {
         let Some(data) = &self.data else {
             return text("Loading…").style(theme::muted).into();
         };
-        let mut content = Column::new().spacing(theme::SPACING * 1.5);
+        // Each section has its place whether it shows or not, so it can
+        // unfold when it gets its first task and fold away after its last.
+        // The gap under a panel is inside its place, to fold away with it.
+        let gap = theme::SPACING * 1.5;
+        let key = day_key(data.day) * 8;
+        let place = |section: Section, shown: bool, panel: Element<'a, Message>| {
+            motion::fold(
+                shown,
+                container(panel).padding(iced::Padding::ZERO.bottom(gap)),
+            )
+            .key(key + section as u64)
+        };
+        let below =
+            |panel: Element<'a, Message>| container(panel).padding(iced::Padding::ZERO.bottom(gap));
+        let mut content = Column::new();
 
         let recommended = self.placement.tasks(data, Section::Recommended);
-        if !recommended.is_empty() {
-            let head = panel_head("Recommended", Some(recommended.len()), text::default);
-            content = content.push(panel::panel(head, Some(self.rows(recommended, data, true))));
-        } else if data.recommending && data.day >= data.today {
-            let head = panel_head("Recommended", None, text::default);
-            let body = text("Picking the top tasks…")
-                .size(theme::TEXT_SMALL)
-                .style(theme::muted);
-            content = content.push(panel::panel(head, Some(body.into())));
-        }
+        let picking = recommended.is_empty() && data.recommending && data.day >= data.today;
+        let head = panel_head(
+            "Recommended",
+            (!recommended.is_empty()).then_some(recommended.len()),
+            text::default,
+        );
+        let shown = !recommended.is_empty() || picking;
+        let picking_note = text("Picking the top tasks…")
+            .size(theme::TEXT_SMALL)
+            .style(theme::muted);
+        let body = column![
+            self.rows(Section::Recommended, recommended, data, true),
+            motion::fold(picking, picking_note),
+        ];
+        content = content.push(place(
+            Section::Recommended,
+            shown,
+            panel::panel(head, Some(body.into())),
+        ));
 
-        content = content.push(self.day_panel(data));
+        content = content.push(below(self.day_panel(data)));
 
         let overdue = self.placement.tasks(data, Section::Overdue);
-        if !overdue.is_empty() {
-            let head = panel_head("Overdue", Some(overdue.len()), theme::danger);
-            content = content.push(panel::panel(head, Some(self.rows(overdue, data, false))));
-        }
+        let shown = !overdue.is_empty();
+        let head = panel_head("Overdue", shown.then_some(overdue.len()), theme::danger);
+        let body = self.rows(Section::Overdue, overdue, data, false);
+        content = content.push(place(
+            Section::Overdue,
+            shown,
+            panel::panel(head, Some(body)),
+        ));
 
-        content = content.push(self.day_notes_view(data));
+        content = content.push(below(self.day_notes_view(data)));
 
         let collapsibles = [
             (
@@ -881,14 +996,21 @@ impl DayView {
         ];
         for (section, label, open, toggle) in collapsibles {
             let tasks = self.placement.tasks(data, section);
-            if !tasks.is_empty() {
-                content = content.push(self.collapsible(section, label, open, toggle, tasks, data));
-            }
+            let shown = !tasks.is_empty();
+            content = content.push(place(
+                section,
+                shown,
+                self.collapsible(section, label, open, toggle, tasks, data),
+            ));
         }
 
+        // The last place's gap is part of the padding at the bottom.
         let page = container(
             content
-                .padding(theme::SPACING * 2.0)
+                .padding(iced::Padding {
+                    bottom: theme::SPACING * 2.0 - gap,
+                    ..iced::Padding::new(theme::SPACING * 2.0)
+                })
                 .max_width(theme::CONTENT_WIDTH),
         )
         .center_x(Fill);
@@ -906,7 +1028,7 @@ impl DayView {
                         offset: iced::Vector::new(0.0, 6.0),
                         blur_radius: 16.0,
                     },
-                    ..card_box(true, false)(t)
+                    ..card_box(false, true, false)(t)
                 });
             layers = layers.push(pin(ghost).position(Point::new(at.x - 40.0, at.y - 22.0)));
         }
@@ -1022,18 +1144,18 @@ impl DayView {
             .padding(CARD_PADDING)
             .size(theme::TEXT_BODY)
             .style(theme::input);
-        let list: Element<'a, Message> = if day_tasks.is_empty() {
-            container(
-                text("Nothing planned")
-                    .size(theme::TEXT_SMALL)
-                    .style(theme::muted),
-            )
-            .padding(iced::Padding::ZERO.bottom(theme::SPACING / 2.0))
-            .into()
-        } else {
-            self.sortable_rows(day_tasks, data)
-        };
-        panel::panel(head.into(), Some(column![list, quick_add].into()))
+        let nothing = container(
+            text("Nothing planned")
+                .size(theme::TEXT_SMALL)
+                .style(theme::muted),
+        )
+        .padding(iced::Padding::ZERO.bottom(theme::SPACING / 2.0));
+        let body = column![
+            motion::fold(day_tasks.is_empty(), nothing).key(day_key(data.day)),
+            self.sortable_rows(day_tasks, data),
+            quick_add,
+        ];
+        panel::panel(head.into(), Some(body.into()))
     }
 
     /// Shows a suggested priority on the inline form of task `id`.
@@ -1048,6 +1170,52 @@ impl DayView {
         self.drag.as_ref().filter(|d| d.active)
     }
 
+    /// A section's tasks as shown: with those that just left it back in
+    /// their places, to be drawn going.
+    fn shown<'a>(
+        &'a self,
+        section: Section,
+        tasks: Vec<&'a Task>,
+    ) -> Vec<(&'a Task, Option<&'a Departure>)> {
+        let mut rows: Vec<_> = tasks.into_iter().map(|t| (t, None)).collect();
+        for d in self.departures.iter().filter(|d| d.from == section) {
+            rows.insert(d.index.min(rows.len()), (&d.task, Some(d)));
+        }
+        rows
+    }
+
+    /// A row of `section`'s [`motion::list`]: going if it `left`, else
+    /// coming from where it was if it just arrived.
+    fn item<'a>(
+        &self,
+        section: Section,
+        task: &Task,
+        left: Option<&Departure>,
+        row: impl Into<Element<'a, Message>>,
+    ) -> motion::Item<'a, Message> {
+        let item = motion::Item::new(task.id as u64, row);
+        match left {
+            Some(d) => item.leaving(towards(d.from, d.to)),
+            None => {
+                let from = self
+                    .departures
+                    .iter()
+                    .rev()
+                    .find(|d| d.task.id == task.id && d.to == Some(section))
+                    .map(|d| towards(section, Some(d.from)));
+                item.from(from.unwrap_or(0.0))
+            }
+        }
+    }
+
+    /// A list for a section's rows, `spacing` apart.
+    fn list<'a>(data: &DayData, spacing: f32) -> motion::List<'a, Message> {
+        motion::list()
+            .spacing(spacing)
+            .key(day_key(data.day))
+            .fade_from(theme::soft_fill)
+    }
+
     /// The Tasks section's rows: open cards drag to rearrange; the open
     /// form stays as it is. A thin strip after the last card takes drops
     /// at the end.
@@ -1058,36 +1226,52 @@ impl DayView {
     ) -> Element<'a, Message> {
         let dragging = self.dragging();
         let over = dragging.and_then(|d| d.over);
-        let mut list = Column::new().spacing(3);
-        for task in tasks {
+        let any = !tasks.is_empty();
+        let mut list = Self::list(data, 3.0);
+        for (task, left) in self.shown(Section::Day, tasks) {
             let id = task.id;
-            if let Some(form) = self.editing.as_ref().filter(|f| f.id == id) {
-                let form = edit_card(task, form, data.today);
-                list = list.push(motion::unfold(true, form).key(id as u64));
-                continue;
-            }
-            let held = dragging.is_some_and(|d| d.id == id);
-            let line = !held && over == Some(Spot::Before(id));
-            let card = container(card_content(task, data.today, None))
-                .padding(CARD_PADDING)
-                .width(Fill)
-                .style(card_box(
-                    held || (dragging.is_none() && self.hovered == Some(id)),
-                    self.selected == Some(id),
-                ));
-            let mut area = mouse_area(column![drop_line(line), card].spacing(3))
-                .on_press(Message::Press(id))
-                .on_enter(Message::Enter(Spot::Before(id)))
-                .on_exit(Message::Leave(id))
-                .interaction(if dragging.is_some() {
-                    mouse::Interaction::Grabbing
-                } else {
-                    mouse::Interaction::Pointer
-                });
-            if dragging.is_some() {
-                area = area.on_release(Message::DropOn(Spot::Before(id)));
-            }
-            list = list.push(motion::unfold(false, area).key(id as u64));
+            let row: Element<'a, Message> = if left.is_some() {
+                // Going: as it is now, untouchable.
+                let card = container(card_content(task, data.today, None))
+                    .padding(CARD_PADDING)
+                    .width(Fill)
+                    .style(card_box(!task.status.is_open(), false, false));
+                motion::unfold(false, column![drop_line(false), card].spacing(3))
+                    .key(id as u64)
+                    .into()
+            } else if let Some(form) = self.editing.as_ref().filter(|f| f.id == id) {
+                motion::unfold(true, edit_card(task, form, data.today))
+                    .key(id as u64)
+                    .into()
+            } else {
+                let held = dragging.is_some_and(|d| d.id == id);
+                let line = !held && over == Some(Spot::Before(id));
+                let card = container(card_content(task, data.today, None))
+                    .padding(CARD_PADDING)
+                    .width(Fill)
+                    .style(card_box(
+                        false,
+                        held || (dragging.is_none() && self.hovered == Some(id)),
+                        self.selected == Some(id),
+                    ));
+                let mut area = mouse_area(column![drop_line(line), card].spacing(3))
+                    .on_press(Message::Press(id))
+                    .on_enter(Message::Enter(Spot::Before(id)))
+                    .on_exit(Message::Leave(id))
+                    .interaction(if dragging.is_some() {
+                        mouse::Interaction::Grabbing
+                    } else {
+                        mouse::Interaction::Pointer
+                    });
+                if dragging.is_some() {
+                    area = area.on_release(Message::DropOn(Spot::Before(id)));
+                }
+                motion::unfold(false, area).key(id as u64).into()
+            };
+            list = list.push(self.item(Section::Day, task, left, row));
+        }
+        if !any {
+            return list.into();
         }
         let mut end = mouse_area(
             column![drop_line(over == Some(Spot::End))]
@@ -1099,7 +1283,7 @@ impl DayView {
                 .on_enter(Message::Enter(Spot::End))
                 .on_release(Message::DropOn(Spot::End));
         }
-        list.push(end).into()
+        column![list, end].spacing(3).into()
     }
 
     /// A collapsed section: a panel whose title bar opens it (arrow, name,
@@ -1117,7 +1301,13 @@ impl DayView {
             row![
                 theme::disclosure(open),
                 text(label).size(theme::TEXT_BODY).font(theme::FONT_BOLD),
-                text(tasks.len().to_string()).size(theme::TEXT_SMALL),
+                // None while it folds away after its last.
+                text(if tasks.is_empty() {
+                    String::new()
+                } else {
+                    tasks.len().to_string()
+                })
+                .size(theme::TEXT_SMALL),
             ]
             .spacing(8)
             .align_y(Center),
@@ -1144,11 +1334,13 @@ impl DayView {
         }
         // Built closed too, to be drawn folding away.
         let body = if section == Section::Deleted {
-            Column::with_children(tasks.into_iter().map(deleted_row))
-                .spacing(6)
-                .into()
+            let mut list = Self::list(data, 6.0);
+            for (task, left) in self.shown(section, tasks) {
+                list = list.push(self.item(section, task, left, deleted_row(task)));
+            }
+            list.into()
         } else {
-            self.rows(tasks, data, false)
+            self.rows(section, tasks, data, false)
         };
         panel::folding_panel(head.into(), open, body, section as u64)
     }
@@ -1157,24 +1349,36 @@ impl DayView {
     /// numbers them 1, 2, 3 in the order shown.
     fn rows<'a>(
         &'a self,
+        section: Section,
         tasks: Vec<&'a Task>,
         data: &'a DayData,
         ranked: bool,
     ) -> Element<'a, Message> {
-        // A task opening into its form grows from its card's height.
-        Column::with_children(tasks.into_iter().enumerate().map(|(i, task)| {
-            let (open, row) = match &self.editing {
-                Some(form) if form.id == task.id => (true, edit_card(task, form, data.today)),
-                _ => {
-                    let rank = ranked.then_some(i + 1);
+        let mut list = Self::list(data, 6.0);
+        let mut rank = 0;
+        for (task, left) in self.shown(section, tasks) {
+            // A task opening into its form grows from its card's height.
+            let (open, row) = match (left, &self.editing) {
+                // Going: as it is now, with the rank it had.
+                (Some(d), _) => {
+                    let rank = ranked.then_some(d.index + 1);
+                    (false, task_row(task, data.today, false, rank))
+                }
+                (None, Some(form)) if form.id == task.id => {
+                    rank += 1;
+                    (true, edit_card(task, form, data.today))
+                }
+                (None, _) => {
+                    rank += 1;
                     let selected = self.selected == Some(task.id);
+                    let rank = ranked.then_some(rank);
                     (false, task_row(task, data.today, selected, rank))
                 }
             };
-            motion::unfold(open, row).key(task.id as u64).into()
-        }))
-        .spacing(6)
-        .into()
+            let row = motion::unfold(open, row).key(task.id as u64);
+            list = list.push(self.item(section, task, left, row));
+        }
+        list.into()
     }
 }
 
@@ -1346,16 +1550,17 @@ fn task_row<'a>(
         .into()
 }
 
-/// An open Tasks card's fill, as [`task_card_style`] gives a button:
-/// lighter when `lit` (hovered or held), with an accent ring when selected.
-fn card_box(lit: bool, selected: bool) -> impl Fn(&Theme) -> container::Style {
+/// A Tasks card's fill, as [`task_card_style`] gives a button: quiet when
+/// `done`, lighter when `lit` (hovered or held), with an accent ring when
+/// selected.
+fn card_box(done: bool, lit: bool, selected: bool) -> impl Fn(&Theme) -> container::Style {
     move |theme| {
         let status = if lit {
             button::Status::Hovered
         } else {
             button::Status::Active
         };
-        let b = task_card_style(false, selected)(theme, status);
+        let b = task_card_style(done, selected)(theme, status);
         container::Style {
             background: b.background,
             text_color: Some(b.text_color),
@@ -1673,6 +1878,79 @@ mod tests {
         view.update(Message::Moved(Point::new(5.0, 5.0)));
         view.update(Message::EndDrag);
         assert_eq!(view.editing.as_ref().map(|f| f.id), Some(1));
+    }
+
+    /// `(id, from, index, to)` of each task kept to be drawn going.
+    fn departures(view: &DayView) -> Vec<(TaskId, Section, usize, Option<Section>)> {
+        view.departures
+            .iter()
+            .map(|d| (d.task.id, d.from, d.index, d.to))
+            .collect()
+    }
+
+    #[test]
+    fn a_ticked_task_is_kept_to_be_drawn_leaving_as_it_now_is() {
+        let tasks = || vec![task(2, "a", Some(today())), task(3, "b", Some(today()))];
+        let mut view = loaded(tasks());
+        assert!(departures(&view).is_empty());
+        let mut ticked = tasks();
+        ticked[0] = done_on(ticked[0].clone(), today());
+        view.load(data_for(today(), ticked));
+        assert_eq!(
+            departures(&view),
+            vec![(2, Section::Day, 0, Some(Section::Done))]
+        );
+        assert!(view.departures[0].task.is_done());
+        // Unticked: back in its place, nothing to draw going there; it
+        // leaves Completed instead.
+        view.load(data_for(today(), tasks()));
+        assert_eq!(
+            departures(&view),
+            vec![(2, Section::Done, 0, Some(Section::Day))]
+        );
+    }
+
+    #[test]
+    fn a_task_the_model_picks_leaves_its_section_upwards() {
+        let mut data = data_for(today(), vec![task(2, "a", Some(today()))]);
+        let mut view = DayView::new();
+        view.load(data.clone());
+        data.recommended = vec![Recommended { id: 2 }];
+        view.load(data);
+        let d = &view.departures[0];
+        assert_eq!((d.from, d.to), (Section::Day, Some(Section::Recommended)));
+        assert_eq!(towards(d.from, d.to), -1.0);
+    }
+
+    #[test]
+    fn departures_go_with_another_day_or_after_a_while() {
+        let tasks = || vec![task(2, "a", Some(today())), task(3, "b", Some(today()))];
+        let mut view = loaded(tasks());
+        let mut ticked = tasks();
+        ticked[0] = done_on(ticked[0].clone(), today());
+        view.load(data_for(today(), ticked.clone()));
+        assert_eq!(view.departures.len(), 1);
+        // Another day: everything there is simply there.
+        view.load(data_for(today().tomorrow().unwrap(), ticked.clone()));
+        assert!(view.departures.is_empty());
+
+        let mut view = loaded(tasks());
+        let t0 = Instant::now();
+        let data = data_for(today(), ticked.clone());
+        let placement = Placement::new(&data);
+        view.note_departures(&data, &placement, t0);
+        view.placement = placement;
+        view.data = Some(data);
+        // Still going a moment later; forgotten at new data once gone.
+        let mut both = ticked.clone();
+        both[1] = done_on(both[1].clone(), today());
+        let data = data_for(today(), both);
+        let placement = Placement::new(&data);
+        view.note_departures(&data, &placement, t0 + LINGER);
+        assert_eq!(
+            departures(&view),
+            vec![(3, Section::Day, 0, Some(Section::Done))]
+        );
     }
 
     #[test]
