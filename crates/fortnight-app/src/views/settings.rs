@@ -8,7 +8,7 @@
 //! in the form until the saved settings change.
 //!
 //! Order, top to bottom: Appearance (Theme and Color side by side, then App
-//! icon and Today width), Model, Recommendations, Week (first day, working days and work
+//! icon and Width, which sets the Today column), Model, Recommendations, Week (first day, working days and work
 //! hours), Prompts (folded shut until its heading is clicked: they are
 //! long), and the Data folder last. There are no report times: the summary's
 //! background update follows the working days (`week::due_reports`).
@@ -827,7 +827,7 @@ impl SettingsView {
                 theme::dropdown(icon)
             ]
             .spacing(theme::SPACING / 3.0),
-            labelled("Today width", theme::dropdown(width)),
+            labelled("Width", theme::dropdown(width)),
         ]
         .spacing(theme::SPACING * 2.0);
         section(
