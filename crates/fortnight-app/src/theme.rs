@@ -59,7 +59,8 @@
 //! # Round 2: navigation and calendar
 //!
 //! - [`top_bar`]: the slim bar across the top (container).
-//! - [`tab_bar`] + [`tab_button`]: the Today | Week | Month segmented control.
+//! - [`tab_bar`] + [`tab_button`]: the Today | Week | Month segmented control;
+//!   [`tab_pill`]: its selected fill, where it slides between tabs.
 //! - [`icon`] + [`icon_button`]: SVG icons ([`Icon`]) in square, fill-on-hover
 //!   buttons (lock, gear, chevrons).
 //! - [`day_column`]: a column of the Week tab; `is_today` adds the accent ring.
@@ -67,9 +68,9 @@
 //!   outside the month).
 //! - [`load_bar`] + [`load_bar_done`]: `progress_bar` styles for the Week
 //!   load bar: capacity track, gray task share, accent done.
-//! - [`backdrop`] + [`overlay_panel`]: the dimmed layer and the panel of an
-//!   overlay (Settings); [`dialog_backdrop`]: the darker one of the task
-//!   dialog.
+//! - [`overlay_panel`]: the panel of an overlay (Settings, a dialog), over a
+//!   dimmed layer (`motion::dim`) at [`BACKDROP`], or [`DIALOG_BACKDROP`]
+//!   for the task dialog.
 //!
 //! # Shared helpers
 //!
@@ -474,20 +475,19 @@ pub fn top_tab_bar(theme: &Theme) -> container::Style {
 
 /// A tab inside [`tab_bar`]: the active one is filled with the accent and
 /// has white text, like every other selected thing (a calendar day, a ticked
-/// checkbox, the primary button); the others are muted text.
+/// checkbox, the primary button); the others are muted text. (The top bar
+/// draws all its tabs inactive and slides a [`tab_pill`] under the selected
+/// one.)
 pub fn tab_button(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
         let p = theme.palette();
         if active {
+            let pill = tab_pill();
             button::Style {
-                background: Some(accent_color().into()),
+                background: Some(pill.color.into()),
                 text_color: Color::WHITE,
-                border: border::rounded(RADIUS - 2.0),
-                shadow: iced::Shadow {
-                    color: Color::BLACK.scale_alpha(0.12),
-                    offset: iced::Vector::new(0.0, 1.0),
-                    blur_radius: 2.0,
-                },
+                border: border::rounded(pill.radius),
+                shadow: pill.shadow,
                 ..button::Style::default()
             }
         } else {
@@ -501,6 +501,20 @@ pub fn tab_button(active: bool) -> impl Fn(&Theme, button::Status) -> button::St
                 ..button::Style::default()
             }
         }
+    }
+}
+
+/// The fill of the active [`tab_button`], for a pill that slides between
+/// tabs (`motion::pill`): the accent, with a slight shadow.
+pub fn tab_pill() -> crate::motion::PillStyle {
+    crate::motion::PillStyle {
+        color: accent_color(),
+        radius: RADIUS - 2.0,
+        shadow: iced::Shadow {
+            color: Color::BLACK.scale_alpha(0.12),
+            offset: iced::Vector::new(0.0, 1.0),
+            blur_radius: 2.0,
+        },
     }
 }
 
@@ -700,22 +714,12 @@ pub fn load_bar_done(_theme: &Theme) -> progress_bar::Style {
     }
 }
 
-/// The dimmed layer behind an overlay.
-pub fn backdrop(_theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Color::BLACK.scale_alpha(0.45).into()),
-        ..container::Style::default()
-    }
-}
+/// How dark the layer behind an overlay is (`motion::dim`).
+pub const BACKDROP: f32 = 0.45;
 
-/// The task dialog's backdrop: darker than Settings' so the page
-/// behind recedes. (iced 0.14 has no backdrop blur.)
-pub fn dialog_backdrop(_theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Color::BLACK.scale_alpha(0.55).into()),
-        ..container::Style::default()
-    }
-}
+/// The task dialog's: darker than Settings' so the page behind recedes.
+/// (iced 0.14 has no backdrop blur.)
+pub const DIALOG_BACKDROP: f32 = 0.55;
 
 /// The panel of an overlay: the plain background, rounded, with a shadow.
 pub fn overlay_panel(theme: &Theme) -> container::Style {

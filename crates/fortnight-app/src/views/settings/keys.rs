@@ -2,13 +2,13 @@
 //! controls and the password pop-up, and saving a key.
 
 use fortnight_core::vault::MIN_PASSWORD_LEN;
-use iced::widget::{button, column, container, row, text, text_input};
+use iced::widget::{button, column, container, row, stack, text, text_input};
 use iced::{Center, Element, Fill};
 use secrecy::SecretString;
 use std::fmt;
 
 use super::{Action, Message, SettingsView, Which, error_text, input, primary, secondary};
-use crate::theme;
+use crate::{motion, theme};
 
 /// The state of the encrypted API key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,14 +211,14 @@ impl SettingsView {
             ]
             .spacing(theme::SPACING / 2.0),
         );
-        container(
-            container(card)
-                .padding(theme::SPACING * 2.0)
-                .max_width(380)
-                .style(theme::overlay_panel),
-        )
-        .center(Fill)
-        .style(theme::backdrop)
+        let panel = container(card)
+            .padding(theme::SPACING * 2.0)
+            .max_width(380)
+            .style(theme::overlay_panel);
+        stack![
+            motion::dim(theme::BACKDROP),
+            container(motion::appear(panel).rise(motion::RISE)).center(Fill),
+        ]
         .into()
     }
 

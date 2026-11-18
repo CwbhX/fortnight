@@ -28,6 +28,7 @@ impl Ready {
                 form: task_form::open_form(task, &self.tasks, self.settings.schedule.week_start),
                 task: Some(id),
             });
+            return crate::unfocus();
         }
         Task::none()
     }

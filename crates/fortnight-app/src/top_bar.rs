@@ -10,6 +10,7 @@
 //! ```
 
 use crate::calendar::{Popup, month_picker, year_picker};
+use crate::motion;
 use crate::theme::{self, Icon};
 use fortnight_core::domain::Schedule;
 use fortnight_core::week::{add_months, month_label, week_containing};
@@ -134,21 +135,35 @@ pub fn period_label(tab: Tab, selected: Date, today: Date, schedule: &Schedule) 
 }
 
 pub fn view<'a>(bar: Bar<'a>) -> Element<'a, Message> {
+    // Every tab is drawn unselected; the pill, with the same labels in
+    // white on it, slides to the selected one (`motion::pill`).
     let mut tabs = row![].spacing(2);
+    let mut lit = row![].spacing(2);
     for tab in Tab::ALL {
         let label = if tab == Tab::Week && bar.week_badge {
             format!("{} •", tab.label())
         } else {
             tab.label().to_string()
         };
+        lit = lit.push(
+            container(
+                text(label.clone())
+                    .size(theme::TEXT_BODY)
+                    .color(iced::Color::WHITE),
+            )
+            .padding(theme::tab_padding()),
+        );
         tabs = tabs.push(
             button(text(label).size(theme::TEXT_BODY))
                 .padding(theme::tab_padding())
-                .style(theme::tab_button(tab == bar.tab))
+                .style(theme::tab_button(false))
                 .on_press(Message::Tab(tab)),
         );
     }
-    let tabs = container(tabs).padding(3).style(theme::top_tab_bar);
+    let selected = Tab::ALL.iter().position(|t| *t == bar.tab).unwrap_or(0);
+    let tabs = container(motion::pill(tabs, lit, selected, theme::tab_pill()))
+        .padding(3)
+        .style(theme::top_tab_bar);
 
     let icon_button = |icon: Icon, message: Message, tip: &'a str| {
         tooltip(

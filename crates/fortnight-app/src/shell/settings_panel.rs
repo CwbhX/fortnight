@@ -22,7 +22,7 @@ impl Ready {
     /// model lists.
     pub(crate) fn open_settings(&mut self) -> Task<Message> {
         self.settings_open = true;
-        Task::batch([detect_ollama(), load_models()])
+        Task::batch([crate::unfocus(), detect_ollama(), load_models()])
     }
 
     /// Hides Settings, by any route: typed secrets are wiped

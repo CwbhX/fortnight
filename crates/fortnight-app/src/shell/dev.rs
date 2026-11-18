@@ -1,8 +1,9 @@
 //! Developer hooks: the forced theme (`FORTNIGHT_THEME`), the self
-//! screenshot (`FORTNIGHT_SCREENSHOT`), the `--data-dir` flag and the start
-//! page (`FORTNIGHT_PAGE`).
+//! screenshot (`FORTNIGHT_SCREENSHOT`), the `--data-dir` flag, the start
+//! page (`FORTNIGHT_PAGE`) and held animations (`FORTNIGHT_MOTION`).
 
 use crate::Message;
+use fortnight_app::motion;
 use fortnight_app::top_bar::Tab;
 use iced::Task;
 use std::path::PathBuf;
@@ -15,6 +16,22 @@ pub(crate) fn forced_theme() -> Option<bool> {
         Ok("dark") => Some(true),
         Ok("light") => Some(false),
         _ => None,
+    }
+}
+
+/// Sets up the animations: off for the self screenshot (it shows each
+/// thing in its final place) and when the system asks for reduced motion.
+/// Dev aid: `FORTNIGHT_MOTION=<0 to 1>` holds every animation that far
+/// along instead, for a screenshot of one mid-way.
+pub(crate) fn set_up_motion() {
+    let held = std::env::var("FORTNIGHT_MOTION")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok());
+    if let Some(progress) = held {
+        motion::hold_at(progress);
+    } else if std::env::var_os("FORTNIGHT_SCREENSHOT").is_some() || motion::system_reduces_motion()
+    {
+        motion::set_enabled(false);
     }
 }
 

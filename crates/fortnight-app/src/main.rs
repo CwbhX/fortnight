@@ -4,7 +4,8 @@
 //!
 //! Layout (PLAN.md 4.2): the top bar (tabs, period navigation over one
 //! shared selected date, lock, gear), then the active tab. Settings opens
-//! over the current view.
+//! over the current view. The few animations (the open tab fading in, the
+//! dialogs, the tab pill) run themselves: see `fortnight_app::motion`.
 //!
 //! This file holds the app plumbing (boot, theme, icon, subscriptions),
 //! the `Message` enum, the `Ready` state, the message dispatch, navigation
@@ -39,6 +40,7 @@ mod shell {
 }
 
 use fortnight_app::app_icon;
+use fortnight_app::motion;
 use fortnight_app::theme;
 use fortnight_app::top_bar::{self, LockIcon, Tab};
 use fortnight_app::views::day::{self, DayView};
@@ -80,6 +82,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub fn main() -> iced::Result {
+    dev::set_up_motion();
     iced::application(App::boot, App::update, App::view)
         .title("Fortnight")
         // One bundled typeface (Inter, OFL), so bold and italic Markdown
@@ -781,16 +784,25 @@ impl Ready {
 
     // ---- view ----
 
+    /// The page, then the layers over it: the dark layer (always there, so
+    /// it can fade out after a dialog closes, and so the page under it
+    /// keeps its place in the widget tree and with it its scroll position),
+    /// the task dialog or Settings, and the unlock prompt.
     fn view(&self) -> Element<'_, Message> {
-        let base = self.main_view();
-        if !self.unlocking {
-            return base;
+        let today = self.today();
+        let (dimmed, panel) = self.overlay(today);
+        let mut layers = stack![self.page(today), motion::dim(dimmed)];
+        if let Some(panel) = panel {
+            layers = layers.push(panel);
         }
-        stack![base, opaque(self.unlock_view.view().map(Message::Unlock))].into()
+        if self.unlocking {
+            layers = layers.push(opaque(self.unlock_view.view().map(Message::Unlock)));
+        }
+        layers.into()
     }
 
-    fn main_view(&self) -> Element<'_, Message> {
-        let today = self.today();
+    /// The top bar, the open tab, and any notice or error under it.
+    fn page(&self, today: Date) -> Element<'_, Message> {
         let bar = top_bar::view(top_bar::Bar {
             tab: self.tab,
             selected: self.selected,
@@ -811,6 +823,13 @@ impl Ready {
             Tab::Week => self.week_view.view().map(Message::Week),
             Tab::Month => self.month_view.view().map(Message::Month),
         };
+        // Another tab fades in; another day, week or month slides in from
+        // the side it lies on.
+        let (group, position) = self.page_number();
+        let content = motion::appear(content)
+            .rise(motion::RISE)
+            .fade_from(|theme: &Theme| theme.palette().background)
+            .page(group, position);
 
         let mut main = column![bar, container(content).width(Fill).height(Fill)];
         if let Some(n) = &self.notice {
@@ -838,8 +857,25 @@ impl Ready {
                 .padding(theme::SPACING),
             );
         }
-        let base: Element<'_, Message> = main.height(Fill).into();
+        main.height(Fill).into()
+    }
 
+    /// Which page the open tab shows, for `motion::Appear::page`: the tab,
+    /// and the period it shows as a number that grows with time.
+    fn page_number(&self) -> (u32, i64) {
+        let months = |d: Date| i64::from(d.year()) * 12 + i64::from(d.month());
+        let days = |d: Date| months(d) * 31 + i64::from(d.day());
+        match self.tab {
+            Tab::Today => (0, days(self.selected)),
+            Tab::Week => (1, days(self.week_of(self.selected).start)),
+            Tab::Month => (2, months(self.selected)),
+        }
+    }
+
+    /// What is open over the page: how dark the page goes, and the task
+    /// dialog or Settings in a layer that takes every click (one outside
+    /// the panel closes it).
+    fn overlay(&self, today: Date) -> (f32, Option<Element<'_, Message>>) {
         if let Some(dialog) = &self.dialog {
             let panel = container(
                 task_form::task_dialog(&dialog.form, dialog.day, dialog.task.is_some(), today)
@@ -847,42 +883,41 @@ impl Ready {
             )
             .max_width(640)
             .style(theme::overlay_panel);
-            return stack![
-                base,
-                opaque(
-                    mouse_area(
-                        container(opaque(panel))
-                            .padding([32, 24])
-                            .center(Fill)
-                            .style(theme::dialog_backdrop)
-                    )
-                    .on_press(Message::Dialog(day::Message::Close))
+            let layer = opaque(
+                mouse_area(
+                    container(opaque(motion::appear(panel).rise(motion::RISE)))
+                        .padding([32, 24])
+                        .center(Fill),
                 )
-            ]
-            .into();
+                .on_press(Message::Dialog(day::Message::Close)),
+            );
+            return (theme::DIALOG_BACKDROP, Some(layer));
         }
         if !self.settings_open {
-            return base;
+            return (0.0, None);
         }
         let panel = container(self.settings_view.view().map(Message::Settings))
             .max_width(760)
             .height(Fill)
             .style(theme::overlay_panel);
-        stack![
-            base,
-            opaque(
-                mouse_area(
-                    container(opaque(panel))
-                        .padding([32, 24])
-                        .center_x(Fill)
-                        .height(Fill)
-                        .style(theme::backdrop)
-                )
-                .on_press(Message::CloseSettings)
+        let layer = opaque(
+            mouse_area(
+                container(opaque(motion::appear(panel).rise(motion::RISE)))
+                    .padding([32, 24])
+                    .center_x(Fill)
+                    .height(Fill),
             )
-        ]
-        .into()
+            .on_press(Message::CloseSettings),
+        );
+        (theme::BACKDROP, Some(layer))
     }
+}
+
+/// Takes the keyboard focus from whatever has it. The page keeps its
+/// widget state while a dialog or Settings is open over it, so a field left
+/// focused there would go on taking what is typed.
+fn unfocus() -> Task<Message> {
+    iced::advanced::widget::operate(iced::advanced::widget::operation::focusable::unfocus())
 }
 
 /// The task dialog over everything: a new task for `day`, or an edit of

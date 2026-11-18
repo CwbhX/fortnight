@@ -26,11 +26,14 @@ cargo test
   - jiff 1.0: `Zoned` is now `jiff::ZonedDateTime`; `civil::Weekday` has no serde impl.
 - Old data folders must keep opening with nothing lost: the database migrates on open, and settings JSON may lack newer fields. `crates/fortnight-core/tests/fixtures/round1.db` is a real schema-version-1 database used by the tests.
 - LLM client tests run against `wiremock` mock servers, never a real endpoint or key.
+- Animations are widgets that animate themselves (`crates/fortnight-app/src/motion.rs`): no app state, no timers. Its module doc explains how fades and drawing order work in iced 0.14.
 
 ## Seeing the GUI without a screen
 
 Run the app with `FORTNIGHT_SCREENSHOT=/path/out.raw`; it screenshots its own window after two seconds, writes `<w> <h>\n` + RGBA, and exits. Convert with `python3 -I tools/raw2png.py out.raw out.png`, then view the PNG. If the machine is busy the capture can come out half-drawn; `FORTNIGHT_SCREENSHOT_DELAY=5` waits longer.
 
 Useful environment: `--data-dir <folder>` (use a scratch folder outside the repo, never the repo), `FORTNIGHT_PAGE=today|week|month|settings`, `FORTNIGHT_THEME=light|dark`.
+
+A screenshot shows everything in its final place (animations are off for it). `FORTNIGHT_MOTION=0.3` holds every animation 30% of the way along instead, to see one mid-way.
 
 Sample data: copy `crates/fortnight-core/tests/fixtures/round1.db` to `<scratch folder>/fortnight.db` (it migrates on open; tasks are around 16 Nov 2026). To see richer data, insert rows into that scratch copy with `sqlite3` (schema in `crates/fortnight-core/src/sqlite.rs`).
