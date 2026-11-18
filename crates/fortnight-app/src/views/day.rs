@@ -1322,7 +1322,8 @@ impl DayView {
     }
 
     /// A collapsed section: a panel whose title bar opens it (arrow, name,
-    /// count), with Delete all at the right of Deleted's when open.
+    /// count), with Delete all at the right of Deleted's when open and
+    /// something is in it.
     fn collapsible<'a>(
         &'a self,
         section: Section,
@@ -1352,7 +1353,7 @@ impl DayView {
         .style(theme::text_button)
         .on_press(toggle);
         let mut head = row![toggle].align_y(Center);
-        if open && section == Section::Deleted {
+        if open && section == Section::Deleted && !tasks.is_empty() {
             let trash = theme::icon(theme::Icon::Trash).style(|theme: &Theme, _| {
                 iced::widget::svg::Style {
                     color: Some(theme::danger_color(theme)),
@@ -1380,7 +1381,7 @@ impl DayView {
         };
         let nothing = text(match section {
             Section::Done => "Nothing completed",
-            _ => "Nothing deleted",
+            _ => "Nothing in the bin",
         })
         .size(theme::TEXT_SMALL)
         .style(theme::muted);
