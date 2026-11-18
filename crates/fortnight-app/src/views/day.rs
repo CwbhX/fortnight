@@ -1142,16 +1142,15 @@ impl DayView {
                 tooltip::Position::Bottom,
             ));
         }
-        let body = open.then(|| {
-            if section == Section::Deleted {
-                Column::with_children(tasks.into_iter().map(deleted_row))
-                    .spacing(6)
-                    .into()
-            } else {
-                self.rows(tasks, data, false)
-            }
-        });
-        panel::folding_panel(head.into(), body, section as u64)
+        // Built closed too, to be drawn folding away.
+        let body = if section == Section::Deleted {
+            Column::with_children(tasks.into_iter().map(deleted_row))
+                .spacing(6)
+                .into()
+        } else {
+            self.rows(tasks, data, false)
+        };
+        panel::folding_panel(head.into(), open, body, section as u64)
     }
 
     /// The rows of a section. `ranked` (the Recommended section only)

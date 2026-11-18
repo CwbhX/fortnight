@@ -2,7 +2,7 @@
 //! controls and the password pop-up, and saving a key.
 
 use fortnight_core::vault::MIN_PASSWORD_LEN;
-use iced::widget::{button, column, container, row, stack, text, text_input};
+use iced::widget::{button, column, container, row, text, text_input};
 use iced::{Center, Element, Fill};
 use secrecy::SecretString;
 use std::fmt;
@@ -215,11 +215,10 @@ impl SettingsView {
             .padding(theme::SPACING * 2.0)
             .max_width(380)
             .style(theme::overlay_panel);
-        stack![
-            motion::dim(theme::BACKDROP),
-            container(motion::appear(panel).rise(motion::RISE)).center(Fill),
-        ]
-        .into()
+        // The dark layer under it is the caller's, so it can fade out.
+        container(motion::appear(panel).rise(motion::RISE))
+            .center(Fill)
+            .into()
     }
 
     /// One key: its field and Save, or its state with Unlock, Replace and

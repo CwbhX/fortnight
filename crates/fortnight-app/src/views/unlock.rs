@@ -1,6 +1,6 @@
 //! The unlock prompt, opened from the lock icon.
 
-use iced::widget::{Space, button, column, container, operation, stack, text, text_input};
+use iced::widget::{Space, button, column, container, operation, text, text_input};
 use iced::{Element, Fill};
 use secrecy::SecretString;
 use std::fmt;
@@ -122,11 +122,10 @@ impl UnlockView {
             .padding(theme::SPACING * 2.5)
             .max_width(380)
             .style(theme::overlay_panel);
-        stack![
-            motion::dim(theme::BACKDROP),
-            container(motion::appear(panel).rise(motion::RISE)).center(Fill),
-        ]
-        .into()
+        // The dark layer under it is the caller's, so it can fade out.
+        container(motion::appear(panel).rise(motion::RISE))
+            .center(Fill)
+            .into()
     }
 }
 

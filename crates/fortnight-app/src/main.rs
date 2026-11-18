@@ -62,7 +62,7 @@ use fortnight_core::vault::VaultError;
 use fortnight_core::week::{add_months, week_containing};
 use iced::keyboard;
 use iced::widget::{
-    button, center, column, container, mouse_area, opaque, operation, row, stack, text,
+    Space, button, center, column, container, mouse_area, opaque, operation, row, stack, text,
 };
 use iced::{Element, Fill, Subscription, Task, Theme};
 use jiff::civil::Date;
@@ -768,21 +768,30 @@ impl Ready {
 
     // ---- view ----
 
-    /// The page, then the layers over it: the dark layer (always there, so
-    /// it can fade out after a dialog closes, and so the page under it
-    /// keeps its place in the widget tree and with it its scroll position),
-    /// the task dialog or Settings, and the unlock prompt.
+    /// The page, then the layers over it: a dark layer, the task dialog or
+    /// Settings, another dark layer, and the unlock prompt (which can open
+    /// over Settings). Every layer is always there, an empty space when
+    /// closed: a dark layer can then fade out after its dialog closes, and
+    /// nothing under a closing layer moves in the widget tree (the page
+    /// keeps its scroll position, an open panel its state).
     fn view(&self) -> Element<'_, Message> {
         let today = self.today();
         let (dimmed, panel) = self.overlay(today);
-        let mut layers = stack![self.page(today), motion::dim(dimmed)];
-        if let Some(panel) = panel {
-            layers = layers.push(panel);
-        }
-        if self.unlocking {
-            layers = layers.push(opaque(self.unlock_view.view().map(Message::Unlock)));
-        }
-        layers.into()
+        let none = || Element::from(Space::new());
+        let unlock = if self.unlocking {
+            opaque(self.unlock_view.view().map(Message::Unlock))
+        } else {
+            none()
+        };
+        let unlock_dimmed = if self.unlocking { theme::BACKDROP } else { 0.0 };
+        stack![
+            self.page(today),
+            motion::dim(dimmed),
+            panel.unwrap_or_else(none),
+            motion::dim(unlock_dimmed),
+            unlock,
+        ]
+        .into()
     }
 
     /// The top bar, the open tab, and any notice or error under it.

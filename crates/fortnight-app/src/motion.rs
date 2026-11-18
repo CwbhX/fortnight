@@ -13,7 +13,14 @@
 //!   is given, in and out.
 //! - [`pill`]: the selected-tab pill, sliding to the selected tab.
 //! - [`unfold`] and [`fold`]: something that opens (a folded section, a
-//!   task opening into its form) growing to its open height.
+//!   task opening into its form) growing to its open height, and shrinking
+//!   back when it closes.
+//!
+//! Whatever plays on the way in plays back on the way out where the widget
+//! can still draw what is leaving: the dark layer fades out, folds shrink
+//! (a [`fold`] keeps its body for that, hidden while closed). A dialog's
+//! panel can't sink back out: once the view drops it there is nothing left
+//! to draw, so it goes at once while its dark layer fades.
 //!
 //! iced 0.14 can't draw a widget tree at part opacity, so a fade here is a
 //! "veil": a rectangle in the colour behind the content, drawn over it and
@@ -45,7 +52,7 @@ const PANEL: Duration = Duration::from_millis(200);
 const DIM: Duration = Duration::from_millis(180);
 /// How long the tab pill takes to reach another tab.
 const PILL: Duration = Duration::from_millis(220);
-/// How long something takes to open to its full height.
+/// How long something takes to open to its full height, or close.
 const UNFOLD: Duration = Duration::from_millis(220);
 /// A page changed again this soon after the last change (a held arrow key,
 /// quick clicks) is shown at once.
@@ -812,11 +819,12 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Pill<'_, M, T, R> {
 
 // ----------------------------------------------------------------- unfold
 
-/// `content` growing to its full height when `open` turns true: from the
-/// height it had closed, showing more of the open content from the top
-/// down. Closing is immediate. Give it the closed content while closed and
-/// the open content while open; see [`fold`] for a body that is simply
-/// absent while closed.
+/// `content` changing height smoothly when `open` changes: opening, it
+/// grows from the height it had closed, showing more of the open content
+/// from the top down; closing, it shrinks back to the closed content's
+/// height, the closed content drawn at the top as the space under it
+/// closes up. Give it the closed content while closed and the open content
+/// while open; see [`fold`] for a body that is hidden while closed.
 pub fn unfold<'a, M, T, R>(
     open: bool,
     content: impl Into<Element<'a, M, T, R>>,
@@ -825,19 +833,19 @@ pub fn unfold<'a, M, T, R>(
         content: content.into(),
         open,
         key: 0,
+        hide: false,
     }
 }
 
-/// A folded section's body: nothing while `body` is `None`, unfolding when
-/// it is given.
-pub fn fold<'a, M: 'a, T: 'a, R: renderer::Renderer + 'a>(
-    body: Option<Element<'a, M, T, R>>,
-) -> Unfold<'a, M, T, R> {
-    let open = body.is_some();
-    unfold(
-        open,
-        body.unwrap_or_else(|| iced::widget::Space::new().into()),
-    )
+/// A folded section's body: nothing while closed, unfolding when `open`
+/// turns true and folding away again when it turns false. Give it the body
+/// either way: it is laid out but neither drawn nor sent anything while
+/// closed, and drawn shrinking away as it closes.
+pub fn fold<'a, M, T, R>(open: bool, body: impl Into<Element<'a, M, T, R>>) -> Unfold<'a, M, T, R> {
+    Unfold {
+        hide: true,
+        ..unfold(open, body)
+    }
 }
 
 /// See [`unfold`].
@@ -845,15 +853,22 @@ pub struct Unfold<'a, M, T, R> {
     content: Element<'a, M, T, R>,
     open: bool,
     key: u64,
+    /// Closed, it takes no room and its content is hidden ([`fold`]).
+    hide: bool,
 }
 
 impl<M, T, R> Unfold<'_, M, T, R> {
     /// What this is (a task's id, a section): in a list whose items move,
-    /// an item that lands where a closed one was doesn't open with a
-    /// flourish it didn't earn.
+    /// an item that lands where another one was doesn't open or close with
+    /// a flourish it didn't earn.
     pub fn key(mut self, key: u64) -> Self {
         self.key = key;
         self
+    }
+
+    /// Closed and folded away: its content takes no clicks or keys.
+    fn hidden(&self) -> bool {
+        self.hide && !self.open
     }
 }
 
@@ -861,7 +876,7 @@ struct UnfoldState {
     run: Run,
     open: bool,
     key: u64,
-    /// The height it had when it last opened.
+    /// The height it had when it last opened or closed.
     from: f32,
     /// The height it was last laid out at.
     height: f32,
@@ -899,12 +914,10 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Unfold<'_, M, T, R> {
         if state.key != self.key {
             state.key = self.key;
             state.run.skip();
-        } else if self.open && !state.open {
+        } else if self.open != state.open {
             state.from = state.height;
             state.run.restart();
             state.settled = false;
-        } else if !self.open {
-            state.run.skip();
         }
         state.open = self.open;
         tree.diff_children(std::slice::from_ref(&self.content));
@@ -924,13 +937,14 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Unfold<'_, M, T, R> {
             .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits);
         let full = content.size();
+        let target = if self.hidden() { 0.0 } else { full.height };
         let state = tree.state.downcast_mut::<UnfoldState>();
         let t = ease_out(state.run.progress(UNFOLD));
         // Whole pixels, so what follows it stays sharp as it moves.
         state.height = if t < 1.0 {
-            lerp(state.from, full.height, t).round()
+            lerp(state.from, target, t).round()
         } else {
-            full.height
+            target
         };
         layout::Node::with_children(Size::new(full.width, state.height), vec![content])
     }
@@ -946,7 +960,9 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Unfold<'_, M, T, R> {
         shell: &mut Shell<'_, M>,
         viewport: &Rectangle,
     ) {
-        if let Some(content) = layout.children().next() {
+        if !self.hidden()
+            && let Some(content) = layout.children().next()
+        {
             self.content.as_widget_mut().update(
                 &mut tree.children[0],
                 event,
@@ -990,6 +1006,12 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Unfold<'_, M, T, R> {
         let widget = self.content.as_widget();
         let child = &tree.children[0];
         let bounds = layout.bounds();
+        // Folding away, it is only drawn: nothing in it lights up.
+        let cursor = if self.hidden() {
+            mouse::Cursor::Unavailable
+        } else {
+            cursor
+        };
         if content.bounds().height <= bounds.height {
             widget.draw(child, renderer, theme, style, content, cursor, viewport);
         } else if let Some(clip) = bounds.intersection(viewport) {
@@ -1007,7 +1029,10 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Unfold<'_, M, T, R> {
         renderer: &R,
         operation: &mut dyn Operation,
     ) {
-        if let Some(content) = layout.children().next() {
+        // Nothing folded away takes the focus.
+        if !self.hidden()
+            && let Some(content) = layout.children().next()
+        {
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
                 content,
@@ -1025,7 +1050,7 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Unfold<'_, M, T, R> {
         viewport: &Rectangle,
         renderer: &R,
     ) -> mouse::Interaction {
-        match layout.children().next() {
+        match layout.children().next().filter(|_| !self.hidden()) {
             Some(content) => self.content.as_widget().mouse_interaction(
                 &tree.children[0],
                 content,
@@ -1045,6 +1070,9 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Unfold<'_, M, T, R> {
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, M, T, R>> {
+        if self.hidden() {
+            return None;
+        }
         let content = layout.children().next()?;
         self.content.as_widget_mut().overlay(
             &mut tree.children[0],
@@ -1339,7 +1367,7 @@ mod tests {
 
     /// A section's body, 120 tall, folded away or open.
     fn section<'a>(open: bool) -> El<'a> {
-        fold(open.then(|| space().width(200).height(120).into())).into()
+        fold(open, space().width(200).height(120)).into()
     }
 
     #[test]
@@ -1366,10 +1394,72 @@ mod tests {
         assert!(!stage.frame(t1 + ms(5000)));
         assert_eq!(stage.layouts, layouts);
 
-        // Folding is immediate.
+        // Folding plays it back: from the full height to nothing, the
+        // body still laid out inside.
         stage.set(section(false));
+        assert_eq!(height(&stage), 120.0);
+        let t2 = t1 + ms(6000);
+        assert!(stage.frame(t2));
+        assert!(stage.frame(t2 + UNFOLD / 2));
+        assert!(height(&stage) > 0.0 && height(&stage) < 60.0);
+        assert_eq!(stage.node.children()[0].size().height, 120.0);
+        assert!(!stage.frame(t2 + UNFOLD));
         assert_eq!(height(&stage), 0.0);
-        assert!(!stage.frame(t1 + ms(6000)));
+        let layouts = stage.layouts;
+        assert!(!stage.frame(t2 + ms(5000)));
+        assert_eq!(stage.layouts, layouts);
+    }
+
+    #[test]
+    fn a_section_turned_back_half_open_folds_from_where_it_is() {
+        let height = |stage: &Stage<'_>| stage.node.size().height;
+        let mut stage = Stage::new(section(false));
+        let t0 = Instant::now();
+        stage.frame(t0);
+        stage.set(section(true));
+        stage.frame(t0 + ms(1000));
+        stage.frame(t0 + ms(1000) + UNFOLD / 2);
+        let half = height(&stage);
+        stage.set(section(false));
+        assert_eq!(height(&stage), half);
+        assert!(stage.frame(t0 + ms(1000) + UNFOLD / 2 + ms(16)));
+        assert!(height(&stage) <= half);
+    }
+
+    #[test]
+    fn a_folded_body_takes_no_clicks() {
+        use iced::widget::button;
+        let body = |open: bool| -> El<'static> {
+            fold(open, button(space().width(200).height(120)).on_press(())).into()
+        };
+        let click = |stage: &mut Stage<'_>| {
+            let mut messages = Vec::new();
+            for event in [
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            ] {
+                // A shell per event, as iced does.
+                let mut shell = Shell::new(&mut messages);
+                stage.element.as_widget_mut().update(
+                    &mut stage.tree,
+                    &Event::Mouse(event),
+                    Layout::new(&stage.node),
+                    mouse::Cursor::Available(Point::new(10.0, 10.0)),
+                    &(),
+                    &mut clipboard::Null,
+                    &mut shell,
+                    &Rectangle::with_size(WINDOW),
+                );
+            }
+            messages.len()
+        };
+        let mut stage = Stage::new(body(true));
+        assert_eq!(click(&mut stage), 1);
+        // Folding away (still drawn) and folded: nothing.
+        stage.set(body(false));
+        assert_eq!(click(&mut stage), 0);
+        stage.frame(Instant::now());
+        assert_eq!(click(&mut stage), 0);
     }
 
     #[test]
@@ -1401,6 +1491,16 @@ mod tests {
         assert!(height(&stage) > 120.0 && height(&stage) < 200.0);
         assert!(!stage.frame(t0 + ms(1000) + UNFOLD));
         assert_eq!(height(&stage), 200.0);
+
+        // Closing, it shrinks back to its closed height.
+        stage.set(item(false, 7));
+        assert_eq!(height(&stage), 200.0);
+        let t1 = t0 + ms(2000);
+        assert!(stage.frame(t1));
+        assert!(stage.frame(t1 + UNFOLD / 2));
+        assert!(height(&stage) > 40.0 && height(&stage) < 120.0);
+        assert!(!stage.frame(t1 + UNFOLD));
+        assert_eq!(height(&stage), 40.0);
     }
 
     #[test]
@@ -1411,5 +1511,13 @@ mod tests {
         stage.set(item(true, 8));
         assert_eq!(stage.node.size().height, 200.0);
         assert!(!stage.frame(t0 + ms(1000)));
+    }
+
+    #[test]
+    fn another_item_taking_an_open_ones_place_is_shown_closed_at_once() {
+        let mut stage = Stage::new(item(true, 7));
+        stage.set(item(false, 8));
+        assert_eq!(stage.node.size().height, 40.0);
+        assert!(!stage.frame(Instant::now()));
     }
 }

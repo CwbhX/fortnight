@@ -615,10 +615,20 @@ impl SettingsView {
                 ))
                 .height(Fill)
         ];
-        if !self.password_prompt {
-            return page.into();
-        }
-        stack![page, opaque(self.password_view())].into()
+        // The dark layer is always there, so it fades out when the prompt
+        // closes, and the page keeps its place (and its scroll position)
+        // in the widget tree.
+        let prompt: Element<'_, Message> = if self.password_prompt {
+            opaque(self.password_view())
+        } else {
+            Space::new().into()
+        };
+        let dimmed = if self.password_prompt {
+            theme::BACKDROP
+        } else {
+            0.0
+        };
+        stack![page, motion::dim(dimmed), prompt].into()
     }
 
     fn model_section(&self) -> Element<'_, Message> {
@@ -747,16 +757,13 @@ impl SettingsView {
         .padding([4, 0])
         .style(theme::text_button)
         .on_press(Message::TogglePrompts);
-        let prompts = self.prompts_open.then(|| {
-            column![
-                editor("Work summary", PromptKind::Summary),
-                editor("Recommended tasks", PromptKind::Plan),
-            ]
-            .spacing(theme::SPACING * 1.25)
-            .padding(iced::Padding::ZERO.top(theme::SPACING))
-            .into()
-        });
-        column![heading, motion::fold(prompts)].into()
+        let prompts = column![
+            editor("Work summary", PromptKind::Summary),
+            editor("Recommended tasks", PromptKind::Plan),
+        ]
+        .spacing(theme::SPACING * 1.25)
+        .padding(iced::Padding::ZERO.top(theme::SPACING));
+        column![heading, motion::fold(self.prompts_open, prompts)].into()
     }
 
     fn appearance_section(&self) -> Element<'_, Message> {

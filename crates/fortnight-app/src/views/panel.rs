@@ -61,22 +61,24 @@ pub fn panel<'a, M: 'a>(head: Element<'a, M>, body: Option<Element<'a, M>>) -> E
     container(content).width(Fill).style(theme::card).into()
 }
 
-/// A [`panel`] that folds: its body unfolds when it is given
-/// (`motion::fold`). `key` tells the folding panels of a page apart, so one
-/// taking another's place doesn't unfold.
+/// A [`panel`] that folds: its body unfolds when `open` turns true and
+/// folds away when it turns false (`motion::fold`), so it is given either
+/// way. `key` tells the folding panels of a page apart, so one taking
+/// another's place doesn't unfold or fold.
 pub fn folding_panel<'a, M: 'a>(
     head: Element<'a, M>,
-    body: Option<Element<'a, M>>,
+    open: bool,
+    body: Element<'a, M>,
     key: u64,
 ) -> Element<'a, M> {
     let bar = container(head).padding(title_padding()).width(Fill);
-    let bar = if body.is_some() {
+    let bar = if open {
         bar.style(title_bar(theme::RADIUS))
     } else {
         bar.style(title_bar_alone(theme::RADIUS))
     };
-    let body = body.map(|body| container(body).padding(theme::SPACING).width(Fill).into());
-    container(column![bar, motion::fold(body).key(key)])
+    let body = container(body).padding(theme::SPACING).width(Fill);
+    container(column![bar, motion::fold(open, body).key(key)])
         .width(Fill)
         .style(theme::card)
         .into()
