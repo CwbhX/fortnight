@@ -1,8 +1,8 @@
 //! The pieces the Week and Today tabs share, so both read the same way:
-//! panels with a tinted title bar over their contents, the day's load bar,
-//! and the raised task-card fill.
+//! panels with a tinted title bar over their contents (some fold), the
+//! day's load bar, and the raised task-card fill.
 
-use crate::theme;
+use crate::{motion, theme};
 use fortnight_core::report::{ColumnLoad, fmt_hours};
 use iced::widget::{column, container, progress_bar, row, stack, tooltip};
 use iced::{Center, Element, Fill, Theme};
@@ -59,6 +59,27 @@ pub fn panel<'a, M: 'a>(head: Element<'a, M>, body: Option<Element<'a, M>>) -> E
         None => bar.style(title_bar_alone(theme::RADIUS)).into(),
     };
     container(content).width(Fill).style(theme::card).into()
+}
+
+/// A [`panel`] that folds: its body unfolds when it is given
+/// (`motion::fold`). `key` tells the folding panels of a page apart, so one
+/// taking another's place doesn't unfold.
+pub fn folding_panel<'a, M: 'a>(
+    head: Element<'a, M>,
+    body: Option<Element<'a, M>>,
+    key: u64,
+) -> Element<'a, M> {
+    let bar = container(head).padding(title_padding()).width(Fill);
+    let bar = if body.is_some() {
+        bar.style(title_bar(theme::RADIUS))
+    } else {
+        bar.style(title_bar_alone(theme::RADIUS))
+    };
+    let body = body.map(|body| container(body).padding(theme::SPACING).width(Fill).into());
+    container(column![bar, motion::fold(body).key(key)])
+        .width(Fill)
+        .style(theme::card)
+        .into()
 }
 
 /// The load bar in a day's title bar. The track is the day's capacity.

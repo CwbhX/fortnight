@@ -12,6 +12,8 @@
 //! - [`dim`]: the dark layer behind a dialog, fading to whatever level it
 //!   is given, in and out.
 //! - [`pill`]: the selected-tab pill, sliding to the selected tab.
+//! - [`unfold`] and [`fold`]: something that opens (a folded section, a
+//!   task opening into its form) growing to its open height.
 //!
 //! iced 0.14 can't draw a widget tree at part opacity, so a fade here is a
 //! "veil": a rectangle in the colour behind the content, drawn over it and
@@ -43,6 +45,8 @@ const PANEL: Duration = Duration::from_millis(200);
 const DIM: Duration = Duration::from_millis(180);
 /// How long the tab pill takes to reach another tab.
 const PILL: Duration = Duration::from_millis(220);
+/// How long something takes to open to its full height.
+const UNFOLD: Duration = Duration::from_millis(220);
 /// A page changed again this soon after the last change (a held arrow key,
 /// quick clicks) is shown at once.
 const QUIET: Duration = Duration::from_millis(300);
@@ -806,6 +810,260 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Pill<'_, M, T, R> {
     }
 }
 
+// ----------------------------------------------------------------- unfold
+
+/// `content` growing to its full height when `open` turns true: from the
+/// height it had closed, showing more of the open content from the top
+/// down. Closing is immediate. Give it the closed content while closed and
+/// the open content while open; see [`fold`] for a body that is simply
+/// absent while closed.
+pub fn unfold<'a, M, T, R>(
+    open: bool,
+    content: impl Into<Element<'a, M, T, R>>,
+) -> Unfold<'a, M, T, R> {
+    Unfold {
+        content: content.into(),
+        open,
+        key: 0,
+    }
+}
+
+/// A folded section's body: nothing while `body` is `None`, unfolding when
+/// it is given.
+pub fn fold<'a, M: 'a, T: 'a, R: renderer::Renderer + 'a>(
+    body: Option<Element<'a, M, T, R>>,
+) -> Unfold<'a, M, T, R> {
+    let open = body.is_some();
+    unfold(
+        open,
+        body.unwrap_or_else(|| iced::widget::Space::new().into()),
+    )
+}
+
+/// See [`unfold`].
+pub struct Unfold<'a, M, T, R> {
+    content: Element<'a, M, T, R>,
+    open: bool,
+    key: u64,
+}
+
+impl<M, T, R> Unfold<'_, M, T, R> {
+    /// What this is (a task's id, a section): in a list whose items move,
+    /// an item that lands where a closed one was doesn't open with a
+    /// flourish it didn't earn.
+    pub fn key(mut self, key: u64) -> Self {
+        self.key = key;
+        self
+    }
+}
+
+struct UnfoldState {
+    run: Run,
+    open: bool,
+    key: u64,
+    /// The height it had when it last opened.
+    from: f32,
+    /// The height it was last laid out at.
+    height: f32,
+    /// The frame for which a new layout was last asked: once per frame
+    /// (iced sends a frame again after laying out).
+    asked: Option<Instant>,
+    /// Laid out at its full height since the run ended.
+    settled: bool,
+}
+
+impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Unfold<'_, M, T, R> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<UnfoldState>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(UnfoldState {
+            // Something already open when it first shows just is open.
+            run: Run::finished(),
+            open: self.open,
+            key: self.key,
+            from: 0.0,
+            height: 0.0,
+            asked: None,
+            settled: true,
+        })
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        let state = tree.state.downcast_mut::<UnfoldState>();
+        if state.key != self.key {
+            state.key = self.key;
+            state.run.skip();
+        } else if self.open && !state.open {
+            state.from = state.height;
+            state.run.restart();
+            state.settled = false;
+        } else if !self.open {
+            state.run.skip();
+        }
+        state.open = self.open;
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn size_hint(&self) -> Size<Length> {
+        self.content.as_widget().size_hint()
+    }
+
+    fn layout(&mut self, tree: &mut Tree, renderer: &R, limits: &layout::Limits) -> layout::Node {
+        let content = self
+            .content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits);
+        let full = content.size();
+        let state = tree.state.downcast_mut::<UnfoldState>();
+        let t = ease_out(state.run.progress(UNFOLD));
+        // Whole pixels, so what follows it stays sharp as it moves.
+        state.height = if t < 1.0 {
+            lerp(state.from, full.height, t).round()
+        } else {
+            full.height
+        };
+        layout::Node::with_children(Size::new(full.width, state.height), vec![content])
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &R,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, M>,
+        viewport: &Rectangle,
+    ) {
+        if let Some(content) = layout.children().next() {
+            self.content.as_widget_mut().update(
+                &mut tree.children[0],
+                event,
+                content,
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+        }
+        if let Some(now) = frame_time(event) {
+            let state = tree.state.downcast_mut::<UnfoldState>();
+            let moving = state.run.frame(now, UNFOLD);
+            // The height changes on every frame of the run, and once more
+            // for the full height at its end.
+            if (moving || !state.settled) && state.asked != Some(now) {
+                state.asked = Some(now);
+                state.settled = !moving;
+                shell.invalidate_layout();
+            }
+            if moving {
+                shell.request_redraw();
+            }
+        }
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut R,
+        theme: &T,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        let Some(content) = layout.children().next() else {
+            return;
+        };
+        let widget = self.content.as_widget();
+        let child = &tree.children[0];
+        let bounds = layout.bounds();
+        if content.bounds().height <= bounds.height {
+            widget.draw(child, renderer, theme, style, content, cursor, viewport);
+        } else if let Some(clip) = bounds.intersection(viewport) {
+            // Part open: only what fits is drawn.
+            renderer.with_layer(clip, |renderer| {
+                widget.draw(child, renderer, theme, style, content, cursor, &clip);
+            });
+        }
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &R,
+        operation: &mut dyn Operation,
+    ) {
+        if let Some(content) = layout.children().next() {
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                content,
+                renderer,
+                operation,
+            );
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &R,
+    ) -> mouse::Interaction {
+        match layout.children().next() {
+            Some(content) => self.content.as_widget().mouse_interaction(
+                &tree.children[0],
+                content,
+                cursor,
+                viewport,
+                renderer,
+            ),
+            None => mouse::Interaction::None,
+        }
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &R,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, M, T, R>> {
+        let content = layout.children().next()?;
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            content,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+}
+
+impl<'a, M: 'a, T: 'a, R: renderer::Renderer + 'a> From<Unfold<'a, M, T, R>>
+    for Element<'a, M, T, R>
+{
+    fn from(unfold: Unfold<'a, M, T, R>) -> Self {
+        Element::new(unfold)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -827,6 +1085,8 @@ mod tests {
         element: El<'a>,
         tree: Tree,
         node: layout::Node,
+        /// How many times a frame asked for a new layout.
+        layouts: usize,
     }
 
     impl<'a> Stage<'a> {
@@ -835,6 +1095,7 @@ mod tests {
                 tree: Tree::new(&element),
                 element,
                 node: layout::Node::default(),
+                layouts: 0,
             };
             stage.lay_out();
             stage
@@ -869,7 +1130,29 @@ mod tests {
                 &mut shell,
                 &Rectangle::with_size(WINDOW),
             );
-            shell.redraw_request() == window::RedrawRequest::NextFrame
+            let again = shell.redraw_request() == window::RedrawRequest::NextFrame;
+            // As iced does: lay out again when asked, then send the frame
+            // once more.
+            if shell.is_layout_invalid() {
+                self.layouts += 1;
+                self.lay_out();
+                let mut shell = Shell::new(&mut messages);
+                self.element.as_widget_mut().update(
+                    &mut self.tree,
+                    &Event::Window(window::Event::RedrawRequested(now)),
+                    Layout::new(&self.node),
+                    mouse::Cursor::Unavailable,
+                    &(),
+                    &mut clipboard::Null,
+                    &mut shell,
+                    &Rectangle::with_size(WINDOW),
+                );
+                assert!(
+                    !shell.is_layout_invalid(),
+                    "a new layout asked for twice in one frame"
+                );
+            }
+            again
         }
 
         fn state<S: 'static>(&self) -> &S {
@@ -1052,5 +1335,81 @@ mod tests {
         stage.set(tabs(2));
         assert!(stage.frame(t2 + PILL / 2 + ms(16)));
         assert_eq!(shown(&stage), half);
+    }
+
+    /// A section's body, 120 tall, folded away or open.
+    fn section<'a>(open: bool) -> El<'a> {
+        fold(open.then(|| space().width(200).height(120).into())).into()
+    }
+
+    #[test]
+    fn a_folded_section_opens_from_nothing_to_its_full_height() {
+        let height = |stage: &Stage<'_>| stage.node.size().height;
+        let mut stage = Stage::new(section(false));
+        let t0 = Instant::now();
+        assert!(!stage.frame(t0));
+        assert_eq!(height(&stage), 0.0);
+
+        stage.set(section(true));
+        assert_eq!(height(&stage), 0.0);
+        let t1 = t0 + ms(1000);
+        assert!(stage.frame(t1));
+        assert_eq!(height(&stage), 0.0);
+        assert!(stage.frame(t1 + UNFOLD / 2));
+        assert!(height(&stage) > 60.0 && height(&stage) < 120.0);
+        // The whole content is laid out inside, cut to the part showing.
+        assert_eq!(stage.node.children()[0].size().height, 120.0);
+        assert!(!stage.frame(t1 + UNFOLD));
+        assert_eq!(height(&stage), 120.0);
+        // Then it rests: no more frames, no more layouts.
+        let layouts = stage.layouts;
+        assert!(!stage.frame(t1 + ms(5000)));
+        assert_eq!(stage.layouts, layouts);
+
+        // Folding is immediate.
+        stage.set(section(false));
+        assert_eq!(height(&stage), 0.0);
+        assert!(!stage.frame(t1 + ms(6000)));
+    }
+
+    #[test]
+    fn a_section_open_from_the_start_does_not_animate() {
+        let mut stage = Stage::new(section(true));
+        assert_eq!(stage.node.size().height, 120.0);
+        assert!(!stage.frame(Instant::now()));
+        assert_eq!(stage.layouts, 0);
+    }
+
+    /// A list item: 40 tall closed, 200 open.
+    fn item<'a>(open: bool, key: u64) -> El<'a> {
+        unfold(open, space().width(200).height(if open { 200 } else { 40 }))
+            .key(key)
+            .into()
+    }
+
+    #[test]
+    fn an_item_opens_from_its_closed_height() {
+        let height = |stage: &Stage<'_>| stage.node.size().height;
+        let mut stage = Stage::new(item(false, 7));
+        let t0 = Instant::now();
+        stage.frame(t0);
+        assert_eq!(height(&stage), 40.0);
+        stage.set(item(true, 7));
+        assert_eq!(height(&stage), 40.0);
+        assert!(stage.frame(t0 + ms(1000)));
+        assert!(stage.frame(t0 + ms(1000) + UNFOLD / 2));
+        assert!(height(&stage) > 120.0 && height(&stage) < 200.0);
+        assert!(!stage.frame(t0 + ms(1000) + UNFOLD));
+        assert_eq!(height(&stage), 200.0);
+    }
+
+    #[test]
+    fn another_item_taking_a_closed_ones_place_is_shown_open_at_once() {
+        let mut stage = Stage::new(item(false, 7));
+        let t0 = Instant::now();
+        stage.frame(t0);
+        stage.set(item(true, 8));
+        assert_eq!(stage.node.size().height, 200.0);
+        assert!(!stage.frame(t0 + ms(1000)));
     }
 }

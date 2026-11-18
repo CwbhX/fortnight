@@ -71,6 +71,7 @@ use secrecy::SecretString;
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::motion;
 use crate::theme::{self, Icon};
 
 mod endpoint;
@@ -746,17 +747,16 @@ impl SettingsView {
         .padding([4, 0])
         .style(theme::text_button)
         .on_press(Message::TogglePrompts);
-        let mut body = column![heading].spacing(theme::SPACING);
-        if self.prompts_open {
-            body = body.push(
-                column![
-                    editor("Work summary", PromptKind::Summary),
-                    editor("Recommended tasks", PromptKind::Plan),
-                ]
-                .spacing(theme::SPACING * 1.25),
-            );
-        }
-        body.into()
+        let prompts = self.prompts_open.then(|| {
+            column![
+                editor("Work summary", PromptKind::Summary),
+                editor("Recommended tasks", PromptKind::Plan),
+            ]
+            .spacing(theme::SPACING * 1.25)
+            .padding(iced::Padding::ZERO.top(theme::SPACING))
+            .into()
+        });
+        column![heading, motion::fold(prompts)].into()
     }
 
     fn appearance_section(&self) -> Element<'_, Message> {

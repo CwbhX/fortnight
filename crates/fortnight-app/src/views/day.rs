@@ -85,7 +85,7 @@ use super::panel::{self, load_line, load_view};
 use super::rich_editor::rich_editor;
 use super::rich_notes;
 use super::task_form::{EditForm, field, form_fields, open_form};
-use crate::theme;
+use crate::{motion, theme};
 
 /// The id of the add-a-task input, for `operation::focus`.
 pub const QUICK_ADD_ID: &str = "quick-add";
@@ -1060,11 +1060,12 @@ impl DayView {
         let over = dragging.and_then(|d| d.over);
         let mut list = Column::new().spacing(3);
         for task in tasks {
-            if let Some(form) = self.editing.as_ref().filter(|f| f.id == task.id) {
-                list = list.push(edit_card(task, form, data.today));
+            let id = task.id;
+            if let Some(form) = self.editing.as_ref().filter(|f| f.id == id) {
+                let form = edit_card(task, form, data.today);
+                list = list.push(motion::unfold(true, form).key(id as u64));
                 continue;
             }
-            let id = task.id;
             let held = dragging.is_some_and(|d| d.id == id);
             let line = !held && over == Some(Spot::Before(id));
             let card = container(card_content(task, data.today, None))
@@ -1086,7 +1087,7 @@ impl DayView {
             if dragging.is_some() {
                 area = area.on_release(Message::DropOn(Spot::Before(id)));
             }
-            list = list.push(area);
+            list = list.push(motion::unfold(false, area).key(id as u64));
         }
         let mut end = mouse_area(
             column![drop_line(over == Some(Spot::End))]
@@ -1150,7 +1151,7 @@ impl DayView {
                 self.rows(tasks, data, false)
             }
         });
-        panel::panel(head.into(), body)
+        panel::folding_panel(head.into(), body, section as u64)
     }
 
     /// The rows of a section. `ranked` (the Recommended section only)
@@ -1161,18 +1162,18 @@ impl DayView {
         data: &'a DayData,
         ranked: bool,
     ) -> Element<'a, Message> {
-        Column::with_children(
-            tasks
-                .into_iter()
-                .enumerate()
-                .map(|(i, task)| match &self.editing {
-                    Some(form) if form.id == task.id => edit_card(task, form, data.today),
-                    _ => {
-                        let rank = ranked.then_some(i + 1);
-                        task_row(task, data.today, self.selected == Some(task.id), rank)
-                    }
-                }),
-        )
+        // A task opening into its form grows from its card's height.
+        Column::with_children(tasks.into_iter().enumerate().map(|(i, task)| {
+            let (open, row) = match &self.editing {
+                Some(form) if form.id == task.id => (true, edit_card(task, form, data.today)),
+                _ => {
+                    let rank = ranked.then_some(i + 1);
+                    let selected = self.selected == Some(task.id);
+                    (false, task_row(task, data.today, selected, rank))
+                }
+            };
+            motion::unfold(open, row).key(task.id as u64).into()
+        }))
         .spacing(6)
         .into()
     }
