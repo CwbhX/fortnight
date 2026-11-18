@@ -8,6 +8,7 @@
 
 pub mod app_icon;
 pub mod calendar;
+pub mod inert;
 pub mod motion;
 pub mod open_below;
 pub mod theme;

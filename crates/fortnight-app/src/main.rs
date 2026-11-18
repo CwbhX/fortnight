@@ -545,10 +545,8 @@ impl Ready {
             }
             Message::PointerUp => {
                 self.local = true;
-                let week = match self.week_view.update(week::Message::EndDrag) {
-                    week::Action::Edit(id) => self.open_edit(id),
-                    _ => Task::none(),
-                };
+                let action = self.week_view.update(week::Message::EndDrag);
+                let week = self.week_action(action);
                 let action = self.day_view.update(day::Message::EndDrag);
                 let day = self.day_action(action);
                 Task::batch([week, day])
@@ -562,24 +560,10 @@ impl Ready {
                     _ => Task::none(),
                 }
             }
-            Message::Week(m) => match self.week_view.update(m) {
-                week::Action::None => {
-                    self.local = true;
-                    Task::none()
-                }
-                week::Action::Move(id, day, position) => {
-                    self.move_task(id, day, position);
-                    Task::none()
-                }
-                week::Action::SetStatus(id, status) => {
-                    self.set_status(id, status);
-                    Task::none()
-                }
-                week::Action::NewTask(day) => self.open_new_task(day),
-                week::Action::Edit(id) => self.open_edit(id),
-                week::Action::OpenDay(day) => self.show(Tab::Today, Some(day)),
-                week::Action::Panel(action) => self.panel_action(action),
-            },
+            Message::Week(m) => {
+                let action = self.week_view.update(m);
+                self.week_action(action)
+            }
             Message::Month(m) => match self.month_view.update(m) {
                 month::Action::None => {
                     self.local = true;

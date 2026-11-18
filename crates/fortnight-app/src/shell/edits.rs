@@ -4,7 +4,7 @@
 //! itself (Ctrl/Cmd+Z).
 
 use crate::{Message, Ready};
-use fortnight_app::views::day;
+use fortnight_app::views::{day, week};
 use fortnight_core::domain::{DeletedTask, EventId, Task as CoreTask, TaskId, TaskStatus};
 use fortnight_core::store::Store;
 use iced::Task;
@@ -299,6 +299,28 @@ impl Ready {
             self.undo.remember(Undo::Deleted(removed));
         }
         self.reload_tasks();
+    }
+
+    /// Carries out what the Week tab asked for.
+    pub(crate) fn week_action(&mut self, action: week::Action) -> Task<Message> {
+        match action {
+            week::Action::None => {
+                self.local = true;
+                Task::none()
+            }
+            week::Action::Move(id, day, position) => {
+                self.move_task(id, day, position);
+                Task::none()
+            }
+            week::Action::SetStatus(id, status) => {
+                self.set_status(id, status);
+                Task::none()
+            }
+            week::Action::NewTask(day) => self.open_new_task(day),
+            week::Action::Edit(id) => self.open_edit(id),
+            week::Action::OpenDay(day) => self.show(crate::Tab::Today, Some(day)),
+            week::Action::Panel(action) => self.panel_action(action),
+        }
     }
 
     pub(crate) fn day_action(&mut self, action: day::Action) -> Task<Message> {

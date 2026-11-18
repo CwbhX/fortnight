@@ -97,6 +97,7 @@ use super::panel::{self, load_line, load_view};
 use super::rich_editor::rich_editor;
 use super::rich_notes;
 use super::task_form::{EditForm, field, form_fields, open_form};
+use crate::inert::inert;
 use crate::{motion, theme};
 
 /// The id of the add-a-task input, for `operation::focus`.
@@ -164,13 +165,12 @@ pub enum Message {
     /// The pointer moved while a card is held (position in the tab).
     Moved(Point),
     /// The pointer entered a card (or, while dragging, the space after the
-    /// last card).
+    /// last card); while dragging, also sent on every move inside it.
     Enter(Spot),
     /// The pointer left a card.
     Leave(TaskId),
-    /// A dragged card was let go there.
-    DropOn(Spot),
-    /// The mouse button went up anywhere: the drag (if any) is over.
+    /// The mouse button went up anywhere: the drag (if any) is over, and
+    /// the card lands where the landing line shows (`Drag::over`).
     EndDrag,
 }
 
@@ -793,20 +793,22 @@ impl DayView {
                 }
                 Action::None
             }
-            Message::DropOn(spot) => {
-                let Some(drag) = self.drag.take().filter(|d| d.active) else {
-                    return Action::None;
-                };
-                // The cards move under the pointer without enter/exit events.
-                self.hovered = None;
-                let order: Vec<&Task> = self.placement.tasks(data, Section::Day);
-                reorder(&order, drag.id, spot)
-                    .map(Action::Reorder)
-                    .unwrap_or(Action::None)
-            }
-            // A press let go before it became a drag is a click.
+            // A press let go before it became a drag is a click; a drag
+            // lands where the line shows, wherever the button goes up.
             Message::EndDrag => match self.drag.take() {
                 Some(drag) if !drag.active => self.update(Message::Expand(drag.id)),
+                Some(Drag {
+                    id,
+                    over: Some(spot),
+                    ..
+                }) => {
+                    // The cards move under the pointer without enter/exit events.
+                    self.hovered = None;
+                    let order: Vec<&Task> = self.placement.tasks(data, Section::Day);
+                    reorder(&order, id, spot)
+                        .map(Action::Reorder)
+                        .unwrap_or(Action::None)
+                }
                 _ => Action::None,
             },
             Message::Remove(id) => Action::SetStatus(id, TaskStatus::Dropped),
@@ -1007,7 +1009,8 @@ impl DayView {
                     },
                     ..card_box(false, true, false)(t)
                 });
-            layers = layers.push(pin(ghost).position(Point::new(at.x - 40.0, at.y - 22.0)));
+            // Inert: the pointer is on it, and must reach the targets below.
+            layers = layers.push(pin(inert(ghost)).position(Point::new(at.x - 40.0, at.y - 22.0)));
         }
         let mut area = mouse_area(layers);
         if self.drag.is_some() {
@@ -1297,7 +1300,7 @@ impl DayView {
                         mouse::Interaction::Pointer
                     });
                 if dragging.is_some() {
-                    area = area.on_release(Message::DropOn(Spot::Before(id)));
+                    area = area.on_move(move |_| Message::Enter(Spot::Before(id)));
                 }
                 motion::unfold(false, area).key(id as u64).into()
             };
@@ -1311,7 +1314,7 @@ impl DayView {
         if dragging.is_some() {
             end = end
                 .on_enter(Message::Enter(Spot::End))
-                .on_release(Message::DropOn(Spot::End));
+                .on_move(|_| Message::Enter(Spot::End));
         }
         // Always the same shape, the strip folding away with no cards: a
         // list given a new place in the tree starts afresh, and a fresh
@@ -1928,7 +1931,7 @@ mod tests {
         assert!(view.dragging().is_some());
         let _ = view.view();
         assert_eq!(
-            view.update(Message::DropOn(Spot::Before(1))),
+            view.update(Message::EndDrag),
             Action::Reorder(vec![(2, 1.0), (1, 2.0)])
         );
         assert_eq!(view.update(Message::EndDrag), Action::None);
@@ -2397,7 +2400,7 @@ mod tests {
         view.update(Message::Moved(Point::new(0.0, 0.0)));
         view.update(Message::Moved(Point::new(0.0, 40.0)));
         view.update(Message::Enter(Spot::Before(1)));
-        view.update(Message::DropOn(Spot::Before(1)));
+        view.update(Message::EndDrag);
         assert_eq!(view.hovered, None);
         // Save and Delete from the form.
         view.update(Message::Expand(1));

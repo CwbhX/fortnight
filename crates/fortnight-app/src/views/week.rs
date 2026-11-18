@@ -25,10 +25,14 @@
 //! becomes the task's planned day (its deadline stays as it is); within a
 //! day only the order (`Task::position`) changes. Dropping on the weekend
 //! column's free space uses its first day; letting go anywhere else cancels.
+//! The card lands exactly where the highlight and line show when the
+//! button goes up (the pointer's last target, kept up to date on every
+//! move), and the copy under the pointer lets it through (`inert`).
 //! A click on a card opens the task dialog.
 //!
 //! Skipped on purpose: deleted tasks (the Today tab has them).
 
+use crate::inert::inert;
 use crate::motion;
 use crate::theme;
 use crate::views::panel::{self, LoadLine, load_line, load_view, title_bar, title_bar_alone};
@@ -58,15 +62,15 @@ pub enum Message {
     Press(TaskId),
     /// The pointer moved while a card is held (position in the tab).
     Moved(Point),
-    /// While dragging, the pointer entered a day column's free space
-    /// (`None`) or the card of this task.
+    /// While dragging, the pointer is over a day column's free space
+    /// (`None`) or the card of this task (sent on entering and on every
+    /// move inside, so it is always where the pointer last was).
     Hover(Date, Option<TaskId>),
     /// While dragging, the pointer left what `Hover` with the same day and
     /// card reported entering.
     Leave(Date, Option<TaskId>),
-    /// A dragged card was let go there.
-    DropOn(Date, Option<TaskId>),
-    /// The mouse button went up: the drag (if any) is over.
+    /// The mouse button went up: the drag (if any) is over, and the card
+    /// lands where the highlight and landing line showed (`Drag::over`).
     EndDrag,
     /// A day's `+`: add a task planned for that day.
     AddTask(Date),
@@ -83,11 +87,7 @@ impl Message {
     pub fn is_pointer_move(&self) -> bool {
         matches!(
             self,
-            Message::Press(_)
-                | Message::Moved(_)
-                | Message::Hover(..)
-                | Message::Leave(..)
-                | Message::EndDrag
+            Message::Press(_) | Message::Moved(_) | Message::Hover(..) | Message::Leave(..)
         )
     }
 }
@@ -230,11 +230,17 @@ impl WeekView {
                 }
                 Action::None
             }
-            Message::DropOn(day, before) => {
-                let Some(drag) = self.drag.take().filter(|d| d.active) else {
+            // A press let go before it became a drag is a click; a drag
+            // lands on what the pointer was last over, exactly what the
+            // highlight and line show, or nowhere.
+            Message::EndDrag => {
+                let Some(drag) = self.drag.take() else {
                     return Action::None;
                 };
-                let Some(data) = &self.data else {
+                if !drag.active {
+                    return Action::Edit(drag.id);
+                }
+                let (Some((day, before)), Some(data)) = (drag.over, &self.data) else {
                     return Action::None;
                 };
                 let Some(task) = data.tasks.iter().find(|t| t.id == drag.id) else {
@@ -245,11 +251,6 @@ impl WeekView {
                     None => Action::None,
                 }
             }
-            // A press let go before it became a drag is a click.
-            Message::EndDrag => match self.drag.take() {
-                Some(drag) if !drag.active => Action::Edit(drag.id),
-                _ => Action::None,
-            },
         }
     }
 
@@ -287,8 +288,8 @@ impl WeekView {
                 // The column's free space: drop after its open tasks.
                 free = free
                     .on_enter(Message::Hover(day, None))
-                    .on_exit(Message::Leave(day, None))
-                    .on_release(Message::DropOn(day, None));
+                    .on_move(move |_| Message::Hover(day, None))
+                    .on_exit(Message::Leave(day, None));
             }
             backgrounds = backgrounds.push(free);
             contents = contents.push(day_column(data, &self.layout, column, dragging, held));
@@ -326,7 +327,8 @@ impl WeekView {
                 },
                 ..container::Style::default()
             });
-            layers = layers.push(pin(ghost).position(Point::new(at.x - 24.0, at.y - 16.0)));
+            // Inert: the pointer is on it, and must reach the targets below.
+            layers = layers.push(pin(inert(ghost)).position(Point::new(at.x - 24.0, at.y - 16.0)));
         }
         let mut area = mouse_area(layers);
         if self.drag.is_some() {
@@ -720,6 +722,7 @@ fn task_row<'a>(
     dragging: Option<bool>,
     line_above: bool,
 ) -> Element<'a, Message> {
+    let id = task.id;
     let card = column![
         slot(line_above),
         task_card(task, day, today, dragging == Some(true))
@@ -736,7 +739,7 @@ fn task_row<'a>(
             area = area
                 .on_enter(Message::Hover(day, Some(task.id)))
                 .on_exit(Message::Leave(day, Some(task.id)))
-                .on_release(Message::DropOn(day, Some(task.id)));
+                .on_move(move |_| Message::Hover(day, Some(id)));
         }
         return area.into();
     }
@@ -753,7 +756,7 @@ fn task_row<'a>(
         area = area
             .on_enter(Message::Hover(day, Some(task.id)))
             .on_exit(Message::Leave(day, Some(task.id)))
-            .on_release(Message::DropOn(day, Some(task.id)));
+            .on_move(move |_| Message::Hover(day, Some(id)));
     }
     area.into()
 }
@@ -1211,7 +1214,8 @@ mod tests {
         // A press and release without moving is a click: nothing.
         v.update(Message::Press(1));
         v.update(Message::Moved(Point::new(10.0, 10.0)));
-        assert_eq!(v.update(Message::DropOn(wed, None)), Action::None);
+        v.update(Message::Hover(wed, None));
+        assert_eq!(v.update(Message::EndDrag), Action::Edit(1));
 
         v.update(Message::Press(1));
         v.update(Message::Moved(Point::new(10.0, 10.0)));
@@ -1219,10 +1223,7 @@ mod tests {
         assert!(v.dragging().is_some());
         v.update(Message::Hover(wed, None));
         let _ = v.view();
-        assert_eq!(
-            v.update(Message::DropOn(wed, None)),
-            Action::Move(1, wed, 1.0)
-        );
+        assert_eq!(v.update(Message::EndDrag), Action::Move(1, wed, 1.0));
         assert!(v.drag.is_none());
 
         // A press let go without moving is a click: edit the task.
@@ -1238,7 +1239,7 @@ mod tests {
         v.update(Message::EndDrag);
         assert!(v.drag.is_none());
         assert!(Message::Moved(Point::ORIGIN).is_pointer_move());
-        assert!(!Message::DropOn(wed, None).is_pointer_move());
+        assert!(!Message::EndDrag.is_pointer_move());
     }
 
     #[test]
@@ -1297,10 +1298,7 @@ mod tests {
         v.update(Message::Moved(Point::new(0.0, 40.0)));
         v.update(Message::Hover(tue, Some(1)));
         let _ = v.view();
-        assert_eq!(
-            v.update(Message::DropOn(tue, Some(1))),
-            Action::Move(2, tue, 0.0)
-        );
+        assert_eq!(v.update(Message::EndDrag), Action::Move(2, tue, 0.0));
     }
 
     #[test]
