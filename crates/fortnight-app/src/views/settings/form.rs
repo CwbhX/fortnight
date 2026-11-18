@@ -1,6 +1,6 @@
 //! The editable copy of the non-secret settings, and its validation.
 
-use fortnight_core::domain::{Accent, AppIcon, Schedule, Settings};
+use fortnight_core::domain::{Accent, AppIcon, Appearance, Schedule, Settings};
 use fortnight_core::parse::{format_hours, format_time, parse_hours, parse_time};
 use fortnight_core::report::{DEFAULT_PLAN_PROMPT, DEFAULT_SUMMARY_PROMPT, WEEKDAYS};
 use jiff::civil::Weekday;
@@ -21,6 +21,7 @@ pub(super) struct Form {
     pub(super) working_days: [bool; 7],
     /// Decimal hours as typed, e.g. `5.5`.
     pub(super) focus_hours: String,
+    pub(super) appearance: Appearance,
     pub(super) app_icon: AppIcon,
     pub(super) accent: Accent,
     /// The prompts as shown and edited.
@@ -60,6 +61,7 @@ impl Form {
             plan_time: format_time(sched.plan_time),
             working_days: WEEKDAYS.map(|d| sched.working_days.contains(&d)),
             focus_hours: format_hours(s.focus_minutes_per_day),
+            appearance: s.appearance,
             app_icon: s.app_icon,
             accent: s.accent,
             summary_prompt: summary_shown.clone(),
@@ -104,6 +106,7 @@ impl Form {
             },
             summary_instructions,
             focus_minutes_per_day: parse_hours(&self.focus_hours)?,
+            appearance: self.appearance,
             app_icon: self.app_icon,
             accent: self.accent,
             summary_prompt,
@@ -237,6 +240,18 @@ mod tests {
             panic!("expected Save");
         };
         assert_eq!(s.accent, Accent::Purple);
+    }
+
+    #[test]
+    fn appearance_choice_saves() {
+        let mut v = loaded(KeyState::NoKey);
+        assert_eq!(v.form.appearance, Appearance::System);
+        v.update(Message::Appearance(Appearance::Dark));
+        assert!(v.is_dirty());
+        let Action::Save(s) = v.update(Message::Save) else {
+            panic!("expected Save");
+        };
+        assert_eq!(s.appearance, Appearance::Dark);
     }
 
     #[test]

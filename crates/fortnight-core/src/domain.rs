@@ -499,6 +499,9 @@ pub struct Settings {
     /// The system prompt for recommended tasks. Empty means the built-in
     /// one (`report::DEFAULT_PLAN_PROMPT`).
     pub plan_prompt: String,
+    /// Light or dark colours, or follow the system. Missing in older data:
+    /// follow the system.
+    pub appearance: Appearance,
     /// Which app icon to show.
     pub app_icon: AppIcon,
     /// The accent colour of selected tabs, primary buttons, checkboxes,
@@ -549,6 +552,16 @@ impl Accent {
     }
 }
 
+/// The app's colours: light or dark, or following the system appearance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Appearance {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
 /// The app icon: the Dock icon on macOS, the window and taskbar icon
 /// elsewhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -571,6 +584,7 @@ impl Default for Settings {
             focus_minutes_per_day: DEFAULT_FOCUS_MINUTES,
             summary_prompt: String::new(),
             plan_prompt: String::new(),
+            appearance: Appearance::System,
             app_icon: AppIcon::System,
             accent: Accent::Orange,
         }
@@ -625,6 +639,20 @@ mod tests {
         assert!(json.contains(r#""app_icon":"dark""#));
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.app_icon, AppIcon::Dark);
+    }
+
+    #[test]
+    fn appearance_defaults_to_system_and_round_trips() {
+        let old: Settings = serde_json::from_str(r#"{"accent":"teal"}"#).unwrap();
+        assert_eq!(old.appearance, Appearance::System);
+        let s = Settings {
+            appearance: Appearance::Dark,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""appearance":"dark""#));
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.appearance, Appearance::Dark);
     }
 
     #[test]

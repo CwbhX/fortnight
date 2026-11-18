@@ -261,10 +261,14 @@ impl App {
     }
 
     fn theme(&self) -> Option<Theme> {
-        // An unknown system appearance (`None`) gets Fortnight's light
-        // theme, not iced's stock one.
+        // `FORTNIGHT_THEME` beats the setting; an unknown system appearance
+        // gets Fortnight's light theme, not iced's stock one.
         match self {
-            App::Ready(_, dark) => Some(theme::theme_for(dark.unwrap_or(false))),
+            App::Ready(ready, system) => {
+                let dark = forced_theme()
+                    .unwrap_or_else(|| theme::is_dark(ready.settings.appearance, *system));
+                Some(theme::theme_for(dark))
+            }
             App::Fatal(_) => None,
         }
     }

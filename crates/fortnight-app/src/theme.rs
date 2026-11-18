@@ -1,7 +1,7 @@
 //! Theme and shared styles. Owner: orchestrator (round 2; was agent E).
 //! Views may add private style helpers in their own files.
 //!
-//! Follows the system light/dark theme. One accent colour, picked in
+//! Light, dark, or following the system (Settings' Appearance). One accent colour, picked in
 //! Settings (orange `#ea580c` by default; [`accent_color`]), used sparingly
 //! (primary buttons, selected tabs, focus rings, checked boxes). Generous spacing,
 //! no borders where whitespace will do. Other views use the constants and
@@ -9,10 +9,11 @@
 //!
 //! # Picking light or dark
 //!
-//! `main.rs` keeps a `dark: bool`, asks the system once at launch with
-//! `iced::system::theme()` (a `Task<iced::theme::Mode>`), follows changes with
-//! the subscription `iced::system::theme_changes()`, and returns
-//! `Some(theme_for(mode == iced::theme::Mode::Dark))` from its `theme` fn.
+//! `main.rs` keeps the system appearance (`Option<bool>`, `Some(true)` =
+//! dark), asks the system once at launch with `iced::system::theme()` (a
+//! `Task<iced::theme::Mode>`), follows changes with the subscription
+//! `iced::system::theme_changes()`, and returns
+//! `Some(theme_for(is_dark(settings.appearance, system)))` from its `theme` fn.
 //!
 //! # Constants
 //!
@@ -78,7 +79,7 @@
 //! - [`title_with_marks`] and [`priority_marks`]: a task title with its
 //!   priority marks.
 
-use fortnight_core::domain::{Accent, Priority};
+use fortnight_core::domain::{Accent, Appearance, Priority};
 use iced::border::{self, Border};
 use iced::theme::{Palette, palette};
 use iced::widget::{
@@ -174,8 +175,18 @@ const DARK: Palette = Palette {
     danger: color!(0xf87171),
 };
 
+/// Whether to use the dark theme: Settings' choice, or the system
+/// appearance for "Match system" (light when the system doesn't say).
+pub fn is_dark(choice: Appearance, system_dark: Option<bool>) -> bool {
+    match choice {
+        Appearance::Light => false,
+        Appearance::Dark => true,
+        Appearance::System => system_dark.unwrap_or(false),
+    }
+}
+
 /// The app theme for light (`dark = false`) or dark mode, with the accent.
-/// `main.rs` picks `dark` from the system setting (see the module doc).
+/// `main.rs` picks `dark` with [`is_dark`] (see the module doc).
 pub fn theme_for(dark: bool) -> Theme {
     let (name, base) = if dark {
         ("Fortnight Dark", DARK)
@@ -724,6 +735,15 @@ pub fn due_style(overdue: bool) -> fn(&Theme) -> text::Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn appearance_choice_and_system_appearance() {
+        assert!(!is_dark(Appearance::System, None));
+        assert!(!is_dark(Appearance::System, Some(false)));
+        assert!(is_dark(Appearance::System, Some(true)));
+        assert!(is_dark(Appearance::Dark, Some(false)));
+        assert!(!is_dark(Appearance::Light, Some(true)));
+    }
 
     #[test]
     fn themes_use_the_accent_and_report_their_mode() {

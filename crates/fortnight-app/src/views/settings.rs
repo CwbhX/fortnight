@@ -2,10 +2,15 @@
 //!
 //! Settings opens as an overlay panel over the current tab. It is one
 //! scrollable column under a fixed header that holds the title, the single
-//! Save button (it saves the whole form: endpoint and protocol, schedule,
-//! capacity, the two prompts and the appearance) and a close button. Closing with unsaved
+//! Save button (it saves the whole form: appearance, endpoint and protocol,
+//! schedule, capacity and the two prompts) and a close button. Closing with unsaved
 //! changes is allowed: the header says "Unsaved changes", and the edits stay
 //! in the form until the saved settings change.
+//!
+//! Order, top to bottom: Appearance (Theme and Color side by side, then App
+//! icon), Model, Recommendations, Schedule, Capacity, Data folder, and
+//! Prompts last, folded shut until its heading is clicked (they are long).
+//! Theme and Color apply on Save, like everything else in the form.
 //!
 //! Models: two blocks of label/field rows, Model (everything) and
 //! Recommendations (off unless "Use a different model" is ticked; then it
@@ -48,7 +53,7 @@
 //! selectable data-folder text (iced 0.14 has no selectable text widget),
 //! and a confirmation before closing with unsaved changes.
 
-use fortnight_core::domain::{Accent, AppIcon, LlmSettings, Settings};
+use fortnight_core::domain::{Accent, AppIcon, Appearance, LlmSettings, Settings};
 use fortnight_core::ollama::{ModelKind, OllamaModel};
 use fortnight_core::parse::{parse_hours, parse_time};
 use fortnight_core::report::{
@@ -129,6 +134,10 @@ pub enum Message {
     ConfirmRemove,
     /// Close whichever key form or confirmation is open.
     CancelKey,
+    /// Light, dark or match system: applied on Save.
+    Appearance(Appearance),
+    /// Open or fold the Prompts section.
+    TogglePrompts,
     AppIcon(AppIcon),
     /// A colour swatch: the accent colour, applied on Save.
     Accent(Accent),
@@ -255,6 +264,26 @@ impl fmt::Display for IconChoice {
     }
 }
 
+/// An appearance choice with a `Display` impl, for `pick_list`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ThemeChoice(Appearance);
+
+const THEME_CHOICES: [ThemeChoice; 3] = [
+    ThemeChoice(Appearance::System),
+    ThemeChoice(Appearance::Light),
+    ThemeChoice(Appearance::Dark),
+];
+
+impl fmt::Display for ThemeChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self.0 {
+            Appearance::System => "Match system",
+            Appearance::Light => "Light",
+            Appearance::Dark => "Dark",
+        })
+    }
+}
+
 /// A weekday with a `Display` impl, for `pick_list`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Day(Weekday);
@@ -304,6 +333,8 @@ pub struct SettingsView {
     password_prompt: bool,
     summary_editor: text_editor::Content,
     plan_editor: text_editor::Content,
+    /// The Prompts section is unfolded. Shut by default: they are long.
+    prompts_open: bool,
 }
 
 impl Default for SettingsView {
@@ -334,6 +365,7 @@ impl Default for SettingsView {
             tested: Which::Main,
             tested_llm: None,
             password_prompt: false,
+            prompts_open: false,
         }
     }
 }
@@ -417,6 +449,8 @@ impl SettingsView {
                 return Action::Close;
             }
             Message::WeekStart(d) => form.week_start = d,
+            Message::Appearance(choice) => form.appearance = choice,
+            Message::TogglePrompts => self.prompts_open = !self.prompts_open,
             Message::AppIcon(choice) => form.app_icon = choice,
             Message::Accent(accent) => form.accent = accent,
             Message::SummaryDay(d) => form.summary_day = d,
@@ -558,13 +592,13 @@ impl SettingsView {
         .width(Fill);
 
         let content = column![
+            self.appearance_section(),
             self.model_section(),
             self.recommendations_section(),
             self.schedule_section(),
             self.capacity_section(),
-            self.prompts_section(),
-            self.appearance_section(),
             self.data_section(),
+            self.prompts_section(),
         ]
         .spacing(theme::SPACING * 2.5)
         .padding(iced::Padding {
@@ -729,14 +763,23 @@ impl SettingsView {
             ]
             .spacing(theme::SPACING / 3.0)
         };
-        section(
-            "Prompts",
-            column![
-                editor("Work summary", PromptKind::Summary),
-                editor("Recommended tasks", PromptKind::Plan),
-            ]
-            .spacing(theme::SPACING * 1.25),
-        )
+        // Folds like Today's No date section.
+        let arrow = if self.prompts_open { "▾" } else { "▸" };
+        let heading = button(text(format!("{arrow}  Prompts")).size(theme::TEXT_SMALL))
+            .padding([4, 0])
+            .style(theme::text_button)
+            .on_press(Message::TogglePrompts);
+        let mut body = column![heading].spacing(theme::SPACING);
+        if self.prompts_open {
+            body = body.push(
+                column![
+                    editor("Work summary", PromptKind::Summary),
+                    editor("Recommended tasks", PromptKind::Plan),
+                ]
+                .spacing(theme::SPACING * 1.25),
+            );
+        }
+        body.into()
     }
 
     fn appearance_section(&self) -> Element<'_, Message> {
@@ -754,10 +797,23 @@ impl SettingsView {
             .map(|a| swatch(a, self.form.accent == a)))
         .spacing(theme::SPACING / 2.0)
         .align_y(Center);
+        let mode = pick_list(
+            THEME_CHOICES,
+            Some(ThemeChoice(self.form.appearance)),
+            |c: ThemeChoice| Message::Appearance(c.0),
+        )
+        .padding([8, 12])
+        .text_size(theme::TEXT_BODY)
+        .width(180)
+        .style(picker);
+        let theme_row = row![
+            column![text("Theme").size(theme::TEXT_SMALL), mode].spacing(theme::SPACING / 3.0),
+            labelled("Color", swatches),
+        ]
+        .spacing(theme::SPACING * 2.0);
         section(
             "Appearance",
-            column![labelled("Color", swatches), labelled("App icon", icon)]
-                .spacing(theme::SPACING),
+            column![theme_row, labelled("App icon", icon)].spacing(theme::SPACING),
         )
     }
 
@@ -1007,6 +1063,17 @@ mod tests {
         assert!(matches!(v.update(Message::Close), Action::Close));
         v.load(data(Settings::default(), KeyState::NoKey));
         assert_eq!(v.form.main.model, "unsaved");
+    }
+
+    #[test]
+    fn prompts_start_folded_and_toggle_without_dirtying() {
+        let mut v = loaded(KeyState::NoKey);
+        assert!(!v.prompts_open);
+        v.update(Message::TogglePrompts);
+        assert!(v.prompts_open);
+        assert!(!v.is_dirty());
+        v.update(Message::TogglePrompts);
+        assert!(!v.prompts_open);
     }
 
     #[test]
