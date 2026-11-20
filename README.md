@@ -40,6 +40,7 @@ Your tasks and their history stay in one SQLite file on your machine. Fortnight 
 - [Project layout](#project-layout)
 - [Development](#development)
 - [Not included](#not-included)
+- [About](#about)
 - [License](#license)
 
 ## Features
@@ -187,6 +188,7 @@ Settings has these parts, from top to bottom:
 - **Week.** The first day of the week (Sunday by default), the working days, and the work hours per day (8 by default). The load bars use the last two. You can also make new tasks due on the day you add them (off by default).
 - **Prompts.** The system prompts for the Weekly Summary and Recommended tasks. They start folded. Reset brings back the built-in prompt.
 - **Data folder.** Where your data is.
+- **About.** The app version, author and license.
 
 ### Ollama
 
@@ -318,8 +320,10 @@ cargo test
 - **Code signing.** A build you make yourself isn't flagged. If you copy a build to another machine, it shows a one-time Gatekeeper or SmartScreen warning there.
 - **Notifications.** Fortnight doesn't send any.
 
+## About
+
+Made by Clement Hathaway ([GitHub](https://github.com/CwbhX)), with [T3 Code](https://t3.codes).
+
 ## License
 
 MIT, as set in `Cargo.toml`.
-
-Made with [T3 Code](https://t3.codes).

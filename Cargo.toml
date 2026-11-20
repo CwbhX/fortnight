@@ -6,6 +6,7 @@ members = ["crates/fortnight-core", "crates/fortnight-app", "crates/fortnight-cl
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+authors = ["Clement Hathaway"]
 
 [workspace.dependencies]
 fortnight-core = { path = "crates/fortnight-core" }

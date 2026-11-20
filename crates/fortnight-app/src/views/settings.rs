@@ -11,7 +11,7 @@
 //! icon and Width, which sets the Today column), Model, Recommendations,
 //! Week (first day, working days, work hours, and whether new tasks are due
 //! the day they're added to), Prompts (folded shut until its heading is
-//! clicked: they are long), and the Data folder last. There are no report times: the summary's
+//! clicked: they are long), the Data folder, and About last. There are no report times: the summary's
 //! background update follows the working days (`week::due_reports`).
 //! Theme and Color apply on Save, like everything else in the form.
 //!
@@ -613,6 +613,7 @@ impl SettingsView {
             self.week_section(),
             self.prompts_section(),
             self.data_section(),
+            self.about_section(),
         ]
         .spacing(theme::SPACING * 2.5)
         .padding(iced::Padding {
@@ -859,6 +860,26 @@ impl SettingsView {
                 .style(theme::muted),
         )
     }
+
+    fn about_section(&self) -> Element<'_, Message> {
+        let (heading, details) = about_lines();
+        section(
+            "About",
+            column![
+                text(heading).size(theme::TEXT_BODY),
+                text(details).size(theme::TEXT_SMALL).style(theme::muted),
+            ]
+            .spacing(theme::SPACING / 3.0),
+        )
+    }
+}
+
+fn about_lines() -> (String, String) {
+    let authors = env!("CARGO_PKG_AUTHORS").replace(':', ", ");
+    (
+        format!("Fortnight {}", env!("CARGO_PKG_VERSION")),
+        format!("Made by {authors} · {} license", env!("CARGO_PKG_LICENSE")),
+    )
 }
 
 // ------------------------------------------------------------ view helpers
@@ -1102,5 +1123,15 @@ mod tests {
             text_editor::Action::Edit(text_editor::Edit::Insert('!')),
         ));
         assert_eq!(v.form.summary_prompt, format!("{DEFAULT_SUMMARY_PROMPT}!"));
+    }
+
+    #[test]
+    fn about_section_includes_author_and_version() {
+        let (heading, details) = about_lines();
+        assert_eq!(heading, format!("Fortnight {}", env!("CARGO_PKG_VERSION")));
+        assert!(details.contains("Clement Hathaway"));
+        assert!(details.contains("MIT"));
+        let v = loaded(KeyState::NoKey);
+        let _ = v.view();
     }
 }
