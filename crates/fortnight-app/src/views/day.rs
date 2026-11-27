@@ -267,11 +267,29 @@ pub struct DayData {
     pub load: Option<ColumnLoad>,
 }
 
+/// How long the outgoing day is kept after a day switch so the horizontal
+/// slide finishes cleanly before it is dropped.
+const SLIDE_LINGER: Duration = Duration::from_millis(600);
+
+/// The day that just slid out, kept briefly for [`motion::slide`].
+#[derive(Debug)]
+struct PreviousDay {
+    data: DayData,
+    placement: Placement,
+    notes: rich_notes::Content,
+    editing: Option<EditForm>,
+    show_done: bool,
+    show_deleted: bool,
+    at: Instant,
+}
+
 #[derive(Debug, Default)]
 pub struct DayView {
     data: Option<DayData>,
     /// Where `data`'s tasks are shown, worked out in `load`.
     placement: Placement,
+    /// The previous day, kept briefly so switching days slides smoothly.
+    previous: Option<PreviousDay>,
     show_done: bool,
     show_deleted: bool,
     /// The keyboard selection highlight.
@@ -573,6 +591,8 @@ impl DayView {
             return;
         }
         let before = self.visible();
+        let day_changed = self.data.as_ref().is_some_and(|old| old.day != data.day);
+        let mut prev_notes = None;
         if self.notes_day != Some(data.day) {
             // Another day: what was typed on the last one is saved first.
             if self.notes_edited.take().is_some()
@@ -584,12 +604,17 @@ impl DayView {
             }
             // Back on a day left before its notes were saved: what was
             // typed, still to be saved.
-            if let Some(i) = self.notes_left.iter().position(|(d, _)| *d == data.day) {
-                let (_, text) = self.notes_left.remove(i);
-                self.notes = rich_notes::Content::with_text(&text);
-                self.notes_edited = Some(Instant::now());
-            } else {
-                self.notes = rich_notes::Content::with_text(&day_notes(&data, data.day));
+            let next_notes =
+                if let Some(i) = self.notes_left.iter().position(|(d, _)| *d == data.day) {
+                    let (_, text) = self.notes_left.remove(i);
+                    self.notes_edited = Some(Instant::now());
+                    rich_notes::Content::with_text(&text)
+                } else {
+                    rich_notes::Content::with_text(&day_notes(&data, data.day))
+                };
+            let old_notes = std::mem::replace(&mut self.notes, next_notes);
+            if day_changed {
+                prev_notes = Some(old_notes);
             }
             self.notes_day = Some(data.day);
         } else if self.notes_edited.is_none() {
@@ -605,9 +630,36 @@ impl DayView {
                 self.notes = tidied;
             }
         }
+        let now = Instant::now();
         let placement = Placement::new(&data);
-        self.note_departures(&data, &placement, Instant::now());
-        self.placement = placement;
+        self.note_departures(&data, &placement, now);
+        if day_changed && let Some(old_data) = self.data.take() {
+            self.drag = None;
+            let prev_editing = self.editing.take_if(|form| {
+                matches!(
+                    placement.section_of_id(&data, form.id),
+                    None | Some(Section::Deleted)
+                )
+            });
+            self.previous = Some(PreviousDay {
+                data: old_data,
+                placement: std::mem::replace(&mut self.placement, placement),
+                notes: prev_notes.unwrap_or_default(),
+                editing: prev_editing,
+                show_done: self.show_done,
+                show_deleted: self.show_deleted,
+                at: now,
+            });
+        } else {
+            if self
+                .previous
+                .as_ref()
+                .is_some_and(|p| now.saturating_duration_since(p.at) >= SLIDE_LINGER)
+            {
+                self.previous = None;
+            }
+            self.placement = placement;
+        }
         self.data = Some(data);
 
         // A card that left the Tasks section sends no exit event.
@@ -624,7 +676,6 @@ impl DayView {
                 Some(_) => {}
             }
         }
-        let now = Instant::now();
         let placement = &self.placement;
         let data = self.data.as_ref();
         self.closing.retain(|(f, at)| {
@@ -942,21 +993,6 @@ impl DayView {
         self.editing = Some(form);
     }
 
-    /// The open or recently-closed form for `id`, if any (and whether it is
-    /// currently open).
-    fn form_for(&self, id: TaskId) -> (bool, Option<&EditForm>) {
-        if let Some(form) = self.editing.as_ref().filter(|f| f.id == id) {
-            return (true, Some(form));
-        }
-        let closing = self
-            .closing
-            .iter()
-            .rev()
-            .find(|(f, _)| f.id == id)
-            .map(|(f, _)| f);
-        (false, closing)
-    }
-
     fn task(&self, id: TaskId) -> Option<&Task> {
         self.data.as_ref()?.tasks.iter().find(|t| t.id == id)
     }
@@ -978,73 +1014,41 @@ impl DayView {
         let Some(data) = &self.data else {
             return text("Loading…").style(theme::muted).into();
         };
-        // The gap under each panel.
-        let gap = theme::SPACING * 1.5;
-        let below =
-            |panel: Element<'a, Message>| container(panel).padding(iced::Padding::ZERO.bottom(gap));
-        let mut content = Column::new();
-
-        content = content.push(below(self.day_panel(data)));
-
-        content = content.push(below(self.day_notes_view(data)));
-
-        let collapsibles = [
-            (
-                Section::Done,
-                "Completed",
-                self.show_done,
-                Message::ToggleShowDone,
-            ),
-            (
-                Section::Deleted,
-                "Deleted",
-                self.show_deleted,
-                Message::ToggleShowDeleted,
-            ),
-        ];
-        // Always there, even empty: a footer that comes and goes would jolt
-        // the page each time a first task lands in it or a last one leaves.
-        for (section, label, open, toggle) in collapsibles {
-            let tasks = self.placement.tasks(data, section);
-            content = content.push(below(
-                self.collapsible(section, label, open, toggle, tasks, data),
-            ));
+        let current = DayPage {
+            data,
+            placement: &self.placement,
+            notes: &self.notes,
+            quick_add: &self.quick_add,
+            show_done: self.show_done,
+            show_deleted: self.show_deleted,
+            selected: self.selected,
+            editing: self.editing.as_ref(),
+            closing: &self.closing,
+            drag: self.drag.as_ref(),
+            hovered: self.hovered,
+            departures: &self.departures,
         }
-
-        // The last place's gap is part of the padding at the bottom.
-        let page = container(
-            content
-                .padding(iced::Padding {
-                    bottom: theme::SPACING * 2.0 - gap,
-                    ..iced::Padding::new(theme::SPACING * 2.0)
-                })
-                .max_width(theme::today_width()),
-        )
-        .center_x(Fill);
-        let mut layers = stack![page];
-        if let Some(drag) = self.dragging()
-            && let Some(at) = drag.at
-            && let Some(task) = data.tasks.iter().find(|t| t.id == drag.id)
-        {
-            let ghost = container(card_content(task, data.today, None))
-                .padding(CARD_PADDING)
-                .width(theme::today_width() - theme::SPACING * 6.0)
-                .style(|t: &Theme| container::Style {
-                    shadow: iced::Shadow {
-                        color: Color::BLACK.scale_alpha(0.35),
-                        offset: iced::Vector::new(0.0, 6.0),
-                        blur_radius: 16.0,
-                    },
-                    ..card_box(false, true, false)(t)
-                });
-            // Inert: the pointer is on it, and must reach the targets below.
-            layers = layers.push(pin(inert(ghost)).position(Point::new(at.x - 40.0, at.y - 22.0)));
-        }
-        let mut area = mouse_area(layers);
-        if self.drag.is_some() {
-            area = area.on_move(Message::Moved);
-        }
-        scrollable(area).height(Fill).into()
+        .view();
+        let previous = self.previous.as_ref().map(|prev| {
+            DayPage {
+                data: &prev.data,
+                placement: &prev.placement,
+                notes: &prev.notes,
+                quick_add: "",
+                show_done: prev.show_done,
+                show_deleted: prev.show_deleted,
+                selected: None,
+                editing: prev.editing.as_ref(),
+                closing: &[],
+                drag: None,
+                hovered: None,
+                departures: &[],
+            }
+            .view()
+        });
+        motion::slide(day_key(data.day) as i64, current, previous)
+            .fade_from(|theme: &Theme| theme.palette().background)
+            .into()
     }
 
     /// The open inline form's task, title and notes, for `main.rs`'s
@@ -1087,16 +1091,137 @@ impl DayView {
         }
     }
 
+    /// Shows a suggested priority on the inline form of task `id`.
+    pub fn set_suggested(&mut self, id: TaskId, priority: Option<Priority>) {
+        if let Some(form) = self.editing.as_mut().filter(|f| f.id == id) {
+            form.suggested = priority;
+        }
+    }
+
+    /// The task being dragged (past the threshold), if any.
+    #[cfg(test)]
+    fn dragging(&self) -> Option<&Drag> {
+        self.drag.as_ref().filter(|d| d.active)
+    }
+}
+
+/// Borrowed state needed to render one day page (either the live day or the
+/// outgoing day sliding off-screen).
+struct DayPage<'a> {
+    data: &'a DayData,
+    placement: &'a Placement,
+    notes: &'a rich_notes::Content,
+    quick_add: &'a str,
+    show_done: bool,
+    show_deleted: bool,
+    selected: Option<TaskId>,
+    editing: Option<&'a EditForm>,
+    closing: &'a [(EditForm, Instant)],
+    drag: Option<&'a Drag>,
+    hovered: Option<TaskId>,
+    departures: &'a [Departure],
+}
+
+impl<'a> DayPage<'a> {
+    fn view(&self) -> Element<'a, Message> {
+        let data = self.data;
+        // The gap under each panel.
+        let gap = theme::SPACING * 1.5;
+        let below =
+            |panel: Element<'a, Message>| container(panel).padding(iced::Padding::ZERO.bottom(gap));
+        let mut content = Column::new();
+
+        content = content.push(below(self.day_panel()));
+
+        content = content.push(below(self.day_notes_view()));
+
+        let collapsibles = [
+            (
+                Section::Done,
+                "Completed",
+                self.show_done,
+                Message::ToggleShowDone,
+            ),
+            (
+                Section::Deleted,
+                "Deleted",
+                self.show_deleted,
+                Message::ToggleShowDeleted,
+            ),
+        ];
+        // Always there, even empty: a footer that comes and goes would jolt
+        // the page each time a first task lands in it or a last one leaves.
+        for (section, label, open, toggle) in collapsibles {
+            let tasks = self.placement.tasks(data, section);
+            content = content.push(below(self.collapsible(section, label, open, toggle, tasks)));
+        }
+
+        // The last place's gap is part of the padding at the bottom.
+        let page = container(
+            content
+                .padding(iced::Padding {
+                    bottom: theme::SPACING * 2.0 - gap,
+                    ..iced::Padding::new(theme::SPACING * 2.0)
+                })
+                .max_width(theme::today_width()),
+        )
+        .center_x(Fill);
+        let mut layers = stack![page];
+        if let Some(drag) = self.dragging()
+            && let Some(at) = drag.at
+            && let Some(task) = data.tasks.iter().find(|t| t.id == drag.id)
+        {
+            let ghost = container(card_content(task, data.today, None))
+                .padding(CARD_PADDING)
+                .width(theme::today_width() - theme::SPACING * 6.0)
+                .style(|t: &Theme| container::Style {
+                    shadow: iced::Shadow {
+                        color: Color::BLACK.scale_alpha(0.35),
+                        offset: iced::Vector::new(0.0, 6.0),
+                        blur_radius: 16.0,
+                    },
+                    ..card_box(false, true, false)(t)
+                });
+            // Inert: the pointer is on it, and must reach the targets below.
+            layers = layers.push(pin(inert(ghost)).position(Point::new(at.x - 40.0, at.y - 22.0)));
+        }
+        let mut area = mouse_area(layers);
+        if self.drag.is_some() {
+            area = area.on_move(Message::Moved);
+        }
+        scrollable(area).width(Fill).height(Fill).into()
+    }
+
+    /// The open or recently-closed form for `id`, if any (and whether it is
+    /// currently open).
+    fn form_for(&self, id: TaskId) -> (bool, Option<&'a EditForm>) {
+        if let Some(form) = self.editing.filter(|f| f.id == id) {
+            return (true, Some(form));
+        }
+        let closing = self
+            .closing
+            .iter()
+            .rev()
+            .find(|(f, _)| f.id == id)
+            .map(|(f, _)| f);
+        (false, closing)
+    }
+
+    /// The task being dragged (past the threshold), if any.
+    fn dragging(&self) -> Option<&'a Drag> {
+        self.drag.filter(|d| d.active)
+    }
+
     /// The shown day's notes, saved as you type: "Today's Notes" on today,
     /// "Notes" on any other day. While not being edited (and not empty)
     /// they show formatted; a click edits them.
-    fn day_notes_view<'a>(&'a self, data: &'a DayData) -> Element<'a, Message> {
-        let heading = if data.day == data.today {
+    fn day_notes_view(&self) -> Element<'a, Message> {
+        let heading = if self.data.day == self.data.today {
             "Today's Notes"
         } else {
             "Notes"
         };
-        let editor = rich_editor(&self.notes, Message::EditDayNotes)
+        let editor = rich_editor(self.notes, Message::EditDayNotes)
             .id(NOTES_ID)
             .placeholder("What's on your mind?")
             .on_link(Message::OpenLink)
@@ -1105,7 +1230,7 @@ impl DayView {
             .size(theme::TEXT_BODY);
         let mut body = Column::new().spacing(8).push(editor);
         if let Some(prompt) =
-            rich_notes::link_prompt(&self.notes, NOTES_LINK_ID, Message::EditDayNotes)
+            rich_notes::link_prompt(self.notes, NOTES_LINK_ID, Message::EditDayNotes)
         {
             body = body.push(prompt);
         }
@@ -1122,7 +1247,8 @@ impl DayView {
     /// the weekday (accent on today), the date, the `+` and the load bar;
     /// under it the day's cards (or "Nothing planned") and the add-a-task
     /// input.
-    fn day_panel<'a>(&'a self, data: &'a DayData) -> Element<'a, Message> {
+    fn day_panel(&self) -> Element<'a, Message> {
+        let data = self.data;
         let name_style: fn(&Theme) -> text::Style = if data.day == data.today {
             theme::accent
         } else {
@@ -1158,7 +1284,7 @@ impl DayView {
         let day_tasks = self.placement.tasks(data, Section::Day);
         // Recommended tasks are the day's too: no "Nothing planned" then.
         let has_recommended = !self.placement.tasks(data, Section::Recommended).is_empty();
-        let quick_add = text_input("Add a task", &self.quick_add)
+        let quick_add = text_input("Add a task", self.quick_add)
             .id(QUICK_ADD_ID)
             .on_input(Message::EditQuickAdd)
             .on_submit(Message::SubmitQuickAdd)
@@ -1172,11 +1298,11 @@ impl DayView {
         )
         .padding(iced::Padding::ZERO.bottom(theme::SPACING / 2.0));
         let body = column![
-            self.recommended_part(data),
+            self.recommended_part(),
             motion::fold(day_tasks.is_empty() && !has_recommended, nothing).key(day_key(data.day)),
-            self.sortable_rows(day_tasks, data),
+            self.sortable_rows(day_tasks),
             quick_add,
-            self.overdue_part(data),
+            self.overdue_part(),
         ];
         panel::panel(head.into(), Some(body.into()))
     }
@@ -1185,7 +1311,8 @@ impl DayView {
     /// small heading, numbered, with a hairline between them and the rest
     /// of the day's tasks. Unfolds when there are any (or while they are
     /// being picked) and folds away after the last.
-    fn recommended_part<'a>(&'a self, data: &'a DayData) -> Element<'a, Message> {
+    fn recommended_part(&self) -> Element<'a, Message> {
+        let data = self.data;
         let recommended = self.placement.tasks(data, Section::Recommended);
         let picking = recommended.is_empty() && data.recommending && data.day >= data.today;
         let shown = !recommended.is_empty() || picking;
@@ -1209,7 +1336,7 @@ impl DayView {
             .style(theme::muted);
         let part = column![
             label,
-            self.rows(Section::Recommended, recommended, data, true),
+            self.rows(Section::Recommended, recommended, true),
             motion::fold(picking, picking_note),
             // The column's spacing is above it already.
             container(rule::horizontal(1).style(divider))
@@ -1226,7 +1353,8 @@ impl DayView {
     /// The bottom of the day's panel (today only): the overdue tasks under
     /// a small red heading, below a hairline. Unfolds when there are any
     /// and folds away after the last.
-    fn overdue_part<'a>(&'a self, data: &'a DayData) -> Element<'a, Message> {
+    fn overdue_part(&self) -> Element<'a, Message> {
+        let data = self.data;
         let overdue = self.placement.tasks(data, Section::Overdue);
         let shown = !overdue.is_empty();
         let mut label = row![
@@ -1248,7 +1376,7 @@ impl DayView {
             container(rule::horizontal(1).style(divider))
                 .padding(iced::Padding::ZERO.top(theme::SPACING)),
             label,
-            self.rows(Section::Overdue, overdue, data, false),
+            self.rows(Section::Overdue, overdue, false),
         ]
         .spacing(8);
         // Its last task fades away before it folds.
@@ -1258,22 +1386,10 @@ impl DayView {
             .into()
     }
 
-    /// Shows a suggested priority on the inline form of task `id`.
-    pub fn set_suggested(&mut self, id: TaskId, priority: Option<Priority>) {
-        if let Some(form) = self.editing.as_mut().filter(|f| f.id == id) {
-            form.suggested = priority;
-        }
-    }
-
-    /// The task being dragged (past the threshold), if any.
-    fn dragging(&self) -> Option<&Drag> {
-        self.drag.as_ref().filter(|d| d.active)
-    }
-
     /// A section's tasks as shown: with those that just left it back in
     /// their places, to be drawn going.
-    fn shown<'a>(
-        &'a self,
+    fn shown(
+        &self,
         section: Section,
         tasks: Vec<&'a Task>,
     ) -> Vec<(&'a Task, Option<&'a Departure>)> {
@@ -1286,7 +1402,7 @@ impl DayView {
 
     /// A row of `section`'s [`motion::list`]: going if it `left`, else
     /// coming from where it was if it just arrived.
-    fn item<'a>(
+    fn item(
         &self,
         section: Section,
         task: &Task,
@@ -1309,25 +1425,22 @@ impl DayView {
     }
 
     /// A list for a section's rows, `spacing` apart.
-    fn list<'a>(data: &DayData, spacing: f32) -> motion::List<'a, Message> {
+    fn list(&self, spacing: f32) -> motion::List<'a, Message> {
         motion::list()
             .spacing(spacing)
-            .key(day_key(data.day))
+            .key(day_key(self.data.day))
             .fade_from(theme::soft_fill)
     }
 
     /// The Tasks section's rows: open cards drag to rearrange; the open
     /// form stays as it is. A thin strip after the last card takes drops
     /// at the end.
-    fn sortable_rows<'a>(
-        &'a self,
-        tasks: Vec<&'a Task>,
-        data: &'a DayData,
-    ) -> Element<'a, Message> {
+    fn sortable_rows(&self, tasks: Vec<&'a Task>) -> Element<'a, Message> {
+        let data = self.data;
         let dragging = self.dragging();
         let over = dragging.and_then(|d| d.over);
         let any = !tasks.is_empty();
-        let mut list = Self::list(data, 3.0);
+        let mut list = self.list(3.0);
         for (task, left) in self.shown(Section::Day, tasks) {
             let id = task.id;
             let row: Element<'a, Message> = if left.is_some() {
@@ -1402,15 +1515,15 @@ impl DayView {
     /// A collapsed section: a panel whose title bar opens it (arrow, name,
     /// count), with Delete all at the right of Deleted's when open and
     /// something is in it.
-    fn collapsible<'a>(
-        &'a self,
+    fn collapsible(
+        &self,
         section: Section,
         label: &'a str,
         open: bool,
         toggle: Message,
         tasks: Vec<&'a Task>,
-        data: &'a DayData,
     ) -> Element<'a, Message> {
+        let data = self.data;
         let toggle = button(
             row![
                 theme::disclosure(open),
@@ -1449,13 +1562,13 @@ impl DayView {
         // Built closed too, to be drawn folding away.
         let empty = tasks.is_empty();
         let list = if section == Section::Deleted {
-            let mut list = Self::list(data, 6.0);
+            let mut list = self.list(6.0);
             for (task, left) in self.shown(section, tasks) {
                 list = list.push(self.item(section, task, left, deleted_row(task)));
             }
             list.into()
         } else {
-            self.rows(section, tasks, data, false)
+            self.rows(section, tasks, false)
         };
         let nothing = text(match section {
             Section::Done => "Nothing completed",
@@ -1474,14 +1587,9 @@ impl DayView {
 
     /// The rows of a section. `ranked` (the Recommended section only)
     /// numbers them 1, 2, 3 in the order shown.
-    fn rows<'a>(
-        &'a self,
-        section: Section,
-        tasks: Vec<&'a Task>,
-        data: &'a DayData,
-        ranked: bool,
-    ) -> Element<'a, Message> {
-        let mut list = Self::list(data, 6.0);
+    fn rows(&self, section: Section, tasks: Vec<&'a Task>, ranked: bool) -> Element<'a, Message> {
+        let data = self.data;
+        let mut list = self.list(6.0);
         let mut rank = 0;
         for (task, left) in self.shown(section, tasks) {
             // A task opening into its form expands smoothly from its card,
@@ -2774,10 +2882,10 @@ mod tests {
             iced::Pixels(14.0),
         ));
         let limits = layout::Limits::new(Size::ZERO, WINDOW);
-        // The scrollable's content: the first node down with siblings'
-        // parent, i.e. below the single-child wrappers.
+        // The current day's scrollable content: step into slot 0 of the root
+        // `motion::slide`, then below the single-child wrappers.
         fn content(node: &layout::Node) -> f32 {
-            let mut n = node;
+            let mut n = node.children().first().unwrap_or(node);
             while let [only] = n.children() {
                 n = only;
             }
@@ -2893,5 +3001,25 @@ mod tests {
             hs.iter().filter(|&&h| h < before - 1.0 && h > last).count() >= 3,
             "{hs:?}"
         );
+    }
+
+    #[test]
+    fn switching_days_keeps_the_outgoing_day_for_the_slide() {
+        let mut view = loaded(vec![task(1, "monday task", Some(today()))]);
+        assert!(view.previous.is_none());
+        // Open a task card and switch to the next day: the outgoing day keeps
+        // its data and open card for the slide while the new day starts clean.
+        view.update(Message::Expand(1));
+        assert!(view.editing.is_some());
+        let tomorrow = date(2026, 11, 19);
+        view.load(data_for(
+            tomorrow,
+            vec![task(2, "tuesday task", Some(tomorrow))],
+        ));
+        assert!(view.editing.is_none());
+        let prev = view.previous.as_ref().expect("outgoing day kept for slide");
+        assert_eq!(prev.data.day, today());
+        assert_eq!(prev.editing.as_ref().map(|f| f.id), Some(1));
+        let _ = view.view();
     }
 }

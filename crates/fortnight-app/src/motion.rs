@@ -1586,11 +1586,11 @@ impl<'a, M: 'a, T: 'a, R: renderer::Renderer + 'a> From<Expand<'a, M, T, R>>
 
 // ------------------------------------------------------------------ slide
 
-/// A side-by-side page carousel for switching periods (horizontal for weeks,
-/// or `.vertical()` for months). When `page` changes, `previous` slides
-/// smoothly out while `current` glides in right beside it using pure GPU
-/// translation (zero per-frame relayout, zero blank flash). Rapid clicks and
-/// mid-slide reversals pick up seamlessly from the exact current offset.
+/// A side-by-side page carousel for switching periods (horizontal for days
+/// and weeks, or `.vertical()` for months). When `page` changes, `previous`
+/// slides smoothly out while `current` glides in right beside it using pure
+/// GPU translation (zero per-frame relayout, zero blank flash). Rapid clicks
+/// and mid-slide reversals pick up seamlessly from the exact current offset.
 pub fn slide<'a, M: 'a, T: 'a, R: renderer::Renderer + 'a>(
     page: i64,
     current: impl Into<Element<'a, M, T, R>>,
@@ -1705,9 +1705,12 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Slide<'_, M, T, R> {
                 state.run.skip();
             }
             // Move the outgoing page's widget tree into slot 1 so it keeps
-            // its state (e.g. an open summary panel) while sliding away.
+            // its state (e.g. scroll position, open card, or summary panel)
+            // while sliding away, and start the incoming page with fresh state.
             if tree.children.len() == 2 {
-                tree.children.swap(0, 1);
+                let outgoing =
+                    std::mem::replace(&mut tree.children[0], Tree::new(&self.children[0]));
+                tree.children[1] = outgoing;
             }
         }
         tree.diff_children(&self.children);
@@ -2552,5 +2555,28 @@ mod tests {
         // Previous month enters from above (`-(height + gap) = -206`).
         stage.set(make(1, true));
         assert_eq!(stage.state::<SlideState>().offset().unwrap().0, -206.0);
+    }
+
+    #[test]
+    fn slide_preserves_outgoing_tree_and_starts_incoming_fresh() {
+        let page = |p: i64, open: bool, prev_open: Option<bool>| -> El<'static> {
+            let cur = fold(open, space().width(400).height(100));
+            let prev = prev_open.map(|o| fold(o, space().width(400).height(100)).into());
+            slide(p, cur, prev).into()
+        };
+        let mut stage = Stage::new(page(1, true, None));
+        let t0 = Instant::now();
+        assert!(!stage.frame(t0));
+        // Page 1 starts open (laid out at height 100). Switch to page 2 (closed):
+        // slot 1 keeps page 1's settled open tree, slot 0 starts cleanly closed
+        // at rest rather than animating closed from page 1's state.
+        stage.set(page(2, false, Some(true)));
+        let outgoing = stage.tree.children[1].state.downcast_ref::<UnfoldState>();
+        let incoming = stage.tree.children[0].state.downcast_ref::<UnfoldState>();
+        assert!(outgoing.open);
+        assert_eq!(outgoing.height, 100.0);
+        assert!(!incoming.open);
+        assert!(incoming.settled);
+        assert_eq!(incoming.run.progress(ms(100)), 1.0);
     }
 }

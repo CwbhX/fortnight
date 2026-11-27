@@ -852,16 +852,12 @@ impl Ready {
         main.height(Fill).into()
     }
 
-    /// Which page the open tab shows, for `motion::Appear::page`: the tab,
-    /// and the period it shows as a number that grows with time.
+    /// Which tab is open, for `motion::Appear::page`: changing tabs plays the
+    /// rise-and-fade, while period changes slide inside each tab's own view
+    /// (`motion::slide`) so they are not double-animated.
     fn page_number(&self) -> (u32, i64) {
-        let months = |d: Date| i64::from(d.year()) * 12 + i64::from(d.month());
-        let days = |d: Date| months(d) * 31 + i64::from(d.day());
         match self.tab {
-            Tab::Today => (0, days(self.selected)),
-            // Week and Month period changes slide inside their own views
-            // (`motion::slide`); keeping the position constant here preserves
-            // the tab-switch rise without double-animating period changes.
+            Tab::Today => (0, 0),
             Tab::Week => (1, 0),
             Tab::Month => (2, 0),
         }
