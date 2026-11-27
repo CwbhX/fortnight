@@ -279,6 +279,8 @@ impl App {
                 // model lists as opening it would.
                 let (models, focus) = if ready.settings_open {
                     (load_models(), Task::none())
+                } else if ready.search_open {
+                    (Task::none(), SearchView::focus().map(Message::Search))
                 } else {
                     (Task::none(), operation::focus(day::QUICK_ADD_ID))
                 };
@@ -441,7 +443,9 @@ impl Ready {
         let tz = TimeZone::system();
         let today = Timestamp::now().to_zoned_datetime(tz.clone()).date();
         let keys = Keys::open(&dir);
-        let (tab, settings_open) = dev::start_page();
+        let (tab, settings_open, search_open) = dev::start_page();
+        let mut week_view = WeekView::new();
+        week_view.set_summary_open(dev::open_summary());
         // One writer at a time (PLAN.md 3.5): warn, never refuse.
         let (lock, notice) = match datadir::acquire_lock(&dir) {
             Ok((lock, None)) => (Some(lock), None),
@@ -477,10 +481,10 @@ impl Ready {
             dialog: None,
             date_picker: None,
             settings_open,
-            search_open: false,
+            search_open,
             shortcuts_open: false,
             day_view: DayView::new(),
-            week_view: WeekView::new(),
+            week_view,
             month_view: MonthView::new(),
             settings_view: SettingsView::new(),
             search_view: SearchView::new(),

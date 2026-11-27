@@ -14,17 +14,27 @@ Your tasks and their history stay in one SQLite file on your machine. Fortnight 
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/week-dark.png">
-  <img src="assets/screenshots/week.png" alt="Week tab: a column per working day with load bars and priority marks, and the Weekly Summary below">
+  <img src="assets/screenshots/week.png" alt="Week tab: a column per working day with load bars, priority marks, repeating and private badges, and the Weekly Summary below">
 </picture>
 
 <table>
   <tr>
-    <td width="50%"><img src="assets/screenshots/today.png" alt="Today tab: three numbered recommended tasks, an overdue expense report and the day's tasks"></td>
-    <td width="50%"><img src="assets/screenshots/month.png" alt="Month tab: November as a calendar with done shares per day"></td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/today-dark.png">
+        <img src="assets/screenshots/today.png" alt="Today tab: three numbered recommended tasks, repeating and private tasks, quick add, overdue task in red, and Today's Notes">
+      </picture>
+    </td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/month-dark.png">
+        <img src="assets/screenshots/month.png" alt="Month tab: November as a calendar with done shares per day and weekly summary dots">
+      </picture>
+    </td>
   </tr>
   <tr>
-    <td>Today: recommended tasks, overdue tasks in red, and quick add.</td>
-    <td>Month: every task in the month, with the share done on each day.</td>
+    <td>Today: recommended tasks, recurring and private items, quick add, overdue tasks in red, and Today's Notes.</td>
+    <td>Month: every task in the month, with the share done on each day and dots on weeks with summaries.</td>
   </tr>
 </table>
 
@@ -82,6 +92,11 @@ A task has notes, subtasks, an estimate, a priority, a planned day, a deadline, 
 ### Search and project filter
 
 Press `Cmd+K` / `Ctrl+K`, `/` or click the magnifying glass in the top bar to search across task titles, notes, projects and day notes, filter by `#project`, and jump straight to any result.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/search-dark.png">
+  <img src="assets/screenshots/search.png" alt="Quick search overlay with project filter chips, Open/All toggle, and matching tasks">
+</picture>
 
 ### Weekly Summary
 
@@ -291,7 +306,8 @@ The app also reads these, for development:
 
 | Variable | Meaning |
 |---|---|
-| `FORTNIGHT_PAGE` | `today`, `week`, `month` or `settings`: the tab to open. |
+| `FORTNIGHT_PAGE` | `today`, `week`, `month`, `settings` or `search`: the tab or overlay to open. |
+| `FORTNIGHT_OPEN_SUMMARY` | `1` starts the Week tab with the Weekly Summary unfolded. |
 | `FORTNIGHT_THEME` | `light` or `dark`, instead of the system theme. |
 | `FORTNIGHT_SCREENSHOT` | A file path. The app saves a screenshot of its window there as raw RGBA after two seconds, then quits. `python3 -I tools/raw2png.py <file> out.png` turns it into a PNG. |
 | `FORTNIGHT_SCREENSHOT_DELAY` | Seconds to wait before the screenshot, instead of two. |

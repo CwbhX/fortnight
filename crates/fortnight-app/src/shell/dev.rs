@@ -78,13 +78,20 @@ pub(crate) fn save_screenshot(shot: iced::window::Screenshot) -> Task<Message> {
     iced::exit()
 }
 
-/// The tab to start on, and whether Settings starts open
-/// (`FORTNIGHT_PAGE=today|week|month|settings`).
-pub(crate) fn start_page() -> (Tab, bool) {
+/// The tab to start on, and whether Settings or Search starts open
+/// (`FORTNIGHT_PAGE=today|week|month|settings|search`).
+pub(crate) fn start_page() -> (Tab, bool, bool) {
     match std::env::var("FORTNIGHT_PAGE").as_deref() {
-        Ok("week") => (Tab::Week, false),
-        Ok("month") => (Tab::Month, false),
-        Ok("settings") => (Tab::Today, true),
-        _ => (Tab::Today, false),
+        Ok("week") => (Tab::Week, false, false),
+        Ok("month") => (Tab::Month, false, false),
+        Ok("settings") => (Tab::Today, true, false),
+        Ok("search") => (Tab::Today, false, true),
+        _ => (Tab::Today, false, false),
     }
+}
+
+/// Dev aid: `FORTNIGHT_OPEN_SUMMARY=1` starts the Week tab with the Weekly
+/// Summary card unfolded (for screenshots).
+pub(crate) fn open_summary() -> bool {
+    std::env::var("FORTNIGHT_OPEN_SUMMARY").as_deref() == Ok("1")
 }

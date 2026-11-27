@@ -179,6 +179,11 @@ impl WeekView {
         Self::default()
     }
 
+    /// Sets whether the Weekly Summary card starts unfolded (used by dev hooks).
+    pub fn set_summary_open(&mut self, open: bool) {
+        self.summary_open = open;
+    }
+
     /// Replaces what the view shows. `main.rs` calls this after EVERY
     /// message (and on the minute tick and each streamed piece of text), so
     /// it must be cheap: if `data` equals what the view already has, return
