@@ -91,7 +91,7 @@ A task has notes, subtasks, an estimate, a priority, a planned day, a deadline, 
 
 ### Search and project filter
 
-Press `Cmd+K` / `Ctrl+K`, `/` or click the magnifying glass in the top bar to search across task titles, notes, projects and day notes, filter by `#project`, and jump straight to any result.
+Press `Cmd+F` / `Ctrl+F`, `/` or click the magnifying glass in the top bar to search across task titles, notes, projects and day notes, filter by `#project`, and jump straight to any result.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/search-dark.png">
@@ -133,7 +133,7 @@ Single keys work when no text field has focus. Press Escape to leave a text fiel
 | `←` `→` | Previous or next day, week or month |
 | `T` | Jump to today |
 | `N` or `Ctrl/Cmd+N` | Go to the quick-add bar |
-| `/` or `Ctrl/Cmd+K` | Search and filter by project |
+| `/` or `Ctrl/Cmd+F` | Search and filter by project |
 | `↑` `↓` | Move the selection in Today or Search |
 | `Space` | Mark the selected task done or not done |
 | `Enter` | Open the selected task to edit it |

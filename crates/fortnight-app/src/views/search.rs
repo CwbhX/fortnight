@@ -1,4 +1,4 @@
-//! Quick Search & Project Filter overlay (`⌘K` or `/`).
+//! Quick Search & Project Filter overlay (`⌘F` or `/`).
 //!
 //! Lets the user search across tasks (title, project, notes) and day notes
 //! (`LogLine`), filter by `#project` chip, toggle between open tasks and all

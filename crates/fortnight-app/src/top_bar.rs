@@ -230,7 +230,7 @@ pub fn view<'a>(bar: Bar<'a>) -> Element<'a, Message> {
     .align_y(Center);
 
     let mut right = row![].spacing(2).align_y(Center);
-    right = right.push(icon_button(Icon::Search, Message::Search, "Search (⌘K)"));
+    right = right.push(icon_button(Icon::Search, Message::Search, "Search (⌘F)"));
     match bar.lock {
         Some(LockIcon::Unlocked) => {
             right = right.push(icon_button(Icon::Unlock, Message::Lock, "API key unlocked"));

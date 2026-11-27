@@ -21,7 +21,7 @@ const NAVIGATION_SHORTCUTS: &[(&str, &str)] = &[
     ("1 / 2 / 3", "Today, Week, Month"),
     ("← / →", "Previous / Next period"),
     ("T", "Jump to today"),
-    ("⌘K or /", "Search & filter"),
+    ("⌘F or /", "Search & filter"),
     ("⌘,", "Settings"),
     ("?", "Keyboard shortcuts"),
     ("Esc", "Close dialog / panel"),

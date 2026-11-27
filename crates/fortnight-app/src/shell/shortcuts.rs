@@ -37,7 +37,7 @@ pub(crate) fn shortcut_for(key: Key<&str>, modifiers: keyboard::Modifiers) -> Op
             Key::Character("3") => Some(Shortcut::Tab(Tab::Month)),
             Key::Character(",") => Some(Shortcut::Settings),
             Key::Character("n" | "N") => Some(Shortcut::FocusQuickAdd),
-            Key::Character("k" | "K") => Some(Shortcut::Search),
+            Key::Character("f" | "F") => Some(Shortcut::Search),
             Key::Character("z" | "Z") if modifiers.shift() => Some(Shortcut::Redo),
             Key::Character("z" | "Z") => Some(Shortcut::Undo),
             Key::Character("y" | "Y") if !modifiers.shift() => Some(Shortcut::Redo),
@@ -194,7 +194,7 @@ mod tests {
         );
         assert_eq!(key(Key::Character("t"), none), Some(Shortcut::Today));
         assert_eq!(key(Key::Character("n"), cmd), Some(Shortcut::FocusQuickAdd));
-        assert_eq!(key(Key::Character("k"), cmd), Some(Shortcut::Search));
+        assert_eq!(key(Key::Character("f"), cmd), Some(Shortcut::Search));
         assert_eq!(key(Key::Character("/"), none), Some(Shortcut::Search));
         assert_eq!(
             key(Key::Character("?"), Modifiers::SHIFT),
