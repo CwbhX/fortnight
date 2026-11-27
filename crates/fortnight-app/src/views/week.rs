@@ -228,12 +228,9 @@ impl WeekView {
                 Action::None
             }
             Message::Panel(m) => {
-                let unfold = matches!(
-                    m,
-                    report_panel::Message::StartEdit | report_panel::Message::ToggleFacts
-                );
+                let unfold = matches!(m, report_panel::Message::StartEdit);
                 let action = self.panel.update(m);
-                if unfold && (self.panel.is_editing() || self.panel.showing_facts()) {
+                if unfold && self.panel.is_editing() {
                     self.summary_open = true;
                 }
                 match action {
@@ -1522,7 +1519,6 @@ mod tests {
             blocked: None,
             empty: false,
             stale: true,
-            facts_md: "## Facts\n- Done item".into(),
         });
         let week = d.week;
         v.load(d);
@@ -1532,13 +1528,6 @@ mod tests {
             ))),
             Action::Panel(report_panel::Action::Generate(ReportKind::Summary, week))
         );
-        // Toggling facts unfolds the Weekly Summary card even without a ready summary.
-        assert!(!v.summary_open);
-        assert_eq!(
-            v.update(Message::Panel(report_panel::Message::ToggleFacts)),
-            Action::None
-        );
-        assert!(v.summary_open);
         let _ = v.view();
     }
 

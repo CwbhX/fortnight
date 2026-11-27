@@ -238,7 +238,6 @@ impl Ready {
 
     pub(super) fn panel_data(&mut self, week: WeekRef) -> ReportPanelData {
         let blocked = self.blocked();
-        let today = self.today();
         let mut slots = Vec::new();
         for kind in self.panel_kinds(week) {
             let key = ReportKey {
@@ -247,27 +246,6 @@ impl Ready {
             };
             let versions = self.versions(key);
             let (empty, stale) = self.freshness(kind, week, &versions);
-            let facts_md = if empty {
-                String::new()
-            } else {
-                match kind {
-                    ReportKind::Summary => {
-                        let facts =
-                            report::summary_facts(&self.tasks, &self.events, week, today, &self.tz);
-                        report::summary_facts_markdown(&facts)
-                    }
-                    ReportKind::Plan => {
-                        let facts = report::plan_facts(
-                            &self.tasks,
-                            &self.events,
-                            week,
-                            today,
-                            &self.settings,
-                        );
-                        report::plan_facts_markdown(&facts)
-                    }
-                }
-            };
             slots.push(ReportSlot {
                 kind,
                 versions,
@@ -275,7 +253,6 @@ impl Ready {
                 blocked: blocked.clone(),
                 empty,
                 stale,
-                facts_md,
             });
         }
         ReportPanelData { week, slots }

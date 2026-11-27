@@ -85,7 +85,7 @@ Press `Cmd+K` / `Ctrl+K`, `/` or click the magnifying glass in the top bar to se
 
 ### Weekly Summary
 
-Fortnight records every change to every task. The Weekly Summary uses that history and your notes (private tasks are excluded). It says what you finished, what moved forward, which deadlines changed and what is overdue. From its header you can copy it as Markdown, edit it inline, regenerate it, or switch to **Facts** to see the exact deterministic facts sent to the model.
+Fortnight records every change to every task. The Weekly Summary uses that history and your notes (private tasks are excluded). It says what you finished, what moved forward, which deadlines changed and what is overdue. From its header you can copy it as Markdown, edit it inline, or regenerate it.
 
 The summary updates by itself:
 

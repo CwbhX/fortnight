@@ -564,6 +564,8 @@ pub enum Icon {
     ListNumber,
     Link,
     Search,
+    Edit,
+    Refresh,
 }
 
 impl Icon {
@@ -586,6 +588,8 @@ impl Icon {
             Icon::ListNumber => include_bytes!("../../../assets/icons/list-number.svg"),
             Icon::Link => include_bytes!("../../../assets/icons/link.svg"),
             Icon::Search => include_bytes!("../../../assets/icons/search.svg"),
+            Icon::Edit => include_bytes!("../../../assets/icons/edit.svg"),
+            Icon::Refresh => include_bytes!("../../../assets/icons/refresh.svg"),
         }
     }
 }
