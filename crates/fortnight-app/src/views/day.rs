@@ -278,6 +278,9 @@ pub struct DayView {
     selected: Option<TaskId>,
     /// The expanded row's form.
     editing: Option<EditForm>,
+    /// Recently closed forms, kept briefly so the card can collapse smoothly
+    /// back into its closed row instead of vanishing into an empty gap.
+    closing: Vec<(EditForm, Instant)>,
     /// The shown day's notes.
     notes: rich_notes::Content,
     /// The day `notes` belong to.
@@ -621,6 +624,18 @@ impl DayView {
                 Some(_) => {}
             }
         }
+        let now = Instant::now();
+        let placement = &self.placement;
+        let data = self.data.as_ref();
+        self.closing.retain(|(f, at)| {
+            now.saturating_duration_since(*at) < CLOSING_LINGER
+                && data.is_some_and(|d| {
+                    !matches!(
+                        placement.section_of_id(d, f.id),
+                        None | Some(Section::Deleted)
+                    )
+                })
+        });
 
         if let Some(selected) = self.selected {
             let after = self.visible();
@@ -645,6 +660,7 @@ impl DayView {
             .filter(|old| (old.day, old.today) == (data.day, data.today))
         else {
             self.departures.clear();
+            self.closing.clear();
             return;
         };
         let now_in: std::collections::HashMap<TaskId, Section> = Section::ALL
@@ -702,11 +718,12 @@ impl DayView {
                 None => Action::None,
             },
             NavKey::Open => {
-                if let Some(task) = self.selected.and_then(|id| self.task(id))
+                if let Some(task) = self.selected.and_then(|id| self.task(id)).cloned()
                     && self.editing.as_ref().is_none_or(|f| f.id != task.id)
                     && let Some(data) = &self.data
                 {
-                    self.editing = Some(open_form(task, &data.tasks, data.week_start));
+                    let form = open_form(&task, &data.tasks, data.week_start);
+                    self.open_editing(form);
                     // The form replaces the card, which sends no exit.
                     self.hovered = None;
                 }
@@ -719,7 +736,7 @@ impl DayView {
                     // Only the form's due calendar closes.
                     form.calendar = None;
                 } else if self.editing.is_some() {
-                    self.editing = None;
+                    self.close_editing();
                     self.hovered = None;
                 } else {
                     self.selected = None;
@@ -813,10 +830,11 @@ impl DayView {
                 // The card is replaced by the form (or back) with no exit event.
                 self.hovered = None;
                 if self.editing.as_ref().is_some_and(|f| f.id == id) {
-                    self.editing = None;
+                    self.close_editing();
                     self.selected = None;
                 } else if let Some(task) = data.tasks.iter().find(|t| t.id == id) {
-                    self.editing = Some(open_form(task, &data.tasks, data.week_start));
+                    let form = open_form(task, &data.tasks, data.week_start);
+                    self.open_editing(form);
                     self.selected = Some(id);
                 }
                 Action::None
@@ -859,13 +877,14 @@ impl DayView {
                 };
                 match form.apply(task) {
                     Ok(updated) => {
-                        self.editing = None;
+                        let changed = &updated != task;
+                        self.close_editing();
                         self.selected = None;
                         self.hovered = None;
-                        if &updated == task {
-                            Action::None
-                        } else {
+                        if changed {
                             Action::Update(updated)
+                        } else {
+                            Action::None
                         }
                     }
                     Err(e) => {
@@ -876,6 +895,7 @@ impl DayView {
             }
             Message::Delete => match self.editing.take() {
                 Some(form) => {
+                    self.closing.retain(|(f, _)| f.id != form.id);
                     self.selected = None;
                     self.hovered = None;
                     Action::SetStatus(form.id, TaskStatus::Dropped)
@@ -883,7 +903,7 @@ impl DayView {
                 None => Action::None,
             },
             Message::Close => {
-                self.editing = None;
+                self.close_editing();
                 self.selected = None;
                 self.hovered = None;
                 Action::None
@@ -901,6 +921,40 @@ impl DayView {
             // Form edits with no form open.
             _ => Action::None,
         }
+    }
+
+    /// Moves the currently open form into `self.closing` so it can collapse
+    /// smoothly back into its closed row.
+    fn close_editing(&mut self) {
+        let now = Instant::now();
+        self.closing
+            .retain(|(_, at)| now.saturating_duration_since(*at) < CLOSING_LINGER);
+        if let Some(form) = self.editing.take() {
+            self.closing.retain(|(f, _)| f.id != form.id);
+            self.closing.push((form, now));
+        }
+    }
+
+    /// Opens `form`, smoothly closing any previously open form.
+    fn open_editing(&mut self, form: EditForm) {
+        self.close_editing();
+        self.closing.retain(|(f, _)| f.id != form.id);
+        self.editing = Some(form);
+    }
+
+    /// The open or recently-closed form for `id`, if any (and whether it is
+    /// currently open).
+    fn form_for(&self, id: TaskId) -> (bool, Option<&EditForm>) {
+        if let Some(form) = self.editing.as_ref().filter(|f| f.id == id) {
+            return (true, Some(form));
+        }
+        let closing = self
+            .closing
+            .iter()
+            .rev()
+            .find(|(f, _)| f.id == id)
+            .map(|(f, _)| f);
+        (false, closing)
     }
 
     fn task(&self, id: TaskId) -> Option<&Task> {
@@ -1282,14 +1336,13 @@ impl DayView {
                     .padding(CARD_PADDING)
                     .width(Fill)
                     .style(card_box(!task.status.is_open(), false, false));
-                motion::unfold(false, column![drop_line(false), card].spacing(3))
+                let card = motion::expand(false, card, None)
                     .key(id as u64)
-                    .into()
-            } else if let Some(form) = self.editing.as_ref().filter(|f| f.id == id) {
-                motion::unfold(true, edit_card(task, form, data.today))
-                    .key(id as u64)
-                    .into()
+                    .surface(open_card_fill)
+                    .radius(panel::CARD_RADIUS);
+                column![drop_line(false), card].spacing(3).into()
             } else {
+                let (open, form) = self.form_for(id);
                 let held = dragging.is_some_and(|d| d.id == id);
                 let line = !held && over == Some(Spot::Before(id));
                 let card = container(card_content(task, data.today, None))
@@ -1300,7 +1353,7 @@ impl DayView {
                         held || (dragging.is_none() && self.hovered == Some(id)),
                         self.selected == Some(id),
                     ));
-                let mut area = mouse_area(column![drop_line(line), card].spacing(3))
+                let closed = mouse_area(card)
                     .on_press(Message::Press(id))
                     .on_enter(Message::Enter(Spot::Before(id)))
                     .on_exit(Message::Leave(Spot::Before(id)))
@@ -1309,10 +1362,21 @@ impl DayView {
                     } else {
                         mouse::Interaction::Pointer
                     });
+                let opened = form.map(|f| edit_card(task, f, data.today));
+                let expanded = motion::expand(open, closed, opened)
+                    .key(id as u64)
+                    .surface(open_card_fill)
+                    .radius(panel::CARD_RADIUS);
+                let col = column![drop_line(line), expanded].spacing(3);
+                let mut area = mouse_area(col);
                 if dragging.is_some() {
-                    area = area.on_move(move |_| Message::Enter(Spot::Before(id)));
+                    area = area
+                        .on_enter(Message::Enter(Spot::Before(id)))
+                        .on_move(move |_| Message::Enter(Spot::Before(id)))
+                        .on_exit(Message::Leave(Spot::Before(id)))
+                        .interaction(mouse::Interaction::Grabbing);
                 }
-                motion::unfold(false, area).key(id as u64).into()
+                area.into()
             };
             list = list.push(self.item(Section::Day, task, left, row));
         }
@@ -1420,25 +1484,28 @@ impl DayView {
         let mut list = Self::list(data, 6.0);
         let mut rank = 0;
         for (task, left) in self.shown(section, tasks) {
-            // A task opening into its form grows from its card's height.
-            let (open, row) = match (left, &self.editing) {
+            // A task opening into its form expands smoothly from its card,
+            // and collapses back cleanly when closed.
+            let (open, closed, opened) = match left {
                 // Going: as it is now, with the rank it had.
-                (Some(d), _) => {
+                Some(d) => {
                     let rank = ranked.then_some(d.index + 1);
-                    (false, task_row(task, data.today, false, rank))
+                    (false, task_row(task, data.today, false, rank), None)
                 }
-                (None, Some(form)) if form.id == task.id => {
-                    rank += 1;
-                    (true, edit_card(task, form, data.today))
-                }
-                (None, _) => {
+                None => {
                     rank += 1;
                     let selected = self.selected == Some(task.id);
                     let rank = ranked.then_some(rank);
-                    (false, task_row(task, data.today, selected, rank))
+                    let closed = task_row(task, data.today, selected, rank);
+                    let (open, form) = self.form_for(task.id);
+                    let opened = form.map(|f| edit_card(task, f, data.today));
+                    (open, closed, opened)
                 }
             };
-            let row = motion::unfold(open, row).key(task.id as u64);
+            let row = motion::expand(open, closed, opened)
+                .key(task.id as u64)
+                .surface(open_card_fill)
+                .radius(panel::CARD_RADIUS);
             list = list.push(self.item(section, task, left, row));
         }
         list.into()
@@ -1494,6 +1561,14 @@ fn day_notes(data: &DayData, day: Date) -> String {
 
 /// How long typing must pause before Today's Notes are saved.
 const NOTES_SAVE_DELAY: Duration = Duration::from_millis(1200);
+
+/// How long a recently closed edit form is kept so the card can collapse
+/// smoothly back into its closed row.
+const CLOSING_LINGER: Duration = Duration::from_millis(600);
+
+fn open_card_fill(theme: &Theme) -> Color {
+    panel::card_fill(theme, false, false)
+}
 
 /// Padding inside a task card (and the inputs that sit with them).
 const CARD_PADDING: [u16; 2] = [10, 12];
@@ -1763,20 +1838,12 @@ fn edit_card<'a>(task: &'a Task, form: &'a EditForm, today: Date) -> Element<'a,
         .align_y(Center),
     );
 
-    // A little air above and below so the card doesn't touch its
-    // neighbours (rows sit 2 px apart).
-    container(
-        container(body)
-            .padding(theme::SPACING * 1.25)
-            .width(Fill)
-            .style(|theme: &Theme| container::Style {
-                background: Some(panel::card_fill(theme, false, false).into()),
-                border: border::rounded(panel::CARD_RADIUS),
-                ..container::Style::default()
-            }),
-    )
-    .padding([theme::SPACING / 2.0, 0.0])
-    .into()
+    // The rounded card surface is drawn by `motion::expand`, so the form
+    // interior sits cleanly inside it with no corner clipping while animating.
+    container(body)
+        .padding(theme::SPACING * 1.25)
+        .width(Fill)
+        .into()
 }
 
 #[cfg(test)]

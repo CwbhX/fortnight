@@ -89,6 +89,8 @@ impl EditForm {
             .map(parse::format_estimate)
             .unwrap_or_default();
         let (subtasks, text) = split_notes(&task.notes);
+        let notes = rich_notes::Content::with_text(&text);
+        let original_notes = notes.text().trim().to_string();
         Self {
             id: task.id,
             title: task.title.clone(),
@@ -104,16 +106,10 @@ impl EditForm {
             priority_picked: false,
             subtasks: subtasks.clone(),
             new_subtask: String::new(),
-            notes: rich_notes::Content::with_text(&text),
+            notes,
             // As the editor writes them (Markdown is tidied), so untouched
             // notes count as unchanged.
-            original_split: (
-                subtasks,
-                rich_notes::Content::with_text(&text)
-                    .text()
-                    .trim()
-                    .to_string(),
-            ),
+            original_split: (subtasks, original_notes),
             error: None,
         }
     }

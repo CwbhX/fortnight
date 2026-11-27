@@ -62,6 +62,10 @@ const DIM: Duration = Duration::from_millis(180);
 const PILL: Duration = Duration::from_millis(220);
 /// How long something takes to open to its full height, or close.
 const UNFOLD: Duration = Duration::from_millis(220);
+/// How long an inline task card takes to expand into its form, and to close
+/// back down (closing is slightly brisker so it feels snappy).
+const EXPAND_OPEN: Duration = Duration::from_millis(240);
+const EXPAND_CLOSE: Duration = Duration::from_millis(200);
 /// A page changed again this soon after the last change (a held arrow key,
 /// quick clicks) is shown at once.
 const QUIET: Duration = Duration::from_millis(300);
@@ -1006,9 +1010,10 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Unfold<'_, M, T, R> {
             state.from = full.height;
         }
         let t = ease_out(state.run.progress(UNFOLD));
-        // Whole pixels, so what follows it stays sharp as it moves.
+        // Half-pixel steps (whole physical pixels on 2x displays) so the
+        // decelerating tail settles without 2px jumps.
         state.height = if t < 1.0 {
-            lerp(state.from, target, t).round()
+            (lerp(state.from, target, t) * 2.0).round() * 0.5
         } else {
             target
         };
@@ -1047,9 +1052,12 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Unfold<'_, M, T, R> {
         if let Some(now) = frame_time(event) {
             let state = tree.state.downcast_mut::<UnfoldState>();
             let moving = state.run.frame(now, UNFOLD);
-            // The height changes on every frame of the run, and once more
-            // for the full height at its end.
-            if (moving || !state.settled) && state.asked != Some(now) {
+            let progress = state.run.progress(UNFOLD);
+            // The height changes once the run moves past 0, and once more
+            // for the full height at its end. Skipping frame 0 avoids a
+            // redundant full-window relayout on the click frame itself.
+            let needs_layout = (moving && progress > 0.0) || (!moving && !state.settled);
+            if needs_layout && state.asked != Some(now) {
                 state.asked = Some(now);
                 state.settled = !moving;
                 shell.invalidate_layout();
@@ -1159,6 +1167,413 @@ impl<'a, M: 'a, T: 'a, R: renderer::Renderer + 'a> From<Unfold<'a, M, T, R>>
 {
     fn from(unfold: Unfold<'a, M, T, R>) -> Self {
         Element::new(unfold)
+    }
+}
+
+// ----------------------------------------------------------------- expand
+
+/// A card that morphs smoothly between its `closed` row and its `opened`
+/// form: the rounded card surface resizes cleanly (keeping rounded bottom
+/// corners on every frame), while the closed row and the open form
+/// crossfade through the card fill. Pass `opened` while `open` is true and
+/// briefly while closing so the form collapses smoothly instead of
+/// disappearing into an empty gap.
+pub fn expand<'a, M: 'a, T: 'a, R: renderer::Renderer + 'a>(
+    open: bool,
+    closed: impl Into<Element<'a, M, T, R>>,
+    opened: Option<Element<'a, M, T, R>>,
+) -> Expand<'a, M, T, R> {
+    let has_opened = opened.is_some();
+    let opened = opened.unwrap_or_else(|| iced::widget::Space::new().into());
+    Expand {
+        children: [closed.into(), opened],
+        open,
+        has_opened,
+        key: 0,
+        radius: 0.0,
+        surface: None,
+    }
+}
+
+/// See [`expand`].
+pub struct Expand<'a, M, T, R> {
+    children: [Element<'a, M, T, R>; 2],
+    open: bool,
+    has_opened: bool,
+    key: u64,
+    radius: f32,
+    surface: Option<Behind<'a, T>>,
+}
+
+impl<'a, M, T, R> Expand<'a, M, T, R> {
+    pub fn key(mut self, key: u64) -> Self {
+        self.key = key;
+        self
+    }
+
+    /// Corner radius of the expanding card surface.
+    pub fn radius(mut self, radius: f32) -> Self {
+        self.radius = radius;
+        self
+    }
+
+    /// Card background fill drawn behind the open form and used as the
+    /// crossfade veil during opening and closing.
+    pub fn surface(mut self, fill: impl Fn(&T) -> Color + 'a) -> Self {
+        self.surface = Some(Box::new(fill));
+        self
+    }
+
+    fn duration(&self) -> Duration {
+        if self.open { EXPAND_OPEN } else { EXPAND_CLOSE }
+    }
+}
+
+struct ExpandState {
+    run: Run,
+    open: bool,
+    key: u64,
+    from_height: f32,
+    from_open: f32,
+    height: f32,
+    shown_open: f32,
+    measured: bool,
+    asked: Option<Instant>,
+    settled: bool,
+}
+
+impl ExpandState {
+    fn resting_open(&self) -> bool {
+        self.open && self.shown_open >= 1.0
+    }
+
+    fn resting_closed(&self) -> bool {
+        !self.open && self.shown_open <= 0.0
+    }
+}
+
+impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Expand<'_, M, T, R> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<ExpandState>()
+    }
+
+    fn state(&self) -> tree::State {
+        let shown_open = if self.open { 1.0 } else { 0.0 };
+        tree::State::new(ExpandState {
+            run: Run::finished(),
+            open: self.open,
+            key: self.key,
+            from_height: 0.0,
+            from_open: shown_open,
+            height: 0.0,
+            shown_open,
+            measured: false,
+            asked: None,
+            settled: true,
+        })
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        self.children.iter().map(Tree::new).collect()
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        let state = tree.state.downcast_mut::<ExpandState>();
+        if state.key != self.key {
+            state.key = self.key;
+            state.open = self.open;
+            state.run.skip();
+            state.shown_open = if self.open { 1.0 } else { 0.0 };
+            state.from_open = state.shown_open;
+            state.measured = false;
+            state.settled = true;
+        } else if self.open != state.open {
+            state.from_height = state.height;
+            state.from_open = state.shown_open;
+            state.open = self.open;
+            state.run.restart();
+            state.settled = false;
+        }
+        tree.diff_children(&self.children);
+    }
+
+    fn size(&self) -> Size<Length> {
+        Size::new(Length::Fill, Length::Shrink)
+    }
+
+    fn size_hint(&self) -> Size<Length> {
+        Size::new(Length::Fill, Length::Shrink)
+    }
+
+    fn layout(&mut self, tree: &mut Tree, renderer: &R, limits: &layout::Limits) -> layout::Node {
+        let closed =
+            self.children[0]
+                .as_widget_mut()
+                .layout(&mut tree.children[0], renderer, limits);
+        let opened =
+            self.children[1]
+                .as_widget_mut()
+                .layout(&mut tree.children[1], renderer, limits);
+        let target_size = if self.open {
+            opened.size()
+        } else {
+            closed.size()
+        };
+        let target_open = if self.open { 1.0 } else { 0.0 };
+        let dur = self.duration();
+        let state = tree.state.downcast_mut::<ExpandState>();
+        let t = ease_out(state.run.progress(dur));
+        if !state.measured || t >= 1.0 {
+            state.height = target_size.height;
+            state.shown_open = target_open;
+            state.measured = true;
+        } else {
+            // Half-pixel snapping keeps lines crisp on Retina while avoiding
+            // coarse 2-physical-pixel steps during the settle.
+            state.height = (lerp(state.from_height, target_size.height, t) * 2.0).round() * 0.5;
+            state.shown_open = lerp(state.from_open, target_open, t);
+        }
+        let width = closed.size().width.max(opened.size().width);
+        layout::Node::with_children(Size::new(width, state.height), vec![closed, opened])
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &R,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, M>,
+        viewport: &Rectangle,
+    ) {
+        let active = usize::from(self.open);
+        if let Some(child_layout) = layout.children().nth(active) {
+            let cursor = shown_cursor(cursor, layout.bounds());
+            self.children[active].as_widget_mut().update(
+                &mut tree.children[active],
+                event,
+                child_layout,
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+        }
+        if let Some(now) = frame_time(event) {
+            let dur = self.duration();
+            let state = tree.state.downcast_mut::<ExpandState>();
+            let moving = state.run.frame(now, dur);
+            let progress = state.run.progress(dur);
+            let needs_layout = (moving && progress > 0.0) || (!moving && !state.settled);
+            if needs_layout && state.asked != Some(now) {
+                state.asked = Some(now);
+                state.settled = !moving;
+                shell.invalidate_layout();
+            }
+            if moving {
+                shell.request_redraw();
+            }
+        }
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut R,
+        theme: &T,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        let mut children = layout.children();
+        let (Some(closed_layout), Some(opened_layout)) = (children.next(), children.next()) else {
+            return;
+        };
+        let state = tree.state.downcast_ref::<ExpandState>();
+        let bounds = layout.bounds();
+
+        // At rest, closed: draw the closed card directly with no extra layer.
+        if state.resting_closed() {
+            self.children[0].as_widget().draw(
+                &tree.children[0],
+                renderer,
+                theme,
+                style,
+                closed_layout,
+                cursor,
+                viewport,
+            );
+            return;
+        }
+
+        let fill = self.surface.as_ref().map(|f| f(theme));
+        if let Some(bg) = fill {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds,
+                    border: iced::border::rounded(self.radius),
+                    ..renderer::Quad::default()
+                },
+                bg,
+            );
+        }
+
+        // At rest, open: draw the open form directly inside its card surface.
+        if state.resting_open() {
+            self.children[1].as_widget().draw(
+                &tree.children[1],
+                renderer,
+                theme,
+                style,
+                opened_layout,
+                cursor,
+                viewport,
+            );
+            return;
+        }
+
+        // Animating: smoothly crossfade between the closed row and the open
+        // form through the rounded card fill.
+        let Some(clip) = bounds.intersection(viewport) else {
+            return;
+        };
+        let p = state.shown_open.clamp(0.0, 1.0);
+        const CROSS: f32 = 0.25;
+        if p < CROSS || !self.has_opened {
+            let fade = ease_out((p / CROSS).clamp(0.0, 1.0));
+            renderer.with_layer(clip, |renderer| {
+                self.children[0].as_widget().draw(
+                    &tree.children[0],
+                    renderer,
+                    theme,
+                    style,
+                    closed_layout,
+                    mouse::Cursor::Unavailable,
+                    &clip,
+                );
+                if let Some(bg) = fill
+                    && fade > 0.001
+                {
+                    renderer.with_layer(clip, |renderer| {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds,
+                                border: iced::border::rounded(self.radius),
+                                ..renderer::Quad::default()
+                            },
+                            bg.scale_alpha(fade),
+                        );
+                    });
+                }
+            });
+        } else {
+            // Keep a sliver of rounded bottom edge clear while sliding.
+            let inner = Rectangle {
+                height: (bounds.height - self.radius * 0.5).max(0.0),
+                ..bounds
+            };
+            let Some(inner_clip) = inner.intersection(viewport) else {
+                return;
+            };
+            let shown = ease_out(((p - CROSS) / 0.45).clamp(0.0, 1.0));
+            let veil = 1.0 - shown;
+            renderer.with_layer(inner_clip, |renderer| {
+                self.children[1].as_widget().draw(
+                    &tree.children[1],
+                    renderer,
+                    theme,
+                    style,
+                    opened_layout,
+                    mouse::Cursor::Unavailable,
+                    &inner_clip,
+                );
+                if let Some(bg) = fill
+                    && veil > 0.001
+                {
+                    renderer.with_layer(inner_clip, |renderer| {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: inner_clip,
+                                ..renderer::Quad::default()
+                            },
+                            bg.scale_alpha(veil),
+                        );
+                    });
+                }
+            });
+        }
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &R,
+        operation: &mut dyn Operation,
+    ) {
+        let active = usize::from(self.open);
+        if let Some(child_layout) = layout.children().nth(active) {
+            self.children[active].as_widget_mut().operate(
+                &mut tree.children[active],
+                child_layout,
+                renderer,
+                operation,
+            );
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &R,
+    ) -> mouse::Interaction {
+        let active = usize::from(self.open);
+        match layout.children().nth(active) {
+            Some(child_layout) => self.children[active].as_widget().mouse_interaction(
+                &tree.children[active],
+                child_layout,
+                shown_cursor(cursor, layout.bounds()),
+                viewport,
+                renderer,
+            ),
+            None => mouse::Interaction::None,
+        }
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &R,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, M, T, R>> {
+        if !self.open {
+            return None;
+        }
+        let opened = layout.children().nth(1)?;
+        self.children[1].as_widget_mut().overlay(
+            &mut tree.children[1],
+            opened,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+}
+
+impl<'a, M: 'a, T: 'a, R: renderer::Renderer + 'a> From<Expand<'a, M, T, R>>
+    for Element<'a, M, T, R>
+{
+    fn from(expand: Expand<'a, M, T, R>) -> Self {
+        Element::new(expand)
     }
 }
 
@@ -1619,5 +2034,59 @@ mod tests {
         stage.set(item(false, 8));
         assert_eq!(stage.node.size().height, 40.0);
         assert!(!stage.frame(Instant::now()));
+    }
+
+    fn card<'a>(open: bool, key: u64, has_opened: bool) -> El<'a> {
+        let closed = space().width(200).height(44);
+        let opened = has_opened.then(|| space().width(200).height(300).into());
+        expand(open, closed, opened)
+            .key(key)
+            .radius(6.0)
+            .surface(|_: &Theme| Color::BLACK)
+            .into()
+    }
+
+    #[test]
+    fn expanding_card_opens_closes_and_reverses_smoothly() {
+        let height = |stage: &Stage<'_>| stage.node.size().height;
+        let mut stage = Stage::new(card(false, 7, false));
+        let t0 = Instant::now();
+        assert!(!stage.frame(t0));
+        assert_eq!(height(&stage), 44.0);
+        assert_eq!(stage.state::<ExpandState>().shown_open, 0.0);
+
+        // Open: starts from closed height without an extra click-frame layout.
+        stage.set(card(true, 7, true));
+        assert_eq!(height(&stage), 44.0);
+        let layouts_before = stage.layouts;
+        let t1 = t0 + ms(1000);
+        assert!(stage.frame(t1));
+        assert_eq!(stage.layouts, layouts_before);
+        assert!(stage.frame(t1 + EXPAND_OPEN / 2));
+        assert!(height(&stage) > 170.0 && height(&stage) < 300.0);
+        assert!(!stage.frame(t1 + EXPAND_OPEN));
+        assert_eq!(height(&stage), 300.0);
+        assert_eq!(stage.state::<ExpandState>().shown_open, 1.0);
+
+        // Close: shrinks smoothly while the closing form stays mounted.
+        stage.set(card(false, 7, true));
+        assert_eq!(height(&stage), 300.0);
+        let t2 = t1 + ms(1000);
+        assert!(stage.frame(t2));
+        assert!(stage.frame(t2 + EXPAND_CLOSE / 2));
+        let mid_h = height(&stage);
+        let mid_p = stage.state::<ExpandState>().shown_open;
+        assert!(mid_h > 44.0 && mid_h < 180.0);
+        assert!(mid_p > 0.0 && mid_p < 0.5);
+
+        // Re-open mid-close: picks up from the current height & fade phase.
+        stage.set(card(true, 7, true));
+        assert_eq!(height(&stage), mid_h);
+        assert_eq!(stage.state::<ExpandState>().shown_open, mid_p);
+        let t3 = t2 + EXPAND_CLOSE / 2 + ms(16);
+        assert!(stage.frame(t3));
+        assert!(!stage.frame(t3 + EXPAND_OPEN));
+        assert_eq!(height(&stage), 300.0);
+        assert_eq!(stage.state::<ExpandState>().shown_open, 1.0);
     }
 }
