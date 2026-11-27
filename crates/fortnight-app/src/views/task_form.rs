@@ -15,15 +15,19 @@
 //! (or `Ctrl`), `⌘K` for a link, and lists started with `* `, `- ` or
 //! `1. ` that carry on with `Enter`.
 
-use fortnight_core::domain::{NewTask, Priority, Task, TaskId};
+use std::fmt;
+
+use fortnight_core::domain::{NewTask, Priority, Recurrence, Task, TaskId};
 use fortnight_core::notes::{Subtask, join_notes, split_notes};
 use fortnight_core::parse;
 use fortnight_core::week::add_months;
 use iced::widget::overlay::menu;
 use iced::widget::{
-    Column, Row, Space, button, checkbox, column, combo_box, container, row, text, text_input,
+    Column, Row, Space, button, checkbox, column, combo_box, container, pick_list, row, text,
+    text_input,
 };
-use iced::{Center, Color, Element, Fill, Theme, border};
+use iced::{Background, Border, Center, Color, Element, Fill, Theme, border};
+use jiff::ToSpan;
 use jiff::civil::{Date, Weekday};
 
 use super::day::Message;
@@ -59,6 +63,12 @@ pub struct EditForm {
     pub project: String,
     /// The projects of open tasks, for the project field's list.
     pub projects: combo_box::State<String>,
+    /// The planned day (where the task is shown).
+    pub planned: Option<Date>,
+    /// The month the planned-day calendar shows, while it is open.
+    pub planned_calendar: Option<Date>,
+    /// Whether the planned day was explicitly changed or cleared in the form.
+    planned_edited: bool,
     /// The deadline.
     pub due: Option<Date>,
     /// The month the calendar shows, while it is open.
@@ -74,6 +84,10 @@ pub struct EditForm {
     pub suggested: Option<Priority>,
     /// A priority was picked by hand: a suggestion no longer changes it.
     pub priority_picked: bool,
+    /// How often the task repeats when marked done.
+    pub recurrence: Option<Recurrence>,
+    /// Never sent to the LLM: excluded from every digest.
+    pub private: bool,
     pub(super) subtasks: Vec<Subtask>,
     pub new_subtask: String,
     /// The notes without the subtasks.
@@ -96,6 +110,9 @@ impl EditForm {
             title: task.title.clone(),
             project: task.project.clone().unwrap_or_default(),
             projects: combo_box::State::default(),
+            planned: task.planned_for,
+            planned_calendar: None,
+            planned_edited: false,
             due: task.due_on,
             calendar: None,
             week_start: Weekday::Monday,
@@ -104,6 +121,8 @@ impl EditForm {
             priority: priority_level(task.priority),
             suggested: None,
             priority_picked: false,
+            recurrence: task.recurrence,
+            private: task.private,
             subtasks: subtasks.clone(),
             new_subtask: String::new(),
             notes,
@@ -116,9 +135,8 @@ impl EditForm {
 
     /// Builds the updated task from the form, or an error message.
     ///
-    /// The due date is only the deadline: the planned day (where the task
-    /// is shown) is kept. An unchanged estimate is not re-parsed; a typed
-    /// subtask not yet added is added.
+    /// An unchanged estimate is not re-parsed; a typed subtask not yet added
+    /// is added.
     pub fn apply(&self, task: &Task) -> Result<Task, String> {
         let title = self.title.trim();
         if title.is_empty() {
@@ -163,8 +181,11 @@ impl EditForm {
             title: title.to_string(),
             project: (!project.is_empty()).then(|| project.to_string()),
             due_on: self.due,
+            planned_for: self.planned,
             estimate_minutes,
             priority,
+            private: self.private,
+            recurrence: self.recurrence,
             notes,
             ..task.clone()
         })
@@ -197,11 +218,26 @@ impl EditForm {
         open_form(&Task::default(), tasks, week_start)
     }
 
-    /// The new task this form describes, planned for `day`, or an error
-    /// message.
-    pub fn new_task(&self, day: Date) -> Result<NewTask, String> {
+    /// An empty form for a new task initially planned for `day`, with the
+    /// project list from `tasks`.
+    pub fn for_new_task(day: Date, tasks: &[Task], week_start: Weekday) -> Self {
         let base = Task {
             planned_for: Some(day),
+            ..Task::default()
+        };
+        open_form(&base, tasks, week_start)
+    }
+
+    /// The new task this form describes, defaulting its planned day to `day`
+    /// unless the user picked or cleared it, or an error message.
+    pub fn new_task(&self, day: Date) -> Result<NewTask, String> {
+        let planned_for = if self.planned_edited {
+            self.planned
+        } else {
+            self.planned.or(Some(day))
+        };
+        let base = Task {
+            planned_for,
             ..Task::default()
         };
         let t = self.apply(&base)?;
@@ -210,10 +246,11 @@ impl EditForm {
             notes: t.notes,
             project: t.project,
             due_on: t.due_on,
-            planned_for: t.planned_for,
+            planned_for,
             estimate_minutes: t.estimate_minutes,
             priority: t.priority,
-            private: false,
+            private: t.private,
+            recurrence: t.recurrence,
         })
     }
 
@@ -251,11 +288,14 @@ impl EditForm {
                 self.priority = priority_level(*p);
                 self.priority_picked = true;
             }
+            Message::SetRecurrence(recurrence) => self.recurrence = *recurrence,
+            Message::TogglePrivate(private) => self.private = *private,
             Message::ToggleCalendar => {
+                self.planned_calendar = None;
                 self.calendar = match self.calendar {
                     Some(_) => None,
                     None => Some(self.due.unwrap_or(today).first_of_month()),
-                }
+                };
             }
             Message::CloseCalendar => self.calendar = None,
             Message::CalendarMonth(step) => {
@@ -270,6 +310,29 @@ impl EditForm {
             Message::ClearDue => {
                 self.due = None;
                 self.calendar = None;
+            }
+            Message::TogglePlannedCalendar => {
+                self.calendar = None;
+                self.planned_calendar = match self.planned_calendar {
+                    Some(_) => None,
+                    None => Some(self.planned.unwrap_or(today).first_of_month()),
+                };
+            }
+            Message::ClosePlannedCalendar => self.planned_calendar = None,
+            Message::PlannedCalendarMonth(step) => {
+                if let Some(month) = &mut self.planned_calendar {
+                    *month = add_months(*month, *step).first_of_month();
+                }
+            }
+            Message::PickPlanned(date) => {
+                self.planned = Some(*date);
+                self.planned_edited = true;
+                self.planned_calendar = None;
+            }
+            Message::ClearPlanned => {
+                self.planned = None;
+                self.planned_edited = true;
+                self.planned_calendar = None;
             }
             Message::ToggleSubtask(i, done) => {
                 if let Some(s) = self.subtasks.get_mut(*i) {
@@ -356,20 +419,150 @@ fn suggested_tab(t: &Theme, status: button::Status) -> button::Style {
     style
 }
 
-/// The due-date field: a button showing the date that opens the calendar.
-fn due_button(due: Option<Date>, today: Date) -> Element<'static, Message> {
-    let label = match due {
-        Some(d) if d.year() == today.year() => d.strftime("%a %-d %b").to_string(),
-        Some(d) => d.strftime("%a %-d %b %Y").to_string(),
-        None => String::new(),
+/// A repeat cadence choice with a `Display` impl, for `pick_list`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RepeatChoice(Option<Recurrence>);
+
+const REPEAT_CHOICES: [RepeatChoice; 5] = [
+    RepeatChoice(None),
+    RepeatChoice(Some(Recurrence::Daily)),
+    RepeatChoice(Some(Recurrence::Weekdays)),
+    RepeatChoice(Some(Recurrence::Weekly)),
+    RepeatChoice(Some(Recurrence::Monthly)),
+];
+
+impl fmt::Display for RepeatChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0.map_or("None", Recurrence::label))
+    }
+}
+
+/// The repeat picker: None, Daily, Weekdays, Weekly, Monthly.
+fn repeat_picker<'a>(current: Option<Recurrence>) -> Element<'a, Message> {
+    let list = pick_list(
+        REPEAT_CHOICES,
+        Some(RepeatChoice(current)),
+        |c: RepeatChoice| Message::SetRecurrence(c.0),
+    )
+    .padding(theme::DROPDOWN_PADDING)
+    .handle(pick_list::Handle::None)
+    .text_size(theme::TEXT_BODY)
+    .width(Fill)
+    .style(picker_style)
+    .menu_style(project_menu);
+    theme::dropdown(list)
+}
+
+/// A pick list styled like [`theme::input`].
+fn picker_style(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
+    let p = theme.palette();
+    let ring = match status {
+        pick_list::Status::Opened { .. } => theme::accent_color(),
+        pick_list::Status::Hovered => theme::tint(theme, 0.15),
+        pick_list::Status::Active => Color::TRANSPARENT,
     };
-    button(text(label).size(theme::TEXT_BODY))
+    pick_list::Style {
+        text_color: p.text,
+        placeholder_color: theme::muted_color(theme),
+        handle_color: theme::muted_color(theme),
+        background: Background::Color(theme::tint(theme, 0.075)),
+        border: Border {
+            radius: theme::RADIUS.into(),
+            width: 1.0,
+            color: ring,
+        },
+    }
+}
+
+/// A date field: a button showing the date (or muted placeholder) that opens
+/// its calendar.
+fn date_button<'a>(
+    date: Option<Date>,
+    today: Date,
+    placeholder: &'a str,
+    on_press: Message,
+) -> Element<'a, Message> {
+    let label = match date {
+        Some(d) if d.year() == today.year() => {
+            text(d.strftime("%a %-d %b").to_string()).size(theme::TEXT_BODY)
+        }
+        Some(d) => text(d.strftime("%a %-d %b %Y").to_string()).size(theme::TEXT_BODY),
+        None => text(placeholder).size(theme::TEXT_BODY).style(theme::muted),
+    };
+    button(label)
         .width(Fill)
         .height(35)
         .padding([8, 10])
         .style(field_button)
-        .on_press(Message::ToggleCalendar)
+        .on_press(on_press)
         .into()
+}
+
+/// The planned-day pop-up: quick picks (`Today`, `Tomorrow`, `+1w`) above the
+/// month calendar.
+fn planned_popup<'a>(
+    month: Date,
+    planned: Option<Date>,
+    today: Date,
+    week_start: Weekday,
+) -> Element<'a, Message> {
+    let tomorrow = today.saturating_add(1.days());
+    let next_week = today.saturating_add(7.days());
+    let quick = |label: &'a str, date: Date| {
+        button(
+            text(label)
+                .size(theme::TEXT_SMALL)
+                .width(Fill)
+                .align_x(Center),
+        )
+        .width(Fill)
+        .padding([5, 8])
+        .style(theme::tab_button(planned == Some(date)))
+        .on_press(Message::PickPlanned(date))
+    };
+    // Width matches `calendar::month_picker` (7 * 36 + 2 * SPACING = 276).
+    let quick_bar = container(
+        row![
+            quick("Today", today),
+            quick("Tomorrow", tomorrow),
+            quick("+1w", next_week),
+        ]
+        .spacing(4),
+    )
+    .width(276)
+    .padding(6)
+    .style(popup_bar_style);
+    column![
+        quick_bar,
+        month_picker(
+            month,
+            planned,
+            None,
+            today,
+            week_start,
+            Message::PlannedCalendarMonth,
+            Message::PickPlanned,
+            Some(Message::ClearPlanned),
+        ),
+    ]
+    .spacing(6)
+    .into()
+}
+
+/// The raised panel holding the quick planned-day picks, matching the calendar.
+fn popup_bar_style(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(theme.palette().background.into()),
+        border: border::rounded(theme::RADIUS)
+            .width(1)
+            .color(theme::muted_color(theme).scale_alpha(0.25)),
+        shadow: iced::Shadow {
+            color: Color::BLACK.scale_alpha(0.3),
+            offset: iced::Vector::new(0.0, 6.0),
+            blur_radius: 18.0,
+        },
+        ..container::Style::default()
+    }
 }
 
 /// A button that looks like [`theme::input`].
@@ -463,8 +656,8 @@ fn project_menu(theme: &Theme) -> menu::Style {
 }
 
 /// The form's fields, under `title_row` (the title field, with a checkbox
-/// for an existing task): project, due, estimate, priority, the error,
-/// notes and subtasks.
+/// for an existing task): project, estimate, planned, due, priority, repeat,
+/// private, the error, notes and subtasks.
 pub(super) fn form_fields<'a>(
     form: &'a EditForm,
     today: Date,
@@ -484,40 +677,61 @@ pub(super) fn form_fields<'a>(
         notes = notes.push(prompt);
     }
 
+    let planned_field = Popup::new(
+        date_button(
+            form.planned,
+            today,
+            "No date",
+            Message::TogglePlannedCalendar,
+        ),
+        form.planned_calendar
+            .map(|month| planned_popup(month, form.planned, today, form.week_start)),
+        Message::ClosePlannedCalendar,
+    );
+    let due_field = Popup::new(
+        date_button(form.due, today, "", Message::ToggleCalendar),
+        form.calendar.map(|month| {
+            month_picker(
+                month,
+                form.due,
+                None,
+                today,
+                form.week_start,
+                Message::CalendarMonth,
+                Message::PickDue,
+                Some(Message::ClearDue),
+            )
+        }),
+        Message::CloseCalendar,
+    );
+
     let mut body = column![
         title_row,
         row![
             labelled("Project", project_field(form)),
-            labelled(
-                "Due",
-                Popup::new(
-                    due_button(form.due, today),
-                    form.calendar.map(|month| month_picker(
-                        month,
-                        form.due,
-                        None,
-                        today,
-                        form.week_start,
-                        Message::CalendarMonth,
-                        Message::PickDue,
-                        Some(Message::ClearDue),
-                    )),
-                    Message::CloseCalendar,
-                )
-            ),
             labelled(
                 "Estimate",
                 field("1h30m", &form.estimate, Message::EditEstimate)
             ),
         ]
         .spacing(theme::SPACING),
+        row![
+            labelled("Planned", planned_field),
+            labelled("Due", due_field),
+        ]
+        .spacing(theme::SPACING),
+        row![
+            labelled("Priority", priority_picker(form.priority, form.suggested)),
+            labelled("Repeat", repeat_picker(form.recurrence)),
+        ]
+        .spacing(theme::SPACING),
+        checkbox(form.private)
+            .label("Private (not sent to AI)")
+            .text_size(theme::TEXT_SMALL)
+            .on_toggle(Message::TogglePrivate),
     ]
     .spacing(theme::SPACING);
 
-    body = body.push(labelled(
-        "Priority",
-        priority_picker(form.priority, form.suggested),
-    ));
     if let Some(error) = &form.error {
         body = body.push(text(error).size(theme::TEXT_SMALL).style(theme::danger));
     }
@@ -539,7 +753,12 @@ pub fn task_dialog(
     editing: bool,
     today: Date,
 ) -> Element<'_, Message> {
-    let day_label = day.map_or_else(
+    let shown_day = if form.planned_edited {
+        form.planned
+    } else {
+        form.planned.or(day)
+    };
+    let day_label = shown_day.map_or_else(
         || "No date".to_string(),
         |d| d.strftime("%A %-d %B").to_string(),
     );
@@ -660,5 +879,82 @@ mod tests {
             open_projects(&[a, e, d, b, f]),
             ["Home", "home", "Work", "work"]
         );
+    }
+
+    #[test]
+    fn planned_day_edit_clear_and_mutual_calendar_exclusion() {
+        let mut form = EditForm::for_new_task(today(), &[], Weekday::Monday);
+        assert_eq!(form.planned, Some(today()));
+        form.handle(&Message::EditTitle("Ship release".into()), today());
+
+        // Opening one calendar closes the other.
+        form.handle(&Message::ToggleCalendar, today());
+        assert_eq!(form.calendar, Some(date(2026, 11, 1)));
+        assert_eq!(form.planned_calendar, None);
+
+        form.handle(&Message::TogglePlannedCalendar, today());
+        assert_eq!(form.calendar, None);
+        assert_eq!(form.planned_calendar, Some(date(2026, 11, 1)));
+
+        form.handle(&Message::PlannedCalendarMonth(1), today());
+        assert_eq!(form.planned_calendar, Some(date(2026, 12, 1)));
+
+        // Quick-pick / picking a planned day updates planned and closes popup.
+        let next_week = today().saturating_add(7.days());
+        form.handle(&Message::PickPlanned(next_week), today());
+        assert_eq!(form.planned, Some(next_week));
+        assert_eq!(form.planned_calendar, None);
+        let new = form.new_task(today()).unwrap();
+        assert_eq!(new.planned_for, Some(next_week));
+
+        // Clearing planned in a new-task form keeps it cleared (does not fall back to default day).
+        form.handle(&Message::ClearPlanned, today());
+        assert_eq!(form.planned, None);
+        let cleared = form.new_task(today()).unwrap();
+        assert_eq!(cleared.planned_for, None);
+
+        // Toggle back to due calendar closes planned calendar.
+        form.handle(&Message::TogglePlannedCalendar, today());
+        assert!(form.planned_calendar.is_some());
+        form.handle(&Message::ToggleCalendar, today());
+        assert_eq!(form.planned_calendar, None);
+        assert!(form.calendar.is_some());
+        form.handle(&Message::CloseCalendar, today());
+        assert_eq!(form.calendar, None);
+    }
+
+    #[test]
+    fn recurrence_and_private_round_trip_through_apply_and_new_task() {
+        // New task path.
+        let mut form = EditForm::for_new_task(today(), &[], Weekday::Monday);
+        form.handle(&Message::EditTitle("Pay rent".into()), today());
+        form.handle(&Message::SetRecurrence(Some(Recurrence::Monthly)), today());
+        form.handle(&Message::TogglePrivate(true), today());
+        let new = form.new_task(today()).unwrap();
+        assert_eq!(new.recurrence, Some(Recurrence::Monthly));
+        assert!(new.private);
+        assert_eq!(new.planned_for, Some(today()));
+
+        // Existing task round-trip via from_task -> handle -> apply.
+        let mut existing = task(10, "Standup", Some(today()));
+        existing.recurrence = Some(Recurrence::Weekdays);
+        existing.private = true;
+        let mut edit = EditForm::from_task(&existing);
+        assert_eq!(edit.recurrence, Some(Recurrence::Weekdays));
+        assert!(edit.private);
+        assert_eq!(edit.planned, Some(today()));
+        assert_eq!(edit.apply(&existing).unwrap(), existing);
+
+        edit.handle(&Message::SetRecurrence(Some(Recurrence::Weekly)), today());
+        edit.handle(&Message::TogglePrivate(false), today());
+        edit.handle(&Message::PickPlanned(date(2026, 11, 20)), today());
+        let updated = edit.apply(&existing).unwrap();
+        assert_eq!(updated.recurrence, Some(Recurrence::Weekly));
+        assert!(!updated.private);
+        assert_eq!(updated.planned_for, Some(date(2026, 11, 20)));
+
+        // Dialog view builds cleanly with both calendars and fields populated.
+        edit.handle(&Message::TogglePlannedCalendar, today());
+        let _ = task_dialog(&edit, Some(today()), true, today());
     }
 }

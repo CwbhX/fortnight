@@ -130,6 +130,8 @@ fn only_add_creates_the_data_folder() {
         &["list"][..],
         &["export"],
         &["done", "1"],
+        &["delete", "1"],
+        &["edit", "1", "--title", "x"],
         &["log", "x"],
         &["summary", "--facts"],
         &["run-due"],
@@ -146,6 +148,118 @@ fn only_add_creates_the_data_folder() {
     }
     assert!(run(&dir, &["add", "first"]).status.success());
     assert!(run(&dir, &["list"]).status.success());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn private_recurrence_project_filter_edit_and_delete_flow() {
+    let dir = temp_dir("enhanced");
+
+    // Add a private recurring task with due date and project.
+    let a1 = run(
+        &dir,
+        &[
+            "add",
+            "--private",
+            "standup",
+            "today",
+            "due:2026-11-18",
+            "every:weekdays",
+            "#Ops",
+        ],
+    );
+    assert!(a1.status.success(), "{}", stderr(&a1));
+    let out1 = stdout(&a1);
+    assert!(out1.contains("Added 1: standup"), "{out1}");
+    assert!(out1.contains("↻weekdays"), "{out1}");
+    assert!(out1.contains("private"), "{out1}");
+
+    // Add a second task in another project.
+    let a2 = run(&dir, &["add", "buy", "coffee", "#home"]);
+    assert!(a2.status.success(), "{}", stderr(&a2));
+
+    // Case-insensitive --project filter shows recurrence and (private).
+    let listed = run(&dir, &["list", "--project", "ops"]);
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    let list_out = stdout(&listed);
+    assert!(
+        list_out.contains("standup ↻weekdays (private)"),
+        "{list_out}"
+    );
+    assert!(!list_out.contains("buy coffee"), "{list_out}");
+
+    // Done spawns next occurrence, and undo + re-done is idempotent.
+    let d1 = run(&dir, &["done", "1"]);
+    assert!(d1.status.success(), "{}", stderr(&d1));
+    let d1_out = stdout(&d1);
+    assert!(d1_out.contains("Done 1: standup"), "{d1_out}");
+    assert!(
+        d1_out.contains("Next occurrence #3 planned for 2026-11-17"),
+        "{d1_out}"
+    );
+
+    assert!(run(&dir, &["done", "--undo", "1"]).status.success());
+    let d2 = run(&dir, &["done", "1"]);
+    assert!(d2.status.success(), "{}", stderr(&d2));
+    assert!(!stdout(&d2).contains("Next occurrence"), "{}", stdout(&d2));
+
+    // Edit task 2.
+    let edited = run(
+        &dir,
+        &[
+            "edit",
+            "2",
+            "--title",
+            "buy beans",
+            "--project",
+            "Kitchen",
+            "--due",
+            "+3d",
+            "--planned",
+            "tomorrow",
+            "--estimate",
+            "30m",
+            "--priority",
+            "2",
+            "--private",
+            "--repeat",
+            "weekly",
+        ],
+    );
+    assert!(edited.status.success(), "{}", stderr(&edited));
+    let edit_out = stdout(&edited);
+    assert!(edit_out.contains("Updated 2: buy beans"), "{edit_out}");
+    assert!(edit_out.contains("on 2026-11-17"), "{edit_out}");
+    assert!(edit_out.contains("due 2026-11-19"), "{edit_out}");
+    assert!(edit_out.contains("↻weekly"), "{edit_out}");
+    assert!(edit_out.contains("#Kitchen"), "{edit_out}");
+    assert!(edit_out.contains("~30m"), "{edit_out}");
+    assert!(edit_out.contains("!!"), "{edit_out}");
+    assert!(edit_out.contains("private"), "{edit_out}");
+
+    // Reject empty title with exit code 2.
+    let bad_title = run(&dir, &["edit", "2", "--title", "   "]);
+    assert_eq!(bad_title.status.code(), Some(2));
+
+    // Soft-delete task 2 -> hidden from default list, shown as [-] in --all.
+    let soft = run(&dir, &["delete", "2"]);
+    assert!(soft.status.success(), "{}", stderr(&soft));
+    assert_eq!(stdout(&soft), "Dropped 2: buy beans\n");
+    assert!(!stdout(&run(&dir, &["list"])).contains("buy beans"));
+    let all = stdout(&run(&dir, &["list", "--all"]));
+    assert!(all.contains("[-]") && all.contains("buy beans"), "{all}");
+
+    // Permanent delete task 2 -> gone even from --all.
+    let hard = run(&dir, &["delete", "--forever", "2"]);
+    assert!(hard.status.success(), "{}", stderr(&hard));
+    assert_eq!(stdout(&hard), "Deleted 2: buy beans\n");
+    assert!(!stdout(&run(&dir, &["list", "--all"])).contains("buy beans"));
+
+    // Deleting a missing id fails cleanly.
+    let missing = run(&dir, &["delete", "999"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(stderr(&missing).contains("not found"));
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

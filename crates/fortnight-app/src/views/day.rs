@@ -81,7 +81,7 @@
 use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 
-use fortnight_core::domain::{NewTask, Priority, Task, TaskId, TaskStatus};
+use fortnight_core::domain::{NewTask, Priority, Recurrence, Task, TaskId, TaskStatus};
 use fortnight_core::notes::subtask_counts;
 use fortnight_core::parse;
 use fortnight_core::report::ColumnLoad;
@@ -124,14 +124,26 @@ pub enum Message {
     /// Editing a task's notes.
     EditNotes(rich_notes::Action),
     SetPriority(Priority),
+    /// Set or clear how often the task repeats.
+    SetRecurrence(Option<Recurrence>),
+    /// Mark or unmark the task as private (not sent to AI).
+    TogglePrivate(bool),
     /// Open or close the due-date calendar.
     ToggleCalendar,
-    /// A click outside the open calendar.
+    /// A click outside the open due-date calendar.
     CloseCalendar,
-    /// Show the calendar month before (-1) or after (+1).
+    /// Show the due-date calendar month before (-1) or after (+1).
     CalendarMonth(i32),
     PickDue(Date),
     ClearDue,
+    /// Open or close the planned-day calendar.
+    TogglePlannedCalendar,
+    /// A click outside the open planned-day calendar.
+    ClosePlannedCalendar,
+    /// Show the planned-day calendar month before (-1) or after (+1).
+    PlannedCalendarMonth(i32),
+    PickPlanned(Date),
+    ClearPlanned,
     ToggleSubtask(usize, bool),
     RemoveSubtask(usize),
     EditNewSubtask(String),
@@ -296,6 +308,9 @@ pub struct DayView {
     selected: Option<TaskId>,
     /// The expanded row's form.
     editing: Option<EditForm>,
+    /// A task requested via [`Self::select_and_open`] that wasn't on the
+    /// currently loaded day yet (e.g. jumping from Search to another day).
+    pending_open: Option<TaskId>,
     /// Recently closed forms, kept briefly so the card can collapse smoothly
     /// back into its closed row instead of vanishing into an empty gap.
     closing: Vec<(EditForm, Instant)>,
@@ -700,6 +715,10 @@ impl DayView {
                 });
             }
         }
+
+        if let Some(id) = self.pending_open.take() {
+            self.apply_select_and_open(id);
+        }
     }
 
     /// Notes the tasks that left a section between the data shown and
@@ -769,23 +788,20 @@ impl DayView {
                 None => Action::None,
             },
             NavKey::Open => {
-                if let Some(task) = self.selected.and_then(|id| self.task(id)).cloned()
-                    && self.editing.as_ref().is_none_or(|f| f.id != task.id)
-                    && let Some(data) = &self.data
+                if let Some(id) = self.selected
+                    && self.editing.as_ref().is_none_or(|f| f.id != id)
                 {
-                    let form = open_form(&task, &data.tasks, data.week_start);
-                    self.open_editing(form);
-                    // The form replaces the card, which sends no exit.
-                    self.hovered = None;
+                    return self.switch_editing(id);
                 }
                 Action::None
             }
             NavKey::Close => {
                 if let Some(form) = self.editing.as_mut()
-                    && form.calendar.is_some()
+                    && (form.calendar.is_some() || form.planned_calendar.is_some())
                 {
-                    // Only the form's due calendar closes.
+                    // Only the form's open calendar closes.
                     form.calendar = None;
+                    form.planned_calendar = None;
                 } else if self.editing.is_some() {
                     self.close_editing();
                     self.hovered = None;
@@ -883,12 +899,10 @@ impl DayView {
                 if self.editing.as_ref().is_some_and(|f| f.id == id) {
                     self.close_editing();
                     self.selected = None;
-                } else if let Some(task) = data.tasks.iter().find(|t| t.id == id) {
-                    let form = open_form(task, &data.tasks, data.week_start);
-                    self.open_editing(form);
-                    self.selected = Some(id);
+                    Action::None
+                } else {
+                    self.switch_editing(id)
                 }
-                Action::None
             }
             Message::EditQuickAdd(s) => {
                 self.quick_add = s;
@@ -993,6 +1007,83 @@ impl DayView {
         self.editing = Some(form);
     }
 
+    /// Switches the open inline form to `target_id`. If another form is
+    /// already open, applies its edits first: valid changes are returned as
+    /// [`Action::Update`]; an invalid form stays open with its error so edits
+    /// are not silently lost.
+    fn switch_editing(&mut self, target_id: TaskId) -> Action {
+        let Some(data) = &self.data else {
+            return Action::None;
+        };
+        let Some(target) = data.tasks.iter().find(|t| t.id == target_id) else {
+            return Action::None;
+        };
+        let mut save_action = Action::None;
+        if let Some(old_form) = self.editing.as_mut()
+            && old_form.id != target_id
+            && let Some(old_task) = data.tasks.iter().find(|t| t.id == old_form.id)
+        {
+            match old_form.apply(old_task) {
+                Ok(updated) => {
+                    if &updated != old_task {
+                        save_action = Action::Update(updated);
+                    }
+                }
+                Err(e) => {
+                    old_form.error = Some(e);
+                    return Action::None;
+                }
+            }
+        }
+        let form = open_form(target, &data.tasks, data.week_start);
+        self.open_editing(form);
+        self.selected = Some(target_id);
+        self.hovered = None;
+        save_action
+    }
+
+    /// Selects `id` and opens its inline edit form if it is on the currently
+    /// loaded day; otherwise remembers it for the next [`Self::load`] (such as
+    /// jumping from Search to another day).
+    pub fn select_and_open(&mut self, id: TaskId) {
+        self.selected = Some(id);
+        if !self.apply_select_and_open(id) {
+            self.pending_open = Some(id);
+        }
+    }
+
+    /// Opens `id` on the currently loaded day if it is shown here. Returns
+    /// `true` if the task is shown on this day (even if Deleted).
+    fn apply_select_and_open(&mut self, id: TaskId) -> bool {
+        let Some(section) = self.section_of_id(id) else {
+            return false;
+        };
+        match section {
+            Section::Deleted => {
+                self.show_deleted = true;
+                self.selected = None;
+                self.pending_open = None;
+                true
+            }
+            _ => {
+                if section == Section::Done {
+                    self.show_done = true;
+                }
+                if self.editing.as_ref().is_none_or(|f| f.id != id)
+                    && let Some(data) = &self.data
+                    && let Some(task) = data.tasks.iter().find(|t| t.id == id)
+                {
+                    let form = open_form(task, &data.tasks, data.week_start);
+                    self.open_editing(form);
+                }
+                self.selected = Some(id);
+                self.hovered = None;
+                self.pending_open = None;
+                true
+            }
+        }
+    }
+
     fn task(&self, id: TaskId) -> Option<&Task> {
         self.data.as_ref()?.tasks.iter().find(|t| t.id == id)
     }
@@ -1089,6 +1180,19 @@ impl DayView {
         } else if !self.notes_left.iter().any(|(d, _)| *d == day) {
             self.notes_left.insert(0, (day, text));
         }
+    }
+
+    /// Drains every unsaved day's notes immediately (both previously left days
+    /// and any active typing on the shown day), for flushing on window close.
+    pub fn flush_notes(&mut self) -> Vec<(Date, String)> {
+        let mut out = std::mem::take(&mut self.notes_left);
+        if self.notes_edited.take().is_some()
+            && let Some(day) = self.notes_day
+        {
+            out.retain(|(d, _)| *d != day);
+            out.push((day, self.notes.text().trim_end().to_string()));
+        }
+        out
     }
 
     /// Shows a suggested priority on the inline form of task `id`.
@@ -1737,6 +1841,31 @@ fn card_content(task: &Task, today: Date, rank: Option<usize>) -> Row<'_, Messag
     }
     line = line.push(Space::new().width(Fill));
     let mut details: Vec<Element<'_, Message>> = Vec::new();
+    if task.private {
+        let lock = theme::icon(theme::Icon::Lock)
+            .width(13)
+            .height(13)
+            .style(|theme: &Theme, _| iced::widget::svg::Style {
+                color: Some(theme::muted_color(theme)),
+            });
+        details.push(
+            row![
+                lock,
+                text("Private").size(theme::TEXT_SMALL).style(theme::muted),
+            ]
+            .spacing(4)
+            .align_y(Center)
+            .into(),
+        );
+    }
+    if let Some(recurrence) = task.recurrence {
+        details.push(
+            text(format!("↻ {}", recurrence.label()))
+                .size(theme::TEXT_SMALL)
+                .style(theme::muted)
+                .into(),
+        );
+    }
     let (done, total) = subtask_counts(&task.notes);
     if total > 0 {
         details.push(
@@ -3020,6 +3149,146 @@ mod tests {
         let prev = view.previous.as_ref().expect("outgoing day kept for slide");
         assert_eq!(prev.data.day, today());
         assert_eq!(prev.editing.as_ref().map(|f| f.id), Some(1));
+        let _ = view.view();
+    }
+
+    #[test]
+    fn escape_closes_planned_calendar_before_closing_form() {
+        let mut view = loaded(vec![task(1, "a", Some(today()))]);
+        view.update(Message::Expand(1));
+        view.update(Message::EditTitle("typed".into()));
+        view.update(Message::TogglePlannedCalendar);
+        assert!(view.editing.as_ref().unwrap().planned_calendar.is_some());
+        view.on_key(NavKey::Close);
+        let form = view.editing.as_ref().expect("the form stays open");
+        assert_eq!(form.planned_calendar, None);
+        assert_eq!(form.title, "typed");
+        view.on_key(NavKey::Close);
+        assert!(view.editing.is_none());
+    }
+
+    #[test]
+    fn switching_tasks_auto_saves_valid_edits_and_keeps_invalid_form_open() {
+        let a = planned(task(1, "alpha", None), today());
+        let b = planned(task(2, "beta", None), today());
+        let c = planned(task(3, "gamma", None), today());
+        let mut view = loaded(vec![a.clone(), b.clone(), c.clone()]);
+
+        // Valid edit on 1 -> clicking 2 saves 1 and opens 2.
+        view.update(Message::Expand(1));
+        view.update(Message::EditTitle("alpha edited".into()));
+        view.update(Message::SetRecurrence(Some(Recurrence::Daily)));
+        view.update(Message::TogglePrivate(true));
+        let Action::Update(saved) = view.update(Message::Expand(2)) else {
+            panic!("expected Action::Update when switching from modified task");
+        };
+        assert_eq!(saved.id, 1);
+        assert_eq!(saved.title, "alpha edited");
+        assert_eq!(saved.recurrence, Some(Recurrence::Daily));
+        assert!(saved.private);
+        assert_eq!(view.editing.as_ref().map(|f| f.id), Some(2));
+        assert_eq!(view.selected, Some(2));
+
+        // Unchanged form on 2 -> clicking 3 simply switches with Action::None.
+        assert_eq!(view.update(Message::Expand(3)), Action::None);
+        assert_eq!(view.editing.as_ref().map(|f| f.id), Some(3));
+
+        // Invalid edit (empty title) on 3 -> clicking 2 keeps 3 open with error.
+        view.update(Message::EditTitle("   ".into()));
+        assert_eq!(view.update(Message::Expand(2)), Action::None);
+        let form = view.editing.as_ref().expect("invalid form stays open");
+        assert_eq!(form.id, 3);
+        assert!(form.error.is_some());
+
+        // Fix title on 3, move selection to 2, press Enter (NavKey::Open) -> auto-saves 3 and opens 2.
+        view.update(Message::EditTitle("gamma edited".into()));
+        view.selected = Some(2);
+        let Action::Update(saved_gamma) = view.on_key(NavKey::Open) else {
+            panic!("expected Action::Update on NavKey::Open switch");
+        };
+        assert_eq!(saved_gamma.id, 3);
+        assert_eq!(saved_gamma.title, "gamma edited");
+        assert_eq!(view.editing.as_ref().map(|f| f.id), Some(2));
+
+        // Message::Close still discards unsaved edits.
+        view.update(Message::EditTitle("discard me".into()));
+        assert_eq!(view.update(Message::Close), Action::None);
+        assert!(view.editing.is_none());
+    }
+
+    #[test]
+    fn flush_notes_drains_left_days_and_active_edits() {
+        let (mon, tue, wed) = (today(), date(2026, 11, 17), date(2026, 11, 18));
+        let mut view = DayView::new();
+        view.load(data_for(mon, vec![]));
+        view.update(Message::EditDayNotes(rich_notes::Action::Insert(
+            "mon note  ".into(),
+        )));
+        view.load(data_for(tue, vec![]));
+        view.update(Message::EditDayNotes(rich_notes::Action::Insert(
+            "tue note\n".into(),
+        )));
+        view.load(data_for(wed, vec![]));
+        view.update(Message::EditDayNotes(rich_notes::Action::Insert(
+            "wed active  ".into(),
+        )));
+        assert!(view.notes_pending());
+
+        let flushed = view.flush_notes();
+        assert_eq!(
+            flushed,
+            vec![
+                (mon, "mon note".to_string()),
+                (tue, "tue note".to_string()),
+                (wed, "wed active".to_string()),
+            ]
+        );
+        assert!(!view.notes_pending());
+        assert!(view.flush_notes().is_empty());
+    }
+
+    #[test]
+    fn select_and_open_works_on_same_day_and_across_day_switch() {
+        let wed = date(2026, 11, 18);
+        let tasks = vec![
+            planned(task(1, "monday", None), today()),
+            planned(task(2, "wednesday", None), wed),
+            done_on(planned(task(3, "done wed", None), wed), wed),
+        ];
+        let mut view = loaded(tasks.clone());
+
+        // Same day: opens immediately.
+        view.select_and_open(1);
+        assert_eq!(view.selected, Some(1));
+        assert_eq!(view.editing.as_ref().map(|f| f.id), Some(1));
+
+        // Another day: queued until load() arrives for Wednesday.
+        view.select_and_open(2);
+        assert_eq!(view.pending_open, Some(2));
+        view.load(data_for(wed, tasks.clone()));
+        assert_eq!(view.pending_open, None);
+        assert_eq!(view.selected, Some(2));
+        assert_eq!(view.editing.as_ref().map(|f| f.id), Some(2));
+
+        // Done task on another day: expands Completed and opens its form.
+        view.load(data_for(today(), tasks.clone()));
+        view.show_done = false;
+        view.select_and_open(3);
+        view.load(data_for(wed, tasks));
+        assert!(view.show_done);
+        assert_eq!(view.selected, Some(3));
+        assert_eq!(view.editing.as_ref().map(|f| f.id), Some(3));
+    }
+
+    #[test]
+    fn view_renders_recurrence_and_private_badges_and_planned_popup() {
+        let mut t = planned(task(1, "Weekly review", Some(date(2026, 11, 20))), today());
+        t.recurrence = Some(Recurrence::Weekly);
+        t.private = true;
+        let mut view = loaded(vec![t]);
+        let _ = view.view();
+        view.update(Message::Expand(1));
+        view.update(Message::TogglePlannedCalendar);
         let _ = view.view();
     }
 }

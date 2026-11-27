@@ -31,6 +31,7 @@ pub enum UnlockAction {
 pub struct UnlockView {
     password: String,
     error: Option<String>,
+    busy: bool,
 }
 
 impl fmt::Debug for UnlockView {
@@ -38,6 +39,7 @@ impl fmt::Debug for UnlockView {
         f.debug_struct("UnlockView")
             .field("password", &"***")
             .field("error", &self.error)
+            .field("busy", &self.busy)
             .finish()
     }
 }
@@ -53,9 +55,16 @@ impl UnlockView {
         operation::focus(UNLOCK_INPUT_ID)
     }
 
+    /// Marks the prompt as busy while Argon2 derives the key, disabling the
+    /// Unlock button and relabelling it "Unlocking…".
+    pub fn set_busy(&mut self, busy: bool) {
+        self.busy = busy;
+    }
+
     /// Shows an error such as "Wrong password" and clears the field.
     pub fn set_error(&mut self, message: String) {
         self.error = Some(message);
+        self.busy = false;
         wipe(&mut self.password);
     }
 
@@ -64,17 +73,21 @@ impl UnlockView {
     pub fn reset(&mut self) {
         wipe(&mut self.password);
         self.error = None;
+        self.busy = false;
     }
 
     pub fn update(&mut self, message: UnlockMessage) -> UnlockAction {
         match message {
             UnlockMessage::Password(Typed(s)) => {
+                if self.busy {
+                    return UnlockAction::None;
+                }
                 wipe(&mut self.password);
                 self.password = s;
                 UnlockAction::None
             }
             UnlockMessage::Submit => {
-                if self.password.is_empty() {
+                if self.busy || self.password.is_empty() {
                     return UnlockAction::None;
                 }
                 self.error = None;
@@ -92,15 +105,18 @@ impl UnlockView {
             .id(UNLOCK_INPUT_ID)
             .secure(true)
             .on_input(|s| UnlockMessage::Password(Typed(s)))
-            .on_submit(UnlockMessage::Submit)
+            .on_submit_maybe((!self.busy).then_some(UnlockMessage::Submit))
             .padding([10, 14])
             .size(theme::TEXT_BODY + 1.0)
             .style(theme::input);
-        let unlock = button(container(text("Unlock").size(theme::TEXT_BODY)).center_x(Fill))
+        let label = if self.busy { "Unlocking…" } else { "Unlock" };
+        let unlock = button(container(text(label).size(theme::TEXT_BODY)).center_x(Fill))
             .width(Fill)
             .padding([10, 18])
             .style(theme::primary_button)
-            .on_press_maybe((!self.password.is_empty()).then_some(UnlockMessage::Submit));
+            .on_press_maybe(
+                (!self.busy && !self.password.is_empty()).then_some(UnlockMessage::Submit),
+            );
         let skip = button(text("Cancel").size(theme::TEXT_SMALL))
             .padding([4, 8])
             .style(theme::text_button)
@@ -190,5 +206,32 @@ mod tests {
         let mut u = UnlockView::new();
         u.update(um);
         assert!(!format!("{u:?}").contains("pw-secret"));
+    }
+
+    #[test]
+    fn busy_state_blocks_submit_and_clears_on_error_or_reset() {
+        let mut u = UnlockView::new();
+        u.update(UnlockMessage::Password(Typed("hunter22".into())));
+        u.set_busy(true);
+        assert!(u.busy);
+        // Submitting or editing while busy is ignored.
+        assert!(matches!(
+            u.update(UnlockMessage::Submit),
+            UnlockAction::None
+        ));
+        assert!(matches!(
+            u.update(UnlockMessage::Password(Typed("other".into()))),
+            UnlockAction::None
+        ));
+        let _ = u.view();
+
+        u.set_error("Wrong password".into());
+        assert!(!u.busy);
+        assert_eq!(u.error.as_deref(), Some("Wrong password"));
+
+        u.set_busy(true);
+        u.reset();
+        assert!(!u.busy);
+        assert!(u.error.is_none());
     }
 }

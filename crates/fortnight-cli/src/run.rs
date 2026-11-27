@@ -113,9 +113,11 @@ fn execute(cli: Cli, out: &mut dyn Write) -> CliResult<()> {
     let (store, dir) = open_store(cli.data_dir, create)?;
     let store: &dyn Store = &store;
     match cli.command {
-        Command::Add { words } => commands::add(store, &words, today, out),
+        Command::Add { words, private } => commands::add(store, &words, private, today, out),
         Command::List(opts) => commands::list(store, &opts, today, out),
-        Command::Done { ids, undo } => commands::done(store, &ids, undo, out),
+        Command::Done { ids, undo } => commands::done(store, &ids, undo, today, out),
+        Command::Delete { ids, forever } => commands::delete(store, &ids, forever, out),
+        Command::Edit(opts) => commands::edit(store, &opts, today, out),
         Command::Log { task, words } => commands::log(store, task, &words, out),
         Command::Export(a) => commands::export(store, a.format, &now, a.out.as_deref(), out),
         Command::Summary(a) => block_on(async {

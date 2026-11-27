@@ -5,7 +5,9 @@
 
 use crate::{Message, Ready};
 use fortnight_app::views::{day, week};
-use fortnight_core::domain::{DeletedTask, EventId, Task as CoreTask, TaskId, TaskStatus};
+use fortnight_core::domain::{
+    DeletedTask, EventId, Task as CoreTask, TaskId, TaskStatus, next_occurrence,
+};
 use fortnight_core::store::Store;
 use iced::Task;
 use jiff::Timestamp;
@@ -18,42 +20,85 @@ pub(super) enum Undo {
     Added(TaskId),
     /// A task's status or fields changed. Undo puts the task back exactly as
     /// it was (including `completed_at`) and drops the events the change
-    /// wrote (ids above `last_event`), keeping log lines.
+    /// wrote (ids above `last_event`), keeping log lines. If completing a
+    /// recurring task spawned a next occurrence, `spawned` names it so undo
+    /// removes it too.
     Changed {
         before: Box<CoreTask>,
         last_event: EventId,
         /// Keep the task's position as it is at undo time (a later drag
         /// stays), unless the change was a move, which set the position.
         keep_position: bool,
+        spawned: Option<TaskId>,
     },
     /// Tasks were deleted for good (one, or all of Deleted at once); put
     /// them back with their history.
     Deleted(Vec<DeletedTask>),
 }
 
-/// How many changes undo remembers.
+/// One undone change that Shift+Ctrl/Cmd+Z (or Ctrl+Y) can re-apply.
+#[derive(Debug, Clone)]
+enum Redo {
+    /// Put back an added task that undo removed.
+    Add(DeletedTask),
+    /// Re-apply a task state that undo reverted (plus any spawned recurring
+    /// occurrence that undo removed).
+    Change {
+        after: Box<CoreTask>,
+        keep_position: bool,
+        respawn: Option<DeletedTask>,
+    },
+    /// Delete tasks that undo restored.
+    Delete(Vec<TaskId>),
+}
+
+/// How many changes undo/redo remembers.
 const UNDO_DEPTH: usize = 30;
 
-/// The changes undo can take back, oldest first, at most `UNDO_DEPTH`.
+/// The changes undo and redo can step through, capped at `UNDO_DEPTH`.
 #[derive(Default)]
-pub(crate) struct UndoStack(Vec<Undo>);
+pub(crate) struct UndoStack {
+    undo: Vec<Undo>,
+    redo: Vec<Redo>,
+}
 
 impl UndoStack {
-    /// Remembers a change for undo.
+    /// Remembers a fresh change for undo and clears the redo stack.
     fn remember(&mut self, undo: Undo) {
-        self.0.push(undo);
-        if self.0.len() > UNDO_DEPTH {
-            self.0.remove(0);
+        self.redo.clear();
+        self.push_undo(undo);
+    }
+
+    fn push_undo(&mut self, undo: Undo) {
+        self.undo.push(undo);
+        if self.undo.len() > UNDO_DEPTH {
+            self.undo.remove(0);
+        }
+    }
+
+    fn push_redo(&mut self, redo: Redo) {
+        self.redo.push(redo);
+        if self.redo.len() > UNDO_DEPTH {
+            self.redo.remove(0);
         }
     }
 
     fn pop(&mut self) -> Option<Undo> {
-        self.0.pop()
+        self.undo.pop()
+    }
+
+    fn pop_redo(&mut self) -> Option<Redo> {
+        self.redo.pop()
     }
 
     /// Puts back an entry whose undo failed, for another try.
     fn put_back(&mut self, undo: Undo) {
-        self.0.push(undo);
+        self.undo.push(undo);
+    }
+
+    /// Puts back an entry whose redo failed, for another try.
+    fn put_back_redo(&mut self, redo: Redo) {
+        self.redo.push(redo);
     }
 }
 
@@ -73,29 +118,32 @@ impl Ready {
         let Some(last) = self.undo.pop() else {
             return;
         };
-        let result = match &last {
-            Undo::Added(id) => self.undo_add(*id),
+        let redo = match &last {
+            Undo::Added(id) => self.undo_add(*id).map(Redo::Add),
             Undo::Changed {
                 before,
                 last_event,
                 keep_position,
-            } => self.undo_change(before, *last_event, *keep_position),
+                spawned,
+            } => self.undo_change(before, *last_event, *keep_position, *spawned),
             Undo::Deleted(deleted) => {
                 // Put back what can be; keep the rest for another try.
                 let mut left = Vec::new();
+                let mut restored_ids = Vec::new();
                 let mut failed = None;
                 for d in deleted {
-                    if failed.is_none()
-                        && let Err(e) = self.store.restore_task(d)
-                    {
-                        failed = Some(e.to_string());
+                    if failed.is_none() {
+                        match self.store.restore_task(d) {
+                            Ok(()) => restored_ids.push(d.task.id),
+                            Err(e) => failed = Some(e.to_string()),
+                        }
                     }
                     if failed.is_some() {
                         left.push(d.clone());
                     }
                 }
                 match failed {
-                    None => Ok(()),
+                    None => Ok(Redo::Delete(restored_ids)),
                     Some(e) => {
                         self.undo.put_back(Undo::Deleted(left));
                         self.error = Some(format!("Could not undo: {e}"));
@@ -105,11 +153,63 @@ impl Ready {
                 }
             }
         };
-        if let Err(e) = result {
-            self.error = Some(format!("Could not undo: {e}"));
-            // Keep the entry (and its saved copy) for another try.
-            if !matches!(last, Undo::Added(_)) {
-                self.undo.put_back(last);
+        match redo {
+            Ok(entry) => self.undo.push_redo(entry),
+            Err(e) => {
+                self.error = Some(format!("Could not undo: {e}"));
+                // Keep the entry (and its saved copy) for another try.
+                if !matches!(last, Undo::Added(_)) {
+                    self.undo.put_back(last);
+                }
+            }
+        }
+        self.reload_tasks();
+    }
+
+    /// Re-applies the last undone change (Shift+Ctrl/Cmd+Z or Ctrl+Y).
+    pub(super) fn redo(&mut self) {
+        let Some(entry) = self.undo.pop_redo() else {
+            return;
+        };
+        let undone = match &entry {
+            Redo::Add(deleted) => self
+                .store
+                .restore_task(deleted)
+                .map(|()| Undo::Added(deleted.task.id))
+                .map_err(|e| e.to_string()),
+            Redo::Change {
+                after,
+                keep_position,
+                respawn,
+            } => self.redo_change(after, *keep_position, respawn.as_ref()),
+            Redo::Delete(ids) => {
+                let mut removed = Vec::new();
+                let mut failed = None;
+                for &id in ids {
+                    match self.store.delete_task(id) {
+                        Ok(d) => removed.push(d),
+                        Err(e) => {
+                            failed = Some(e.to_string());
+                            break;
+                        }
+                    }
+                }
+                match failed {
+                    None => Ok(Undo::Deleted(removed)),
+                    Some(e) => {
+                        if !removed.is_empty() {
+                            self.undo.push_undo(Undo::Deleted(removed));
+                        }
+                        Err(e)
+                    }
+                }
+            }
+        };
+        match undone {
+            Ok(u) => self.undo.push_undo(u),
+            Err(e) => {
+                self.error = Some(format!("Could not redo: {e}"));
+                self.undo.put_back_redo(entry);
             }
         }
         self.reload_tasks();
@@ -117,27 +217,77 @@ impl Ready {
 
     /// Deletes a task just added, unless it has since gained history (a log
     /// line, an edit), which deleting would lose. One transaction.
-    fn undo_add(&mut self, id: TaskId) -> Result<(), String> {
+    fn undo_add(&mut self, id: TaskId) -> Result<DeletedTask, String> {
         match self.store.delete_new_task(id) {
-            Ok(Some(_)) => Ok(()),
+            Ok(Some(deleted)) => Ok(deleted),
             Ok(None) => Err("the task has changed since you added it. Delete it instead".into()),
             Err(e) => Err(e.to_string()),
         }
     }
 
     /// Puts the task back as `before` (keeping its current position unless
-    /// `keep_position` is false) and drops the events written since
-    /// `last_event` except log lines. One transaction.
+    /// `keep_position` is false), drops the events written since `last_event`
+    /// except log lines, and removes any recurring task spawned by the change.
     fn undo_change(
         &mut self,
         before: &CoreTask,
         last_event: EventId,
         keep_position: bool,
-    ) -> Result<(), String> {
-        let target = reverted(before, self.task(before.id), keep_position);
+        spawned: Option<TaskId>,
+    ) -> Result<Redo, String> {
+        let after = self
+            .task(before.id)
+            .cloned()
+            .ok_or_else(|| format!("task {} no longer exists", before.id))?;
+        let target = reverted(before, Some(&after), keep_position);
         self.store
             .revert_task(&target, last_event)
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        let respawn = spawned.and_then(|sid| self.store.delete_new_task(sid).ok().flatten());
+        Ok(Redo::Change {
+            after: Box::new(after),
+            keep_position,
+            respawn,
+        })
+    }
+
+    /// Re-applies `after` (and restores `respawn` if any) and returns the
+    /// matching `Undo::Changed` entry.
+    fn redo_change(
+        &mut self,
+        after: &CoreTask,
+        keep_position: bool,
+        respawn: Option<&DeletedTask>,
+    ) -> Result<Undo, String> {
+        let before = self
+            .task(after.id)
+            .cloned()
+            .ok_or_else(|| format!("task {} no longer exists", after.id))?;
+        let last_event = self.events.iter().map(|e| e.id).max().unwrap_or(0);
+        let target = reverted(after, Some(&before), keep_position);
+        self.store.update_task(&target).map_err(|e| e.to_string())?;
+        if target.status != before.status {
+            self.store
+                .set_status(target.id, target.status)
+                .map_err(|e| e.to_string())?;
+        }
+        if !keep_position && target.position != before.position {
+            self.store
+                .set_position(target.id, target.position)
+                .map_err(|e| e.to_string())?;
+        }
+        let spawned = if let Some(d) = respawn {
+            self.store.restore_task(d).map_err(|e| e.to_string())?;
+            Some(d.task.id)
+        } else {
+            None
+        };
+        Ok(Undo::Changed {
+            before: Box::new(before),
+            last_event,
+            keep_position,
+            spawned,
+        })
     }
 
     /// Remembers `before` (the task as it is now) for undo of a change about
@@ -149,7 +299,33 @@ impl Ready {
             before: Box::new(before),
             last_event,
             keep_position,
+            spawned: None,
         })
+    }
+
+    /// If `before` was an open recurring task, spawns its next occurrence
+    /// (unless an open matching occurrence already exists) and returns its id.
+    fn maybe_spawn_next(&mut self, before: &CoreTask, today: Date) -> Option<TaskId> {
+        if !before.status.is_open() {
+            return None;
+        }
+        let next = next_occurrence(before, today)?;
+        let exists = self.tasks.iter().any(|t| {
+            t.status.is_open()
+                && t.title == next.title
+                && t.recurrence == next.recurrence
+                && t.planned_for == next.planned_for
+        });
+        if exists {
+            return None;
+        }
+        match self.store.add_task(next) {
+            Ok(task) => Some(task.id),
+            Err(e) => {
+                self.error = Some(format!("Could not create next occurrence: {e}"));
+                None
+            }
+        }
     }
 
     /// Stores a new task, remembers it for undo, and reloads.
@@ -162,11 +338,23 @@ impl Ready {
     }
 
     pub(crate) fn set_status(&mut self, id: TaskId, status: TaskStatus) {
-        let changed = self.task(id).is_some_and(|t| t.status != status);
+        let before = self.task(id).cloned();
+        let changed = before.as_ref().is_some_and(|t| t.status != status);
         let undo = self.snapshot(id, true);
         match self.store.set_status(id, status) {
             Ok(()) => {
-                if let (true, Some(undo)) = (changed, undo) {
+                let spawned = if changed && status == TaskStatus::Done {
+                    let today = self.today();
+                    before
+                        .as_ref()
+                        .and_then(|t| self.maybe_spawn_next(t, today))
+                } else {
+                    None
+                };
+                if let (true, Some(mut undo)) = (changed, undo) {
+                    if let Undo::Changed { spawned: s, .. } = &mut undo {
+                        *s = spawned;
+                    }
                     self.undo.remember(undo);
                 }
             }
@@ -195,11 +383,15 @@ impl Ready {
         // elsewhere since the last reload is kept; undo puts back the task
         // as the store had it.
         match self.store.complete_on(id, today) {
-            Ok(before) => self.undo.remember(Undo::Changed {
-                before: Box::new(before),
-                last_event,
-                keep_position: true,
-            }),
+            Ok(before) => {
+                let spawned = self.maybe_spawn_next(&before, today);
+                self.undo.remember(Undo::Changed {
+                    before: Box::new(before),
+                    last_event,
+                    keep_position: true,
+                    spawned,
+                });
+            }
             Err(e) => self.error = Some(e.to_string()),
         }
         self.reload_tasks();

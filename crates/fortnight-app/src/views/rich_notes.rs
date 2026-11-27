@@ -22,6 +22,7 @@
 //! takes its marker away; `Tab` / `Shift+Tab` indent. The day's notes add
 //! a [`toolbar`] with the same commands.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use iced::font::Style as FontStyle;
@@ -191,6 +192,10 @@ pub enum Action {
     LinkCancel,
     /// The prompt's Remove: take the link away.
     LinkRemove,
+    /// Undo the last edit.
+    Undo,
+    /// Redo the last undone edit.
+    Redo,
 }
 
 impl Action {
@@ -203,7 +208,9 @@ impl Action {
             | Action::Backspace
             | Action::Delete
             | Action::LinkSubmit
-            | Action::LinkRemove => true,
+            | Action::LinkRemove
+            | Action::Undo
+            | Action::Redo => true,
             Action::Format(cmd) => *cmd != Command::Link,
             _ => false,
         }
@@ -227,6 +234,26 @@ struct LinkPrompt {
     existing: bool,
 }
 
+/// How many undo (and redo) states are kept.
+const MAX_UNDO: usize = 100;
+
+/// A saved state of the notes for undo/redo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Snapshot {
+    blocks: Vec<Block>,
+    cursor: Pos,
+    anchor: Option<Pos>,
+}
+
+/// Which kind of consecutive single-character edit is currently being
+/// coalesced into a single undo step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditGroup {
+    Insert,
+    Backspace,
+    Delete,
+}
+
 /// The notes being edited: blocks of styled characters, the cursor and
 /// selection, and the style for what is typed next.
 #[derive(Debug, Clone)]
@@ -239,6 +266,9 @@ pub struct Content {
     pending: Option<Style>,
     link: Option<LinkPrompt>,
     focus: Option<Focus>,
+    undo: VecDeque<Snapshot>,
+    redo: VecDeque<Snapshot>,
+    edit_group: Option<EditGroup>,
     /// Which content this is, and a count bumped by every change of its
     /// blocks (for the editor's layout).
     id: u64,
@@ -267,9 +297,20 @@ impl Content {
             pending: None,
             link: None,
             focus: None,
+            undo: VecDeque::new(),
+            redo: VecDeque::new(),
+            edit_group: None,
             id: super::rich_editor::content_id(),
             version: 0,
         }
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
     }
 
     pub fn id(&self) -> u64 {
@@ -367,6 +408,12 @@ impl Content {
                 self.link = None;
             }
         }
+        if !matches!(
+            action,
+            Action::Insert(_) | Action::Backspace | Action::Delete
+        ) {
+            self.edit_group = None;
+        }
         match action {
             Action::MoveTo { at, select } => self.move_to(at, select),
             Action::Move { motion, select } => {
@@ -396,33 +443,153 @@ impl Content {
                 self.cursor = Pos::new(last, self.blocks[last].len());
                 self.pending = None;
             }
-            Action::Insert(s) => self.insert(&s),
+            Action::Insert(s) => {
+                let single_char = is_single_word_char(&s);
+                let coalescing = single_char
+                    && self.selection().is_none()
+                    && self.edit_group == Some(EditGroup::Insert);
+                if coalescing {
+                    self.redo.clear();
+                    self.insert(&s);
+                } else {
+                    let before = self.snapshot();
+                    self.insert(&s);
+                    self.finish_edit(before, single_char.then_some(EditGroup::Insert));
+                }
+            }
             Action::Paste(s) => {
+                let before = self.snapshot();
                 self.delete_selection();
                 let blocks = parse(&s.replace("\r\n", "\n"));
                 self.insert_blocks(blocks);
+                self.finish_edit(before, None);
             }
-            Action::Enter => self.enter(),
-            Action::Backspace => self.backspace(),
-            Action::Delete => self.delete(),
-            Action::Format(cmd) => self.format(cmd),
+            Action::Enter => {
+                let before = self.snapshot();
+                self.enter();
+                self.finish_edit(before, None);
+            }
+            Action::Backspace => {
+                let single_char = self.selection().is_none()
+                    && self.cursor.col > 0
+                    && !self.blocks[self.cursor.block].cells[self.cursor.col - 1]
+                        .c
+                        .is_whitespace();
+                if single_char && self.edit_group == Some(EditGroup::Backspace) {
+                    self.redo.clear();
+                    self.backspace();
+                } else {
+                    let before = self.snapshot();
+                    self.backspace();
+                    self.finish_edit(before, single_char.then_some(EditGroup::Backspace));
+                }
+            }
+            Action::Delete => {
+                let single_char = self.selection().is_none()
+                    && self.blocks[self.cursor.block]
+                        .cells
+                        .get(self.cursor.col)
+                        .is_some_and(|cell| !cell.c.is_whitespace());
+                if single_char && self.edit_group == Some(EditGroup::Delete) {
+                    self.redo.clear();
+                    self.delete();
+                } else {
+                    let before = self.snapshot();
+                    self.delete();
+                    self.finish_edit(before, single_char.then_some(EditGroup::Delete));
+                }
+            }
+            Action::Format(Command::Link) => self.open_link_prompt(),
+            Action::Format(cmd) => {
+                let before = self.snapshot();
+                self.format(cmd);
+                self.finish_edit(before, None);
+            }
             Action::LinkInput(s) => {
                 if let Some(l) = &mut self.link {
                     l.url = s;
                 }
             }
-            Action::LinkSubmit => self.submit_link(),
+            Action::LinkSubmit => {
+                let before = self.snapshot();
+                self.submit_link();
+                self.finish_edit(before, None);
+            }
             Action::LinkRemove => {
+                let before = self.snapshot();
                 if let Some(l) = &mut self.link {
                     l.url.clear();
                 }
                 self.submit_link();
+                self.finish_edit(before, None);
             }
             Action::LinkCancel => {
                 self.link = None;
                 self.focus = Some(Focus::Editor);
             }
+            Action::Undo => self.undo(),
+            Action::Redo => self.redo(),
         }
+    }
+
+    // ---- undo / redo
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            blocks: self.blocks.clone(),
+            cursor: self.cursor,
+            anchor: self.anchor,
+        }
+    }
+
+    fn push_undo(&mut self, snapshot: Snapshot) {
+        if self.undo.len() >= MAX_UNDO {
+            self.undo.pop_front();
+        }
+        self.undo.push_back(snapshot);
+    }
+
+    fn push_redo(&mut self, snapshot: Snapshot) {
+        if self.redo.len() >= MAX_UNDO {
+            self.redo.pop_front();
+        }
+        self.redo.push_back(snapshot);
+    }
+
+    fn finish_edit(&mut self, before: Snapshot, group: Option<EditGroup>) {
+        if self.blocks != before.blocks {
+            self.push_undo(before);
+            self.redo.clear();
+            self.edit_group = group;
+        } else {
+            self.edit_group = None;
+        }
+    }
+
+    fn undo(&mut self) {
+        let Some(prev) = self.undo.pop_back() else {
+            return;
+        };
+        let current = self.snapshot();
+        self.push_redo(current);
+        self.blocks = prev.blocks;
+        self.cursor = prev.cursor;
+        self.anchor = prev.anchor;
+        self.pending = None;
+        self.link = None;
+    }
+
+    fn redo(&mut self) {
+        let Some(next) = self.redo.pop_back() else {
+            return;
+        };
+        let current = self.snapshot();
+        self.push_undo(current);
+        self.blocks = next.blocks;
+        self.cursor = next.cursor;
+        self.anchor = next.anchor;
+        self.pending = None;
+        self.link = None;
     }
 
     // ---- moving
@@ -819,6 +986,12 @@ impl Content {
         }
         self.cursor = to;
     }
+}
+
+fn is_single_word_char(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if !c.is_control() && !c.is_whitespace())
+        && chars.next().is_none()
 }
 
 fn is_word(c: char) -> bool {
@@ -1888,5 +2061,247 @@ mod tests {
         let md = c.text();
         assert!(md.contains("\\- foo"), "{md:?}");
         assert_eq!(Content::with_text(&md).blocks()[0].list, List::None);
+    }
+
+    fn type_chars(c: &mut Content, s: &str) {
+        for ch in s.chars() {
+            c.perform(Action::Insert(ch.to_string()));
+        }
+    }
+
+    #[test]
+    fn undo_redo_typing_and_coalescing() {
+        assert!(Action::Undo.is_edit());
+        assert!(Action::Redo.is_edit());
+
+        let mut c = Content::default();
+        assert!(!c.can_undo());
+        assert!(!c.can_redo());
+
+        // Consecutive single non-whitespace characters coalesce into one word step,
+        // while whitespace breaks groups.
+        type_chars(&mut c, "hello world");
+        assert_eq!(c.text(), "hello world");
+        assert!(c.can_undo());
+        assert!(!c.can_redo());
+
+        c.perform(Action::Undo);
+        assert_eq!(c.text(), "hello ");
+        assert_eq!(c.cursor(), Pos::new(0, 6));
+        assert!(c.can_redo());
+
+        c.perform(Action::Undo);
+        assert_eq!(c.text(), "hello");
+        assert_eq!(c.cursor(), Pos::new(0, 5));
+
+        c.perform(Action::Undo);
+        assert_eq!(c.text(), "");
+        assert_eq!(c.cursor(), Pos::new(0, 0));
+        assert!(!c.can_undo());
+
+        // Redo replays the exact steps forward.
+        c.perform(Action::Redo);
+        assert_eq!(c.text(), "hello");
+        assert_eq!(c.cursor(), Pos::new(0, 5));
+        c.perform(Action::Redo);
+        assert_eq!(c.text(), "hello ");
+        c.perform(Action::Redo);
+        assert_eq!(c.text(), "hello world");
+        assert_eq!(c.cursor(), Pos::new(0, 11));
+        assert!(!c.can_redo());
+
+        // Enter and Paste each break coalescing into their own undo steps.
+        c.perform(Action::Enter);
+        type_chars(&mut c, "line");
+        c.perform(Action::Paste("**two**".into()));
+        assert_eq!(c.text(), "hello world\nline**two**");
+
+        c.perform(Action::Undo);
+        assert_eq!(c.text(), "hello world\nline");
+        c.perform(Action::Undo);
+        assert_eq!(c.text(), "hello world\n");
+        c.perform(Action::Undo);
+        assert_eq!(c.text(), "hello world");
+    }
+
+    #[test]
+    fn undo_redo_deletions_coalesce_and_break_properly() {
+        let mut c = Content::with_text("hello world");
+        c.perform(Action::Move {
+            motion: Motion::DocEnd,
+            select: false,
+        });
+
+        // Consecutive non-whitespace backspaces coalesce into one step.
+        for _ in 0..5 {
+            c.perform(Action::Backspace);
+        }
+        assert_eq!(c.text(), "hello ");
+        c.perform(Action::Undo);
+        assert_eq!(c.text(), "hello world");
+        assert_eq!(c.cursor(), Pos::new(0, 11));
+
+        // Switching from typing to backspace creates separate undo steps.
+        type_chars(&mut c, "!");
+        c.perform(Action::Backspace);
+        assert_eq!(c.text(), "hello world");
+        c.perform(Action::Undo);
+        assert_eq!(c.text(), "hello world!");
+        c.perform(Action::Undo);
+        assert_eq!(c.text(), "hello world");
+
+        // Consecutive forward-deletes coalesce; whitespace breaks the group.
+        c.perform(Action::Move {
+            motion: Motion::DocStart,
+            select: false,
+        });
+        for _ in 0..5 {
+            c.perform(Action::Delete);
+        }
+        assert_eq!(c.text(), " world");
+        c.perform(Action::Delete); // deletes space -> separate step
+        assert_eq!(c.text(), "world");
+
+        c.perform(Action::Undo);
+        assert_eq!(c.text(), " world");
+        c.perform(Action::Undo);
+        assert_eq!(c.text(), "hello world");
+
+        // Deleting a selection (e.g. Cut) is its own discrete undo step and restores selection.
+        c.perform(Action::SelectWord(Pos::new(0, 1)));
+        assert_eq!(c.selection(), Some((Pos::new(0, 0), Pos::new(0, 5))));
+        c.perform(Action::Delete);
+        assert_eq!(c.text(), " world");
+        c.perform(Action::Undo);
+        assert_eq!(c.text(), "hello world");
+        assert_eq!(c.selection(), Some((Pos::new(0, 0), Pos::new(0, 5))));
+    }
+
+    #[test]
+    fn undo_redo_formatting_lists_indent_and_links() {
+        let mut c = Content::with_text("hello world");
+        c.perform(Action::SelectWord(Pos::new(0, 1)));
+        c.perform(Action::Format(Command::Bold));
+        assert_eq!(c.text(), "**hello** world");
+
+        c.perform(Action::Format(Command::Italic));
+        assert_eq!(c.text(), "***hello*** world");
+
+        c.perform(Action::Format(Command::Bullets));
+        assert_eq!(c.text(), "• ***hello*** world");
+
+        c.perform(Action::Format(Command::Indent));
+        assert_eq!(c.text(), "  • ***hello*** world");
+
+        // Add a link to "world".
+        c.perform(Action::MoveTo {
+            at: Pos::new(0, 8),
+            select: false,
+        });
+        c.perform(Action::Format(Command::Link));
+        c.perform(Action::LinkInput("https://example.com".into()));
+        c.perform(Action::LinkSubmit);
+        assert_eq!(c.text(), "  • ***hello*** [world](https://example.com)");
+
+        // Undo link, indent, bullets, italic, bold in reverse order.
+        c.perform(Action::Undo);
+        assert_eq!(c.text(), "  • ***hello*** world");
+        c.perform(Action::Undo);
+        assert_eq!(c.text(), "• ***hello*** world");
+        c.perform(Action::Undo);
+        assert_eq!(c.text(), "***hello*** world");
+        c.perform(Action::Undo);
+        assert_eq!(c.text(), "**hello** world");
+        c.perform(Action::Undo);
+        assert_eq!(c.text(), "hello world");
+
+        // Redo all the way back to the linked, indented bullet.
+        for _ in 0..5 {
+            c.perform(Action::Redo);
+        }
+        assert_eq!(c.text(), "  • ***hello*** [world](https://example.com)");
+
+        // Removing the link can also be undone.
+        c.perform(Action::MoveTo {
+            at: Pos::new(0, 8),
+            select: false,
+        });
+        c.perform(Action::Format(Command::Link));
+        c.perform(Action::LinkRemove);
+        assert_eq!(c.text(), "  • ***hello*** world");
+        c.perform(Action::Undo);
+        assert_eq!(c.text(), "  • ***hello*** [world](https://example.com)");
+
+        // Toggling bold with no selection breaks the insert group without pushing a no-op snapshot.
+        let mut c = Content::default();
+        type_chars(&mut c, "ab");
+        c.perform(Action::Format(Command::Bold));
+        type_chars(&mut c, "cd");
+        assert_eq!(c.text(), "ab**cd**");
+        c.perform(Action::Undo);
+        assert_eq!(c.text(), "ab");
+        c.perform(Action::Undo);
+        assert_eq!(c.text(), "");
+    }
+
+    #[test]
+    fn new_edit_clears_redo_stack() {
+        let mut c = Content::default();
+        type_chars(&mut c, "first");
+        c.perform(Action::Enter);
+        type_chars(&mut c, "second");
+        assert_eq!(c.text(), "first\nsecond");
+
+        c.perform(Action::Undo);
+        assert_eq!(c.text(), "first\n");
+        assert!(c.can_redo());
+
+        // Making a new edit discards redo history.
+        type_chars(&mut c, "other");
+        assert_eq!(c.text(), "first\nother");
+        assert!(!c.can_redo());
+
+        c.perform(Action::Redo);
+        assert_eq!(c.text(), "first\nother");
+    }
+
+    #[test]
+    fn undo_redo_on_empty_stacks_is_noop_and_partial_eq_ignores_history() {
+        let mut c = Content::with_text("initial");
+        assert!(!c.can_undo());
+        assert!(!c.can_redo());
+
+        c.perform(Action::Undo);
+        c.perform(Action::Redo);
+        assert_eq!(c.text(), "initial");
+        assert_eq!(c.cursor(), Pos::default());
+        assert!(!c.can_undo());
+        assert!(!c.can_redo());
+
+        // PartialEq compares blocks only, not undo/redo stacks.
+        let fresh = Content::with_text("initial");
+        type_chars(&mut c, "x");
+        c.perform(Action::Undo);
+        assert_eq!(c, fresh);
+        assert!(c.can_redo());
+        assert!(!fresh.can_redo());
+    }
+
+    #[test]
+    fn undo_stack_depth_is_capped() {
+        let mut c = Content::default();
+        for i in 0..(MAX_UNDO + 25) {
+            c.perform(Action::Insert(format!("{i}")));
+            c.perform(Action::Enter);
+        }
+        assert_eq!(c.undo.len(), MAX_UNDO);
+
+        let mut steps = 0;
+        while c.can_undo() {
+            c.perform(Action::Undo);
+            steps += 1;
+        }
+        assert_eq!(steps, MAX_UNDO);
+        assert_eq!(c.redo.len(), MAX_UNDO);
     }
 }

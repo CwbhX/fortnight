@@ -18,8 +18,8 @@
 //! History: every change and its events are written in one transaction.
 
 use crate::domain::{
-    DeletedTask, Event, EventId, EventKind, NewReport, NewTask, Report, ReportId, ReportKey,
-    ReportKind, ReportStatus, Settings, Task, TaskId, TaskStatus,
+    DeletedTask, Event, EventId, EventKind, NewReport, NewTask, Recurrence, Report, ReportId,
+    ReportKey, ReportKind, ReportStatus, Settings, Task, TaskId, TaskStatus,
 };
 use crate::store::{Store, StoreError, StoreResult};
 use jiff::Timestamp;
@@ -124,12 +124,15 @@ const MIGRATIONS: &[&str] = &[
     // the deadline). Copy the deadline into an empty planned day so every
     // task stays on the day it was shown on.
     "UPDATE tasks SET planned_for = due_on WHERE planned_for IS NULL AND due_on IS NOT NULL;",
+    // 4: optional repeat cadence (`daily`, `weekdays`, `weekly`, `monthly`).
+    "ALTER TABLE tasks ADD COLUMN recurrence TEXT;",
 ];
 
 const SETTINGS_KEY: &str = "settings";
 
 const TASK_COLUMNS: &str = "id, title, notes, status, project, due_on, planned_for, \
-     estimate_minutes, priority, private, position, created_at, updated_at, completed_at";
+     estimate_minutes, priority, private, position, created_at, updated_at, completed_at, \
+     recurrence";
 
 const EVENT_COLUMNS: &str = "id, task_id, at, kind, payload";
 
@@ -277,6 +280,7 @@ struct TaskRow {
     created_at: String,
     updated_at: String,
     completed_at: Option<String>,
+    recurrence: Option<String>,
 }
 
 impl TaskRow {
@@ -296,12 +300,18 @@ impl TaskRow {
             created_at: r.get(11)?,
             updated_at: r.get(12)?,
             completed_at: r.get(13)?,
+            recurrence: r.get(14)?,
         })
     }
 
     fn into_task(self) -> StoreResult<Task> {
         let id = self.id;
         let invalid = |what: &str| StoreError::Invalid(format!("task {id}: bad {what}"));
+        let recurrence = self
+            .recurrence
+            .as_deref()
+            .map(|s| Recurrence::parse(s).ok_or_else(|| invalid(&format!("recurrence {s:?}"))))
+            .transpose()?;
         Ok(Task {
             id,
             title: self.title,
@@ -318,6 +328,7 @@ impl TaskRow {
                 .map_err(|_| invalid("estimate"))?,
             priority: u8::try_from(self.priority).map_err(|_| invalid("priority"))?,
             private: self.private,
+            recurrence,
             position: self.position,
             created_at: ts_from_sql(&self.created_at)?,
             updated_at: ts_from_sql(&self.updated_at)?,
@@ -586,10 +597,10 @@ impl Store for SqliteStore {
             .query_row(
                 "INSERT INTO tasks (title, notes, status, project, due_on, planned_for,
                                     estimate_minutes, priority, private, position,
-                                    created_at, updated_at)
+                                    created_at, updated_at, recurrence)
                  VALUES (?1, ?2, 'todo', ?3, ?4, ?5, ?6, ?7, ?8,
                          (SELECT COALESCE(MAX(position) + 1.0, 1.0) FROM tasks),
-                         ?9, ?9)
+                         ?9, ?9, ?10)
                  RETURNING id",
                 params![
                     new.title,
@@ -600,7 +611,8 @@ impl Store for SqliteStore {
                     new.estimate_minutes,
                     new.priority,
                     new.private,
-                    now
+                    now,
+                    new.recurrence.map(Recurrence::as_str),
                 ],
                 |r| r.get(0),
             )
@@ -643,6 +655,7 @@ impl Store for SqliteStore {
             ("estimate", old.estimate_minutes != task.estimate_minutes),
             ("priority", old.priority != task.priority),
             ("private", old.private != task.private),
+            ("recurrence", old.recurrence != task.recurrence),
         ]
         .into_iter()
         .filter(|(_, changed)| *changed)
@@ -660,7 +673,7 @@ impl Store for SqliteStore {
         tx.execute(
             "UPDATE tasks SET title = ?2, notes = ?3, project = ?4, due_on = ?5,
                               planned_for = ?6, estimate_minutes = ?7, priority = ?8,
-                              private = ?9, updated_at = ?10
+                              private = ?9, updated_at = ?10, recurrence = ?11
              WHERE id = ?1",
             params![
                 task.id,
@@ -672,7 +685,8 @@ impl Store for SqliteStore {
                 task.estimate_minutes,
                 task.priority,
                 task.private,
-                now
+                now,
+                task.recurrence.map(Recurrence::as_str),
             ],
         )
         .map_err(db)?;
@@ -785,7 +799,7 @@ impl Store for SqliteStore {
         tx.execute(
             &format!(
                 "INSERT INTO tasks ({TASK_COLUMNS})
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
             ),
             params![
                 t.id,
@@ -801,7 +815,8 @@ impl Store for SqliteStore {
                 t.position,
                 ts_to_sql(t.created_at),
                 ts_to_sql(t.updated_at),
-                t.completed_at.map(ts_to_sql)
+                t.completed_at.map(ts_to_sql),
+                t.recurrence.map(Recurrence::as_str),
             ],
         )
         .map_err(db)?;
@@ -829,7 +844,8 @@ impl Store for SqliteStore {
                 "UPDATE tasks SET title = ?2, notes = ?3, status = ?4, project = ?5,
                                   due_on = ?6, planned_for = ?7, estimate_minutes = ?8,
                                   priority = ?9, private = ?10, position = ?11,
-                                  created_at = ?12, updated_at = ?13, completed_at = ?14
+                                  created_at = ?12, updated_at = ?13, completed_at = ?14,
+                                  recurrence = ?15
                  WHERE id = ?1",
                 params![
                     t.id,
@@ -845,7 +861,8 @@ impl Store for SqliteStore {
                     t.position,
                     ts_to_sql(t.created_at),
                     ts_to_sql(t.updated_at),
-                    t.completed_at.map(ts_to_sql)
+                    t.completed_at.map(ts_to_sql),
+                    t.recurrence.map(Recurrence::as_str),
                 ],
             )
             .map_err(db)?;
@@ -1074,6 +1091,12 @@ impl Store for SqliteStore {
             )
             .map_err(db)?;
         Ok(())
+    }
+
+    fn data_version(&self) -> StoreResult<i64> {
+        self.conn
+            .pragma_query_value(None, "data_version", |r| r.get(0))
+            .map_err(db)
     }
 }
 
@@ -1584,7 +1607,7 @@ mod tests {
         assert_eq!(user_version(&Connection::open(&tmp.0).unwrap()), 1);
 
         let s = SqliteStore::open(&tmp.0).unwrap();
-        assert_eq!(user_version(&s.conn), 3);
+        assert_eq!(user_version(&s.conn), MIGRATIONS.len() as i64);
 
         // Tasks: every value survives; the round 2 fields take defaults.
         let tasks = s.list_tasks().unwrap();
@@ -1727,7 +1750,7 @@ mod tests {
 
         // Reopening is a no-op.
         let s = SqliteStore::open(&tmp.0).unwrap();
-        assert_eq!(user_version(&s.conn), 3);
+        assert_eq!(user_version(&s.conn), MIGRATIONS.len() as i64);
         assert_eq!(&s.list_tasks().unwrap()[..6], &tasks[..]);
         assert_eq!(s.all_reports().unwrap(), reports);
         assert_eq!(s.load_settings().unwrap(), settings);
@@ -1761,7 +1784,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         v1_connection(&conn);
         let s = SqliteStore::init(conn).unwrap();
-        assert_eq!(user_version(&s.conn), 3);
+        assert_eq!(user_version(&s.conn), MIGRATIONS.len() as i64);
 
         let tasks = s.list_tasks().unwrap();
         assert_eq!(tasks.len(), 2);
@@ -2090,6 +2113,7 @@ mod tests {
                 estimate_minutes: Some(45),
                 priority: 2,
                 private: true,
+                recurrence: Some(Recurrence::Weekly),
             })
             .unwrap();
         let mut e = t.clone();
@@ -2691,7 +2715,8 @@ mod tests {
                  position         REAL    NOT NULL,
                  created_at       TEXT    NOT NULL,
                  updated_at       TEXT    NOT NULL,
-                 completed_at     TEXT
+                 completed_at     TEXT,
+                 recurrence       TEXT
              );
              INSERT INTO tasks_new SELECT * FROM tasks;
              DROP TABLE tasks;
@@ -2706,5 +2731,42 @@ mod tests {
             .pragma_query_value(None, "foreign_keys", |r| r.get(0))
             .unwrap();
         assert_eq!(fk, 1);
+    }
+
+    #[test]
+    fn data_version_detects_external_writes() {
+        let tmp = TempDb::new("data_version");
+        let a = SqliteStore::open(&tmp.0).unwrap();
+        let b = SqliteStore::open(&tmp.0).unwrap();
+        let v1 = a.data_version().unwrap();
+        b.add_task(new_task("from cli")).unwrap();
+        let v2 = a.data_version().unwrap();
+        assert_ne!(v1, v2);
+    }
+
+    #[test]
+    fn recurrence_persists_updates_and_reverts() {
+        let s = store();
+        let t = s
+            .add_task(NewTask {
+                title: "Standup".into(),
+                recurrence: Some(Recurrence::Daily),
+                ..NewTask::default()
+            })
+            .unwrap();
+        assert_eq!(t.recurrence, Some(Recurrence::Daily));
+        let last_event = s.task_events(t.id).unwrap().last().unwrap().id;
+        let mut edited = t.clone();
+        edited.recurrence = Some(Recurrence::Weekdays);
+        s.update_task(&edited).unwrap();
+        assert_eq!(
+            s.get_task(t.id).unwrap().unwrap().recurrence,
+            Some(Recurrence::Weekdays)
+        );
+        s.revert_task(&t, last_event).unwrap();
+        assert_eq!(
+            s.get_task(t.id).unwrap().unwrap().recurrence,
+            Some(Recurrence::Daily)
+        );
     }
 }

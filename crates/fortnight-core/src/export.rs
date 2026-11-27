@@ -249,6 +249,9 @@ fn push_task(out: &mut String, task: &Task, logs: Option<&Vec<&Event>>, tz: &Tim
             "!".repeat(usize::from(task.priority.min(MAX_PRIORITY)))
         ));
     }
+    if let Some(r) = task.recurrence {
+        parts.push(format!("repeats: {}", r.as_str()));
+    }
     if let (true, Some(at)) = (task.is_done(), task.completed_at) {
         parts.push(format!("completed: {}", local_date(at, tz)));
     }

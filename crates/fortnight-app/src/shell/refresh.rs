@@ -6,6 +6,7 @@ use crate::Ready;
 use fortnight_app::top_bar::Tab;
 use fortnight_app::views::day::{self, DayData, LogLine};
 use fortnight_app::views::month::MonthData;
+use fortnight_app::views::search::SearchData;
 use fortnight_app::views::settings::SettingsData;
 use fortnight_app::views::week::WeekData;
 use fortnight_core::domain::{Report, ReportKey, ReportKind};
@@ -27,7 +28,7 @@ pub(crate) struct Derived {
 }
 
 impl Ready {
-    pub(super) fn reload_tasks(&mut self) {
+    pub(crate) fn reload_tasks(&mut self) {
         self.tasks_changed = true;
         self.invalidate();
         match self.store.list_tasks() {
@@ -112,6 +113,15 @@ impl Ready {
             }
         }
 
+        if self.search_open {
+            let logs = self.logs();
+            self.search_view.load(SearchData {
+                tasks: self.tasks.clone(),
+                logs,
+                today,
+            });
+        }
+
         if self.settings_open {
             self.settings_view.load(SettingsData {
                 settings: self.settings.clone(),
@@ -121,6 +131,8 @@ impl Ready {
                 test_result: self.test_result.clone(),
                 testing: self.testing,
                 key_message: self.key_message.clone(),
+                saving_key: self.saving_key,
+                export_status: self.export_status.clone(),
                 models: self.models.clone(),
                 ollama: self.ollama.clone(),
             });

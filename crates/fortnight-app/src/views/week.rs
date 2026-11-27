@@ -227,10 +227,20 @@ impl WeekView {
                 self.summary_open = !self.summary_open;
                 Action::None
             }
-            Message::Panel(m) => match self.panel.update(m) {
-                report_panel::Action::None => Action::None,
-                action => Action::Panel(action),
-            },
+            Message::Panel(m) => {
+                let unfold = matches!(
+                    m,
+                    report_panel::Message::StartEdit | report_panel::Message::ToggleFacts
+                );
+                let action = self.panel.update(m);
+                if unfold && (self.panel.is_editing() || self.panel.showing_facts()) {
+                    self.summary_open = true;
+                }
+                match action {
+                    report_panel::Action::None => Action::None,
+                    action => Action::Panel(action),
+                }
+            }
             Message::Press(id) => {
                 self.drag = Some(Drag {
                     id,
@@ -632,7 +642,7 @@ fn date_label(d: Date) -> String {
     d.strftime("%-d %b").to_string()
 }
 
-/// The small grey line under a task title: estimate and project.
+/// The small grey line under a task title: estimate, project, and recurrence mark.
 fn meta_line(task: &Task) -> String {
     let mut parts = Vec::new();
     if let Some(m) = task.estimate_minutes {
@@ -640,6 +650,9 @@ fn meta_line(task: &Task) -> String {
     }
     if let Some(p) = &task.project {
         parts.push(format!("#{p}"));
+    }
+    if task.recurrence.is_some() {
+        parts.push("↻".into());
     }
     parts.join(" · ")
 }
@@ -955,17 +968,19 @@ fn task_card<'a>(task: &'a Task, day: Date, today: Date, faded: bool) -> Element
     if !done {
         let meta = meta_line(task);
         let due = due_corner(task, day);
-        if !meta.is_empty() || due.is_some() {
-            // Estimate and project on the left, the deadline bottom right.
-            let mut line = row![
+        if !meta.is_empty() || due.is_some() || task.private {
+            // Estimate, project, recurrence and private lock on the left, deadline bottom right.
+            let mut line = Row::new().spacing(4).align_y(Center);
+            if task.private {
+                line = line.push(theme::icon(theme::Icon::Lock).width(11).height(11));
+            }
+            line = line.push(
                 text(meta)
                     .size(11)
                     .style(theme::muted)
                     .wrapping(Wrapping::WordOrGlyph)
-                    .width(Fill)
-            ]
-            .spacing(6)
-            .align_y(iced::Bottom);
+                    .width(Fill),
+            );
             if let Some(due) = due {
                 line = line.push(
                     text(due)
@@ -1507,6 +1522,7 @@ mod tests {
             blocked: None,
             empty: false,
             stale: true,
+            facts_md: "## Facts\n- Done item".into(),
         });
         let week = d.week;
         v.load(d);
@@ -1516,6 +1532,25 @@ mod tests {
             ))),
             Action::Panel(report_panel::Action::Generate(ReportKind::Summary, week))
         );
+        // Toggling facts unfolds the Weekly Summary card even without a ready summary.
+        assert!(!v.summary_open);
+        assert_eq!(
+            v.update(Message::Panel(report_panel::Message::ToggleFacts)),
+            Action::None
+        );
+        assert!(v.summary_open);
+        let _ = v.view();
+    }
+
+    #[test]
+    fn meta_line_includes_recurrence_and_private_card_renders() {
+        let d = date(2026, 11, 18);
+        let mut t = task(1, Some(d), TaskStatus::Todo);
+        t.recurrence = Some(fortnight_core::domain::Recurrence::Weekly);
+        t.private = true;
+        assert_eq!(meta_line(&t), "↻");
+        let mut v = WeekView::new();
+        v.load(data(vec![t]));
         let _ = v.view();
     }
 }

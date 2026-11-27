@@ -186,6 +186,7 @@ impl Ready {
         self.suggest.cancel();
         self.abort_model_requests();
         self.testing = false;
+        self.saving_key = false;
         self.key_message = None;
     }
 
@@ -194,6 +195,7 @@ impl Ready {
     pub(crate) fn unlock(&mut self, password: SecretString) -> Task<Message> {
         self.unlock_seq += 1;
         let seq = self.unlock_seq;
+        self.unlock_view.set_busy(true);
         let main = self
             .keys
             .key_exists
@@ -257,6 +259,7 @@ impl Ready {
             self.keys.decision_key_exists = vault::decision_key_path(&self.data_dir).exists();
             return Task::none();
         }
+        self.saving_key = false;
         match result {
             Ok(saved) => {
                 let (mine, other) = match saved.which {
@@ -301,6 +304,7 @@ impl Ready {
     ) -> Task<Message> {
         self.key_save_seq += 1;
         let seq = self.key_save_seq;
+        self.saving_key = true;
         let main_path = vault::key_path(&self.data_dir);
         let decision_path = vault::decision_key_path(&self.data_dir);
         self.key_message = None;
@@ -330,6 +334,7 @@ impl Ready {
     /// Removes the `which` key file and forgets the key (Settings).
     pub(super) fn remove_key(&mut self, which: settings::Which) -> Task<Message> {
         self.key_save_seq += 1;
+        self.saving_key = false;
         let main_path = vault::key_path(&self.data_dir);
         let decision_path = vault::decision_key_path(&self.data_dir);
         let (path, exists, key) = match which {

@@ -31,7 +31,7 @@
 use jiff::Span;
 use jiff::civil::{Date, Weekday};
 
-use crate::domain::{MAX_PRIORITY, NewTask};
+use crate::domain::{MAX_PRIORITY, NewTask, Recurrence};
 
 /// The largest estimate accepted: seven days, in minutes.
 const MAX_ESTIMATE_MINUTES: u32 = 7 * 24 * 60;
@@ -43,6 +43,11 @@ pub struct QuickAdd {
     /// The date in the line: the day you plan to do it (`Task::planned_for`,
     /// where the task is shown), never the deadline. The last date wins.
     pub day: Option<Date>,
+    /// Explicit deadline (`due:fri`, `due:2026-11-20`, `due:nov 20`, …).
+    pub due_on: Option<Date>,
+    /// Repeat cadence (`every:daily`, `every:weekdays`, `every:weekly`,
+    /// `every:monthly`).
+    pub recurrence: Option<Recurrence>,
     /// `~2h`, `~30m`, `~1h30m`, `~1.5h` (round 2, agent B).
     pub estimate_minutes: Option<u32>,
     /// `!` = 1, `!!` = 2, `!!!` = 3 (round 2, agent B).
@@ -57,6 +62,32 @@ pub fn parse_quick_add(input: &str, today: Date) -> QuickAdd {
 
     let mut i = 0;
     while i < tokens.len() {
+        let tok = tokens[i];
+        // `due:<date>` (including two-token `due:nov 20` / `due:20 nov`).
+        if let Some(rest) = strip_prefix_ignore_ascii_case(tok, "due:")
+            && !rest.is_empty()
+        {
+            if let Some(next) = tokens.get(i + 1)
+                && let Some(d) = month_day(rest, next, today)
+            {
+                out.due_on = Some(d);
+                i += 2;
+                continue;
+            }
+            if let Some(d) = single_date(rest, today) {
+                out.due_on = Some(d);
+                i += 1;
+                continue;
+            }
+        }
+        // `every:daily|weekdays|weekly|monthly`
+        if let Some(rest) = strip_prefix_ignore_ascii_case(tok, "every:")
+            && let Some(r) = Recurrence::parse(rest)
+        {
+            out.recurrence = Some(r);
+            i += 1;
+            continue;
+        }
         if let Some(next) = tokens.get(i + 1)
             && let Some(d) = month_day(tokens[i], next, today)
         {
@@ -64,7 +95,6 @@ pub fn parse_quick_add(input: &str, today: Date) -> QuickAdd {
             i += 2;
             continue;
         }
-        let tok = tokens[i];
         if let Some(d) = single_date(tok, today) {
             out.day = Some(d);
         } else if let Some(p) = tok.strip_prefix('#').filter(|p| !p.is_empty()) {
@@ -83,6 +113,12 @@ pub fn parse_quick_add(input: &str, today: Date) -> QuickAdd {
     out
 }
 
+fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &s[prefix.len()..])
+}
+
 /// The task a quick-add line creates, or `None` if it has no title (only
 /// a date, project, estimate or priority, or nothing). The date in the line
 /// is the planned day; without one the task is planned for `default_day`
@@ -96,9 +132,11 @@ pub fn quick_add_task(input: &str, today: Date, default_day: Option<Date>) -> Op
     Some(NewTask {
         title: parsed.title,
         project: parsed.project,
+        due_on: parsed.due_on,
         planned_for: parsed.day.or(default_day),
         estimate_minutes: parsed.estimate_minutes,
         priority: parsed.priority,
+        recurrence: parsed.recurrence,
         ..NewTask::default()
     })
 }
@@ -676,5 +714,35 @@ mod tests {
         for bad in ["", "0", "24.5", "-1", "1e2", "six"] {
             assert_eq!(parse_hours(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn quick_add_due_and_recurrence() {
+        let t = quick_add_task(
+            "Standup notes tomorrow due:fri every:weekdays #work ~15m !",
+            TODAY,
+            Some(TODAY),
+        )
+        .unwrap();
+        assert_eq!(t.title, "Standup notes");
+        assert_eq!(t.planned_for, Some(date(2026, 11, 17)));
+        assert_eq!(t.due_on, Some(date(2026, 11, 20)));
+        assert_eq!(t.recurrence, Some(Recurrence::Weekdays));
+        assert_eq!(t.project.as_deref(), Some("work"));
+        assert_eq!(t.estimate_minutes, Some(15));
+        assert_eq!(t.priority, 1);
+
+        // Two-token due date (`due:nov 25` / `due:25 nov`).
+        let p = parse_quick_add("File taxes due:nov 25 every:monthly", TODAY);
+        assert_eq!(p.title, "File taxes");
+        assert_eq!(p.due_on, Some(date(2026, 11, 25)));
+        assert_eq!(p.day, None);
+        assert_eq!(p.recurrence, Some(Recurrence::Monthly));
+
+        // Invalid due:/every: stay in the title.
+        let p = parse_quick_add("Check due:later every:blue", TODAY);
+        assert_eq!(p.title, "Check due:later every:blue");
+        assert_eq!(p.due_on, None);
+        assert_eq!(p.recurrence, None);
     }
 }

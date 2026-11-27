@@ -7,7 +7,7 @@ use iced::{Center, Element, Fill};
 use secrecy::SecretString;
 use std::fmt;
 
-use super::{Action, Message, SettingsView, Which, error_text, input, primary, secondary};
+use super::{Action, Message, SettingsView, Which, error_text, input, secondary};
 use crate::{motion, theme};
 
 /// The state of the encrypted API key.
@@ -157,6 +157,9 @@ impl SettingsView {
     }
 
     pub(super) fn save_key(&mut self) -> Action {
+        if self.saving_key {
+            return Action::None;
+        }
         let which = self.key_target;
         if self.typed_key(which).trim().is_empty() {
             self.password_prompt = false;
@@ -186,7 +189,7 @@ impl SettingsView {
         .id(PASSWORD_INPUT_ID)
         .secure(true)
         .on_input(|s| Message::Secret(SecretField::Password, Typed(s)))
-        .on_submit(Message::SubmitPassword);
+        .on_submit_maybe((!self.saving_key).then_some(Message::SubmitPassword));
         let other = match self.key_target {
             Which::Main => Which::Decision,
             Which::Decision => Which::Main,
@@ -201,13 +204,22 @@ impl SettingsView {
         if let Some(e) = &self.key_error {
             card = card.push(text(e).size(theme::TEXT_SMALL).style(theme::danger));
         }
+        let save_label = if self.saving_key {
+            "Encrypting…"
+        } else {
+            "Save"
+        };
+        let save = button(text(save_label).size(theme::TEXT_BODY))
+            .padding([8, 18])
+            .style(theme::primary_button)
+            .on_press_maybe((!self.saving_key).then_some(Message::SubmitPassword));
         card = card.push(
             row![
-                primary("Save", Message::SubmitPassword),
+                save,
                 button(text("Cancel").size(theme::TEXT_BODY))
                     .padding([8, 14])
                     .style(theme::text_button)
-                    .on_press(Message::CancelPassword),
+                    .on_press_maybe((!self.saving_key).then_some(Message::CancelPassword)),
             ]
             .spacing(theme::SPACING / 2.0),
         );
@@ -283,10 +295,21 @@ impl SettingsView {
             Which::Main => SecretField::ApiKey,
             Which::Decision => SecretField::DecisionKey,
         };
+        let save_btn = button(
+            text(if self.saving_key {
+                "Encrypting…"
+            } else {
+                "Save"
+            })
+            .size(theme::TEXT_BODY),
+        )
+        .padding([8, 14])
+        .style(theme::secondary_button)
+        .on_press_maybe((!self.saving_key).then_some(Message::SaveKey(which)));
         let mut line = row![
             secret_input("Paste API key", self.typed_key(which), field)
-                .on_submit(Message::SaveKey(which)),
-            secondary("Save", Message::SaveKey(which)),
+                .on_submit_maybe((!self.saving_key).then_some(Message::SaveKey(which))),
+            save_btn,
         ]
         .spacing(theme::SPACING / 2.0)
         .align_y(Center);
@@ -457,5 +480,19 @@ mod tests {
         assert!(matches!(v.update(Message::SubmitPassword), Action::None));
         assert!(!v.password_prompt);
         assert!(v.secrets.password.is_empty());
+    }
+
+    #[test]
+    fn saving_key_disables_password_submit_and_builds_view() {
+        let mut v = loaded(KeyState::NoKey);
+        typed(&mut v, SecretField::ApiKey, "sk-abc");
+        v.update(Message::SaveKey(Which::Main));
+        typed(&mut v, SecretField::Password, "correct horse");
+        let mut d = data(Settings::default(), KeyState::NoKey);
+        d.saving_key = true;
+        v.load(d);
+        assert!(matches!(v.update(Message::SubmitPassword), Action::None));
+        assert!(v.password_prompt);
+        let _ = v.view();
     }
 }

@@ -30,6 +30,7 @@ impl Ready {
     /// (`SettingsView::on_hidden`); form edits are kept.
     pub(crate) fn hide_settings(&mut self) {
         self.settings_open = false;
+        self.export_status = None;
         self.settings_view.on_hidden();
     }
 
@@ -40,7 +41,8 @@ impl Ready {
                 self.hide_settings();
                 Task::none()
             }
-            settings::Action::Save(s) => {
+            settings::Action::Save(mut s) => {
+                s.window_size = self.window_size;
                 let now = Timestamp::now();
                 let summary_prompt_changed = report::summary_prompt(&s)
                     != report::summary_prompt(&self.settings)
@@ -133,6 +135,45 @@ impl Ready {
                 UnlockView::focus().map(Message::Unlock)
             }
             settings::Action::FocusPassword => operation::focus(settings::PASSWORD_INPUT_ID),
+            settings::Action::Export(format) => {
+                self.export_data(format);
+                Task::none()
+            }
+        }
+    }
+
+    /// Writes a full Markdown or JSON export into `<data_dir>/exports/`.
+    fn export_data(&mut self, format: fortnight_core::export::ExportFormat) {
+        let today = self.today();
+        let reports = match self.store.all_reports() {
+            Ok(r) => r,
+            Err(e) => {
+                self.export_status = Some(Err(format!("Could not read reports: {e}")));
+                return;
+            }
+        };
+        let content = fortnight_core::export::export_all(
+            format,
+            &self.tasks,
+            &self.events,
+            &reports,
+            today,
+            &self.tz,
+        );
+        let dir = self.data_dir.join("exports");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.export_status = Some(Err(format!("Could not create exports folder: {e}")));
+            return;
+        }
+        let filename = format!("fortnight-export-{today}.{}", format.extension());
+        let path = dir.join(&filename);
+        match std::fs::write(&path, content) {
+            Ok(()) => {
+                self.export_status = Some(Ok(format!("Saved to {}", path.display())));
+            }
+            Err(e) => {
+                self.export_status = Some(Err(format!("Could not write export: {e}")));
+            }
         }
     }
 

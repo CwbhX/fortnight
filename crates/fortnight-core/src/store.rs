@@ -181,4 +181,10 @@ pub trait Store {
     fn load_settings(&self) -> StoreResult<Settings>;
 
     fn save_settings(&self, settings: &Settings) -> StoreResult<()>;
+
+    // ---- external change detection ----
+
+    /// SQLite's `PRAGMA data_version`: increments whenever another connection
+    /// (such as `fortnight-cli`) commits a change to the database file.
+    fn data_version(&self) -> StoreResult<i64>;
 }

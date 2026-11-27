@@ -2,11 +2,12 @@
 //! use an in-memory store and a mock LLM. Nothing here reads the process
 //! environment, stdin or the clock.
 
-use crate::args::ListArgs;
+use crate::args::{EditArgs, ListArgs};
 use crate::error::{CliError, CliResult, ErrorKind};
 use crate::llm_setup::LlmHandle;
 use fortnight_core::domain::{
-    Report, ReportKey, ReportKind, ReportStatus, Settings, Task, TaskId, TaskStatus, WeekRef,
+    MAX_PRIORITY, Report, ReportKey, ReportKind, ReportStatus, Settings, Task, TaskId, TaskStatus,
+    WeekRef, next_occurrence,
 };
 use fortnight_core::export::{self, ExportFormat};
 use fortnight_core::llm::{ChatEvent, ChatResponse, LlmError};
@@ -39,22 +40,16 @@ pub fn now_for(today: Option<Date>, tz: TimeZone) -> CliResult<ZonedDateTime> {
 
 // ----------------------------------------------------------------- add
 
-/// `add`: parses the quick-add words and stores the task. A date in the
-/// words is the day you plan to do it; without one the task is undated.
-pub fn add(store: &dyn Store, words: &[String], today: Date, out: &mut dyn Write) -> CliResult<()> {
-    let settings = store.load_settings()?;
-    let Some(mut new) = parse::quick_add_task(&words.join(" "), today, None) else {
-        return Err(CliError::usage(
-            "the task needs a title (only a date, project, estimate or priority was given)",
-        ));
-    };
-    if settings.due_on_added_day && new.due_on.is_none() {
-        new.due_on = new.planned_for;
-    }
-    let task = store.add_task(new)?;
+fn format_task_summary(verb: &str, task: &Task) -> String {
     let mut extras = Vec::new();
     if let Some(d) = task.planned_for {
         extras.push(format!("on {d}"));
+    }
+    if let Some(d) = task.due_on {
+        extras.push(format!("due {d}"));
+    }
+    if let Some(r) = task.recurrence {
+        extras.push(format!("↻{}", r.as_str()));
     }
     if let Some(p) = &task.project {
         extras.push(format!("#{p}"));
@@ -65,17 +60,39 @@ pub fn add(store: &dyn Store, words: &[String], today: Date, out: &mut dyn Write
     if task.priority > 0 {
         extras.push("!".repeat(usize::from(task.priority)));
     }
-    if extras.is_empty() {
-        writeln!(out, "Added {}: {}", task.id, task.title)?;
-    } else {
-        writeln!(
-            out,
-            "Added {}: {} ({})",
-            task.id,
-            task.title,
-            extras.join(", ")
-        )?;
+    if task.private {
+        extras.push("private".into());
     }
+    if extras.is_empty() {
+        format!("{verb} {}: {}", task.id, task.title)
+    } else {
+        format!("{verb} {}: {} ({})", task.id, task.title, extras.join(", "))
+    }
+}
+
+/// `add`: parses the quick-add words and stores the task. A date in the
+/// words is the day you plan to do it; without one the task is undated.
+pub fn add(
+    store: &dyn Store,
+    words: &[String],
+    private: bool,
+    today: Date,
+    out: &mut dyn Write,
+) -> CliResult<()> {
+    let settings = store.load_settings()?;
+    let Some(mut new) = parse::quick_add_task(&words.join(" "), today, None) else {
+        return Err(CliError::usage(
+            "the task needs a title (only a date, project, estimate or priority was given)",
+        ));
+    };
+    if private {
+        new.private = true;
+    }
+    if settings.due_on_added_day && new.due_on.is_none() {
+        new.due_on = new.planned_for;
+    }
+    let task = store.add_task(new)?;
+    writeln!(out, "{}", format_task_summary("Added", &task))?;
     Ok(())
 }
 
@@ -93,9 +110,20 @@ pub fn select_tasks(
     week_start: Weekday,
 ) -> Vec<Task> {
     let this_week = week::week_containing(today, week_start);
+    let project_filter = opts.project.as_deref().map(|raw| {
+        let trimmed = raw.trim();
+        trimmed.strip_prefix('#').unwrap_or(trimmed)
+    });
     let mut shown: Vec<Task> = tasks
         .iter()
         .filter(|t| opts.all || t.status.is_open())
+        .filter(|t| {
+            project_filter.is_none_or(|want| {
+                t.project
+                    .as_deref()
+                    .is_some_and(|p| p.eq_ignore_ascii_case(want))
+            })
+        })
         .filter(|t| {
             if opts.week {
                 t.is_overdue(today) || t.day().is_some_and(|d| this_week.contains(d))
@@ -141,8 +169,8 @@ fn status_mark(s: TaskStatus) -> &'static str {
     }
 }
 
-/// Aligned plain-text table: id, status mark, title, project, planned day,
-/// due, estimate, priority.
+/// Aligned plain-text table: id, status mark, title (with recurrence and
+/// privacy markers when set), project, planned day, due, estimate, priority.
 pub fn format_list(tasks: &[Task]) -> String {
     if tasks.is_empty() {
         return "No tasks.\n".to_string();
@@ -158,10 +186,17 @@ pub fn format_list(tasks: &[Task]) -> String {
         "PRI".into(),
     ]];
     for t in tasks {
+        let mut title = t.title.clone();
+        if let Some(r) = t.recurrence {
+            title.push_str(&format!(" ↻{}", r.as_str()));
+        }
+        if t.private {
+            title.push_str(" (private)");
+        }
         rows.push([
             t.id.to_string(),
             status_mark(t.status).to_string(),
-            t.title.clone(),
+            title,
             t.project.clone().unwrap_or_default(),
             t.day().map(|d| d.to_string()).unwrap_or_default(),
             t.due_on.map(|d| d.to_string()).unwrap_or_default(),
@@ -200,11 +235,19 @@ pub fn list(store: &dyn Store, opts: &ListArgs, today: Date, out: &mut dyn Write
     Ok(())
 }
 
-// ------------------------------------------------------------ done, log
+// -------------------------------------------------- done, delete, edit, log
 
-/// `done`: sets each task done (or todo with `undo`). Carries on past a
-/// missing id and reports them all at the end.
-pub fn done(store: &dyn Store, ids: &[TaskId], undo: bool, out: &mut dyn Write) -> CliResult<()> {
+/// `done`: sets each task done (or todo with `undo`). When marking an open
+/// recurring task done, spawns its next occurrence unless an equivalent open
+/// occurrence already exists. Carries on past a missing id and reports them
+/// all at the end.
+pub fn done(
+    store: &dyn Store,
+    ids: &[TaskId],
+    undo: bool,
+    today: Date,
+    out: &mut dyn Write,
+) -> CliResult<()> {
     let status = if undo {
         TaskStatus::Todo
     } else {
@@ -212,19 +255,59 @@ pub fn done(store: &dyn Store, ids: &[TaskId], undo: bool, out: &mut dyn Write) 
     };
     let mut failures = Vec::new();
     for &id in ids {
-        let result = store
-            .set_status(id, status)
-            .and_then(|()| store.get_task(id));
-        match result {
-            Ok(Some(task)) => writeln!(
-                out,
-                "{} {}: {}",
-                if undo { "Reopened" } else { "Done" },
-                task.id,
-                task.title
-            )?,
-            Ok(None) => failures.push(format!("task {id} not found")),
-            Err(e) => failures.push(e.to_string()),
+        let before = match store.get_task(id) {
+            Ok(Some(task)) => task,
+            Ok(None) => {
+                failures.push(format!("task {id} not found"));
+                continue;
+            }
+            Err(e) => {
+                failures.push(e.to_string());
+                continue;
+            }
+        };
+        if let Err(e) = store.set_status(id, status) {
+            failures.push(e.to_string());
+            continue;
+        }
+        writeln!(
+            out,
+            "{} {}: {}",
+            if undo { "Reopened" } else { "Done" },
+            before.id,
+            before.title
+        )?;
+        if !undo
+            && before.status.is_open()
+            && let Some(next) = next_occurrence(&before, today)
+        {
+            match store.list_tasks() {
+                Ok(existing) => {
+                    let already_exists = existing.iter().any(|t| {
+                        t.status.is_open()
+                            && t.title == next.title
+                            && t.recurrence == next.recurrence
+                            && t.planned_for == next.planned_for
+                    });
+                    if !already_exists {
+                        match store.add_task(next) {
+                            Ok(spawned) => {
+                                if let Some(d) = spawned.planned_for {
+                                    writeln!(
+                                        out,
+                                        "Next occurrence #{} planned for {d}",
+                                        spawned.id
+                                    )?;
+                                } else {
+                                    writeln!(out, "Next occurrence #{}", spawned.id)?;
+                                }
+                            }
+                            Err(e) => failures.push(e.to_string()),
+                        }
+                    }
+                }
+                Err(e) => failures.push(e.to_string()),
+            }
         }
     }
     if failures.is_empty() {
@@ -232,6 +315,161 @@ pub fn done(store: &dyn Store, ids: &[TaskId], undo: bool, out: &mut dyn Write) 
     } else {
         Err(CliError::failure(failures.join("\n")))
     }
+}
+
+/// `delete`: moves each task to `Dropped`, or permanently deletes it with
+/// `forever`. Carries on past a missing id and reports them all at the end.
+pub fn delete(
+    store: &dyn Store,
+    ids: &[TaskId],
+    forever: bool,
+    out: &mut dyn Write,
+) -> CliResult<()> {
+    let mut failures = Vec::new();
+    for &id in ids {
+        if forever {
+            match store.delete_task(id) {
+                Ok(deleted) => {
+                    writeln!(out, "Deleted {}: {}", deleted.task.id, deleted.task.title)?;
+                }
+                Err(e) => failures.push(e.to_string()),
+            }
+        } else {
+            let result = store
+                .set_status(id, TaskStatus::Dropped)
+                .and_then(|()| store.get_task(id));
+            match result {
+                Ok(Some(task)) => writeln!(out, "Dropped {}: {}", task.id, task.title)?,
+                Ok(None) => failures.push(format!("task {id} not found")),
+                Err(e) => failures.push(e.to_string()),
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(CliError::failure(failures.join("\n")))
+    }
+}
+
+/// Parses a single date argument (`YYYY-MM-DD`, `today`, `tomorrow`, weekday,
+/// `+3d`, `+2w`, `nov 20`, etc.) relative to `today`.
+pub fn parse_date_arg(s: &str, today: Date) -> CliResult<Date> {
+    let trimmed = s.trim();
+    if let Ok(d) = trimmed.parse::<Date>() {
+        return Ok(d);
+    }
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    if matches!(tokens.len(), 1 | 2) {
+        let parsed = parse::parse_quick_add(trimmed, today);
+        let single_date_only = parsed.title.is_empty()
+            && parsed.project.is_none()
+            && parsed.due_on.is_none()
+            && parsed.recurrence.is_none()
+            && parsed.estimate_minutes.is_none()
+            && parsed.priority == 0;
+        let not_two_separate_dates = tokens.len() == 1
+            || (parse::parse_quick_add(tokens[0], today).day.is_none()
+                && parse::parse_quick_add(tokens[1], today).day.is_none());
+        if let Some(d) = parsed.day
+            && single_date_only
+            && not_two_separate_dates
+        {
+            return Ok(d);
+        }
+    }
+    Err(CliError::usage(format!(
+        "'{s}' is not a date. Use YYYY-MM-DD, today, tomorrow, a weekday, +3d, or e.g. 'nov 20'."
+    )))
+}
+
+/// `edit`: updates the specified fields on an existing task.
+pub fn edit(store: &dyn Store, opts: &EditArgs, today: Date, out: &mut dyn Write) -> CliResult<()> {
+    let title = match &opts.title {
+        Some(raw) => {
+            let t = raw.trim();
+            if t.is_empty() {
+                return Err(CliError::usage("the task title cannot be empty"));
+            }
+            Some(t.to_string())
+        }
+        None => None,
+    };
+    let project = match &opts.project {
+        Some(raw) => {
+            let p = raw.trim();
+            let p = p.strip_prefix('#').unwrap_or(p).trim();
+            if p.is_empty() {
+                return Err(CliError::usage(
+                    "project name cannot be empty (use --clear-project to clear it)",
+                ));
+            }
+            Some(p.to_string())
+        }
+        None => None,
+    };
+    let due = opts
+        .due
+        .as_deref()
+        .map(|s| parse_date_arg(s, today))
+        .transpose()?;
+    let planned = opts
+        .planned
+        .as_deref()
+        .map(|s| parse_date_arg(s, today))
+        .transpose()?;
+    if let Some(p) = opts.priority
+        && p > MAX_PRIORITY
+    {
+        return Err(CliError::usage(format!(
+            "priority must be between 0 and {MAX_PRIORITY}, got {p}"
+        )));
+    }
+
+    let Some(mut task) = store.get_task(opts.id)? else {
+        return Err(CliError::failure(format!("task {} not found", opts.id)));
+    };
+
+    if let Some(t) = title {
+        task.title = t;
+    }
+    if let Some(p) = project {
+        task.project = Some(p);
+    } else if opts.clear_project {
+        task.project = None;
+    }
+    if let Some(d) = due {
+        task.due_on = Some(d);
+    } else if opts.clear_due {
+        task.due_on = None;
+    }
+    if let Some(d) = planned {
+        task.planned_for = Some(d);
+    } else if opts.clear_planned {
+        task.planned_for = None;
+    }
+    if let Some(m) = opts.estimate {
+        task.estimate_minutes = Some(m);
+    } else if opts.clear_estimate {
+        task.estimate_minutes = None;
+    }
+    if let Some(p) = opts.priority {
+        task.priority = p;
+    }
+    if opts.private {
+        task.private = true;
+    } else if opts.no_private {
+        task.private = false;
+    }
+    if let Some(r) = opts.repeat {
+        task.recurrence = Some(r);
+    } else if opts.clear_repeat {
+        task.recurrence = None;
+    }
+
+    store.update_task(&task)?;
+    writeln!(out, "{}", format_task_summary("Updated", &task))?;
+    Ok(())
 }
 
 /// `log`: a note for today (a free-standing log line, which the Today tab

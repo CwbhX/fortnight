@@ -57,6 +57,7 @@
 //! and a confirmation before closing with unsaved changes.
 
 use fortnight_core::domain::{Accent, AppIcon, Appearance, LlmSettings, Settings, TodayWidth};
+use fortnight_core::export::ExportFormat;
 use fortnight_core::ollama::{ModelKind, OllamaModel};
 use fortnight_core::parse::parse_hours;
 use fortnight_core::report::{
@@ -147,6 +148,8 @@ pub enum Message {
     DueOnAddedDay(bool),
     /// "Recommend overdue tasks", applied on Save.
     RecommendOverdue(bool),
+    /// Export all tasks, history and reports to Markdown or JSON.
+    Export(ExportFormat),
 }
 
 /// Which endpoint a field, button or request is for: the main LLM, or the
@@ -226,6 +229,8 @@ pub enum Action {
     FocusPassword,
     /// Send this message back a moment from now (`Message::UrlSettled`).
     Later(Message),
+    /// Export all tasks, history and reports in this format.
+    Export(ExportFormat),
 }
 
 /// Everything the view shows, supplied by `main.rs`.
@@ -240,6 +245,10 @@ pub struct SettingsData {
     /// Result of the last Test: `Ok(model reply)` or `Err(message)`.
     pub test_result: Option<Result<String, String>>,
     pub testing: bool,
+    /// True while Argon2 is encrypting a new API key.
+    pub saving_key: bool,
+    /// Brief confirmation or error from the last data export.
+    pub export_status: Option<Result<String, String>>,
     /// Why the last key operation (saving or removing a key) failed, such
     /// as a wrong password; shown near the key controls.
     pub key_message: Option<String>,
@@ -322,6 +331,8 @@ pub struct SettingsView {
     key_state: KeyState,
     test_result: Option<Result<String, String>>,
     testing: bool,
+    saving_key: bool,
+    export_status: Option<Result<String, String>>,
     key_message: Option<String>,
     secrets: Secrets,
     key_mode: KeyMode,
@@ -367,6 +378,8 @@ impl Default for SettingsView {
             key_state: KeyState::NoKey,
             test_result: None,
             testing: false,
+            saving_key: false,
+            export_status: None,
             key_message: None,
             secrets: Secrets::default(),
             key_mode: KeyMode::Idle,
@@ -413,6 +426,8 @@ impl SettingsView {
         self.data_dir = data.data_dir;
         self.test_result = data.test_result;
         self.testing = data.testing;
+        self.saving_key = data.saving_key;
+        self.export_status = data.export_status;
         self.key_message = data.key_message;
         self.models = data.models;
         self.ollama = data.ollama;
@@ -472,6 +487,7 @@ impl SettingsView {
             Message::TodayWidth(w) => form.today_width = w,
             Message::DueOnAddedDay(on) => form.due_on_added_day = on,
             Message::RecommendOverdue(on) => form.recommend_overdue = on,
+            Message::Export(format) => return Action::Export(format),
             Message::WorkingDay(i, on) => {
                 if let Some(day) = form.working_days.get_mut(i) {
                     *day = on;
@@ -853,12 +869,25 @@ impl SettingsView {
     }
 
     fn data_section(&self) -> Element<'_, Message> {
-        section(
-            "Data folder",
+        let mut body = column![
             text(self.data_dir.display().to_string())
                 .size(theme::TEXT_SMALL)
                 .style(theme::muted),
-        )
+            row![
+                secondary("Export Markdown", Message::Export(ExportFormat::Markdown)),
+                secondary("Export JSON", Message::Export(ExportFormat::Json)),
+            ]
+            .spacing(theme::SPACING / 2.0),
+        ]
+        .spacing(theme::SPACING * 0.75);
+        if let Some(status) = &self.export_status {
+            let (msg, style): (&str, fn(&Theme) -> text::Style) = match status {
+                Ok(msg) => (msg.as_str(), theme::muted),
+                Err(err) => (err.as_str(), theme::danger),
+            };
+            body = body.push(text(msg).size(theme::TEXT_SMALL).style(style));
+        }
+        section("Data folder", body)
     }
 
     fn about_section(&self) -> Element<'_, Message> {
@@ -973,14 +1002,6 @@ fn day_picker<'a>(day: Weekday, on_select: fn(Weekday) -> Message) -> Element<'a
     theme::dropdown(list)
 }
 
-fn primary<'a>(label: &'a str, message: Message) -> Element<'a, Message> {
-    button(text(label).size(theme::TEXT_BODY))
-        .padding([8, 18])
-        .style(theme::primary_button)
-        .on_press(message)
-        .into()
-}
-
 fn secondary<'a>(label: &'a str, message: Message) -> Element<'a, Message> {
     button(text(label).size(theme::TEXT_BODY))
         .padding([8, 14])
@@ -1032,6 +1053,8 @@ mod test_util {
             decision_key_state: KeyState::NoKey,
             test_result: None,
             testing: false,
+            saving_key: false,
+            export_status: None,
             key_message: None,
             models: PerBlock::default(),
             ollama: None,
@@ -1132,6 +1155,28 @@ mod tests {
         assert!(details.contains("Clement Hathaway"));
         assert!(details.contains("MIT"));
         let v = loaded(KeyState::NoKey);
+        let _ = v.view();
+    }
+
+    #[test]
+    fn export_actions_and_status_render() {
+        let mut v = loaded(KeyState::NoKey);
+        assert!(matches!(
+            v.update(Message::Export(ExportFormat::Markdown)),
+            Action::Export(ExportFormat::Markdown)
+        ));
+        assert!(matches!(
+            v.update(Message::Export(ExportFormat::Json)),
+            Action::Export(ExportFormat::Json)
+        ));
+        let mut d = data(Settings::default(), KeyState::NoKey);
+        d.export_status = Some(Ok("Exported to /tmp/fortnight-2026-11-26.md".into()));
+        v.load(d);
+        let _ = v.view();
+
+        let mut d = data(Settings::default(), KeyState::NoKey);
+        d.export_status = Some(Err("Permission denied".into()));
+        v.load(d);
         let _ = v.view();
     }
 }

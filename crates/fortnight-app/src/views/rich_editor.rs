@@ -750,10 +750,22 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
                 let mut actions = Vec::new();
                 let mut handled = false;
                 let shortcut = m.command() || m.control();
-                let letter = key.to_latin(*physical_key);
+                let letter = key.to_latin(*physical_key).map(|c| c.to_ascii_lowercase());
                 if shortcut && !m.alt() {
                     let cmd = m.command();
                     match (letter, m.shift()) {
+                        (Some('z'), false) if cmd => {
+                            actions.push(Action::Undo);
+                            handled = true;
+                        }
+                        (Some('z'), true) if cmd => {
+                            actions.push(Action::Redo);
+                            handled = true;
+                        }
+                        (Some('y'), false) if cmd => {
+                            actions.push(Action::Redo);
+                            handled = true;
+                        }
                         (Some('c'), _) if cmd => {
                             if let Some(s) = self.content.selected_text() {
                                 clipboard.write(clipboard::Kind::Standard, s);

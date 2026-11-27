@@ -20,7 +20,9 @@
 //! is done; only a first summary streams in live.
 
 use fortnight_core::domain::{Report, ReportId, ReportKind, ReportStatus, WeekRef};
-use iced::widget::{Column, button, markdown, mouse_area, row, text, tooltip};
+use iced::widget::{
+    Column, Row, button, column, markdown, mouse_area, row, text, text_editor, tooltip,
+};
 use iced::{Center, Element, Font, Padding, Theme, border, color};
 
 use crate::theme;
@@ -29,7 +31,19 @@ use crate::theme;
 pub enum Message {
     /// Retry after a failed update.
     Retry(ReportKind),
+    /// Regenerate the weekly summary now.
+    Regenerate,
+    /// Open the summary in the inline Markdown editor.
+    StartEdit,
+    /// An edit or cursor action in the summary editor.
+    EditAction(text_editor::Action),
+    /// Save the edited summary text.
+    SaveEdit,
+    /// Exit the summary editor without saving.
+    CancelEdit,
     DiscardEdit,
+    /// Toggle between the AI summary and the deterministic facts Markdown.
+    ToggleFacts,
     Copy,
     /// The pointer left the copy icon: its tooltip says "Copy" again.
     CopyHoverEnd,
@@ -41,7 +55,7 @@ pub enum Message {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     None,
-    /// Generate this kind of report for this week now (Retry).
+    /// Generate this kind of report for this week now (Retry / Regenerate).
     Generate(ReportKind, WeekRef),
     /// Save the user's edit of a report version; `None` discards it.
     SaveEdit(ReportId, Option<String>),
@@ -63,6 +77,8 @@ pub struct ReportSlot {
     pub empty: bool,
     /// The newest ready version no longer matches the tasks.
     pub stale: bool,
+    /// Deterministic Markdown facts computed by `fortnight_core::report::summary_facts_markdown`.
+    pub facts_md: String,
 }
 
 /// Everything the panel shows, supplied by `main.rs`.
@@ -80,9 +96,21 @@ pub struct ReportPanel {
     /// newest ready version), parsed, and its source.
     body: markdown::Content,
     body_src: String,
+    /// Deterministic facts Markdown, parsed, and its source.
+    facts_body: markdown::Content,
+    facts_src: String,
+    /// Whether the panel is showing `facts_md` instead of the AI summary.
+    show_facts: bool,
+    /// Whether the summary body is currently being edited inline.
+    editing: bool,
+    /// Inline Markdown editor content while `editing` is true.
+    editor: text_editor::Content,
     /// How many times `body` was (re)parsed.
     #[cfg(test)]
     body_parses: u32,
+    /// How many times `facts_body` was (re)parsed.
+    #[cfg(test)]
+    facts_parses: u32,
     /// The copy icon was clicked and the pointer hasn't left it since.
     copied: bool,
 }
@@ -106,8 +134,22 @@ impl ReportPanel {
         if self.data.as_ref() == Some(&data) {
             return;
         }
+        let week_changed = self.data.as_ref().is_some_and(|old| old.week != data.week);
         self.data = Some(data);
+        if week_changed {
+            self.editing = false;
+            self.show_facts = false;
+            self.copied = false;
+        }
         self.refresh();
+    }
+
+    pub fn is_editing(&self) -> bool {
+        self.editing
+    }
+
+    pub fn showing_facts(&self) -> bool {
+        self.show_facts
     }
 
     /// The summary shown: the newest ready version, kept while a new one
@@ -119,6 +161,9 @@ impl ReportPanel {
             .ready(ReportKind::Summary)
             .and_then(Report::text)
             .map(str::to_owned);
+        if ready.is_none() {
+            self.editing = false;
+        }
         let body_src = match self.slot(ReportKind::Summary) {
             Some(slot) => match (&slot.streaming, ready) {
                 (_, Some(ready)) => ready,
@@ -138,6 +183,21 @@ impl ReportPanel {
                 self.body_parses += 1;
             }
             self.copied = false;
+        }
+        let facts_src = self
+            .slot(ReportKind::Summary)
+            .map(|s| s.facts_md.clone())
+            .unwrap_or_default();
+        if facts_src != self.facts_src {
+            self.facts_body = markdown::Content::parse(&facts_src);
+            self.facts_src = facts_src;
+            #[cfg(test)]
+            {
+                self.facts_parses += 1;
+            }
+        }
+        if self.facts_src.is_empty() {
+            self.show_facts = false;
         }
     }
 
@@ -204,21 +264,80 @@ impl ReportPanel {
                 }
                 _ => Action::None,
             },
-            Message::DiscardEdit => match self.ready(ReportKind::Summary) {
-                Some(r) if r.edited_md.is_some() => Action::SaveEdit(r.id, None),
+            Message::Regenerate => match (&self.data, self.slot(ReportKind::Summary)) {
+                (Some(data), Some(slot))
+                    if slot.blocked.is_none() && slot.streaming.is_none() && !slot.empty =>
+                {
+                    self.editing = false;
+                    self.show_facts = false;
+                    Action::Generate(ReportKind::Summary, data.week)
+                }
                 _ => Action::None,
             },
-            Message::Copy => match self
-                .ready(ReportKind::Summary)
-                .and_then(Report::text)
-                .map(str::to_owned)
-            {
-                Some(text) => {
-                    self.copied = true;
-                    Action::Copy(text)
+            Message::StartEdit => {
+                if let Some(text) = self.ready(ReportKind::Summary).and_then(Report::text) {
+                    self.editor = text_editor::Content::with_text(text);
+                    self.editing = true;
+                    self.show_facts = false;
                 }
-                None => Action::None,
+                Action::None
+            }
+            Message::EditAction(action) => {
+                if self.editing {
+                    self.editor.perform(action);
+                }
+                Action::None
+            }
+            Message::SaveEdit => {
+                if !self.editing {
+                    return Action::None;
+                }
+                self.editing = false;
+                match self.ready(ReportKind::Summary) {
+                    Some(r) => Action::SaveEdit(r.id, Some(self.editor.text())),
+                    None => Action::None,
+                }
+            }
+            Message::CancelEdit => {
+                self.editing = false;
+                Action::None
+            }
+            Message::DiscardEdit => match self.ready(ReportKind::Summary) {
+                Some(r) if r.edited_md.is_some() => {
+                    let id = r.id;
+                    self.editing = false;
+                    Action::SaveEdit(id, None)
+                }
+                _ => Action::None,
             },
+            Message::ToggleFacts => {
+                if self.show_facts {
+                    self.show_facts = false;
+                } else if self
+                    .slot(ReportKind::Summary)
+                    .is_some_and(|s| !s.facts_md.is_empty())
+                {
+                    self.show_facts = true;
+                    self.editing = false;
+                }
+                Action::None
+            }
+            Message::Copy => {
+                let text = if self.show_facts && !self.facts_src.is_empty() {
+                    Some(self.facts_src.clone())
+                } else {
+                    self.ready(ReportKind::Summary)
+                        .and_then(Report::text)
+                        .map(str::to_owned)
+                };
+                match text {
+                    Some(text) => {
+                        self.copied = true;
+                        Action::Copy(text)
+                    }
+                    None => Action::None,
+                }
+            }
             Message::CopyHoverEnd => {
                 self.copied = false;
                 Action::None
@@ -227,25 +346,50 @@ impl ReportPanel {
         }
     }
 
-    /// What sits beside the Work summary heading: the copy icon (with a
-    /// tooltip) and, for an edited summary, Discard edit. `None` without a
-    /// ready summary.
+    /// What sits beside the Work summary heading: Copy, Edit, Regenerate,
+    /// Discard edit (when edited), and the Facts/Summary toggle (shown even
+    /// without a ready summary when deterministic facts exist).
     pub fn summary_tools(&self) -> Option<Element<'_, Message>> {
-        let ready = self.ready(ReportKind::Summary)?;
-        ready.text()?;
-        let (icon, tip) = if self.copied {
-            (theme::Icon::Check, "Copied")
-        } else {
-            (theme::Icon::Copy, "Copy as Markdown")
-        };
-        let copy = button(theme::icon(icon).width(16).height(16))
-            .padding(theme::ICON_PADDING)
-            .style(theme::icon_button)
-            .on_press(Message::Copy);
-        let copy = mouse_area(tooltip(copy, theme::tip(tip), tooltip::Position::Bottom))
-            .on_exit(Message::CopyHoverEnd);
-        let mut tools = row![copy].spacing(theme::SPACING / 2.0).align_y(Center);
-        if ready.edited_md.is_some() {
+        let slot = self.slot(ReportKind::Summary)?;
+        let ready = self.ready(ReportKind::Summary);
+        let has_ready_text = ready.and_then(Report::text).is_some();
+        let has_facts = !slot.facts_md.is_empty();
+        let can_regen = slot.streaming.is_none() && slot.blocked.is_none() && !slot.empty;
+        if !has_ready_text && !has_facts && !can_regen {
+            return None;
+        }
+        let mut tools = Row::new().spacing(theme::SPACING / 2.0).align_y(Center);
+        if has_ready_text || (self.show_facts && has_facts) {
+            let (icon, tip) = if self.copied {
+                (theme::Icon::Check, "Copied")
+            } else {
+                (theme::Icon::Copy, "Copy as Markdown")
+            };
+            let copy = button(theme::icon(icon).width(16).height(16))
+                .padding(theme::ICON_PADDING)
+                .style(theme::icon_button)
+                .on_press(Message::Copy);
+            let copy = mouse_area(tooltip(copy, theme::tip(tip), tooltip::Position::Bottom))
+                .on_exit(Message::CopyHoverEnd);
+            tools = tools.push(copy);
+        }
+        if has_ready_text && slot.streaming.is_none() && !self.editing {
+            tools = tools.push(
+                button(text("Edit").size(theme::TEXT_SMALL))
+                    .padding([2, 8])
+                    .style(theme::text_button)
+                    .on_press(Message::StartEdit),
+            );
+        }
+        if can_regen && !self.editing {
+            tools = tools.push(
+                button(text("Regenerate").size(theme::TEXT_SMALL))
+                    .padding([2, 8])
+                    .style(theme::text_button)
+                    .on_press(Message::Regenerate),
+            );
+        }
+        if ready.is_some_and(|r| r.edited_md.is_some()) && !self.editing {
             tools = tools.push(
                 button(text("Discard edit").size(theme::TEXT_SMALL))
                     .padding([2, 8])
@@ -253,16 +397,70 @@ impl ReportPanel {
                     .on_press(Message::DiscardEdit),
             );
         }
+        if has_facts && !self.editing {
+            let label = if self.show_facts {
+                "Summary"
+            } else if has_ready_text {
+                "Facts"
+            } else {
+                "View facts"
+            };
+            let style = if self.show_facts {
+                theme::secondary_button
+            } else {
+                theme::text_button
+            };
+            tools = tools.push(
+                button(text(label).size(theme::TEXT_SMALL))
+                    .padding([2, 8])
+                    .style(style)
+                    .on_press(Message::ToggleFacts),
+            );
+        }
         Some(tools.into())
     }
 
-    /// The Work summary's body. Empty when there is no summary to show
-    /// (`refresh` leaves `body_src` empty without a summary slot).
+    /// The Work summary's body: the inline Markdown editor while editing, the
+    /// deterministic facts Markdown when toggled on, the AI summary, or a
+    /// "View facts" fallback button when no summary exists yet.
     pub fn summary_view(&self) -> Element<'_, Message> {
-        if self.body_src.is_empty() {
-            return Column::new().into();
+        if self.editing {
+            let editor = text_editor(&self.editor)
+                .on_action(Message::EditAction)
+                .height(260)
+                .padding(10)
+                .size(theme::TEXT_BODY)
+                .style(theme::editor);
+            let actions = row![
+                button(text("Save").size(theme::TEXT_SMALL))
+                    .padding([6, 14])
+                    .style(theme::primary_button)
+                    .on_press(Message::SaveEdit),
+                button(text("Cancel").size(theme::TEXT_SMALL))
+                    .padding([6, 12])
+                    .style(theme::text_button)
+                    .on_press(Message::CancelEdit),
+            ]
+            .spacing(theme::SPACING / 2.0)
+            .align_y(Center);
+            return column![editor, actions].spacing(theme::SPACING).into();
         }
-        md(&self.body, theme::TEXT_BODY)
+        if self.show_facts && !self.facts_src.is_empty() {
+            return md(&self.facts_body, theme::TEXT_BODY);
+        }
+        if !self.body_src.is_empty() {
+            return md(&self.body, theme::TEXT_BODY);
+        }
+        if !self.facts_src.is_empty() {
+            return row![
+                button(text("View facts").size(theme::TEXT_SMALL))
+                    .padding([6, 12])
+                    .style(theme::secondary_button)
+                    .on_press(Message::ToggleFacts),
+            ]
+            .into();
+        }
+        Column::new().into()
     }
 
     /// The status line for `kind` as an element (with Retry when offered).
@@ -373,6 +571,7 @@ mod tests {
             blocked: None,
             empty: false,
             stale: false,
+            facts_md: String::new(),
         }
     }
 
@@ -501,5 +700,69 @@ mod tests {
         let _ = p.summary_view();
         let _ = p.summary_tools();
         let _ = p.status_view(ReportKind::Summary);
+    }
+
+    #[test]
+    fn regenerate_edit_and_facts_toggle() {
+        let mut p = ReportPanel::new();
+        let mut s = slot(
+            ReportKind::Summary,
+            vec![report(7, ReportKind::Summary, "Original summary")],
+        );
+        s.facts_md = "## Completed\n- Shipped v1".into();
+        p.load(data(vec![s.clone()]));
+
+        // Regenerate emits Generate when not streaming/blocked/empty.
+        assert_eq!(
+            p.update(Message::Regenerate),
+            Action::Generate(ReportKind::Summary, week())
+        );
+
+        // Inline edit flow: StartEdit -> EditAction -> SaveEdit.
+        assert_eq!(p.update(Message::StartEdit), Action::None);
+        assert!(p.is_editing());
+        let _ = p.summary_view();
+        p.update(Message::EditAction(text_editor::Action::Move(
+            text_editor::Motion::DocumentEnd,
+        )));
+        p.update(Message::EditAction(text_editor::Action::Edit(
+            text_editor::Edit::Insert('!'),
+        )));
+        assert_eq!(
+            p.update(Message::SaveEdit),
+            Action::SaveEdit(7, Some("Original summary!".into()))
+        );
+        assert!(!p.is_editing());
+
+        // CancelEdit exits without saving.
+        p.update(Message::StartEdit);
+        assert!(p.is_editing());
+        assert_eq!(p.update(Message::CancelEdit), Action::None);
+        assert!(!p.is_editing());
+
+        // Facts toggle parses facts once and copies facts when active.
+        assert_eq!(p.facts_parses, 1);
+        p.update(Message::ToggleFacts);
+        assert!(p.showing_facts());
+        assert_eq!(
+            p.update(Message::Copy),
+            Action::Copy("## Completed\n- Shipped v1".into())
+        );
+        let _ = p.summary_view();
+        let _ = p.summary_tools();
+        p.update(Message::ToggleFacts);
+        assert!(!p.showing_facts());
+
+        // With no ready summary and blocked LLM, summary_tools is still Some if facts_md is non-empty.
+        let mut blocked = slot(ReportKind::Summary, vec![]);
+        blocked.blocked = Some("the API key is locked.".into());
+        blocked.facts_md = "## Facts".into();
+        p.load(data(vec![blocked]));
+        assert!(p.summary_tools().is_some());
+        assert_eq!(p.update(Message::Regenerate), Action::None);
+        let _ = p.summary_view();
+        p.update(Message::ToggleFacts);
+        assert!(p.showing_facts());
+        let _ = p.summary_view();
     }
 }

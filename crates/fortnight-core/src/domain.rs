@@ -61,6 +61,71 @@ pub type Priority = u8;
 /// The highest priority the app uses.
 pub const MAX_PRIORITY: Priority = 3;
 
+/// How often a task repeats when marked done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Recurrence {
+    Daily,
+    Weekdays,
+    Weekly,
+    Monthly,
+}
+
+impl Recurrence {
+    /// Every choice, in the order pickers show them.
+    pub const ALL: [Recurrence; 4] = [
+        Recurrence::Daily,
+        Recurrence::Weekdays,
+        Recurrence::Weekly,
+        Recurrence::Monthly,
+    ];
+
+    /// The string stored in the `tasks.recurrence` column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Recurrence::Daily => "daily",
+            Recurrence::Weekdays => "weekdays",
+            Recurrence::Weekly => "weekly",
+            Recurrence::Monthly => "monthly",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "daily" | "day" => Some(Recurrence::Daily),
+            "weekdays" | "weekday" => Some(Recurrence::Weekdays),
+            "weekly" | "week" => Some(Recurrence::Weekly),
+            "monthly" | "month" => Some(Recurrence::Monthly),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Recurrence::Daily => "Daily",
+            Recurrence::Weekdays => "Weekdays",
+            Recurrence::Weekly => "Weekly",
+            Recurrence::Monthly => "Monthly",
+        }
+    }
+
+    /// The next date after `from` for this cadence.
+    pub fn next_date(self, from: Date) -> Date {
+        match self {
+            Recurrence::Daily => from.saturating_add(1.days()),
+            Recurrence::Weekdays => {
+                let mut d = from.saturating_add(1.days());
+                while matches!(d.weekday(), Weekday::Saturday | Weekday::Sunday) {
+                    d = d.saturating_add(1.days());
+                }
+                d
+            }
+            Recurrence::Weekly => from.saturating_add(7.days()),
+            Recurrence::Monthly => crate::week::add_months(from, 1),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,
@@ -78,6 +143,9 @@ pub struct Task {
     pub priority: Priority,
     /// Never sent to the LLM: excluded from every digest.
     pub private: bool,
+    /// Repeat cadence: when marked done, spawns the next occurrence.
+    #[serde(default)]
+    pub recurrence: Option<Recurrence>,
     /// Manual ordering; lower sorts first.
     pub position: f64,
     pub created_at: Timestamp,
@@ -131,6 +199,49 @@ pub struct NewTask {
     pub estimate_minutes: Option<u32>,
     pub priority: Priority,
     pub private: bool,
+    #[serde(default)]
+    pub recurrence: Option<Recurrence>,
+}
+
+/// Builds the next occurrence of a recurring task completed on `today`, or
+/// `None` if the task does not repeat.
+///
+/// The next planned day advances from `max(planned_for, today)` so completing
+/// a carried-over task schedules a future date. If a deadline was set too, its
+/// offset from `planned_for` is preserved (or it advances directly if there was
+/// no planned day). Checklist subtasks in `notes` are reset to unchecked.
+pub fn next_occurrence(task: &Task, today: Date) -> Option<NewTask> {
+    let recurrence = task.recurrence?;
+    let base_planned = task.planned_for.unwrap_or(today).max(today);
+    let next_planned = recurrence.next_date(base_planned);
+    let next_due = match (task.planned_for, task.due_on) {
+        (Some(p), Some(d)) => {
+            let offset_days = p.until(d).map(|s| i64::from(s.get_days())).unwrap_or(0);
+            Some(next_planned.saturating_add(offset_days.days()))
+        }
+        (None, Some(d)) => Some(recurrence.next_date(d.max(today))),
+        (_, None) => None,
+    };
+    let (mut subtasks, text) = crate::notes::split_notes(&task.notes);
+    let notes = if subtasks.is_empty() {
+        task.notes.clone()
+    } else {
+        for s in &mut subtasks {
+            s.done = false;
+        }
+        crate::notes::join_notes(&subtasks, &text)
+    };
+    Some(NewTask {
+        title: task.title.clone(),
+        notes,
+        project: task.project.clone(),
+        due_on: next_due,
+        planned_for: Some(next_planned),
+        estimate_minutes: task.estimate_minutes,
+        priority: task.priority,
+        private: task.private,
+        recurrence: Some(recurrence),
+    })
 }
 
 // ------------------------------------------------------------------ history
@@ -511,6 +622,9 @@ pub struct Settings {
     /// Overdue tasks can be recommended (and then show in Recommended
     /// rather than Overdue). Missing in older data: off.
     pub recommend_overdue: bool,
+    /// Last window size `(width, height)` in logical pixels. Missing in older
+    /// data: the app's default window size.
+    pub window_size: Option<(u32, u32)>,
 }
 
 /// The width of the Today tab's column, picked in Settings. The app maps
@@ -622,6 +736,7 @@ impl Default for Settings {
             today_width: TodayWidth::Standard,
             due_on_added_day: false,
             recommend_overdue: false,
+            window_size: None,
         }
     }
 }
@@ -801,5 +916,41 @@ mod tests {
         assert!(w.contains(jiff::civil::date(2026, 11, 22)));
         assert!(!w.contains(jiff::civil::date(2026, 11, 23)));
         assert_eq!(w.next().prev(), w);
+    }
+
+    #[test]
+    fn recurrence_next_date_and_occurrence() {
+        use jiff::civil::date;
+        let fri = date(2026, 11, 20);
+        assert_eq!(Recurrence::Daily.next_date(fri), date(2026, 11, 21));
+        assert_eq!(Recurrence::Weekdays.next_date(fri), date(2026, 11, 23));
+        assert_eq!(Recurrence::Weekly.next_date(fri), date(2026, 11, 27));
+        assert_eq!(Recurrence::Monthly.next_date(fri), date(2026, 12, 20));
+        assert_eq!(
+            Recurrence::Monthly.next_date(date(2026, 1, 31)),
+            date(2026, 2, 28)
+        );
+
+        let task = Task {
+            title: "Weekly review".into(),
+            notes: "Prep deck\n\n- [x] pull metrics\n- [x] send email".into(),
+            project: Some("work".into()),
+            planned_for: Some(date(2026, 11, 16)),
+            due_on: Some(date(2026, 11, 18)),
+            estimate_minutes: Some(60),
+            priority: 2,
+            private: true,
+            recurrence: Some(Recurrence::Weekly),
+            ..Task::default()
+        };
+        let next = next_occurrence(&task, date(2026, 11, 18)).unwrap();
+        assert_eq!(next.planned_for, Some(date(2026, 11, 25)));
+        assert_eq!(next.due_on, Some(date(2026, 11, 27)));
+        assert_eq!(
+            next.notes,
+            "Prep deck\n\n- [ ] pull metrics\n- [ ] send email"
+        );
+        assert_eq!(next.recurrence, Some(Recurrence::Weekly));
+        assert!(next.private);
     }
 }

@@ -19,8 +19,11 @@ pub(crate) enum Shortcut {
     Next,
     Today,
     FocusQuickAdd,
+    Search,
+    ShortcutsHelp,
     Settings,
     Undo,
+    Redo,
     Escape,
     Nav(NavKey),
 }
@@ -33,8 +36,11 @@ pub(crate) fn shortcut_for(key: Key<&str>, modifiers: keyboard::Modifiers) -> Op
             Key::Character("2") => Some(Shortcut::Tab(Tab::Week)),
             Key::Character("3") => Some(Shortcut::Tab(Tab::Month)),
             Key::Character(",") => Some(Shortcut::Settings),
-            Key::Character("n") => Some(Shortcut::FocusQuickAdd),
-            Key::Character("z") if !modifiers.shift() => Some(Shortcut::Undo),
+            Key::Character("n" | "N") => Some(Shortcut::FocusQuickAdd),
+            Key::Character("k" | "K") => Some(Shortcut::Search),
+            Key::Character("z" | "Z") if modifiers.shift() => Some(Shortcut::Redo),
+            Key::Character("z" | "Z") => Some(Shortcut::Undo),
+            Key::Character("y" | "Y") if !modifiers.shift() => Some(Shortcut::Redo),
             _ => None,
         };
     }
@@ -47,6 +53,8 @@ pub(crate) fn shortcut_for(key: Key<&str>, modifiers: keyboard::Modifiers) -> Op
         Key::Character("3") => Some(Shortcut::Tab(Tab::Month)),
         Key::Character("t" | "T") => Some(Shortcut::Today),
         Key::Character("n" | "N") => Some(Shortcut::FocusQuickAdd),
+        Key::Character("/") => Some(Shortcut::Search),
+        Key::Character("?") => Some(Shortcut::ShortcutsHelp),
         Key::Named(Named::ArrowLeft) => Some(Shortcut::Prev),
         Key::Named(Named::ArrowRight) => Some(Shortcut::Next),
         Key::Named(Named::ArrowUp) => Some(Shortcut::Nav(NavKey::Up)),
@@ -59,14 +67,43 @@ pub(crate) fn shortcut_for(key: Key<&str>, modifiers: keyboard::Modifiers) -> Op
 }
 
 impl Ready {
-    /// Applies a keyboard shortcut. While the unlock prompt or Settings is
-    /// showing, only the keys that close or toggle them apply.
+    /// Applies a keyboard shortcut. While an overlay or dialog is showing,
+    /// only the keys that apply to it run.
     pub(crate) fn shortcut(&mut self, shortcut: Shortcut) -> Task<Message> {
         if self.unlocking {
             if shortcut == Shortcut::Escape {
                 self.close_unlock();
             }
             return Task::none();
+        }
+        if self.shortcuts_open {
+            if matches!(shortcut, Shortcut::Escape | Shortcut::ShortcutsHelp) {
+                self.shortcuts_open = false;
+            }
+            return Task::none();
+        }
+        if self.search_open {
+            match shortcut {
+                Shortcut::Escape | Shortcut::Search => {
+                    self.close_search();
+                    return Task::none();
+                }
+                Shortcut::Nav(NavKey::Up) => {
+                    self.local = true;
+                    self.search_view.move_selection(-1);
+                    return Task::none();
+                }
+                Shortcut::Nav(NavKey::Down) => {
+                    self.local = true;
+                    self.search_view.move_selection(1);
+                    return Task::none();
+                }
+                Shortcut::Nav(NavKey::Open) => {
+                    let action = self.search_view.activate_selected();
+                    return self.search_action(action);
+                }
+                _ => return Task::none(),
+            }
         }
         if self.settings_open {
             if matches!(shortcut, Shortcut::Escape | Shortcut::Settings) {
@@ -76,9 +113,11 @@ impl Ready {
         }
         if let Some(dialog) = &mut self.dialog {
             if shortcut == Shortcut::Escape {
-                // An open due calendar closes first, keeping the form.
+                // An open calendar closes first, keeping the form.
                 if dialog.form.calendar.is_some() {
                     dialog.form.calendar = None;
+                } else if dialog.form.planned_calendar.is_some() {
+                    dialog.form.planned_calendar = None;
                 } else {
                     self.dialog = None;
                 }
@@ -97,9 +136,19 @@ impl Ready {
                 self.show(Tab::Today, None),
                 operation::focus(day::QUICK_ADD_ID),
             ]),
+            Shortcut::Search => self.open_search(),
+            Shortcut::ShortcutsHelp => {
+                self.date_picker = None;
+                self.shortcuts_open = true;
+                crate::unfocus()
+            }
             Shortcut::Settings => self.open_settings(),
             Shortcut::Undo => {
                 self.undo();
+                Task::none()
+            }
+            Shortcut::Redo => {
+                self.redo();
                 Task::none()
             }
             Shortcut::Escape => {
@@ -145,9 +194,19 @@ mod tests {
         );
         assert_eq!(key(Key::Character("t"), none), Some(Shortcut::Today));
         assert_eq!(key(Key::Character("n"), cmd), Some(Shortcut::FocusQuickAdd));
+        assert_eq!(key(Key::Character("k"), cmd), Some(Shortcut::Search));
+        assert_eq!(key(Key::Character("/"), none), Some(Shortcut::Search));
+        assert_eq!(
+            key(Key::Character("?"), Modifiers::SHIFT),
+            Some(Shortcut::ShortcutsHelp)
+        );
         assert_eq!(key(Key::Character(","), cmd), Some(Shortcut::Settings));
         assert_eq!(key(Key::Character("z"), cmd), Some(Shortcut::Undo));
-        assert_eq!(key(Key::Character("z"), cmd | Modifiers::SHIFT), None);
+        assert_eq!(
+            key(Key::Character("z"), cmd | Modifiers::SHIFT),
+            Some(Shortcut::Redo)
+        );
+        assert_eq!(key(Key::Character("y"), cmd), Some(Shortcut::Redo));
         assert_eq!(
             key(Key::Named(Named::ArrowLeft), none),
             Some(Shortcut::Prev)

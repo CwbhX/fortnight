@@ -45,9 +45,11 @@ use fortnight_app::theme;
 use fortnight_app::top_bar::{self, LockIcon, Tab};
 use fortnight_app::views::day::{self, DayView};
 use fortnight_app::views::month::{self, MonthView};
+use fortnight_app::views::search::{self, SearchData, SearchView};
 use fortnight_app::views::settings::{
     self, KeyState, SettingsView, UnlockAction, UnlockMessage, UnlockView,
 };
+use fortnight_app::views::shortcuts_help;
 use fortnight_app::views::task_form;
 use fortnight_app::views::week::{self, WeekData, WeekView};
 use fortnight_core::datadir::{self, DataLock};
@@ -95,6 +97,7 @@ pub fn main() -> iced::Result {
         .theme(App::theme)
         .subscription(App::subscription)
         .window_size((1100.0, 760.0))
+        .exit_on_close_request(false)
         .run()
 }
 
@@ -105,6 +108,10 @@ enum Message {
     Week(week::Message),
     Month(month::Message),
     Settings(settings::Message),
+    Search(search::Message),
+    CloseSearch,
+    ShortcutsHelp(shortcuts_help::Message),
+    CloseShortcuts,
     Unlock(UnlockMessage),
     CloseSettings,
     /// The task dialog (the Week tab's `+`, or a click on a card).
@@ -145,8 +152,14 @@ enum Message {
     DismissError,
     Shoot,
     Shot(iced::window::Screenshot),
-    /// The window opened: show the app icon on it.
-    WindowOpened,
+    /// The window opened: show the app icon and apply saved size.
+    WindowOpened(iced::window::Id),
+    /// The window was resized: remember its size for the next launch.
+    WindowResized(iced::Size),
+    /// The window gained focus: check for external DB writes (e.g. CLI).
+    WindowFocused,
+    /// The user closed the window: flush unsaved notes, save window size, exit.
+    CloseRequested,
 }
 
 /// Everything that needs the open database.
@@ -167,11 +180,14 @@ struct Ready {
     /// The month the top bar's date calendar shows, while it is open.
     date_picker: Option<Date>,
     settings_open: bool,
+    search_open: bool,
+    shortcuts_open: bool,
 
     day_view: DayView,
     week_view: WeekView,
     month_view: MonthView,
     settings_view: SettingsView,
+    search_view: SearchView,
     unlock_view: UnlockView,
     /// The unlock prompt is showing (opened from the lock icon).
     unlocking: bool,
@@ -189,6 +205,16 @@ struct Ready {
     test_result: Option<Result<String, String>>,
     /// Why the last key save or removal failed.
     key_message: Option<String>,
+    /// True while Argon2 is encrypting a new API key.
+    saving_key: bool,
+    /// Result of the last Settings export action.
+    export_status: Option<Result<String, String>>,
+    /// Last seen SQLite `PRAGMA data_version` for detecting external CLI writes.
+    last_data_version: i64,
+    /// Last observed window size `(width, height)`, persisted on close.
+    window_size: Option<(u32, u32)>,
+    /// Saved window size has been applied once on launch.
+    window_sized: bool,
     /// Each Settings block's model list.
     models: settings::PerBlock<settings::ModelList>,
     /// Each block's model-list request in flight: a newer one, and Lock,
@@ -303,7 +329,13 @@ impl App {
             summary_wait,
             notes,
             iced::system::theme_changes().map(Message::ThemeMode),
-            iced::window::open_events().map(|_| Message::WindowOpened),
+            iced::window::events().filter_map(|(id, event)| match event {
+                iced::window::Event::Opened { .. } => Some(Message::WindowOpened(id)),
+                iced::window::Event::Resized(size) => Some(Message::WindowResized(size)),
+                iced::window::Event::Focused => Some(Message::WindowFocused),
+                iced::window::Event::CloseRequested => Some(Message::CloseRequested),
+                _ => None,
+            }),
             // Ends a card drag (Week or Today) even when the button is let
             // go outside the window.
             iced::event::listen_with(|event, _, _| match event {
@@ -347,9 +379,18 @@ impl App {
                 .and_then(iced::window::screenshot)
                 .map(Message::Shot),
             (_, Message::Shot(shot)) => save_screenshot(shot),
-            (App::Ready(ready, _), Message::WindowOpened) => {
+            (App::Fatal(_), Message::CloseRequested) => iced::exit(),
+            (App::Ready(ready, _), Message::WindowOpened(id)) => {
                 // A window icon set before the window existed went nowhere.
                 ready.icon_dark = None;
+                if !ready.window_sized {
+                    ready.window_sized = true;
+                    if let Some((w, h)) = ready.settings.window_size {
+                        let w = w.max(640) as f32;
+                        let h = h.max(480) as f32;
+                        return iced::window::resize(id, iced::Size::new(w, h));
+                    }
+                }
                 Task::none()
             }
             (App::Ready(_, _), Message::ThemeMode(_)) if forced_theme().is_some() => Task::none(),
@@ -395,6 +436,8 @@ impl Ready {
         let events = store
             .events_between(Timestamp::MIN, Timestamp::MAX)
             .map_err(|e| e.to_string())?;
+        let last_data_version = store.data_version().unwrap_or(0);
+        let window_size = settings.window_size;
         let tz = TimeZone::system();
         let today = Timestamp::now().to_zoned_datetime(tz.clone()).date();
         let keys = Keys::open(&dir);
@@ -434,10 +477,13 @@ impl Ready {
             dialog: None,
             date_picker: None,
             settings_open,
+            search_open: false,
+            shortcuts_open: false,
             day_view: DayView::new(),
             week_view: WeekView::new(),
             month_view: MonthView::new(),
             settings_view: SettingsView::new(),
+            search_view: SearchView::new(),
             unlock_view: UnlockView::new(),
             unlocking: false,
             keys,
@@ -447,6 +493,11 @@ impl Ready {
             testing: false,
             test_result: None,
             key_message: None,
+            saving_key: false,
+            export_status: None,
+            last_data_version,
+            window_size,
+            window_sized: false,
             models: settings::PerBlock::default(),
             model_requests: settings::PerBlock::default(),
             ollama: None,
@@ -514,6 +565,83 @@ impl Ready {
         self.tasks.iter().find(|t| t.id == id)
     }
 
+    /// Checks SQLite's `PRAGMA data_version` and reloads tasks, events and
+    /// settings if another process (such as `fortnight-cli`) modified the DB.
+    fn sync_external_changes(&mut self) -> bool {
+        let Ok(version) = self.store.data_version() else {
+            return false;
+        };
+        if version == self.last_data_version {
+            return false;
+        }
+        self.last_data_version = version;
+        if let Ok(settings) = self.store.load_settings() {
+            theme::set_accent(settings.accent);
+            theme::set_today_width(settings.today_width);
+            self.settings = settings;
+        }
+        self.reload_tasks();
+        true
+    }
+
+    /// Opens the Quick Search & Project Filter overlay and focuses its input.
+    pub(crate) fn open_search(&mut self) -> Task<Message> {
+        self.date_picker = None;
+        self.shortcuts_open = false;
+        self.search_open = true;
+        self.search_view.reset();
+        let today = self.today();
+        let logs = self.events_as_logs();
+        self.search_view.load(SearchData {
+            tasks: self.tasks.clone(),
+            logs,
+            today,
+        });
+        SearchView::focus().map(Message::Search)
+    }
+
+    /// Closes Quick Search and clears its query.
+    pub(crate) fn close_search(&mut self) {
+        self.search_open = false;
+        self.search_view.reset();
+    }
+
+    /// Carries out what Quick Search asked for.
+    pub(crate) fn search_action(&mut self, action: search::Action) -> Task<Message> {
+        match action {
+            search::Action::None => {
+                self.local = true;
+                Task::none()
+            }
+            search::Action::Close => {
+                self.close_search();
+                Task::none()
+            }
+            search::Action::OpenTask { id, day } => {
+                self.close_search();
+                self.day_view.select_and_open(id);
+                self.show(Tab::Today, Some(day))
+            }
+            search::Action::OpenDay(day) => {
+                self.close_search();
+                self.show(Tab::Today, Some(day))
+            }
+        }
+    }
+
+    fn events_as_logs(&self) -> Vec<day::LogLine> {
+        self.events
+            .iter()
+            .filter(|e| e.task_id.is_none())
+            .filter_map(|e| {
+                Some(day::LogLine {
+                    date: self.tz.to_datetime(e.at).date(),
+                    text: e.log_text()?.to_string(),
+                })
+            })
+            .collect()
+    }
+
     // ---- update ----
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -532,6 +660,9 @@ impl Ready {
                 | Message::DayRecs(..)
                 | Message::SuggestPriority(_)
                 | Message::PrioritySuggested(..)
+                | Message::WindowResized(_)
+                | Message::WindowFocused
+                | Message::CloseRequested
         );
         let task = self.handle_message(message);
         if no_form_change {
@@ -587,6 +718,18 @@ impl Ready {
                 self.hide_settings();
                 Task::none()
             }
+            Message::Search(m) => {
+                let action = self.search_view.update(m);
+                self.search_action(action)
+            }
+            Message::CloseSearch => {
+                self.close_search();
+                Task::none()
+            }
+            Message::ShortcutsHelp(shortcuts_help::Message::Close) | Message::CloseShortcuts => {
+                self.shortcuts_open = false;
+                Task::none()
+            }
             Message::Dialog(m) => self.dialog_message(m),
             Message::Unlock(m) => match self.unlock_view.update(m) {
                 UnlockAction::None => {
@@ -604,10 +747,41 @@ impl Ready {
                 if today != self.last_today {
                     self.new_day(today);
                 }
+                self.sync_external_changes();
                 // Facts depend on the date and reports may come from the
                 // CLI: work everything out afresh once a minute.
                 self.invalidate();
                 self.catch_up()
+            }
+            Message::WindowResized(size) => {
+                self.local = true;
+                let w = size.width.round() as u32;
+                let h = size.height.round() as u32;
+                if w >= 640 && h >= 480 {
+                    self.window_size = Some((w, h));
+                }
+                Task::none()
+            }
+            Message::WindowFocused => {
+                if self.sync_external_changes() {
+                    self.catch_up()
+                } else {
+                    self.local = true;
+                    Task::none()
+                }
+            }
+            Message::CloseRequested => {
+                // Flush any pending day notes before quitting so last-second
+                // typing is never lost.
+                for (day, text) in self.day_view.flush_notes() {
+                    let _ = self.save_notes(day, &text);
+                }
+                if self.window_size != self.settings.window_size {
+                    let mut s = self.settings.clone();
+                    s.window_size = self.window_size;
+                    let _ = self.store.save_settings(&s);
+                }
+                return iced::exit();
             }
             Message::NotesTick => {
                 // Saving reloads (and so refreshes); otherwise nothing changed.
@@ -671,7 +845,10 @@ impl Ready {
                 Task::none()
             }
             // `App::handle` takes these before they get here.
-            Message::ThemeMode(_) | Message::Shoot | Message::Shot(_) | Message::WindowOpened => {
+            Message::ThemeMode(_)
+            | Message::Shoot
+            | Message::Shot(_)
+            | Message::WindowOpened(_) => {
                 return Task::none();
             }
         };
@@ -740,6 +917,7 @@ impl Ready {
                 self.date_picker = None;
                 self.update_week_reports()
             }
+            top_bar::Message::Search => self.open_search(),
             top_bar::Message::Lock => {
                 self.date_picker = None;
                 if self.keys.any_key_state() == KeyState::Unlocked {
@@ -867,6 +1045,31 @@ impl Ready {
     /// dialog or Settings in a layer that takes every click (one outside
     /// the panel closes it).
     fn overlay(&self, today: Date) -> (f32, Option<Element<'_, Message>>) {
+        if self.shortcuts_open {
+            let panel = shortcuts_help::view().map(Message::ShortcutsHelp);
+            let layer = opaque(
+                mouse_area(
+                    container(opaque(motion::appear(panel).rise(motion::RISE)))
+                        .padding([32, 24])
+                        .center(Fill),
+                )
+                .on_press(Message::CloseShortcuts),
+            );
+            return (theme::DIALOG_BACKDROP, Some(layer));
+        }
+        if self.search_open {
+            let panel = self.search_view.view().map(Message::Search);
+            let layer = opaque(
+                mouse_area(
+                    container(opaque(motion::appear(panel).rise(motion::RISE)))
+                        .padding([48, 24])
+                        .center_x(Fill)
+                        .height(Fill),
+                )
+                .on_press(Message::CloseSearch),
+            );
+            return (theme::DIALOG_BACKDROP, Some(layer));
+        }
         if let Some(dialog) = &self.dialog {
             let panel = container(
                 task_form::task_dialog(&dialog.form, dialog.day, dialog.task.is_some(), today)

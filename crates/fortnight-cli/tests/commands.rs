@@ -1,12 +1,14 @@
 //! The commands against an in-memory store and the mock LLM client.
 
-use fortnight_cli::args::ListArgs;
+use fortnight_cli::args::{EditArgs, ListArgs};
 use fortnight_cli::commands::{self, now_for};
 use fortnight_cli::error::{CliError, CliResult};
 use fortnight_cli::llm_setup::LlmHandle;
 use fortnight_cli::run::lock_warning;
 use fortnight_core::datadir;
-use fortnight_core::domain::{NewTask, ReportKind, ReportStatus, Task, TaskStatus, WeekRef};
+use fortnight_core::domain::{
+    NewTask, Recurrence, ReportKind, ReportStatus, Task, TaskStatus, WeekRef,
+};
 use fortnight_core::export::{self, ExportFormat};
 use fortnight_core::fallback::Endpoint;
 use fortnight_core::llm::{LlmError, MockClient};
@@ -77,6 +79,7 @@ fn add_parses_quick_add_and_prints_id_and_summary() {
     commands::add(
         &s,
         &words("write report fri #work ~2h !!"),
+        false,
         wednesday(),
         &mut out,
     )
@@ -93,25 +96,58 @@ fn add_parses_quick_add_and_prints_id_and_summary() {
     assert_eq!(t.project.as_deref(), Some("work"));
     assert_eq!(t.estimate_minutes, Some(120));
     assert_eq!(t.priority, 2);
+    assert!(!t.private);
 
     // When `due_on_added_day` is enabled, quick-add sets `due_on` to the
     // planned day too, matching the app.
     let mut settings = monday_settings();
     settings.due_on_added_day = true;
     s.save_settings(&settings).unwrap();
-    commands::add(&s, &words("file taxes fri"), wednesday(), &mut Vec::new()).unwrap();
+    commands::add(
+        &s,
+        &words("file taxes fri"),
+        false,
+        wednesday(),
+        &mut Vec::new(),
+    )
+    .unwrap();
     let t2 = s.get_task(2).unwrap().unwrap();
     assert_eq!(t2.planned_for, Some(date(2026, 11, 20)));
     assert_eq!(t2.due_on, Some(date(2026, 11, 20)));
 }
 
 #[test]
+fn add_private_due_and_recurrence() {
+    let s = store();
+    let mut out = Vec::new();
+    commands::add(
+        &s,
+        &words("review budget today due:fri every:weekly #finance"),
+        true,
+        wednesday(),
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(
+        text(out),
+        "Added 1: review budget (on 2026-11-18, due 2026-11-20, ↻weekly, #finance, private)\n"
+    );
+    let t = s.get_task(1).unwrap().unwrap();
+    assert!(t.private);
+    assert_eq!(t.planned_for, Some(date(2026, 11, 18)));
+    assert_eq!(t.due_on, Some(date(2026, 11, 20)));
+    assert_eq!(t.recurrence, Some(Recurrence::Weekly));
+    assert_eq!(t.project.as_deref(), Some("finance"));
+}
+
+#[test]
 fn add_plain_title_and_title_required() {
     let s = store();
     let mut out = Vec::new();
-    commands::add(&s, &words("buy milk"), wednesday(), &mut out).unwrap();
+    commands::add(&s, &words("buy milk"), false, wednesday(), &mut out).unwrap();
     assert_eq!(text(out), "Added 1: buy milk\n");
-    let err = commands::add(&s, &words("fri #work"), wednesday(), &mut Vec::new()).unwrap_err();
+    let err =
+        commands::add(&s, &words("fri #work"), false, wednesday(), &mut Vec::new()).unwrap_err();
     assert_eq!(err.code, 2);
     assert_eq!(s.list_tasks().unwrap().len(), 1);
 }
@@ -273,13 +309,102 @@ fn list_planned_day_wins_for_ordering() {
 }
 
 #[test]
+fn list_project_filter_is_case_insensitive_and_shows_recurrence_and_private() {
+    let s = store();
+    s.add_task(NewTask {
+        title: "standup".into(),
+        project: Some("Work".into()),
+        recurrence: Some(Recurrence::Weekdays),
+        private: true,
+        planned_for: Some(wednesday()),
+        ..NewTask::default()
+    })
+    .unwrap();
+    s.add_task(NewTask {
+        title: "retro".into(),
+        project: Some("work".into()),
+        recurrence: Some(Recurrence::Monthly),
+        planned_for: Some(date(2026, 11, 20)),
+        ..NewTask::default()
+    })
+    .unwrap();
+    s.add_task(NewTask {
+        title: "groceries".into(),
+        project: Some("Home".into()),
+        recurrence: Some(Recurrence::Daily),
+        ..NewTask::default()
+    })
+    .unwrap();
+    s.add_task(NewTask {
+        title: "no project".into(),
+        private: true,
+        ..NewTask::default()
+    })
+    .unwrap();
+
+    // Case-insensitive match (with or without leading #).
+    let mut out = Vec::new();
+    commands::list(
+        &s,
+        &ListArgs {
+            project: Some("WORK".into()),
+            ..ListArgs::default()
+        },
+        wednesday(),
+        &mut out,
+    )
+    .unwrap();
+    let out = text(out);
+    assert!(out.contains("standup ↻weekdays (private)"), "{out}");
+    assert!(out.contains("retro ↻monthly"), "{out}");
+    assert!(!out.contains("groceries"), "{out}");
+    assert!(!out.contains("no project"), "{out}");
+
+    // Leading `#` is accepted too.
+    let mut out = Vec::new();
+    commands::list(
+        &s,
+        &ListArgs {
+            project: Some("#home".into()),
+            ..ListArgs::default()
+        },
+        wednesday(),
+        &mut out,
+    )
+    .unwrap();
+    let out = text(out);
+    assert!(out.contains("groceries ↻daily"), "{out}");
+    assert!(!out.contains("standup"), "{out}");
+
+    // Non-matching project gives empty list.
+    let mut out = Vec::new();
+    commands::list(
+        &s,
+        &ListArgs {
+            project: Some("unknown".into()),
+            ..ListArgs::default()
+        },
+        wednesday(),
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(text(out), "No tasks.\n");
+
+    // Full list shows `(private)` alone without recurrence.
+    let mut out = Vec::new();
+    commands::list(&s, &ListArgs::default(), wednesday(), &mut out).unwrap();
+    let out = text(out);
+    assert!(out.contains("no project (private)"), "{out}");
+}
+
+#[test]
 fn empty_list_says_so() {
     let mut out = Vec::new();
     commands::list(&store(), &ListArgs::default(), wednesday(), &mut out).unwrap();
     assert_eq!(text(out), "No tasks.\n");
 }
 
-// ----------------------------------------------------------- done, log
+// -------------------------------------------------- done, delete, edit, log
 
 #[test]
 fn done_and_undo() {
@@ -287,13 +412,13 @@ fn done_and_undo() {
     let a = add_task(&s, "alpha", None);
     let b = add_task(&s, "beta", None);
     let mut out = Vec::new();
-    commands::done(&s, &[a.id, b.id], false, &mut out).unwrap();
+    commands::done(&s, &[a.id, b.id], false, wednesday(), &mut out).unwrap();
     assert_eq!(text(out), "Done 1: alpha\nDone 2: beta\n");
     assert!(s.get_task(a.id).unwrap().unwrap().is_done());
     assert!(s.get_task(a.id).unwrap().unwrap().completed_at.is_some());
 
     let mut out = Vec::new();
-    commands::done(&s, &[a.id], true, &mut out).unwrap();
+    commands::done(&s, &[a.id], true, wednesday(), &mut out).unwrap();
     assert_eq!(text(out), "Reopened 1: alpha\n");
     let t = s.get_task(a.id).unwrap().unwrap();
     assert_eq!(t.status, TaskStatus::Todo);
@@ -306,10 +431,293 @@ fn done_reports_missing_ids_but_handles_the_rest() {
     let s = store();
     let a = add_task(&s, "alpha", None);
     let mut out = Vec::new();
-    let err = commands::done(&s, &[99, a.id], false, &mut out).unwrap_err();
+    let err = commands::done(&s, &[99, a.id], false, wednesday(), &mut out).unwrap_err();
     assert_eq!(err.code, 1);
     assert!(err.message.contains("99"));
     assert!(s.get_task(a.id).unwrap().unwrap().is_done());
+}
+
+#[test]
+fn done_spawns_next_occurrence_for_recurring_task_idempotently() {
+    let s = store();
+    // Friday 2026-11-20 with weekdays recurrence -> next occurrence is Monday 2026-11-23.
+    let friday = date(2026, 11, 20);
+    let t = s
+        .add_task(NewTask {
+            title: "daily standup".into(),
+            project: Some("ops".into()),
+            planned_for: Some(friday),
+            due_on: Some(date(2026, 11, 21)),
+            estimate_minutes: Some(15),
+            priority: 1,
+            private: true,
+            recurrence: Some(Recurrence::Weekdays),
+            ..NewTask::default()
+        })
+        .unwrap();
+
+    let mut out = Vec::new();
+    commands::done(&s, &[t.id], false, friday, &mut out).unwrap();
+    assert_eq!(
+        text(out),
+        "Done 1: daily standup\nNext occurrence #2 planned for 2026-11-23\n"
+    );
+
+    let tasks = s.list_tasks().unwrap();
+    assert_eq!(tasks.len(), 2);
+    let next = s.get_task(2).unwrap().unwrap();
+    assert_eq!(next.title, "daily standup");
+    assert_eq!(next.status, TaskStatus::Todo);
+    assert_eq!(next.planned_for, Some(date(2026, 11, 23)));
+    assert_eq!(next.due_on, Some(date(2026, 11, 24)));
+    assert_eq!(next.project.as_deref(), Some("ops"));
+    assert_eq!(next.estimate_minutes, Some(15));
+    assert_eq!(next.priority, 1);
+    assert!(next.private);
+    assert_eq!(next.recurrence, Some(Recurrence::Weekdays));
+
+    // Marking already-done task done again does NOT spawn another.
+    let mut out = Vec::new();
+    commands::done(&s, &[t.id], false, friday, &mut out).unwrap();
+    assert_eq!(text(out), "Done 1: daily standup\n");
+    assert_eq!(s.list_tasks().unwrap().len(), 2);
+
+    // Undo then re-done is idempotent (an open occurrence already exists).
+    commands::done(&s, &[t.id], true, friday, &mut Vec::new()).unwrap();
+    let mut out = Vec::new();
+    commands::done(&s, &[t.id], false, friday, &mut out).unwrap();
+    assert_eq!(text(out), "Done 1: daily standup\n");
+    assert_eq!(s.list_tasks().unwrap().len(), 2);
+
+    // A dropped recurring task marked done was not previously open -> does NOT spawn.
+    let dropped = s
+        .add_task(NewTask {
+            title: "dropped repeat".into(),
+            recurrence: Some(Recurrence::Daily),
+            planned_for: Some(friday),
+            ..NewTask::default()
+        })
+        .unwrap();
+    s.set_status(dropped.id, TaskStatus::Dropped).unwrap();
+    let mut out = Vec::new();
+    commands::done(&s, &[dropped.id], false, friday, &mut out).unwrap();
+    assert_eq!(text(out), "Done 3: dropped repeat\n");
+    assert_eq!(s.list_tasks().unwrap().len(), 3);
+}
+
+#[test]
+fn delete_soft_and_forever_and_missing_ids() {
+    let s = store();
+    let a = add_task(&s, "alpha", None);
+    let b = add_task(&s, "beta", None);
+    let c = add_task(&s, "gamma", None);
+
+    // Soft-delete moves to Dropped and preserves the task in storage.
+    let mut out = Vec::new();
+    commands::delete(&s, &[a.id, b.id], false, &mut out).unwrap();
+    assert_eq!(text(out), "Dropped 1: alpha\nDropped 2: beta\n");
+    assert_eq!(
+        s.get_task(a.id).unwrap().unwrap().status,
+        TaskStatus::Dropped
+    );
+    assert_eq!(
+        s.get_task(b.id).unwrap().unwrap().status,
+        TaskStatus::Dropped
+    );
+
+    // Permanent delete removes task and its events.
+    let mut out = Vec::new();
+    commands::delete(&s, &[b.id], true, &mut out).unwrap();
+    assert_eq!(text(out), "Deleted 2: beta\n");
+    assert!(s.get_task(b.id).unwrap().is_none());
+    assert!(s.task_events(b.id).unwrap().is_empty());
+
+    // Missing IDs are reported while valid IDs still succeed.
+    let mut out = Vec::new();
+    let err = commands::delete(&s, &[99, c.id], false, &mut out).unwrap_err();
+    assert_eq!(err.code, 1);
+    assert!(err.message.contains("99"));
+    assert_eq!(text(out), "Dropped 3: gamma\n");
+    assert_eq!(
+        s.get_task(c.id).unwrap().unwrap().status,
+        TaskStatus::Dropped
+    );
+
+    let err = commands::delete(&s, &[99], true, &mut Vec::new()).unwrap_err();
+    assert_eq!(err.code, 1);
+    assert!(err.message.contains("99"));
+}
+
+#[test]
+fn edit_updates_and_clears_all_fields() {
+    let s = store();
+    let t = add_task(&s, "original", None);
+
+    // Set every editable field.
+    let mut out = Vec::new();
+    commands::edit(
+        &s,
+        &EditArgs {
+            id: t.id,
+            title: Some("  renamed task  ".into()),
+            project: Some("#Eng".into()),
+            due: Some("+5d".into()),
+            planned: Some("fri".into()),
+            estimate: Some(90),
+            priority: Some(2),
+            private: true,
+            repeat: Some(Recurrence::Weekly),
+            ..EditArgs::default()
+        },
+        wednesday(),
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(
+        text(out),
+        "Updated 1: renamed task (on 2026-11-20, due 2026-11-23, ↻weekly, #Eng, ~1h30m, !!, private)\n"
+    );
+    let updated = s.get_task(t.id).unwrap().unwrap();
+    assert_eq!(updated.title, "renamed task");
+    assert_eq!(updated.project.as_deref(), Some("Eng"));
+    assert_eq!(updated.due_on, Some(date(2026, 11, 23)));
+    assert_eq!(updated.planned_for, Some(date(2026, 11, 20)));
+    assert_eq!(updated.estimate_minutes, Some(90));
+    assert_eq!(updated.priority, 2);
+    assert!(updated.private);
+    assert_eq!(updated.recurrence, Some(Recurrence::Weekly));
+
+    // Clear every clearable field and lower priority to 0.
+    let mut out = Vec::new();
+    commands::edit(
+        &s,
+        &EditArgs {
+            id: t.id,
+            clear_project: true,
+            clear_due: true,
+            clear_planned: true,
+            clear_estimate: true,
+            priority: Some(0),
+            no_private: true,
+            clear_repeat: true,
+            ..EditArgs::default()
+        },
+        wednesday(),
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(text(out), "Updated 1: renamed task\n");
+    let cleared = s.get_task(t.id).unwrap().unwrap();
+    assert_eq!(cleared.project, None);
+    assert_eq!(cleared.due_on, None);
+    assert_eq!(cleared.planned_for, None);
+    assert_eq!(cleared.estimate_minutes, None);
+    assert_eq!(cleared.priority, 0);
+    assert!(!cleared.private);
+    assert_eq!(cleared.recurrence, None);
+}
+
+#[test]
+fn edit_validates_inputs_and_missing_id() {
+    let s = store();
+    let t = add_task(&s, "alpha", None);
+
+    // Date parsing covers ISO, keywords, weekdays, relative, month-day, and rejects garbage.
+    assert_eq!(
+        commands::parse_date_arg("2026-12-01", wednesday()).unwrap(),
+        date(2026, 12, 1)
+    );
+    assert_eq!(
+        commands::parse_date_arg("today", wednesday()).unwrap(),
+        date(2026, 11, 18)
+    );
+    assert_eq!(
+        commands::parse_date_arg("tomorrow", wednesday()).unwrap(),
+        date(2026, 11, 19)
+    );
+    assert_eq!(
+        commands::parse_date_arg("nov 25", wednesday()).unwrap(),
+        date(2026, 11, 25)
+    );
+    assert_eq!(
+        commands::parse_date_arg("+3d", wednesday()).unwrap(),
+        date(2026, 11, 21)
+    );
+    for bad in ["", "someday", "fri #work", "2026-11-20 extra", "fri mon"] {
+        let err = commands::parse_date_arg(bad, wednesday()).unwrap_err();
+        assert_eq!(err.code, 2, "{bad}");
+    }
+
+    // Empty title rejected with exit code 2.
+    let err = commands::edit(
+        &s,
+        &EditArgs {
+            id: t.id,
+            title: Some("   ".into()),
+            ..EditArgs::default()
+        },
+        wednesday(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, 2);
+
+    // Empty project rejected with exit code 2.
+    let err = commands::edit(
+        &s,
+        &EditArgs {
+            id: t.id,
+            project: Some("#".into()),
+            ..EditArgs::default()
+        },
+        wednesday(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, 2);
+
+    // Bad due date rejected with exit code 2.
+    let err = commands::edit(
+        &s,
+        &EditArgs {
+            id: t.id,
+            due: Some("not-a-date".into()),
+            ..EditArgs::default()
+        },
+        wednesday(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, 2);
+
+    // Priority out of range rejected with exit code 2.
+    let err = commands::edit(
+        &s,
+        &EditArgs {
+            id: t.id,
+            priority: Some(4),
+            ..EditArgs::default()
+        },
+        wednesday(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, 2);
+
+    // Missing task id rejected with exit code 1.
+    let err = commands::edit(
+        &s,
+        &EditArgs {
+            id: 99,
+            title: Some("valid".into()),
+            ..EditArgs::default()
+        },
+        wednesday(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, 1);
+    assert!(err.message.contains("99"));
 }
 
 #[test]

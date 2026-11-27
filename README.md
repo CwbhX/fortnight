@@ -69,17 +69,23 @@ The quick-add bar is always on screen. Type a title, then add any of these:
 | Type | Meaning | Examples |
 |---|---|---|
 | A date | The planned day | `fri`, `tomorrow`, `nov 20`, `+3d` |
+| `due:<date>` | The deadline | `due:fri`, `due:nov 20`, `due:+5d`, `due:2026-11-20` |
 | `#name` | The project | `#work` |
 | `~time` | The estimate | `~2h`, `~30m`, `~1h30m` |
 | `!`, `!!` or `!!!` | The priority | `!` is priority 1 |
+| `every:<cadence>` | Repeat when completed | `every:daily`, `every:weekdays`, `every:weekly`, `every:monthly` |
 
-For example, `Write Q4 report fri #work ~2h !` makes a task for Friday in project `work`. It has a two-hour estimate and priority 1. Cards show the priority as marks after the title.
+For example, `Write Q4 report wed due:fri #work ~2h ! every:weekly` makes a weekly task planned for Wednesday, due Friday, in project `work`, with a two-hour estimate and priority 1. Cards show the priority as marks after the title.
 
-A task has notes, an estimate, a priority, a planned day, a deadline and a status: to do, done or deleted. While you type a title or notes, Fortnight suggests a priority. A new task uses the suggestion unless you pick a priority yourself.
+A task has notes, subtasks, an estimate, a priority, a planned day, a deadline, an optional repeat cadence, a private flag (excluded from LLM prompts), and a status: to do, done or deleted. While you type a title or notes, Fortnight suggests a priority. A new task uses the suggestion unless you pick a priority yourself.
+
+### Search and project filter
+
+Press `Cmd+K` / `Ctrl+K`, `/` or click the magnifying glass in the top bar to search across task titles, notes, projects and day notes, filter by `#project`, and jump straight to any result.
 
 ### Weekly Summary
 
-Fortnight records every change to every task. The Weekly Summary uses that history and your notes. It says what you finished, what moved forward, which deadlines changed and what is overdue. The copy icon in its header copies it.
+Fortnight records every change to every task. The Weekly Summary uses that history and your notes (private tasks are excluded). It says what you finished, what moved forward, which deadlines changed and what is overdue. From its header you can copy it as Markdown, edit it inline, regenerate it, or switch to **Facts** to see the exact deterministic facts sent to the model.
 
 The summary updates by itself:
 
@@ -98,13 +104,13 @@ At the top of the Today tab, Fortnight shows up to three tasks to do first, numb
 - Rust collects the facts, and the model picks the order. It weighs priority and deadlines.
 - The list updates when your tasks change.
 
-### Undo
+### Undo and redo
 
-`Cmd+Z` or `Ctrl+Z` undoes the last add, status change, edit or delete.
+`Cmd+Z` / `Ctrl+Z` undoes the last add, status change, edit or delete (including any spawned recurring occurrence), and `Shift+Cmd+Z` / `Shift+Ctrl+Z` (or `Ctrl+Y`) redoes it. The notes editor has its own text undo and redo while focused.
 
 ### Keyboard
 
-Single keys work when no text field has focus. Press Escape to leave a text field.
+Single keys work when no text field has focus. Press Escape to leave a text field, or `?` at any time to open the in-app shortcut sheet.
 
 | Key | Action |
 |---|---|
@@ -112,11 +118,14 @@ Single keys work when no text field has focus. Press Escape to leave a text fiel
 | `←` `→` | Previous or next day, week or month |
 | `T` | Jump to today |
 | `N` or `Ctrl/Cmd+N` | Go to the quick-add bar |
-| `↑` `↓` | Move the selection in Today |
+| `/` or `Ctrl/Cmd+K` | Search and filter by project |
+| `↑` `↓` | Move the selection in Today or Search |
 | `Space` | Mark the selected task done or not done |
 | `Enter` | Open the selected task to edit it |
 | `Ctrl/Cmd+,` | Settings |
 | `Ctrl/Cmd+Z` | Undo the last change |
+| `Shift+Ctrl/Cmd+Z` | Redo |
+| `?` | Keyboard shortcuts |
 
 ## Install
 
@@ -187,7 +196,7 @@ Settings has these parts, from top to bottom:
 - **Recommendations.** Recommend overdue tasks (off by default). Use a different model, which opens a second endpoint block just for Recommended tasks.
 - **Week.** The first day of the week (Sunday by default), the working days, and the work hours per day (8 by default). The load bars use the last two. You can also make new tasks due on the day you add them (off by default).
 - **Prompts.** The system prompts for the Weekly Summary and Recommended tasks. They start folded. Reset brings back the built-in prompt.
-- **Data folder.** Where your data is.
+- **Data folder.** Where your data is, plus one-click Markdown and JSON export into `<data_dir>/exports/`.
 - **About.** The app version, author and license.
 
 ### Ollama
@@ -221,7 +230,7 @@ Fortnight writes nothing outside this folder. To move your data, copy the folder
 > [!WARNING]
 > If the folder is in a synced place such as Dropbox or iCloud, open it on one machine at a time. The app warns you if it finds a lock from another machine.
 
-The app makes `fortnight.lock` when it starts and removes it when it quits. The CLI never takes the lock, so it can run while the app is open. The app reads tasks again only at launch and after you change something in it. So a task the CLI adds or completes shows up after your next change, or after a restart.
+The app makes `fortnight.lock` when it starts and removes it when it quits. The CLI never takes the lock, so it can run while the app is open. When the CLI changes the database, the app automatically reloads on window focus or the next minute tick.
 
 ### Your API keys
 
@@ -239,9 +248,11 @@ The app makes `fortnight.lock` when it starts and removes it when it quits. The 
 `fortnight-cli` works on the same data folder, without a window. `--data-dir <path>` can go anywhere on the line. Only `add` makes a new data folder. The other commands fail if the folder has no database.
 
 ```
-fortnight-cli add <words...>                    # quick-add syntax: fri, nov 20, +3d, #project, ~2h, !
-fortnight-cli list [--all] [--today] [--week]   # open tasks; --today is the Today list plus overdue; --all adds done and deleted ones
-fortnight-cli done <id>... [--undo]             # mark tasks done, or open them again
+fortnight-cli add [--private] <words...>        # quick-add syntax: fri, due:fri, +3d, #project, ~2h, !, every:weekly
+fortnight-cli list [--all] [--today] [--week] [--project <name>]  # open tasks; --today is Today plus overdue; --all adds done and deleted
+fortnight-cli done <id>... [--undo]             # mark tasks done (spawns next occurrence if repeating), or open them again
+fortnight-cli edit <id> [--title ...] [--project ...|--clear-project] [--due ...|--clear-due] [--planned ...|--clear-planned] [--estimate ...|--clear-estimate] [--priority 0..3] [--private|--no-private] [--repeat daily|weekdays|weekly|monthly|--clear-repeat]
+fortnight-cli delete <id>... [--forever]        # move tasks to Deleted, or remove permanently with --forever
 fortnight-cli log [--task <id>] <words...>      # add a note for today (the Today tab's Notes), or a log line on a task
 fortnight-cli summary [--week this|last|YYYY-MM-DD] [--facts]   # the weekly summary, streamed
 fortnight-cli plan [--facts]                    # recommended tasks for today
