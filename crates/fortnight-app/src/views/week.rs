@@ -147,12 +147,28 @@ pub struct WeekData {
     pub panel: ReportPanelData,
 }
 
+/// How long the outgoing week is kept after a week switch so the slide
+/// animation finishes cleanly before it is dropped.
+const SLIDE_LINGER: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// The week that just slid out, kept briefly for [`motion::slide`].
+#[derive(Debug)]
+struct PreviousWeek {
+    data: WeekData,
+    layout: Layout,
+    panel: ReportPanel,
+    summary_open: bool,
+    at: std::time::Instant,
+}
+
 #[derive(Debug, Default)]
 pub struct WeekView {
     data: Option<WeekData>,
     /// Worked out from `data` by `load`; `view` only reads it.
     layout: Layout,
     panel: ReportPanel,
+    /// The previous week, kept briefly so switching weeks slides smoothly.
+    previous: Option<PreviousWeek>,
     drag: Option<Drag>,
     /// Whether the Weekly Summary is unfolded (it starts folded).
     summary_open: bool,
@@ -170,6 +186,24 @@ impl WeekView {
     pub fn load(&mut self, data: WeekData) {
         if self.data.as_ref() == Some(&data) {
             return;
+        }
+        if let Some(old_data) = self.data.take()
+            && old_data.week != data.week
+        {
+            self.previous = Some(PreviousWeek {
+                data: old_data,
+                layout: std::mem::take(&mut self.layout),
+                panel: std::mem::take(&mut self.panel),
+                summary_open: self.summary_open,
+                at: std::time::Instant::now(),
+            });
+            self.drag = None;
+        } else if self
+            .previous
+            .as_ref()
+            .is_some_and(|p| p.at.elapsed() >= SLIDE_LINGER)
+        {
+            self.previous = None;
         }
         self.panel.load(data.panel.clone());
         self.layout = Layout::new(&data);
@@ -268,47 +302,28 @@ impl WeekView {
         // The dragged task, if it still exists.
         let held = dragging.and_then(|d| data.tasks.iter().find(|t| t.id == d.id));
 
-        // Equal heights: the backgrounds are pushed under the contents in a
-        // stack, so they take the height of the tallest column (iced's row
-        // can't stretch its children to the tallest one inside a scrollable).
-        let mut backgrounds = Row::new().spacing(theme::SPACING);
-        let mut contents = Row::new().spacing(theme::SPACING);
-        for column in &self.layout.columns {
-            let spec = &column.spec;
-            let day = spec.days[0];
-            let mut free =
-                mouse_area(container(space()).width(Fill).height(Fill).style(
-                    drop_target(
-                        spec.is_today,
-                        dragging.is_some_and(|d| {
-                            d.over.is_some_and(|(day, _)| spec.days.contains(&day))
-                        }),
-                    ),
-                ));
-            if dragging.is_some() {
-                // The column's free space: drop after its open tasks.
-                free = free
-                    .on_enter(Message::Hover(day, None))
-                    .on_move(move |_| Message::Hover(day, None))
-                    .on_exit(Message::Leave(day, None));
-            }
-            backgrounds = backgrounds.push(free);
-            contents = contents.push(day_column(data, &self.layout, column, dragging, held));
-        }
-        let grid = column_grid(contents, backgrounds);
+        let current = week_body(
+            data,
+            &self.layout,
+            &self.panel,
+            self.summary_open,
+            dragging,
+            held,
+        );
+        let previous = self.previous.as_ref().map(|prev| {
+            week_body(
+                &prev.data,
+                &prev.layout,
+                &prev.panel,
+                prev.summary_open,
+                None,
+                None,
+            )
+        });
+        let sliding = motion::slide(week_ordinal(data.week.start), current, previous)
+            .fade_from(|theme: &Theme| theme.palette().background);
 
-        let mut body = Column::new().spacing(theme::SPACING * 2.0).push(grid);
-        if self.panel.slot(ReportKind::Summary).is_some() {
-            body = body.push(summary_card(
-                self.summary_open,
-                self.panel.summary_tools().map(|e| e.map(Message::Panel)),
-                self.panel
-                    .status_view(ReportKind::Summary)
-                    .map(|e| e.map(Message::Panel)),
-                self.panel.summary_view().map(Message::Panel),
-            ));
-        }
-        let mut layers = stack![body.padding(theme::SPACING * 2.0)];
+        let mut layers = stack![sliding];
         if let Some(drag) = dragging
             && let Some(at) = drag.at
             && let Some(task) = held
@@ -337,6 +352,65 @@ impl WeekView {
         }
         scrollable(area).height(Fill).into()
     }
+}
+
+/// Monotonic ordinal for a week's start date, used by [`motion::slide`] to
+/// decide slide direction.
+fn week_ordinal(d: Date) -> i64 {
+    (i64::from(d.year()) * 12 + i64::from(d.month())) * 31 + i64::from(d.day())
+}
+
+/// One week's columns and (when present) its Weekly Summary card.
+fn week_body<'a>(
+    data: &'a WeekData,
+    layout: &'a Layout,
+    panel: &'a ReportPanel,
+    summary_open: bool,
+    dragging: Option<&'a Drag>,
+    held: Option<&'a Task>,
+) -> Element<'a, Message> {
+    // Equal heights: the backgrounds are pushed under the contents in a
+    // stack, so they take the height of the tallest column (iced's row
+    // can't stretch its children to the tallest one inside a scrollable).
+    let mut backgrounds = Row::new().spacing(theme::SPACING);
+    let mut contents = Row::new().spacing(theme::SPACING);
+    for column in &layout.columns {
+        let spec = &column.spec;
+        let day = spec.days[0];
+        let mut free = mouse_area(
+            container(space())
+                .width(Fill)
+                .height(Fill)
+                .style(drop_target(
+                    spec.is_today,
+                    dragging
+                        .is_some_and(|d| d.over.is_some_and(|(day, _)| spec.days.contains(&day))),
+                )),
+        );
+        if dragging.is_some() {
+            // The column's free space: drop after its open tasks.
+            free = free
+                .on_enter(Message::Hover(day, None))
+                .on_move(move |_| Message::Hover(day, None))
+                .on_exit(Message::Leave(day, None));
+        }
+        backgrounds = backgrounds.push(free);
+        contents = contents.push(day_column(data, layout, column, dragging, held));
+    }
+    let grid = column_grid(contents, backgrounds);
+
+    let mut body = Column::new().spacing(theme::SPACING * 2.0).push(grid);
+    if panel.slot(ReportKind::Summary).is_some() {
+        body = body.push(summary_card(
+            summary_open,
+            panel.summary_tools().map(|e| e.map(Message::Panel)),
+            panel
+                .status_view(ReportKind::Summary)
+                .map(|e| e.map(Message::Panel)),
+            panel.summary_view().map(Message::Panel),
+        ));
+    }
+    body.padding(theme::SPACING * 2.0).into()
 }
 
 /// The Weekly Summary card. Its heading sits in a tinted bar of its own, in

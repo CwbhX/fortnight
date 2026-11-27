@@ -66,6 +66,8 @@ const UNFOLD: Duration = Duration::from_millis(220);
 /// back down (closing is slightly brisker so it feels snappy).
 const EXPAND_OPEN: Duration = Duration::from_millis(240);
 const EXPAND_CLOSE: Duration = Duration::from_millis(200);
+/// How long a full-width horizontal page slide (Week view) takes.
+const PAGE_SLIDE: Duration = Duration::from_millis(280);
 /// A page changed again this soon after the last change (a held arrow key,
 /// quick clicks) is shown at once.
 const QUIET: Duration = Duration::from_millis(300);
@@ -130,6 +132,11 @@ pub fn system_reduces_motion() -> bool {
 /// Fast at first, settling gently: `t` (0–1) eased.
 fn ease_out(t: f32) -> f32 {
     1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+/// Immediate start with a longer, silky settle: `t` (0–1) eased.
+fn ease_out_quart(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(4)
 }
 
 fn lerp(from: f32, to: f32, t: f32) -> f32 {
@@ -1577,6 +1584,337 @@ impl<'a, M: 'a, T: 'a, R: renderer::Renderer + 'a> From<Expand<'a, M, T, R>>
     }
 }
 
+// ------------------------------------------------------------------ slide
+
+/// A side-by-side horizontal page carousel for switching periods (such as
+/// weeks in the Week view). When `page` changes, `previous` slides smoothly
+/// off to the side while `current` glides in right beside it using pure GPU
+/// translation (zero per-frame relayout, zero blank flash). Rapid clicks and
+/// mid-slide reversals pick up seamlessly from the exact current offset.
+pub fn slide<'a, M: 'a, T: 'a, R: renderer::Renderer + 'a>(
+    page: i64,
+    current: impl Into<Element<'a, M, T, R>>,
+    previous: Option<Element<'a, M, T, R>>,
+) -> Slide<'a, M, T, R> {
+    let has_previous = previous.is_some();
+    let previous = previous.unwrap_or_else(|| iced::widget::Space::new().into());
+    Slide {
+        children: [current.into(), previous],
+        page,
+        has_previous,
+        veil: None,
+    }
+}
+
+/// See [`slide`].
+pub struct Slide<'a, M, T, R> {
+    children: [Element<'a, M, T, R>; 2],
+    page: i64,
+    has_previous: bool,
+    veil: Option<Behind<'a, T>>,
+}
+
+impl<'a, M, T, R> Slide<'a, M, T, R> {
+    /// Gently recedes the outgoing page into `behind` as it slides away.
+    pub fn fade_from(mut self, behind: impl Fn(&T) -> Color + 'a) -> Self {
+        self.veil = Some(Box::new(behind));
+        self
+    }
+}
+
+struct SlideState {
+    run: Run,
+    page: i64,
+    /// +1.0 when moving forward (entering from the right), -1.0 backward.
+    dir: f32,
+    /// Horizontal offset of `current` at the start of the active slide.
+    from_x: f32,
+    /// Last laid-out width of the carousel.
+    width: f32,
+}
+
+impl SlideState {
+    /// Current horizontal offset of `current` (0.0 at rest), and progress 0–1.
+    fn offset(&self) -> Option<(f32, f32)> {
+        let p = self.run.progress(PAGE_SLIDE);
+        if p >= 1.0 || self.width <= 0.0 {
+            return None;
+        }
+        let eased = ease_out_quart(p);
+        let raw = self.from_x * (1.0 - eased);
+        // Half-pixel steps (whole physical pixels on 2x displays).
+        let x = (raw * 2.0).round() * 0.5;
+        Some((x, eased))
+    }
+}
+
+impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Slide<'_, M, T, R> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<SlideState>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(SlideState {
+            run: Run::finished(),
+            page: self.page,
+            dir: 1.0,
+            from_x: 0.0,
+            width: 0.0,
+        })
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        self.children.iter().map(Tree::new).collect()
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        let state = tree.state.downcast_mut::<SlideState>();
+        if self.page != state.page {
+            let dir = if self.page > state.page { 1.0 } else { -1.0 };
+            let cur_x = state.offset().map_or(0.0, |(x, _)| x);
+            state.page = self.page;
+            state.dir = dir;
+            if state.width > 0.0 {
+                // Keep the outgoing page glued to the exact pixel it already
+                // occupied (even on rapid clicks or mid-slide reversals).
+                let max = state.width * 1.5;
+                state.from_x = (cur_x + dir * state.width).clamp(-max, max);
+                state.run.restart();
+            } else {
+                state.from_x = 0.0;
+                state.run.skip();
+            }
+            // Move the outgoing page's widget tree into slot 1 so it keeps
+            // its state (e.g. an open summary panel) while sliding away.
+            if tree.children.len() == 2 {
+                tree.children.swap(0, 1);
+            }
+        }
+        tree.diff_children(&self.children);
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.children[0].as_widget().size()
+    }
+
+    fn size_hint(&self) -> Size<Length> {
+        self.children[0].as_widget().size_hint()
+    }
+
+    fn layout(&mut self, tree: &mut Tree, renderer: &R, limits: &layout::Limits) -> layout::Node {
+        let current =
+            self.children[0]
+                .as_widget_mut()
+                .layout(&mut tree.children[0], renderer, limits);
+        let previous =
+            self.children[1]
+                .as_widget_mut()
+                .layout(&mut tree.children[1], renderer, limits);
+        let size = current.size();
+        tree.state.downcast_mut::<SlideState>().width = size.width;
+        layout::Node::with_children(size, vec![current, previous])
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &R,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, M>,
+        viewport: &Rectangle,
+    ) {
+        if let Some(current_layout) = layout.children().next() {
+            self.children[0].as_widget_mut().update(
+                &mut tree.children[0],
+                event,
+                current_layout,
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+        }
+        if let Some(now) = frame_time(event) {
+            let state = tree.state.downcast_mut::<SlideState>();
+            if state.run.frame(now, PAGE_SLIDE) {
+                shell.request_redraw();
+            }
+        }
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut R,
+        theme: &T,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        let mut children = layout.children();
+        let (Some(current_layout), Some(previous_layout)) = (children.next(), children.next())
+        else {
+            return;
+        };
+        let state = tree.state.downcast_ref::<SlideState>();
+        let Some((curr_x, eased)) = state.offset() else {
+            self.children[0].as_widget().draw(
+                &tree.children[0],
+                renderer,
+                theme,
+                style,
+                current_layout,
+                cursor,
+                viewport,
+            );
+            return;
+        };
+
+        let bounds = layout.bounds();
+        // Clip horizontally to the slide container and vertically to the
+        // visible viewport so a taller outgoing week never clips abruptly.
+        let horiz = Rectangle {
+            x: bounds.x,
+            width: bounds.width,
+            y: viewport.y,
+            height: viewport.height,
+        };
+        let Some(clip) = horiz.intersection(viewport) else {
+            return;
+        };
+
+        let prev_x = curr_x - state.dir * bounds.width;
+        let local_viewport = |dx: f32| Rectangle {
+            x: clip.x - dx,
+            y: clip.y,
+            width: clip.width,
+            height: clip.height,
+        };
+
+        renderer.with_layer(clip, |renderer| {
+            // Outgoing page slides smoothly away beside the incoming page.
+            if self.has_previous {
+                let prev_rect = Rectangle {
+                    x: bounds.x + prev_x,
+                    width: bounds.width,
+                    y: clip.y,
+                    height: clip.height,
+                };
+                if let Some(prev_clip) = prev_rect.intersection(&clip) {
+                    let prev_vp = local_viewport(prev_x);
+                    renderer.with_translation(Vector::new(prev_x, 0.0), |renderer| {
+                        self.children[1].as_widget().draw(
+                            &tree.children[1],
+                            renderer,
+                            theme,
+                            style,
+                            previous_layout,
+                            mouse::Cursor::Unavailable,
+                            &prev_vp,
+                        );
+                    });
+                    if let Some(behind) = &self.veil {
+                        let veil = 0.25 * eased;
+                        if veil > 0.001 {
+                            renderer.with_layer(prev_clip, |renderer| {
+                                renderer.fill_quad(
+                                    renderer::Quad {
+                                        bounds: prev_clip,
+                                        ..renderer::Quad::default()
+                                    },
+                                    behind(theme).scale_alpha(veil),
+                                );
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Incoming page glides crisply into place.
+            let curr_vp = local_viewport(curr_x);
+            renderer.with_translation(Vector::new(curr_x, 0.0), |renderer| {
+                self.children[0].as_widget().draw(
+                    &tree.children[0],
+                    renderer,
+                    theme,
+                    style,
+                    current_layout,
+                    mouse::Cursor::Unavailable,
+                    &curr_vp,
+                );
+            });
+        });
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &R,
+        operation: &mut dyn Operation,
+    ) {
+        if let Some(current_layout) = layout.children().next() {
+            self.children[0].as_widget_mut().operate(
+                &mut tree.children[0],
+                current_layout,
+                renderer,
+                operation,
+            );
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &R,
+    ) -> mouse::Interaction {
+        match layout.children().next() {
+            Some(current_layout) => self.children[0].as_widget().mouse_interaction(
+                &tree.children[0],
+                current_layout,
+                cursor,
+                viewport,
+                renderer,
+            ),
+            None => mouse::Interaction::None,
+        }
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &R,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, M, T, R>> {
+        let current_layout = layout.children().next()?;
+        self.children[0].as_widget_mut().overlay(
+            &mut tree.children[0],
+            current_layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+}
+
+impl<'a, M: 'a, T: 'a, R: renderer::Renderer + 'a> From<Slide<'a, M, T, R>>
+    for Element<'a, M, T, R>
+{
+    fn from(slide: Slide<'a, M, T, R>) -> Self {
+        Element::new(slide)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2088,5 +2426,47 @@ mod tests {
         assert!(!stage.frame(t3 + EXPAND_OPEN));
         assert_eq!(height(&stage), 300.0);
         assert_eq!(stage.state::<ExpandState>().shown_open, 1.0);
+    }
+
+    fn week_slide<'a>(page: i64, has_prev: bool) -> El<'a> {
+        let cur = space().width(400).height(200);
+        let prev = has_prev.then(|| space().width(400).height(200).into());
+        slide(page, cur, prev)
+            .fade_from(|_: &Theme| Color::BLACK)
+            .into()
+    }
+
+    #[test]
+    fn sliding_pages_move_without_relayout_and_reverse_continuously() {
+        let mut stage = Stage::new(week_slide(10, false));
+        let t0 = Instant::now();
+        assert!(!stage.frame(t0));
+        assert_eq!(stage.state::<SlideState>().offset(), None);
+
+        // Next week: starts one full width to the right, slides to 0 with zero relayouts.
+        let layouts_before = stage.layouts;
+        stage.set(week_slide(11, true));
+        assert_eq!(stage.state::<SlideState>().offset().unwrap().0, 400.0);
+        let t1 = t0 + ms(1000);
+        assert!(stage.frame(t1));
+        assert!(stage.frame(t1 + PAGE_SLIDE / 4));
+        let (mid_x, _) = stage.state::<SlideState>().offset().unwrap();
+        assert!(mid_x > 0.0 && mid_x < 400.0, "{mid_x}");
+        assert_eq!(stage.layouts, layouts_before);
+
+        // Reversing mid-slide keeps both pages glued with zero jump:
+        // page 10 was at `mid_x - 400.0`, so returning to page 10 starts there.
+        stage.set(week_slide(10, true));
+        let (rev_x, _) = stage.state::<SlideState>().offset().unwrap();
+        assert!(
+            (rev_x - (mid_x - 400.0)).abs() <= 0.5,
+            "{rev_x} vs {}",
+            mid_x - 400.0
+        );
+        let t2 = t1 + PAGE_SLIDE / 4 + ms(16);
+        assert!(stage.frame(t2));
+        assert!(!stage.frame(t2 + PAGE_SLIDE));
+        assert_eq!(stage.state::<SlideState>().offset(), None);
+        assert_eq!(stage.layouts, layouts_before);
     }
 }

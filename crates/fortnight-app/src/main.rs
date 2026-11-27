@@ -859,7 +859,10 @@ impl Ready {
         let days = |d: Date| months(d) * 31 + i64::from(d.day());
         match self.tab {
             Tab::Today => (0, days(self.selected)),
-            Tab::Week => (1, days(self.week_of(self.selected).start)),
+            // Week-to-week transitions slide side-by-side inside `WeekView`
+            // (`motion::slide`); keeping the position constant here preserves
+            // the tab-switch rise without double-animating week changes.
+            Tab::Week => (1, 0),
             Tab::Month => (2, months(self.selected)),
         }
     }
