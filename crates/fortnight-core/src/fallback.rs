@@ -96,11 +96,6 @@ impl FallbackClient {
     pub fn used_fallback(&self) -> bool {
         self.used.load(Ordering::SeqCst)
     }
-
-    /// The model the fallback sends requests with.
-    pub fn fallback_model(&self) -> &str {
-        self.fallback.model()
-    }
 }
 
 /// Where a `chat_stream` is up to.
@@ -373,7 +368,6 @@ mod tests {
         assert_eq!(reply.text, "from main");
         assert_eq!(reply.model, "mock");
         assert!(c.used_fallback());
-        assert_eq!(c.fallback_model(), "mock");
         assert_eq!(fallback.requests.lock().unwrap().len(), 1);
 
         let c = FallbackClient::new(down(), fallback);

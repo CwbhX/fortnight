@@ -49,8 +49,12 @@ impl Ready {
 
     /// Pushes fresh data into the visible tab (and Settings when open).
     pub(crate) fn refresh(&mut self) {
-        self.must_refresh = false;
         let today = self.today();
+        if today != self.last_today {
+            self.new_day(today);
+            self.derived = Derived::default();
+        }
+        self.must_refresh = false;
         match self.tab {
             Tab::Today => {
                 let (recommended, recommending) = self.day_recommendations(today);

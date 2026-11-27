@@ -237,9 +237,14 @@ pub fn connect_with(
     uses_decision: bool,
     process: Process<'_>,
 ) -> CliResult<LlmHandle> {
-    let flags_name_endpoint =
-        flags.protocol.is_some() || flags.base_url.is_some() || flags.model.is_some();
-    let decision = if uses_decision && !flags_name_endpoint {
+    let get = |name: &str| (process.var)(name).filter(|v| !v.trim().is_empty());
+    let endpoint_overridden = flags.protocol.is_some()
+        || flags.base_url.is_some()
+        || flags.model.is_some()
+        || get("FORTNIGHT_LLM_PROTOCOL").is_some()
+        || get("FORTNIGHT_LLM_BASE_URL").is_some()
+        || get("FORTNIGHT_LLM_MODEL").is_some();
+    let decision = if uses_decision && !endpoint_overridden {
         decision.clone()
     } else {
         LlmSettings::default()
@@ -253,11 +258,16 @@ pub fn connect_with(
     if !llm.is_configured() {
         return Err(CliError::not_configured(NOT_CONFIGURED));
     }
+    // Never unlock and send the saved main API key to a different host when
+    // `--base-url` or `FORTNIGHT_LLM_BASE_URL` overrides the saved endpoint.
+    let saved_host = LlmConfig::from_settings(saved, None).endpoint_host();
+    let effective_host = LlmConfig::from_settings(&llm, None).endpoint_host();
+    let same_main_host = saved_host.is_none() || saved_host == effective_host;
     // A keyless or local endpoint (Ollama, LM Studio) needs no key: its
     // file isn't opened, so there is no password prompt. The environment
     // keys still apply to a local one, for a local proxy.
     let needs = KeyNeeds {
-        main: secure::needs_saved_key(&llm),
+        main: same_main_host && secure::needs_saved_key(&llm),
         decision: decision.is_configured() && secure::needs_saved_key(&decision),
     };
     let (main_key, decision_key) = resolve_keys(
@@ -818,5 +828,62 @@ mod tests {
     fn password_stdin_keeps_trailing_spaces() {
         let got = read_password(true, &mut &b"pass word \r\n"[..], &mut no_prompt()).unwrap();
         assert_eq!(got.expose_secret(), "pass word ");
+    }
+
+    #[test]
+    fn overriding_base_url_to_another_host_does_not_open_saved_key() {
+        let dir = temp_dir("other-host");
+        vault::save(
+            &vault::key_path(&dir),
+            &secret("sk-saved"),
+            &secret("pw-pw-pw-pw"),
+        )
+        .unwrap();
+        let saved = settings("https://api.openai.com/v1", false);
+        let override_flags = LlmArgs {
+            base_url: Some("https://other.example/v1".into()),
+            ..LlmArgs::default()
+        };
+        // Must not prompt to unlock the saved key for a different host.
+        let h = connect(
+            &saved,
+            &LlmSettings::default(),
+            &override_flags,
+            &dir,
+            false,
+            &mut no_prompt(),
+        )
+        .unwrap();
+        assert_eq!(h.main.host.as_deref(), Some("other.example"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_endpoint_override_bypasses_saved_decision_model() {
+        let dir = temp_dir("env-bypass-decision");
+        let saved = settings("http://localhost:11434/v1", true);
+        let decision = settings("https://decision.example/v1", false);
+        vault::save(
+            &vault::decision_key_path(&dir),
+            &secret("sk-dec"),
+            &secret("pw-pw-pw-pw"),
+        )
+        .unwrap();
+        let h = connect_with(
+            &saved,
+            &decision,
+            &LlmArgs::default(),
+            &dir,
+            true,
+            Process {
+                var: &|n| (n == "FORTNIGHT_LLM_MODEL").then(|| "override-model".to_string()),
+                keys: (None, None),
+                stdin: &mut &b""[..],
+                prompt: &mut no_prompt(),
+            },
+        )
+        .unwrap();
+        assert!(h.decision.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -168,26 +168,11 @@ pub enum Message {
     /// The pointer entered a card (or, while dragging, the space after the
     /// last card); while dragging, also sent on every move inside it.
     Enter(Spot),
-    /// The pointer left a card.
-    Leave(TaskId),
+    /// The pointer left a card or the end drop strip.
+    Leave(Spot),
     /// The mouse button went up anywhere: the drag (if any) is over, and
     /// the card lands where the landing line shows (`Drag::over`).
     EndDrag,
-}
-
-impl Message {
-    /// Pointer bookkeeping that changes no data: `main.rs` skips its
-    /// refresh for these, as they arrive with every mouse move.
-    pub fn is_pointer_move(&self) -> bool {
-        matches!(
-            self,
-            Message::Press(_)
-                | Message::Moved(_)
-                | Message::Enter(_)
-                | Message::Leave(_)
-                | Message::EndDrag
-        )
-    }
 }
 
 /// Where in the Tasks section a dragged card would land.
@@ -395,7 +380,7 @@ fn section_of(task: &Task, day: Date, today: Date, tz: &TimeZone) -> Option<Sect
             return Some(Section::Overdue);
         }
         // With no planned day it is on today's list too.
-        if task.on_today_list(today) || task.day().is_none() {
+        if task.on_today_list(today) {
             return Some(Section::Day);
         }
     }
@@ -791,9 +776,16 @@ impl DayView {
                 }
                 Action::None
             }
-            Message::Leave(id) => {
-                if self.hovered == Some(id) {
+            Message::Leave(spot) => {
+                if let Spot::Before(id) = spot
+                    && self.hovered == Some(id)
+                {
                     self.hovered = None;
+                }
+                if let Some(drag) = self.drag.as_mut()
+                    && drag.over == Some(spot)
+                {
+                    drag.over = None;
                 }
                 Action::None
             }
@@ -1311,7 +1303,7 @@ impl DayView {
                 let mut area = mouse_area(column![drop_line(line), card].spacing(3))
                     .on_press(Message::Press(id))
                     .on_enter(Message::Enter(Spot::Before(id)))
-                    .on_exit(Message::Leave(id))
+                    .on_exit(Message::Leave(Spot::Before(id)))
                     .interaction(if dragging.is_some() {
                         mouse::Interaction::Grabbing
                     } else {
@@ -1332,7 +1324,8 @@ impl DayView {
         if dragging.is_some() {
             end = end
                 .on_enter(Message::Enter(Spot::End))
-                .on_move(|_| Message::Enter(Spot::End));
+                .on_move(|_| Message::Enter(Spot::End))
+                .on_exit(Message::Leave(Spot::End));
         }
         // Always the same shape, the strip folding away with no cards: a
         // list given a new place in the tree starts afresh, and a fresh

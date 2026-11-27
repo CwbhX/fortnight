@@ -29,7 +29,7 @@ pub enum Command {
     /// Add a task. Understands dates (fri, tomorrow, nov 20, +3d), #project,
     /// ~2h estimates and ! priority.
     Add {
-        #[arg(required = true, num_args = 1.., allow_hyphen_values = true, value_name = "WORDS")]
+        #[arg(required = true, num_args = 1.., value_name = "WORDS")]
         words: Vec<String>,
     },
     /// List open tasks: overdue first, then by day, then undated.
@@ -48,7 +48,7 @@ pub enum Command {
         /// Log the line on this task instead.
         #[arg(long, value_name = "ID")]
         task: Option<TaskId>,
-        #[arg(required = true, num_args = 1.., allow_hyphen_values = true, value_name = "WORDS")]
+        #[arg(required = true, num_args = 1.., value_name = "WORDS")]
         words: Vec<String>,
     },
     /// Write the weekly summary (default: the latest week whose summary is
@@ -67,13 +67,13 @@ pub struct ListArgs {
     /// Include done and dropped tasks.
     #[arg(long)]
     pub all: bool,
-    /// Only the Today list (tasks planned for today or carried over from
-    /// earlier days) and overdue tasks. With --all, also today's closed
-    /// tasks.
-    #[arg(long)]
+    /// Only the Today list (tasks planned for today, carried over from
+    /// earlier days, or undated) and overdue tasks. With --all, also today's
+    /// closed tasks.
+    #[arg(long, conflicts_with = "week")]
     pub today: bool,
     /// Only overdue tasks and tasks for this week.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "today")]
     pub week: bool,
 }
 
@@ -215,5 +215,32 @@ mod tests {
         assert!(Cli::try_parse_from(["f", "plan", "--week", "last"]).is_err());
         assert!(Cli::try_parse_from(["f", "done"]).is_err());
         assert!(Cli::try_parse_from(["f", "add"]).is_err());
+        assert!(Cli::try_parse_from(["f", "list", "--today", "--week"]).is_err());
+    }
+
+    #[test]
+    fn trailing_flags_work_on_add_and_log() {
+        let cli = parse(&["add", "buy", "milk", "--data-dir", "/tmp/d"]);
+        assert_eq!(
+            cli.data_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/d"))
+        );
+        match cli.command {
+            Command::Add { words } => assert_eq!(words, vec!["buy", "milk"]),
+            c => panic!("{c:?}"),
+        }
+
+        let cli = parse(&["log", "did", "thing", "--task", "3", "--data-dir", "/tmp/d"]);
+        assert_eq!(
+            cli.data_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/d"))
+        );
+        match cli.command {
+            Command::Log { task, words } => {
+                assert_eq!(task, Some(3));
+                assert_eq!(words, vec!["did", "thing"]);
+            }
+            c => panic!("{c:?}"),
+        }
     }
 }

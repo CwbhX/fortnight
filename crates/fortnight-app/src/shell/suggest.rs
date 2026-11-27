@@ -62,11 +62,16 @@ impl Ready {
     /// notes change, ask for a suggested priority once typing pauses.
     pub(crate) fn maybe_suggest(&mut self) -> Task<Message> {
         if !self.decision_active() {
+            self.suggest.cancel();
+            self.suggest.form = None;
             return Task::none();
         }
         let now = self.open_form_text();
         if now == self.suggest.form {
             return Task::none();
+        }
+        if let Some(old) = self.suggest.request.take() {
+            old.abort();
         }
         let has_title = now.as_ref().is_some_and(|(_, t, _)| !t.trim().is_empty());
         self.suggest.form = now;

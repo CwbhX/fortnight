@@ -30,17 +30,48 @@ fn from_host(host: Option<&str>) -> String {
     let Some(host) = host.map(str::trim).filter(|h| !h.is_empty()) else {
         return DEFAULT_BASE_URL.into();
     };
-    let (scheme, rest) = host.split_once("://").unwrap_or(("http", host));
-    let rest = rest.trim_end_matches('/').replace("0.0.0.0", "127.0.0.1");
-    let has_port = rest
-        .rsplit_once(':')
-        .is_some_and(|(_, p)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
-    let rest = if has_port {
-        rest
+    let candidate = if host.contains("://") {
+        host.to_string()
+    } else if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("http://[{host}]")
+    } else if host.starts_with(':') {
+        format!("http://127.0.0.1{host}")
     } else {
-        format!("{rest}:11434")
+        format!("http://{host}")
     };
-    format!("{scheme}://{rest}/v1")
+    let Ok(mut url) = reqwest::Url::parse(&candidate) else {
+        return DEFAULT_BASE_URL.into();
+    };
+    match url.host_str() {
+        Some("0.0.0.0") => {
+            let _ = url.set_host(Some("127.0.0.1"));
+        }
+        Some("[::]") => {
+            let _ = url.set_host(Some("[::1]"));
+        }
+        _ => {}
+    }
+    // Add Ollama's default port when the input did not name one explicitly
+    // (reqwest drops `:80`/`:443` from `url.port()`).
+    let authority = candidate
+        .split_once("://")
+        .map_or(candidate.as_str(), |(_, rest)| rest)
+        .split('/')
+        .next()
+        .unwrap_or("");
+    let explicit_default_port = (url.scheme() == "http" && authority.ends_with(":80"))
+        || (url.scheme() == "https" && authority.ends_with(":443"));
+    if url.port().is_none() && !explicit_default_port {
+        let _ = url.set_port(Some(11434));
+    }
+    let path = url.path().trim_end_matches('/');
+    let path = if path.ends_with("/v1") {
+        path.to_string()
+    } else {
+        format!("{path}/v1")
+    };
+    url.set_path(&path);
+    url.into()
 }
 
 /// What a model can be used for.
@@ -173,6 +204,22 @@ mod tests {
         assert_eq!(
             from_host(Some("https://box.lan/")),
             "https://box.lan:11434/v1"
+        );
+        assert_eq!(from_host(Some(":11435")), "http://127.0.0.1:11435/v1");
+        assert_eq!(from_host(Some("::")), "http://[::1]:11434/v1");
+        assert_eq!(from_host(Some("::1")), "http://[::1]:11434/v1");
+        assert_eq!(from_host(Some("[::1]:11435")), "http://[::1]:11435/v1");
+        assert_eq!(
+            from_host(Some("http://[::]:11435")),
+            "http://[::1]:11435/v1"
+        );
+        assert_eq!(
+            from_host(Some("http://localhost:11434/v1")),
+            "http://localhost:11434/v1"
+        );
+        assert_eq!(
+            from_host(Some("10.0.0.0:11434")),
+            "http://10.0.0.0:11434/v1"
         );
     }
 

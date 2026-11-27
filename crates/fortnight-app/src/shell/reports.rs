@@ -75,6 +75,17 @@ impl Reports {
         }
     }
 
+    /// Aborts any generation of `kind` (e.g. its prompt or model changed in Settings).
+    pub(super) fn abort_kind(&mut self, kind: ReportKind) {
+        self.generating.retain(|key, g| {
+            let keep = key.kind != kind;
+            if !keep {
+                g.abort.abort();
+            }
+            keep
+        });
+    }
+
     /// The prompt of `kind` was changed in Settings `at`.
     pub(super) fn note_prompt_change(&mut self, kind: ReportKind, at: Timestamp) {
         self.prompt_changed.insert(kind, at);
@@ -418,12 +429,15 @@ impl Ready {
     /// makes them when it shows them. Waits quietly while locked or
     /// unconfigured; failures back off.
     fn run_due(&mut self) -> Task<Message> {
-        if self.blocked().is_some() || self.tasks.is_empty() {
+        if self.blocked().is_some() || (self.tasks.is_empty() && self.events.is_empty()) {
             return Task::none();
         }
         let jobs = due_reports(&self.now(), &self.settings.schedule, &[]);
         let mut tasks = Vec::new();
         for job in jobs {
+            if job.kind == ReportKind::Summary && self.reports.summary_waiting() {
+                continue;
+            }
             let key = ReportKey {
                 kind: job.kind,
                 week_start: job.week.start,

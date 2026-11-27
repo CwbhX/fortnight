@@ -332,15 +332,22 @@ fn plan_question(user: &str, model: &str) -> Option<Ask> {
         serde_json::from_str(user.get(start..end)?.trim()).ok()?;
 
     let mut candidates: Vec<Candidate> = Vec::new();
-    for task in facts
-        .overdue
+    let overdue = if facts.recommend_overdue {
+        facts.overdue.as_slice()
+    } else {
+        &[]
+    };
+    for task in overdue
         .iter()
         .chain(&facts.due_this_week)
         .chain(&facts.due_soon)
         .chain(&facts.undated)
     {
-        // Only the tasks on today's list (carried-over ones too), and
-        // overdue ones until done.
+        // Only the tasks on today's list (carried-over and undated ones too),
+        // and overdue ones when `recommend_overdue` is enabled.
+        if task.overdue && !facts.recommend_overdue {
+            continue;
+        }
         if !task.on_today_list && !task.overdue {
             continue;
         }
@@ -568,10 +575,19 @@ mod tests {
         }
     }
 
-    /// A real recommended-tasks request for Monday 16 Nov 2026.
+    /// A real recommended-tasks request for Monday 16 Nov 2026, with
+    /// overdue tasks eligible (so tests can exercise overdue ranking).
     fn plan_request(tasks: &[Task]) -> ChatRequest {
+        plan_request_with(tasks, true)
+    }
+
+    fn plan_request_with(tasks: &[Task], recommend_overdue: bool) -> ChatRequest {
         let today = date(2026, 11, 16);
-        prepare_plan(tasks, &[], WeekRef::new(today), today, &Settings::default()).request
+        let settings = Settings {
+            recommend_overdue,
+            ..Settings::default()
+        };
+        prepare_plan(tasks, &[], WeekRef::new(today), today, &settings).request
     }
 
     #[tokio::test]
@@ -1045,5 +1061,44 @@ mod tests {
                 .unwrap_err(),
             LlmError::ModelNotFound("nimble".into())
         );
+    }
+
+    #[tokio::test]
+    async fn overdue_tasks_are_excluded_when_recommend_overdue_is_off() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "nimble",
+                "answers": {
+                    "first": {
+                        "type": "choice",
+                        "choice": "t4",
+                        "probabilities": { "t4": 0.6, "t5": 0.4 }
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let tasks = [
+            task(1, "Late A", Some(date(2026, 11, 10))),
+            task(2, "Late B", Some(date(2026, 11, 11))),
+            task(3, "Late C", Some(date(2026, 11, 12))),
+            task(4, "Today A", Some(date(2026, 11, 16))),
+            task(5, "Today B", Some(date(2026, 11, 17))),
+        ];
+        let reply = client(&server)
+            .chat(plan_request_with(&tasks, false))
+            .await
+            .unwrap();
+        let rec = parse_recommendations(&reply.text).unwrap();
+        assert_eq!(rec.tasks.iter().map(|t| t.id).collect::<Vec<_>>(), [4, 5]);
+        let sent: Value = server.received_requests().await.unwrap()[0]
+            .body_json()
+            .unwrap();
+        let criteria = sent["questions"]["first"]["criteria"].as_object().unwrap();
+        assert_eq!(criteria.len(), 2, "{criteria:?}");
+        assert!(criteria.contains_key("t4") && criteria.contains_key("t5"));
     }
 }

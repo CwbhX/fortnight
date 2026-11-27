@@ -22,14 +22,14 @@
 //!
 //! [`parse_estimate`] and [`format_estimate`] read and write estimates on
 //! their own (the `~` is optional there) for the task edit form;
-//! [`parse_time`]/[`format_time`] and [`parse_hours`]/[`format_hours`] do
-//! the same for the settings form's times and daily focus hours.
+//! [`parse_hours`]/[`format_hours`] do the same for the settings form's
+//! daily focus hours.
 //!
 //! Known limitation: a title word that is also a date token ("Call Monday
 //! Corp", "Buy 2 may ...") is read as a date. Prototype scope accepts this.
 
 use jiff::Span;
-use jiff::civil::{Date, Time, Weekday};
+use jiff::civil::{Date, Weekday};
 
 use crate::domain::{MAX_PRIORITY, NewTask};
 
@@ -101,24 +101,6 @@ pub fn quick_add_task(input: &str, today: Date, default_day: Option<Date>) -> Op
         priority: parsed.priority,
         ..NewTask::default()
     })
-}
-
-/// A time of day as `HH:MM` (or `H:MM`), 24-hour. Surrounding whitespace is
-/// ignored; anything else (seconds, signs, `24:00`) is `None`.
-pub fn parse_time(s: &str) -> Option<Time> {
-    let (h, m) = s.trim().split_once(':')?;
-    if h.is_empty() || h.len() > 2 || m.len() != 2 {
-        return None;
-    }
-    if !h.chars().chain(m.chars()).all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    Time::new(h.parse().ok()?, m.parse().ok()?, 0, 0).ok()
-}
-
-/// `HH:MM`, which [`parse_time`] reads back (seconds are dropped).
-pub fn format_time(t: Time) -> String {
-    format!("{:02}:{:02}", t.hour(), t.minute())
 }
 
 /// Decimal hours per day (`6`, `5.5`, `7,25`) as whole minutes. More than 0
@@ -675,23 +657,6 @@ mod tests {
         for empty in ["", "   ", "fri #work ~1h !!"] {
             assert_eq!(quick_add_task(empty, TODAY, Some(other)), None, "{empty:?}");
         }
-    }
-
-    #[test]
-    fn parse_time_accepts_only_hh_mm() {
-        assert_eq!(parse_time("16:00"), Some(Time::constant(16, 0, 0, 0)));
-        assert_eq!(parse_time("8:05"), Some(Time::constant(8, 5, 0, 0)));
-        assert_eq!(parse_time(" 08:05 "), Some(Time::constant(8, 5, 0, 0)));
-        for bad in [
-            "", "16", "16:0", "24:00", "12:60", "1:2:3", "+1:00", "ab:cd",
-        ] {
-            assert_eq!(parse_time(bad), None, "{bad}");
-        }
-        assert_eq!(format_time(Time::constant(8, 5, 30, 0)), "08:05");
-        assert_eq!(
-            parse_time(&format_time(Time::constant(23, 59, 0, 0))),
-            Some(Time::constant(23, 59, 0, 0))
-        );
     }
 
     #[test]

@@ -45,8 +45,9 @@ pub fn parse_recommendations(text: &str) -> Option<Recommendation> {
             .next()?
             .ok()
     })?;
+    let had_raw = !raw.tasks.is_empty();
     let mut seen = BTreeSet::new();
-    let tasks = raw
+    let tasks: Vec<RecommendedTask> = raw
         .tasks
         .into_iter()
         .filter_map(|t| {
@@ -61,6 +62,11 @@ pub fn parse_recommendations(text: &str) -> Option<Recommendation> {
             })
         })
         .collect();
+    // A non-empty list whose entries all lacked valid ids is malformed, not
+    // an intentional "nothing worth doing today".
+    if had_raw && tasks.is_empty() {
+        return None;
+    }
     Some(Recommendation { tasks })
 }
 
@@ -134,6 +140,9 @@ mod tests {
             Some(1)
         );
         assert_eq!(one("{\"tasks\": []}"), Some(0));
+        // A non-empty list whose entries all lack valid ids is malformed.
+        assert_eq!(one("{\"tasks\": [{\"id\": \"not-a-number\"}]}"), None);
+        assert_eq!(one("{\"tasks\": [{\"id\": null}]}"), None);
         // An object with other keys is not an empty recommendation.
         assert_eq!(one("{\"recommendations\": [{\"id\": 3}]}"), None);
         assert_eq!(

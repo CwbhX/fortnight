@@ -172,7 +172,14 @@ impl Ready {
             .cloned()
             .collect();
         if tasks.is_empty() {
-            self.later_days.recs.remove(&day);
+            let mut changed = self.later_days.recs.remove(&day).is_some();
+            if let Some((_, handle)) = self.later_days.pending.remove(&day) {
+                handle.abort();
+                changed = true;
+            }
+            if changed {
+                self.must_refresh = true;
+            }
             return Task::none();
         }
         let prepared =
@@ -247,6 +254,14 @@ impl Ready {
             return None;
         }
         self.later_days.pending.remove(&day);
+        let has_open = self
+            .tasks
+            .iter()
+            .any(|t| t.status.is_open() && t.planned_for == Some(day));
+        if !has_open {
+            self.later_days.recs.remove(&day);
+            return Some(Task::none());
+        }
         match result
             .ok()
             .and_then(|r| report::parse_recommendations(&r.text))

@@ -7,6 +7,7 @@ expression: plan
   "today_weekday": "Wednesday",
   "week_start": "2026-11-16",
   "week_end": "2026-11-22",
+  "recommend_overdue": false,
   "remaining_working_days": [
     {
       "date": "2026-11-18",

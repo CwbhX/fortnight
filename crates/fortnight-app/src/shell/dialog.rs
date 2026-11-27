@@ -12,6 +12,7 @@ use jiff::civil::Date;
 impl Ready {
     /// Opens the task dialog for a new task on `day` and focuses its title.
     pub(crate) fn open_new_task(&mut self, day: Date) -> Task<Message> {
+        self.date_picker = None;
         let mut form = task_form::EditForm::blank(&self.tasks, self.settings.schedule.week_start);
         if self.settings.due_on_added_day {
             form.due = Some(day);
@@ -26,6 +27,7 @@ impl Ready {
 
     /// Opens the task dialog to edit task `id`.
     pub(crate) fn open_edit(&mut self, id: TaskId) -> Task<Message> {
+        self.date_picker = None;
         if let Some(task) = self.task(id) {
             self.dialog = Some(TaskDialog {
                 day: task.day(),

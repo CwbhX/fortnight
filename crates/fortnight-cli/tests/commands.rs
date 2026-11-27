@@ -93,6 +93,16 @@ fn add_parses_quick_add_and_prints_id_and_summary() {
     assert_eq!(t.project.as_deref(), Some("work"));
     assert_eq!(t.estimate_minutes, Some(120));
     assert_eq!(t.priority, 2);
+
+    // When `due_on_added_day` is enabled, quick-add sets `due_on` to the
+    // planned day too, matching the app.
+    let mut settings = monday_settings();
+    settings.due_on_added_day = true;
+    s.save_settings(&settings).unwrap();
+    commands::add(&s, &words("file taxes fri"), wednesday(), &mut Vec::new()).unwrap();
+    let t2 = s.get_task(2).unwrap().unwrap();
+    assert_eq!(t2.planned_for, Some(date(2026, 11, 20)));
+    assert_eq!(t2.due_on, Some(date(2026, 11, 20)));
 }
 
 #[test]
@@ -228,7 +238,7 @@ fn list_today_and_week_filters_keep_overdue() {
             today: true,
             ..ListArgs::default()
         }),
-        ["overdue", "late", "carried", "today"]
+        ["overdue", "late", "carried", "today", "undated"]
     );
     // --all adds what was planned for today and is closed, nothing else.
     assert_eq!(
@@ -237,7 +247,7 @@ fn list_today_and_week_filters_keep_overdue() {
             all: true,
             ..ListArgs::default()
         }),
-        ["overdue", "late", "carried", "today", "closed"]
+        ["overdue", "late", "carried", "today", "closed", "undated"]
     );
     assert_eq!(
         titles(ListArgs {
@@ -447,6 +457,36 @@ async fn plan_defaults_to_this_week_and_stores() {
         .unwrap()
         .unwrap();
     assert_eq!(report.status, ReportStatus::Ready);
+
+    // Closed, private, future, and (when disabled) overdue tasks are filtered
+    // out of printed recommendations even if the model names them.
+    let overdue = add_task(&s, "too late", Some(date(2026, 11, 10)));
+    let future = add_task(&s, "next week", Some(date(2026, 11, 25)));
+    let priv_task = s
+        .add_task(NewTask {
+            title: "secret".into(),
+            planned_for: Some(wednesday()),
+            private: true,
+            ..NewTask::default()
+        })
+        .unwrap();
+    let noisy = Arc::new(MockClient::new(format!(
+        r#"{{"tasks":[{{"id":{}}},{{"id":{}}},{{"id":{}}},{{"id":1}}]}}"#,
+        overdue.id, future.id, priv_task.id
+    )));
+    let mut out = Vec::new();
+    commands::report_command(
+        &s,
+        ReportKind::Plan,
+        None,
+        false,
+        &now(wednesday()),
+        &|_| Ok(handle(&noisy)),
+        &mut out,
+    )
+    .await
+    .unwrap();
+    assert_eq!(text(out), "1. ship the thing\n");
 }
 
 /// Replies a plan can read (`report::parse_recommendations`); a summary

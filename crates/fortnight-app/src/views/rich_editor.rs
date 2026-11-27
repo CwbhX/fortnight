@@ -154,12 +154,19 @@ impl Focus {
     }
 }
 
+/// The current accent colour as raw RGB bits, so changing the accent in
+/// Settings invalidates laid-out link spans.
+fn accent_key() -> [u32; 3] {
+    let c = theme::accent_color();
+    [c.r.to_bits(), c.g.to_bits(), c.b.to_bits()]
+}
+
 /// One block, laid out.
 #[derive(Debug)]
 struct Laid {
     /// What it was laid out from: the block, its number, the text area's
-    /// width and the text size.
-    source: (Block, u32, f32, f32),
+    /// width, the text size and the accent colour.
+    source: (Block, u32, f32, f32, [u32; 3]),
     paragraph: Paragraph,
     marker: Option<Paragraph>,
     /// The width of the marker's column.
@@ -174,7 +181,7 @@ struct Laid {
 }
 
 impl Laid {
-    fn new(block: &Block, number: u32, width: f32, size: f32) -> Self {
+    fn new(block: &Block, number: u32, width: f32, size: f32, accent: [u32; 3]) -> Self {
         let indent = f32::from(block.indent) * INDENT;
         let marker = match block.list {
             List::None => None,
@@ -203,7 +210,7 @@ impl Laid {
         let paragraph = Paragraph::with_spans(text(spans.as_slice(), text_width, size));
         let height = paragraph.min_bounds().height.max(line_height(size));
         Laid {
-            source: (block.clone(), number, width, size),
+            source: (block.clone(), number, width, size, accent),
             paragraph,
             marker,
             gutter,
@@ -217,9 +224,16 @@ impl Laid {
         }
     }
 
-    fn made_for(&self, block: &Block, number: u32, width: f32, size: f32) -> bool {
-        let (b, n, w, s) = &self.source;
-        b == block && *n == number && *w == width && *s == size
+    fn made_for(
+        &self,
+        block: &Block,
+        number: u32,
+        width: f32,
+        size: f32,
+        accent: [u32; 3],
+    ) -> bool {
+        let (b, n, w, s, a) = &self.source;
+        b == block && *n == number && *w == width && *s == size && *a == accent
     }
 }
 
@@ -230,8 +244,8 @@ struct State {
     dragging: bool,
     modifiers: keyboard::Modifiers,
     /// What the layout was made for: the content's id and version, the
-    /// width and the text size.
-    made_for: Option<(u64, u64, f32, f32)>,
+    /// width, the text size and the accent colour.
+    made_for: Option<(u64, u64, f32, f32, [u32; 3])>,
     blocks: Vec<Laid>,
     placeholder: Paragraph,
     /// What the placeholder was laid out from: its text, width and size.
@@ -336,6 +350,7 @@ impl operation::Focusable for State {
     fn unfocus(&mut self) {
         self.focus = None;
         self.dragging = false;
+        self.menu = None;
     }
 }
 
@@ -379,13 +394,14 @@ impl State {
     fn lay_out(&mut self, content: &Content, width: f32, size: f32, placeholder: &str) {
         let blocks = content.blocks();
         let numbers = content.numbers();
+        let accent = accent_key();
         let mut old: Vec<Option<Laid>> = std::mem::take(&mut self.blocks)
             .into_iter()
             .map(Some)
             .collect();
         let same = |laid: &Option<Laid>, i: usize| {
             laid.as_ref()
-                .is_some_and(|l| l.made_for(&blocks[i], numbers[i], width, size))
+                .is_some_and(|l| l.made_for(&blocks[i], numbers[i], width, size, accent))
         };
         let (n, m) = (blocks.len(), old.len());
         let start = (0..n.min(m)).take_while(|&i| same(&old[i], i)).count();
@@ -401,7 +417,8 @@ impl State {
             } else {
                 None
             };
-            let mut laid = kept.unwrap_or_else(|| Laid::new(&blocks[i], numbers[i], width, size));
+            let mut laid =
+                kept.unwrap_or_else(|| Laid::new(&blocks[i], numbers[i], width, size, accent));
             laid.origin.y = y;
             y += laid.height;
             self.blocks.push(laid);
@@ -548,8 +565,21 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
         let limits = limits.width(Length::Fill).height(Length::Shrink);
         let width = limits.max().width;
         let inner = (width - self.padding.x()).max(1.0);
-        let made_for = (self.content.id(), self.content.version(), inner, self.size);
+        let made_for = (
+            self.content.id(),
+            self.content.version(),
+            inner,
+            self.size,
+            accent_key(),
+        );
         if state.made_for != Some(made_for) {
+            if state
+                .made_for
+                .is_some_and(|(id, ..)| id != self.content.id())
+            {
+                state.menu = None;
+                state.dragging = false;
+            }
             state.lay_out(self.content, inner, self.size, self.placeholder);
             state.made_for = Some(made_for);
         }
@@ -585,6 +615,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
 
         match event {
             Event::Window(window::Event::Unfocused) => {
+                state.dragging = false;
                 if let Some(f) = &mut state.focus {
                     f.window_focused = false;
                 }
@@ -657,13 +688,16 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
                     return;
                 }
                 let at = state.hit(p);
-                if let Some((_, url)) = link {
-                    // A plain click: the caret goes there, and the popup
+                let click = mouse::Click::new(p, mouse::Button::Left, state.last_click);
+                if click.kind() == mouse::click::Kind::Single
+                    && !state.modifiers.shift()
+                    && let Some((_, url)) = link
+                {
+                    // A plain single click: the caret goes there, and the popup
                     // offers Open and Edit.
                     let (caret, line_height) = state.caret(at, self.size);
                     state.menu = Some(Menu::new(url, at, Point::new(p.x, caret.y), line_height));
                 }
-                let click = mouse::Click::new(p, mouse::Button::Left, state.last_click);
                 let action = match click.kind() {
                     mouse::click::Kind::Single => {
                         state.dragging = true;
@@ -683,9 +717,19 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 state.dragging = false;
             }
-            Event::Mouse(mouse::Event::CursorMoved { position }) if state.dragging => {
-                let at = state.hit(local(*position));
-                publish(shell, Action::MoveTo { at, select: true });
+            Event::Mouse(mouse::Event::CursorMoved { .. }) if state.dragging => {
+                if let Some(pos) = cursor.position() {
+                    if state.menu.take().is_some() {
+                        shell.request_redraw();
+                    }
+                    let at = state.hit(local(pos));
+                    publish(shell, Action::MoveTo { at, select: true });
+                }
+            }
+            Event::Mouse(mouse::Event::WheelScrolled { .. }) => {
+                if state.menu.take().is_some() {
+                    shell.request_redraw();
+                }
             }
             Event::InputMethod(input_method::Event::Commit(s)) if state.focus.is_some() => {
                 publish(shell, Action::Insert(s.clone()));
@@ -704,6 +748,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
             }) if state.focus.is_some() => {
                 let m = *modifiers;
                 let mut actions = Vec::new();
+                let mut handled = false;
                 let shortcut = m.command() || m.control();
                 let letter = key.to_latin(*physical_key);
                 if shortcut && !m.alt() {
@@ -713,25 +758,49 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
                             if let Some(s) = self.content.selected_text() {
                                 clipboard.write(clipboard::Kind::Standard, s);
                             }
+                            handled = true;
                         }
                         (Some('x'), _) if cmd => {
                             if let Some(s) = self.content.selected_text() {
                                 clipboard.write(clipboard::Kind::Standard, s);
                                 actions.push(Action::Delete);
                             }
+                            handled = true;
                         }
                         (Some('v'), false) if cmd => {
                             if let Some(s) = clipboard.read(clipboard::Kind::Standard) {
                                 actions.push(Action::Paste(s));
                             }
+                            handled = true;
                         }
-                        (Some('a'), _) if cmd => actions.push(Action::SelectAll),
-                        (Some('b'), false) => actions.push(Action::Format(Command::Bold)),
-                        (Some('i'), false) => actions.push(Action::Format(Command::Italic)),
-                        (Some('u'), false) => actions.push(Action::Format(Command::Underline)),
-                        (Some('k'), false) => actions.push(Action::Format(Command::Link)),
-                        (Some('8'), true) => actions.push(Action::Format(Command::Bullets)),
-                        (Some('7'), true) => actions.push(Action::Format(Command::Numbers)),
+                        (Some('a'), _) if cmd => {
+                            actions.push(Action::SelectAll);
+                            handled = true;
+                        }
+                        (Some('b'), false) => {
+                            actions.push(Action::Format(Command::Bold));
+                            handled = true;
+                        }
+                        (Some('i'), false) => {
+                            actions.push(Action::Format(Command::Italic));
+                            handled = true;
+                        }
+                        (Some('u'), false) => {
+                            actions.push(Action::Format(Command::Underline));
+                            handled = true;
+                        }
+                        (Some('k'), false) => {
+                            actions.push(Action::Format(Command::Link));
+                            handled = true;
+                        }
+                        (Some('8'), true) => {
+                            actions.push(Action::Format(Command::Bullets));
+                            handled = true;
+                        }
+                        (Some('7'), true) => {
+                            actions.push(Action::Format(Command::Numbers));
+                            handled = true;
+                        }
                         _ => {}
                     }
                 }
@@ -740,7 +809,10 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
                 let jump = m.jump();
                 let line = m.macos_command();
                 match modified_key.as_ref() {
-                    keyboard::Key::Named(Named::Enter) => actions.push(Action::Enter),
+                    keyboard::Key::Named(Named::Enter) => {
+                        actions.push(Action::Enter);
+                        handled = true;
+                    }
                     keyboard::Key::Named(named @ (Named::Backspace | Named::Delete)) => {
                         let back = named == Named::Backspace;
                         if self.content.selection().is_none() && (jump || line) {
@@ -760,6 +832,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
                         } else {
                             Action::Delete
                         });
+                        handled = true;
                     }
                     keyboard::Key::Named(Named::Tab) if !shortcut => {
                         actions.push(Action::Format(if m.shift() {
@@ -767,6 +840,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
                         } else {
                             Command::Indent
                         }));
+                        handled = true;
                     }
                     keyboard::Key::Named(Named::Escape) => {
                         state.focus = None;
@@ -777,20 +851,26 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
                         // around the editor.
                         return;
                     }
-                    keyboard::Key::Named(Named::ArrowLeft) => actions.push(moving(if line {
-                        Motion::BlockStart
-                    } else if jump {
-                        Motion::WordLeft
-                    } else {
-                        Motion::Left
-                    })),
-                    keyboard::Key::Named(Named::ArrowRight) => actions.push(moving(if line {
-                        Motion::BlockEnd
-                    } else if jump {
-                        Motion::WordRight
-                    } else {
-                        Motion::Right
-                    })),
+                    keyboard::Key::Named(Named::ArrowLeft) => {
+                        actions.push(moving(if line {
+                            Motion::BlockStart
+                        } else if jump {
+                            Motion::WordLeft
+                        } else {
+                            Motion::Left
+                        }));
+                        handled = true;
+                    }
+                    keyboard::Key::Named(Named::ArrowRight) => {
+                        actions.push(moving(if line {
+                            Motion::BlockEnd
+                        } else if jump {
+                            Motion::WordRight
+                        } else {
+                            Motion::Right
+                        }));
+                        handled = true;
+                    }
                     keyboard::Key::Named(named @ (Named::ArrowUp | Named::ArrowDown)) => {
                         let down = named == Named::ArrowDown;
                         actions.push(if line {
@@ -803,9 +883,16 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
                             let at = state.vertical(self.content.cursor(), down, self.size);
                             Action::MoveTo { at, select }
                         });
+                        handled = true;
                     }
-                    keyboard::Key::Named(Named::Home) => actions.push(moving(Motion::BlockStart)),
-                    keyboard::Key::Named(Named::End) => actions.push(moving(Motion::BlockEnd)),
+                    keyboard::Key::Named(Named::Home) => {
+                        actions.push(moving(Motion::BlockStart));
+                        handled = true;
+                    }
+                    keyboard::Key::Named(Named::End) => {
+                        actions.push(moving(Motion::BlockEnd));
+                        handled = true;
+                    }
                     _ if !shortcut => {
                         let typed: String = text
                             .as_deref()
@@ -815,18 +902,21 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for RichEditor<'_, Message>
                             .collect();
                         if !typed.is_empty() {
                             actions.push(Action::Insert(typed));
+                            handled = true;
                         }
                     }
                     _ => {}
                 }
-                if let Some(f) = &mut state.focus {
-                    f.updated_at = Instant::now();
+                if handled {
+                    if let Some(f) = &mut state.focus {
+                        f.updated_at = Instant::now();
+                    }
+                    state.menu = None;
+                    for action in actions {
+                        publish(shell, action);
+                    }
+                    shell.capture_event();
                 }
-                state.menu = None;
-                for action in actions {
-                    publish(shell, action);
-                }
-                shell.capture_event();
             }
             _ => {}
         }

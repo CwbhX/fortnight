@@ -196,17 +196,17 @@ pub enum Action {
 impl Action {
     /// Whether the action can change the notes.
     pub fn is_edit(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Action::Insert(_)
-                | Action::Paste(_)
-                | Action::Enter
-                | Action::Backspace
-                | Action::Delete
-                | Action::Format(_)
-                | Action::LinkSubmit
-                | Action::LinkRemove
-        )
+            | Action::Paste(_)
+            | Action::Enter
+            | Action::Backspace
+            | Action::Delete
+            | Action::LinkSubmit
+            | Action::LinkRemove => true,
+            Action::Format(cmd) => *cmd != Command::Link,
+            _ => false,
+        }
     }
 }
 
@@ -362,6 +362,10 @@ impl Content {
         // that changed).
         if action.is_edit() {
             self.version += 1;
+            if !matches!(action, Action::LinkSubmit | Action::LinkRemove) {
+                // Any document edit invalidates the link prompt's saved range.
+                self.link = None;
+            }
         }
         match action {
             Action::MoveTo { at, select } => self.move_to(at, select),
@@ -777,7 +781,8 @@ impl Content {
         self.focus = Some(Focus::Editor);
         let url = prompt.url.trim();
         let link: Option<Arc<str>> = (!url.is_empty()).then(|| Arc::from(url));
-        let (from, to) = (self.clamp(prompt.from), self.clamp(prompt.to));
+        let (a, b) = (self.clamp(prompt.from), self.clamp(prompt.to));
+        let (from, to) = if a <= b { (a, b) } else { (b, a) };
         self.anchor = None;
         if from == to {
             // Nothing to link: the address becomes the text.
@@ -955,7 +960,7 @@ fn link_at(line: &str, i: usize) -> Option<Link> {
         .next_back()
         .is_none_or(|c| !c.is_alphanumeric());
     if !word_start
-        || !["https://", "http://", "www."]
+        || !["https://", "http://", "www.", "mailto:"]
             .iter()
             .any(|p| rest.starts_with(p))
     {
@@ -976,16 +981,47 @@ fn link_at(line: &str, i: usize) -> Option<Link> {
     })
 }
 
-/// A `[text](url)` link starting at byte `i` (the URL without spaces).
+/// A `[text](url)` or `[text](<url>)` link starting at byte `i`.
 fn markdown_link(line: &str, i: usize) -> Option<Link> {
     let rest = line[i..].strip_prefix('[')?;
     let close = i + 1 + rest.find(']')?;
     if line[i + 1..close].contains('[') || !line[close + 1..].starts_with('(') {
         return None;
     }
-    let url_start = close + 2;
-    let url_end = url_start + line[url_start..].find(|c: char| c == ')' || c.is_whitespace())?;
-    if url_end == url_start || !line[url_end..].starts_with(')') {
+    let after_open = close + 2;
+    if line[after_open..].starts_with('<') {
+        let url_start = after_open + 1;
+        let rel_end = line[url_start..].find(['>', '\n', '\r'])?;
+        let url_end = url_start + rel_end;
+        if url_end == url_start || !line[url_end..].starts_with(">)") {
+            return None;
+        }
+        return Some(Link {
+            whole: i..url_end + 2,
+            text: i + 1..close,
+            url: url_start..url_end,
+            bare: false,
+        });
+    }
+    let url_start = after_open;
+    let mut depth = 0usize;
+    let mut url_end = None;
+    for (off, c) in line[url_start..].char_indices() {
+        if c.is_whitespace() {
+            break;
+        }
+        match c {
+            '(' => depth += 1,
+            ')' if depth == 0 => {
+                url_end = Some(url_start + off);
+                break;
+            }
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    let url_end = url_end?;
+    if url_end == url_start {
         return None;
     }
     Some(Link {
@@ -999,7 +1035,11 @@ fn markdown_link(line: &str, i: usize) -> Option<Link> {
 /// Where a link's address takes you: a scheme is added to `www.…` and
 /// other addresses without one.
 pub fn href(url: &str) -> String {
-    if url.contains("://") || url.starts_with("mailto:") {
+    if url.contains("://")
+        || url
+            .get(..7)
+            .is_some_and(|s| s.eq_ignore_ascii_case("mailto:"))
+    {
         url.to_string()
     } else {
         format!("https://{url}")
@@ -1057,7 +1097,10 @@ fn parse_inline(s: &str) -> Vec<Cell> {
         let rest = &s[i..];
         let c = rest.chars().next().unwrap_or(' ');
         if c == '\\'
-            && let Some(next) = rest[1..].chars().next().filter(char::is_ascii_punctuation)
+            && let Some(next) = rest[1..]
+                .chars()
+                .next()
+                .filter(|c| c.is_ascii_punctuation() || *c == '•')
         {
             pieces.push(Piece::Char(plain(next)));
             i += 1 + next.len_utf8();
@@ -1242,17 +1285,21 @@ fn write(blocks: &[Block]) -> String {
             }
             let text = write_inline(&b.cells);
             // A paragraph that would read as a list item keeps its text.
-            match item(&text).map(|it| it.list) {
-                Some(List::Number) if b.list == List::None => {
-                    let dot = text.find(['.', ')']).unwrap_or(0);
-                    line.push_str(&text[..dot]);
-                    line.push('\\');
-                    line.push_str(&text[dot..]);
-                }
-                Some(List::Dash) if b.list == List::None => {
-                    line.push('\\');
-                    line.push_str(&text);
-                }
+            match item(&text) {
+                Some(it) if b.list == List::None => match it.list {
+                    List::Number => {
+                        let dot = it.indent + text[it.indent..].find(['.', ')']).unwrap_or(0);
+                        line.push_str(&text[..dot]);
+                        line.push('\\');
+                        line.push_str(&text[dot..]);
+                    }
+                    List::Dash | List::Bullet => {
+                        line.push_str(&text[..it.indent]);
+                        line.push('\\');
+                        line.push_str(&text[it.indent..]);
+                    }
+                    List::None => line.push_str(&text),
+                },
                 _ => line.push_str(&text),
             }
             line
@@ -1331,7 +1378,10 @@ fn write_inline(cells: &[Cell]) -> String {
             let unstyled = runs[k..end]
                 .iter()
                 .all(|(_, s)| s.marks() == (false, false, false));
-            if unstyled && text == **url && is_address(url) {
+            let prev_alnum = out.chars().next_back().is_some_and(char::is_alphanumeric);
+            let trailing_punct =
+                url.ends_with(['.', ',', ';', ':', '!', '?', ')', '"', '\'', '*', '_']);
+            if unstyled && text == **url && is_address(url) && !prev_alnum && !trailing_punct {
                 out.push_str(url);
                 k = end;
                 continue;
@@ -1359,9 +1409,17 @@ fn write_inline(cells: &[Cell]) -> String {
         }
         if let Some(url) = &link {
             close_to(&mut out, &mut open, 0);
-            out.push_str("](");
-            out.push_str(url);
-            out.push(')');
+            let needs_angle = url.contains(|c: char| c.is_whitespace() || c == '(' || c == ')')
+                && !url.contains(['>', '\n', '\r']);
+            if needs_angle {
+                out.push_str("](<");
+                out.push_str(url);
+                out.push_str(">)");
+            } else {
+                out.push_str("](");
+                out.push_str(url);
+                out.push(')');
+            }
         }
         k = end;
     }
@@ -1771,5 +1829,64 @@ mod tests {
     fn numbering() {
         let c = Content::with_text("1. a\n  1. b\n  2. c\n1. d\nx\n1. e");
         assert_eq!(c.numbers(), vec![1, 1, 2, 2, 0, 1]);
+    }
+
+    #[test]
+    fn link_prompt_and_markdown_edge_cases() {
+        // Opening the link prompt is not a content edit.
+        assert!(!Action::Format(Command::Link).is_edit());
+        assert!(Action::Format(Command::Bold).is_edit());
+
+        // Editing the document clears an open link prompt instead of panicking
+        // on stale positions when submitted later.
+        let mut c = Content::with_text("first line\nsecond line");
+        c.perform(Action::MoveTo {
+            at: Pos::new(0, 6),
+            select: false,
+        });
+        c.perform(Action::MoveTo {
+            at: Pos::new(1, 3),
+            select: true,
+        });
+        c.perform(Action::Format(Command::Link));
+        assert!(c.link_prompt().is_some());
+        c.perform(Action::SelectAll);
+        c.perform(Action::Backspace);
+        assert!(c.link_prompt().is_none());
+        c.perform(Action::LinkSubmit);
+
+        // Case-insensitive mailto href and bare mailto round-trip.
+        assert_eq!(href("MAILTO:user@example.com"), "MAILTO:user@example.com");
+        round_trip("email mailto:user@example.com now");
+
+        // URLs with parentheses or spaces round-trip cleanly.
+        let mut c = Content::with_text("Rust");
+        c.perform(Action::SelectAll);
+        c.perform(Action::Format(Command::Link));
+        c.perform(Action::LinkInput(
+            "https://en.wikipedia.org/wiki/Rust_(programming_language)".into(),
+        ));
+        c.perform(Action::LinkSubmit);
+        let md = c.text();
+        assert_eq!(
+            md,
+            "[Rust](<https://en.wikipedia.org/wiki/Rust_(programming_language)>)"
+        );
+        assert_eq!(Content::with_text(&md).text(), md);
+        // Existing balanced-paren markdown links also parse.
+        let wiki = "[Rust](https://en.wikipedia.org/wiki/Rust_(programming_language))";
+        let parsed = Content::with_text(wiki);
+        assert_eq!(
+            parsed.blocks()[0].runs()[0].1.link.as_deref(),
+            Some("https://en.wikipedia.org/wiki/Rust_(programming_language)")
+        );
+
+        // Plain paragraphs starting with `• ` or leading space + `- ` escape cleanly.
+        round_trip("\\• not a bullet");
+        let mut c = Content::default();
+        c.perform(Action::Insert(" - foo".into()));
+        let md = c.text();
+        assert!(md.contains("\\- foo"), "{md:?}");
+        assert_eq!(Content::with_text(&md).blocks()[0].list, List::None);
     }
 }

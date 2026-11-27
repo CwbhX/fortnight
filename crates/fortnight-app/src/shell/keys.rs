@@ -42,11 +42,6 @@ impl Keys {
         }
     }
 
-    /// Either key is unlocked.
-    pub(crate) fn any_open(&self) -> bool {
-        self.api_key.is_some() || self.decision_key.is_some()
-    }
-
     /// The saved key is locked and `llm` needs it. A keyless endpoint never
     /// needs it; a local one (Ollama, LM Studio) works without it and gets
     /// it only if it is unlocked.
@@ -67,6 +62,23 @@ impl Keys {
         Ok((client, host))
     }
 
+    /// Why the decision endpoint cannot use its key right now (either its own
+    /// key file is locked, or it borrows the main key on the same host and
+    /// that key is locked).
+    fn decision_lock_error(&self, llm: &LlmSettings, main: &LlmSettings) -> Option<&'static str> {
+        if key_locked(self.decision_key_exists, &self.decision_key, llm) {
+            return Some("The decision model's API key is locked. Unlock it first.");
+        }
+        if !self.decision_key_exists && self.decision_key.is_none() {
+            let main_host = LlmConfig::from_settings(main, None).endpoint_host();
+            let decision_host = LlmConfig::from_settings(llm, None).endpoint_host();
+            if main_host.is_some() && decision_host == main_host && self.locked_for(llm) {
+                return Some("The API key is locked. Unlock it first.");
+            }
+        }
+        None
+    }
+
     /// The client for the decision model (`Settings::decision_llm`) with
     /// these fields, and its host. It uses its own key if one is saved, and
     /// otherwise the main key only on the main endpoint's host
@@ -76,8 +88,8 @@ impl Keys {
         llm: &LlmSettings,
         main: &LlmSettings,
     ) -> Result<(Arc<dyn LlmClient>, Option<String>), String> {
-        if key_locked(self.decision_key_exists, &self.decision_key, llm) {
-            return Err("The decision model's API key is locked. Unlock it first.".into());
+        if let Some(err) = self.decision_lock_error(llm, main) {
+            return Err(err.into());
         }
         let config =
             fallback::decision_config(llm, main, self.api_key.clone(), self.decision_key.clone());
@@ -125,7 +137,12 @@ impl Ready {
 
     /// The saved decision model's client, for priority suggestions.
     pub(super) fn decision_model(&self) -> Option<DecisionClient> {
-        if !self.decision_active() {
+        if !self.decision_active()
+            || self
+                .keys
+                .decision_lock_error(&self.settings.decision_llm, &self.settings.llm)
+                .is_some()
+        {
             return None;
         }
         let config = fallback::decision_config(
@@ -158,6 +175,9 @@ impl Ready {
     pub(crate) fn lock(&mut self) {
         self.keys.api_key = None; // dropping the SecretString zeroizes it
         self.keys.decision_key = None;
+        self.unlock_seq += 1;
+        self.key_save_seq += 1;
+        self.test_seq += 1;
         self.reports.abort_all();
         for handle in self.key_requests.drain(..) {
             handle.abort();
@@ -172,6 +192,8 @@ impl Ready {
     /// Opens both saved keys with `password`. Fails only if it opens
     /// neither.
     pub(crate) fn unlock(&mut self, password: SecretString) -> Task<Message> {
+        self.unlock_seq += 1;
+        let seq = self.unlock_seq;
         let main = self
             .keys
             .key_exists
@@ -188,15 +210,21 @@ impl Ready {
                     (main, decision) => Ok((main.ok().flatten(), decision.ok().flatten())),
                 }
             },
-            Message::Unlocked,
+            move |res| Message::Unlocked(seq, res),
         )
     }
 
     /// The unlock prompt's answer: the keys it opened, or why not.
     pub(crate) fn unlocked(
         &mut self,
+        seq: u64,
         result: Result<(Option<SecretString>, Option<SecretString>), VaultError>,
     ) -> Task<Message> {
+        // Ignore stale or cancelled unlock completions (after Cancel or Lock).
+        if seq != self.unlock_seq || !self.unlocking {
+            self.local = true;
+            return Task::none();
+        }
         match result {
             Ok((main, decision)) => {
                 if main.is_some() {
@@ -211,15 +239,24 @@ impl Ready {
                 self.reset_backoff();
                 return Task::batch([self.catch_up(), load_models()]);
             }
-            // A check that ends after the prompt was cancelled says nothing.
-            Err(e) if self.unlocking => self.unlock_view.set_error(e.to_string()),
-            Err(_) => {}
+            Err(e) => self.unlock_view.set_error(e.to_string()),
         }
         self.catch_up()
     }
 
     /// A key `set_key` saved, or why it couldn't.
-    pub(crate) fn key_saved(&mut self, result: Result<SavedKey, VaultError>) -> Task<Message> {
+    pub(crate) fn key_saved(
+        &mut self,
+        seq: u64,
+        result: Result<SavedKey, VaultError>,
+    ) -> Task<Message> {
+        if seq != self.key_save_seq {
+            // A save that raced with Lock or RemoveKey must not leave a key
+            // unlocked in memory; refresh only whether the files exist on disk.
+            self.keys.key_exists = vault::key_path(&self.data_dir).exists();
+            self.keys.decision_key_exists = vault::decision_key_path(&self.data_dir).exists();
+            return Task::none();
+        }
         match result {
             Ok(saved) => {
                 let (mine, other) = match saved.which {
@@ -262,6 +299,8 @@ impl Ready {
         password: SecretString,
         which: settings::Which,
     ) -> Task<Message> {
+        self.key_save_seq += 1;
+        let seq = self.key_save_seq;
         let main_path = vault::key_path(&self.data_dir);
         let decision_path = vault::decision_key_path(&self.data_dir);
         self.key_message = None;
@@ -284,12 +323,13 @@ impl Ready {
                     other,
                 })
             },
-            Message::KeySaved,
+            move |res| Message::KeySaved(seq, res),
         )
     }
 
     /// Removes the `which` key file and forgets the key (Settings).
     pub(super) fn remove_key(&mut self, which: settings::Which) -> Task<Message> {
+        self.key_save_seq += 1;
         let main_path = vault::key_path(&self.data_dir);
         let decision_path = vault::decision_key_path(&self.data_dir);
         let (path, exists, key) = match which {
@@ -338,7 +378,7 @@ fn key_state(exists: bool, key: &Option<SecretString>) -> KeyState {
 /// Runs blocking work (Argon2) off the UI thread.
 fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, VaultError> + Send + 'static,
-    done: fn(Result<T, VaultError>) -> Message,
+    done: impl Fn(Result<T, VaultError>) -> Message + Send + 'static,
 ) -> Task<Message> {
     Task::perform(
         async move {

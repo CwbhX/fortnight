@@ -333,7 +333,8 @@ pub fn summary_facts(
                     to,
                     to_weekday: weekday_name(to.weekday()),
                     days_later: days_between(from, to),
-                    times: moves.len(),
+                    // A deadline cleared and re-set later still slipped once.
+                    times: moves.len().max(1),
                 },
             ));
         }
@@ -881,6 +882,30 @@ mod tests {
             due_moved(3, 1, "2026-11-12T09:00:00Z", Some(date(2026, 11, 20)), None),
         ];
         assert!(summary_of(&tasks, &events).slipped.is_empty());
+
+        // Cleared and later re-set to a later date: still counts as at least 1 move.
+        let mut t = task(2, "Cleared then reset");
+        t.due_on = Some(date(2026, 11, 14));
+        let events = vec![
+            due_moved(
+                10,
+                2,
+                "2026-11-10T09:00:00Z",
+                Some(date(2026, 11, 11)),
+                None,
+            ),
+            due_moved(
+                11,
+                2,
+                "2026-11-11T09:00:00Z",
+                None,
+                Some(date(2026, 11, 14)),
+            ),
+        ];
+        let f = summary_of(&[t], &events);
+        assert_eq!(f.slipped.len(), 1);
+        assert_eq!(f.slipped[0].days_later, 3);
+        assert_eq!(f.slipped[0].times, 1);
     }
 
     #[test]

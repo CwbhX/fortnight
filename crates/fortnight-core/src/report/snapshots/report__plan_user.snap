@@ -10,6 +10,7 @@ Pick up to three tasks I should do first today, Wednesday 2026-11-18. This week 
   "today_weekday": "Wednesday",
   "week_start": "2026-11-16",
   "week_end": "2026-11-22",
+  "recommend_overdue": false,
   "remaining_working_days": [
     {
       "date": "2026-11-18",
@@ -168,7 +169,7 @@ Pick up to three tasks I should do first today, Wednesday 2026-11-18. This week 
       "days_until_due": null,
       "overdue": false,
       "planned_for": null,
-      "on_today_list": false,
+      "on_today_list": true,
       "planned_weekday": null,
       "estimate_minutes": null,
       "priority": 0,
@@ -183,7 +184,7 @@ Pick up to three tasks I should do first today, Wednesday 2026-11-18. This week 
       "days_until_due": null,
       "overdue": false,
       "planned_for": null,
-      "on_today_list": false,
+      "on_today_list": true,
       "planned_weekday": null,
       "estimate_minutes": null,
       "priority": 0,

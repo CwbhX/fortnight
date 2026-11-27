@@ -32,6 +32,9 @@ pub struct PlanFacts {
     pub today_weekday: WeekdayName,
     pub week_start: Date,
     pub week_end: Date,
+    /// Whether overdue tasks may be recommended (`Settings::recommend_overdue`).
+    #[serde(default)]
+    pub recommend_overdue: bool,
     /// Working days from today (inclusive) to the week's end, each with its
     /// capacity and the estimated load already planned on it.
     pub remaining_working_days: Vec<PlanDay>,
@@ -187,7 +190,9 @@ pub fn plan_facts(
         match t.due_on {
             Some(d) if d < today => overdue.push(to_plan(t)),
             Some(d) if d <= week_end => due_this_week.push(to_plan(t)),
-            Some(d) if d <= horizon || planned_this_week(t) => due_soon.push(to_plan(t)),
+            Some(d) if d <= horizon || planned_this_week(t) || t.on_today_list(today) => {
+                due_soon.push(to_plan(t))
+            }
             Some(_) => {}
             None => undated_tasks.push(t),
         }
@@ -233,6 +238,7 @@ pub fn plan_facts(
         today_weekday: weekday_name(today.weekday()),
         week_start: week.start,
         week_end,
+        recommend_overdue: settings.recommend_overdue,
         remaining_working_days,
         overdue,
         due_this_week,
@@ -380,10 +386,11 @@ pub(super) fn plan_task_details(task: &PlanTask) -> String {
 }
 
 /// True when there is nothing to recommend: no open task is on the Today
-/// list (planned for today or carried over) and none is overdue.
-/// Recommendations only ever come from those.
+/// list (planned for today, carried over, or undated) and, when
+/// `recommend_overdue` is on, none is overdue. Recommendations only ever
+/// come from those.
 pub fn plan_is_empty(facts: &PlanFacts) -> bool {
-    facts.overdue.is_empty()
+    !(facts.recommend_overdue && !facts.overdue.is_empty())
         && !facts
             .due_this_week
             .iter()
@@ -396,15 +403,15 @@ pub fn plan_is_empty(facts: &PlanFacts) -> bool {
 /// in Settings (`Settings::plan_prompt`); `DATA_RULE` and `PLAN_FORMAT` are
 /// always added, so a custom prompt can't break the reply format.
 pub const DEFAULT_PLAN_PROMPT: &str = "\
-You pick up to three tasks the user should do first today (`today`), most important first, from the tasks on today's list (`on_today_list`: planned for today, or for an earlier day and carried over) and the overdue tasks (`overdue`: due on an earlier day and still not done). Be direct and practical.
+You pick up to three tasks the user should do first today (`today`), most important first, from the tasks on today's list (`on_today_list`: planned for today, carried over from an earlier day, or with no planned day) and, when `recommend_overdue` is true, the overdue tasks (`overdue`: due on an earlier day and still not done). Be direct and practical.
 
 - Use only the facts provided. Do not invent tasks, deadlines or estimates.
 - Do no arithmetic: every date, day count and hour figure is already computed.
-- Weigh priority, deadlines and context together. Higher `priority` comes first (2 or more high, 1 medium, 0 low). An overdue task stays a candidate every day until it is done; the longer it is overdue, the more it should rise. Among tasks of the same priority, overdue tasks and the nearest deadlines come first.
+- Weigh priority, deadlines and context together. Higher `priority` comes first (2 or more high, 1 medium, 0 low). Among tasks of the same priority, the nearest deadlines (and, when `recommend_overdue` is true, the most overdue tasks) come first.
 - Use the notes, project and estimate for context: a task that unblocks others or that people are waiting on comes earlier.
-- Prefer what fits in today's `capacity_hours` (the first of `remaining_working_days`).
+- Prefer what fits in today's `capacity_hours` (the entry in `remaining_working_days` whose `date` equals `today`, if today is a working day).
 - Fewer than three, or none, is right when the rest are not worth doing first today: low priority with no deadline soon. Never pad the list.
-- Each reason is a few words, such as \"due Thursday\" or \"overdue 3 days\".";
+- Each reason is a few words, such as \"due Thursday\" or \"high priority\".";
 
 /// The reply format for recommended tasks, parsed by `parse_recommendations`.
 pub(super) const PLAN_FORMAT: &str = "\
@@ -638,9 +645,13 @@ mod tests {
         let monday = date(2026, 11, 16);
         let week = WeekRef::new(monday);
         let settings = Settings::default();
+        let with_overdue = Settings {
+            recommend_overdue: true,
+            ..Settings::default()
+        };
         let elsewhere = vec![
             due(task(1, "Wednesday's"), date(2026, 11, 18)),
-            task(2, "No day"),
+            planned(task(2, "Later undated"), date(2026, 11, 19)),
         ];
         let facts = plan_facts(&elsewhere, &[], week, monday, &settings);
         assert!(plan_is_empty(&facts));
@@ -648,10 +659,17 @@ mod tests {
         today.push(due(task(3, "Today's"), monday));
         let facts = plan_facts(&today, &[], week, monday, &settings);
         assert!(!plan_is_empty(&facts));
-        // An overdue task is a candidate too, whatever day it sits on.
+        // An undated task (no planned day) is on today's list.
+        let mut no_day = elsewhere.clone();
+        no_day.push(task(6, "No day"));
+        let facts = plan_facts(&no_day, &[], week, monday, &settings);
+        assert!(!plan_is_empty(&facts));
+        // An overdue task is a candidate only when `recommend_overdue` is on.
         let mut late = elsewhere;
         late.push(due(task(4, "Last week's"), date(2026, 11, 12)));
         let facts = plan_facts(&late, &[], week, monday, &settings);
+        assert!(plan_is_empty(&facts));
+        let facts = plan_facts(&late, &[], week, monday, &with_overdue);
         assert!(!plan_is_empty(&facts));
         // So is a task carried over from an earlier day, even with a far
         // deadline or none.
@@ -838,7 +856,11 @@ mod tests {
 
     #[test]
     fn undated_is_capped_but_counted() {
-        let mut tasks: Vec<Task> = (1..=14).map(|i| task(i, "Undated")).collect();
+        // Planned for next week (not on today's list): capped at MAX_UNDATED.
+        let next_week = date(2026, 11, 25);
+        let mut tasks: Vec<Task> = (1..=14)
+            .map(|i| planned(task(i, "Later"), next_week))
+            .collect();
         // Planned for this week: listed first despite its position.
         tasks[13] = planned(task(14, "Planned"), date(2026, 11, 19));
         let f = plan_facts(&tasks, &[], plan_week(), plan_today(), &Settings::default());
@@ -847,19 +869,20 @@ mod tests {
         assert_eq!(f.totals.undated, 14);
         assert!(plan_facts_markdown(&f).contains("No due date (showing 10 of 14)"));
 
-        // Tasks on today's list are never cut, however many others are
-        // planned for later this week and sit earlier in the list.
+        // Tasks on today's list (including undated ones) are never cut,
+        // however many others are planned for later this week and sit earlier.
         let mut tasks: Vec<Task> = (1..=12)
             .map(|i| planned(task(i, "Later this week"), date(2026, 11, 19)))
             .collect();
         tasks.push(planned(task(13, "Today"), plan_today()));
         tasks.push(planned(task(14, "Carried over"), date(2026, 11, 16)));
-        tasks.push(task(15, "Someday"));
+        tasks.push(task(15, "No planned day"));
         let f = plan_facts(&tasks, &[], plan_week(), plan_today(), &Settings::default());
-        assert_eq!(f.undated.len(), MAX_UNDATED + 2);
+        assert_eq!(f.undated.len(), MAX_UNDATED + 3);
         assert_eq!(f.undated[0].id, 13);
         assert_eq!(f.undated[1].id, 14);
-        assert!(f.undated[2..].iter().all(|t| !t.on_today_list));
+        assert_eq!(f.undated[2].id, 15);
+        assert!(f.undated[3..].iter().all(|t| !t.on_today_list));
         assert_eq!(f.totals.undated, 15);
         assert!(!plan_is_empty(&f));
     }

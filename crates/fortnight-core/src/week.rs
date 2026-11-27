@@ -27,7 +27,11 @@ pub fn month_weeks(date: Date, week_start: Weekday) -> Vec<WeekRef> {
     let mut out = Vec::new();
     while week.start <= last {
         out.push(week);
-        week = week.next();
+        let next = week.next();
+        if next == week {
+            break;
+        }
+        week = next;
     }
     out
 }

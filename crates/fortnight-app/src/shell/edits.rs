@@ -233,6 +233,36 @@ impl Ready {
         }
     }
 
+    /// Moves task `id` to `day` and renumbers that day's open tasks when
+    /// adjacent positions collided.
+    pub(crate) fn move_task_and_reorder(
+        &mut self,
+        id: TaskId,
+        day: Date,
+        positions: &[(TaskId, f64)],
+    ) {
+        if let Some(task) = self.task(id).cloned() {
+            let undo = self.snapshot(id, false);
+            let mut result = Ok(());
+            if task.day() != Some(day) {
+                result = self.store.update_task(&CoreTask {
+                    planned_for: Some(day),
+                    ..task
+                });
+            }
+            let result = result.and_then(|()| self.store.set_positions(positions));
+            match result {
+                Ok(()) => {
+                    if let Some(undo) = undo {
+                        self.undo.remember(undo);
+                    }
+                }
+                Err(e) => self.error = Some(e.to_string()),
+            }
+            self.reload_tasks();
+        }
+    }
+
     /// Saves a day's notes: its free-standing log lines are replaced by one
     /// holding `notes` (none if it is empty), stamped when the first of
     /// them was, else now on today, else noon on that day. Nothing is
@@ -312,6 +342,10 @@ impl Ready {
                 self.move_task(id, day, position);
                 Task::none()
             }
+            week::Action::MoveAndReorder(id, day, positions) => {
+                self.move_task_and_reorder(id, day, &positions);
+                Task::none()
+            }
             week::Action::SetStatus(id, status) => {
                 self.set_status(id, status);
                 Task::none()
@@ -374,9 +408,12 @@ impl Ready {
 /// Opens a web or mail address from the notes with the system's handler.
 /// Other schemes (`file:`, `javascript:`, …) are refused.
 fn open_link(url: &str) -> Result<(), String> {
-    let allowed = ["https://", "http://", "mailto:"]
-        .iter()
-        .any(|p| url.len() > p.len() && url[..p.len()].eq_ignore_ascii_case(p));
+    let allowed = ["https://", "http://", "mailto:"].iter().any(|p| {
+        url.len() > p.len()
+            && url
+                .get(..p.len())
+                .is_some_and(|s| s.eq_ignore_ascii_case(p))
+    });
     if !allowed {
         return Err(format!("Only web and mail links open from notes: {url}"));
     }
@@ -469,5 +506,13 @@ mod tests {
         assert_eq!(reverted(&before, Some(&now), false).position, 1.0);
         // The task is gone: nothing to keep.
         assert_eq!(reverted(&before, None, true).position, 1.0);
+    }
+
+    #[test]
+    fn open_link_rejects_non_ascii_schemes_without_panicking() {
+        assert!(open_link("日本語://example").is_err());
+        assert!(open_link("éééé://example").is_err());
+        assert!(open_link("file:///etc/passwd").is_err());
+        assert!(open_link("https://").is_err());
     }
 }

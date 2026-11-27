@@ -51,7 +51,7 @@ use crate::store::{Store, StoreResult};
 use serde::Serialize;
 
 /// Bump when a prompt changes.
-pub const PROMPT_VERSION: i64 = 10;
+pub const PROMPT_VERSION: i64 = 11;
 
 /// Everything needed to call the model and store the result.
 #[derive(Debug, Clone, PartialEq)]
@@ -378,7 +378,7 @@ mod tests {
         assert_eq!(r.model.as_deref(), Some("reported"));
         assert_eq!(r.endpoint_host.as_deref(), Some("localhost:11434"));
         assert_eq!(r.prompt_version, PROMPT_VERSION);
-        assert_eq!(r.prompt_version, 10);
+        assert_eq!(r.prompt_version, 11);
         assert_eq!(r.error, None);
         assert_eq!(r.digest_json, digest);
     }

@@ -154,8 +154,13 @@ fn read_file(path: &Path) -> Option<LockInfo> {
 /// host name depending on the network, and for case. An "unknown" host (an
 /// unreadable lock file) is never the same machine.
 pub fn same_host(a: &str, b: &str) -> bool {
-    let base = |s: &str| s.trim().trim_end_matches(".local").to_ascii_lowercase();
-    a != "unknown" && base(a) == base(b)
+    let base = |s: &str| {
+        let s = s.trim().to_ascii_lowercase();
+        s.strip_suffix(".local").unwrap_or(&s).to_string()
+    };
+    let a = base(a);
+    let b = base(b);
+    a != "unknown" && a == b
 }
 
 /// Whether `lock` was written on a machine other than `host` (this one, from
@@ -186,7 +191,7 @@ fn process_running(pid: u32) -> bool {
             .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map_or(true, |o| {
-                String::from_utf8_lossy(&o.stdout).contains(&pid.to_string())
+                !o.status.success() || String::from_utf8_lossy(&o.stdout).contains(&pid.to_string())
             })
     }
     #[cfg(not(any(unix, windows)))]
@@ -229,26 +234,22 @@ pub fn acquire_lock(dir: &Path) -> Result<(DataLock, Option<LockInfo>), DataDirE
         pid,
         since: now,
     };
-    // On `AlreadyExists`, read, report and replace it below. Any other error
-    // (a file system without exclusive create, say) takes the same path,
-    // which reports what it can and fails if the folder is not writable.
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-    {
-        use std::io::Write as _;
-        let written = to_json(&fresh).and_then(|json| {
-            file.write_all(json.as_bytes())
-                .and_then(|()| file.sync_all())
-                .map_err(not_writable)
-        });
-        if let Err(e) = written {
-            drop(file);
-            let _ = std::fs::remove_file(&path);
-            return Err(e);
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let temp_lock = || {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        dir.join(format!(".fortnight.lock.{pid}.{n}.tmp"))
+    };
+    // Write the full JSON to a temp file and atomically link it as `path`
+    // (`hard_link` fails with `AlreadyExists` if `path` exists), so another
+    // instance racing us never observes a 0-byte lock file.
+    let fresh_json = to_json(&fresh)?;
+    let tmp = temp_lock();
+    if std::fs::write(&tmp, &fresh_json).is_ok() {
+        let linked = std::fs::hard_link(&tmp, &path);
+        let _ = std::fs::remove_file(&tmp);
+        if linked.is_ok() {
+            return Ok((DataLock { path, info: fresh }, None));
         }
-        return Ok((DataLock { path, info: fresh }, None));
     }
 
     let previous = match path.try_exists() {
@@ -274,9 +275,7 @@ pub fn acquire_lock(dir: &Path) -> Result<(DataLock, Option<LockInfo>), DataDirE
     let json = to_json(&info)?;
     // Write beside the target, then rename, so readers never see half a file.
     // Unique per call, so two acquires in one process cannot collide.
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = dir.join(format!(".fortnight.lock.{pid}.{n}.tmp"));
+    let tmp = temp_lock();
     std::fs::write(&tmp, json).map_err(not_writable)?;
     if let Err(e) = std::fs::rename(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
@@ -455,8 +454,13 @@ mod tests {
             "Clements-MacBook-Pro.local",
             "clements-macbook-pro"
         ));
+        assert!(same_host(
+            "Clements-MacBook-Pro.LOCAL",
+            "clements-macbook-pro"
+        ));
         assert!(!same_host("a.local", "b.local"));
         assert!(!same_host("unknown", "unknown"));
+        assert!(!same_host("Unknown", "UNKNOWN"));
     }
 
     #[cfg(unix)]

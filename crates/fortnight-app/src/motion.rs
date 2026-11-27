@@ -190,11 +190,11 @@ impl Run {
 
     /// How far along it is at the latest frame, 0–1 (not eased).
     fn progress(&self, duration: Duration) -> f32 {
-        if let Some(held) = held() {
-            return held;
-        }
         if self.skipped || !enabled() || duration.is_zero() {
             return 1.0;
+        }
+        if let Some(held) = held() {
+            return held;
         }
         match (self.start, self.now) {
             (Some(start), Some(now)) => {
@@ -520,7 +520,11 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Dim {
 
     fn state(&self) -> tree::State {
         tree::State::new(DimState {
-            run: Run::default(),
+            run: if self.level == 0.0 {
+                Run::finished()
+            } else {
+                Run::default()
+            },
             from: 0.0,
             to: self.level,
             shown: 0.0,
@@ -1373,6 +1377,10 @@ mod tests {
         assert!(shown(&stage) > 0.0 && shown(&stage) < 0.25);
         assert!(!stage.frame(t1 + DIM));
         assert_eq!(shown(&stage), 0.0);
+
+        // Mounted already clear: still from the start.
+        let mut clear = Stage::new(dim(0.0));
+        assert!(!clear.frame(t0));
     }
 
     /// Three tabs, 60, 80 and 100 wide and 4 apart, with tab `selected`

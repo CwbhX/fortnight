@@ -42,11 +42,15 @@ pub fn now_for(today: Option<Date>, tz: TimeZone) -> CliResult<ZonedDateTime> {
 /// `add`: parses the quick-add words and stores the task. A date in the
 /// words is the day you plan to do it; without one the task is undated.
 pub fn add(store: &dyn Store, words: &[String], today: Date, out: &mut dyn Write) -> CliResult<()> {
-    let Some(new) = parse::quick_add_task(&words.join(" "), today, None) else {
+    let settings = store.load_settings()?;
+    let Some(mut new) = parse::quick_add_task(&words.join(" "), today, None) else {
         return Err(CliError::usage(
             "the task needs a title (only a date, project, estimate or priority was given)",
         ));
     };
+    if settings.due_on_added_day && new.due_on.is_none() {
+        new.due_on = new.planned_for;
+    }
     let task = store.add_task(new)?;
     let mut extras = Vec::new();
     if let Some(d) = task.planned_for {
@@ -444,7 +448,21 @@ pub async fn report_command(
         ReportKind::Plan => {
             let stored = generate_report(store, prepared, &llm, &mut std::io::sink()).await?;
             if let Some(text) = stored.text() {
-                let md = report::recommendations_markdown(text, &store.list_tasks()?);
+                let today = now.date();
+                let eligible: Vec<Task> = store
+                    .list_tasks()?
+                    .into_iter()
+                    .filter(|t| {
+                        t.status.is_open()
+                            && !t.private
+                            && if t.is_overdue(today) {
+                                settings.recommend_overdue
+                            } else {
+                                t.on_today_list(today)
+                            }
+                    })
+                    .collect();
+                let md = report::recommendations_markdown(text, &eligible);
                 out.write_all(md.as_bytes())?;
                 if !md.ends_with('\n') {
                     writeln!(out)?;

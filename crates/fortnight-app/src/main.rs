@@ -122,8 +122,8 @@ enum Message {
     Stream(ReportKey, u64, Result<ChatEvent, LlmError>),
     /// The stream for this report ended (after `Done` or an error, or early).
     StreamEnded(ReportKey, u64),
-    Tested(Result<String, String>),
-    Models(settings::Which, Result<Vec<OllamaModel>, String>),
+    Tested(u64, Result<String, String>),
+    Models(settings::Which, u64, Result<Vec<OllamaModel>, String>),
     /// The local Ollama check: its models, or why it didn't answer.
     OllamaDetected(Result<Vec<OllamaModel>, String>),
     /// Typing in a new task's dialog paused: ask the decision model for a
@@ -137,8 +137,11 @@ enum Message {
     DismissNotice,
     /// The main key and the decision model's key, each if it exists and
     /// opened with the password.
-    Unlocked(Result<(Option<SecretString>, Option<SecretString>), VaultError>),
-    KeySaved(Result<SavedKey, VaultError>),
+    Unlocked(
+        u64,
+        Result<(Option<SecretString>, Option<SecretString>), VaultError>,
+    ),
+    KeySaved(u64, Result<SavedKey, VaultError>),
     DismissError,
     Shoot,
     Shot(iced::window::Screenshot),
@@ -219,6 +222,12 @@ struct Ready {
     must_refresh: bool,
     /// Test connection requests in flight, aborted on Lock.
     key_requests: Vec<iced::task::Handle>,
+    /// Sequence numbers for async key/test/model operations so cancelled or
+    /// pre-Lock completions are ignored.
+    unlock_seq: u64,
+    key_save_seq: u64,
+    test_seq: u64,
+    model_seq: settings::PerBlock<u64>,
     /// The app icon last shown (`Some(true)` = dark), `None` before any.
     icon_dark: Option<bool>,
     /// Held for the app's lifetime; removes the lock file when dropped.
@@ -242,14 +251,14 @@ impl App {
                 ready.refresh();
                 // Settings open from the start (`FORTNIGHT_PAGE`) loads its
                 // model lists as opening it would.
-                let models = if ready.settings_open {
-                    load_models()
+                let (models, focus) = if ready.settings_open {
+                    (load_models(), Task::none())
                 } else {
-                    Task::none()
+                    (Task::none(), operation::focus(day::QUICK_ADD_ID))
                 };
                 let tasks = Task::batch([
                     iced::system::theme().map(Message::ThemeMode),
-                    operation::focus(day::QUICK_ADD_ID),
+                    focus,
                     start,
                     detect_ollama(),
                     models,
@@ -452,6 +461,10 @@ impl Ready {
             local: false,
             must_refresh: false,
             key_requests: Vec::new(),
+            unlock_seq: 0,
+            key_save_seq: 0,
+            test_seq: 0,
+            model_seq: settings::PerBlock::default(),
             icon_dark: None,
             _lock: lock,
         })
@@ -551,15 +564,6 @@ impl Ready {
                 let day = self.day_action(action);
                 Task::batch([week, day])
             }
-            Message::Week(m) if m.is_pointer_move() => {
-                // Drag bookkeeping only: no data changed, skip the refresh.
-                // A press let go without a drag is a click on the card.
-                self.local = true;
-                match self.week_view.update(m) {
-                    week::Action::Edit(id) => self.open_edit(id),
-                    _ => Task::none(),
-                }
-            }
             Message::Week(m) => {
                 let action = self.week_view.update(m);
                 self.week_action(action)
@@ -637,7 +641,7 @@ impl Ready {
                 self.local = true;
                 self.stream_ended(key, id)
             }
-            Message::Tested(result) => self.tested(result),
+            Message::Tested(seq, result) => self.tested(seq, result),
             Message::SuggestPriority(seq) => {
                 self.local = true;
                 let Some(task) = self.suggest_priority(seq) else {
@@ -652,15 +656,15 @@ impl Ready {
                 Task::none()
             }
             Message::OllamaDetected(result) => self.ollama_detected(result),
-            Message::Models(which, result) => self.models_listed(which, result),
+            Message::Models(which, seq, result) => self.models_listed(which, seq, result),
             Message::Key(shortcut) => self.shortcut(shortcut),
             Message::DismissNotice => {
                 self.local = true;
                 self.notice = None;
                 Task::none()
             }
-            Message::Unlocked(result) => self.unlocked(result),
-            Message::KeySaved(result) => self.key_saved(result),
+            Message::Unlocked(seq, result) => self.unlocked(seq, result),
+            Message::KeySaved(seq, result) => self.key_saved(seq, result),
             Message::DismissError => {
                 self.local = true;
                 self.error = None;
@@ -671,10 +675,7 @@ impl Ready {
                 return Task::none();
             }
         };
-        let local = std::mem::take(&mut self.local);
-        if !local || self.must_refresh {
-            self.refresh();
-        }
+        let mut extra = Task::none();
         if std::mem::take(&mut self.tasks_changed) {
             // The Weekly Summary follows changes on the Week tab, once they
             // pause for `SUMMARY_WAIT_SECS`.
@@ -682,11 +683,17 @@ impl Ready {
                 self.reports.start_summary_wait();
             }
             // A decision model is quick: recommendations follow every change.
+            // Run before `refresh()` so `recommending` and cleared later-day
+            // recommendations appear immediately in this frame.
             if self.decision_active() {
-                return Task::batch([task, self.update_week_reports()]);
+                extra = self.update_week_reports();
             }
         }
-        task
+        let local = std::mem::take(&mut self.local);
+        if !local || self.must_refresh {
+            self.refresh();
+        }
+        Task::batch([task, extra])
     }
 
     fn top_bar(&mut self, message: top_bar::Message) -> Task<Message> {
@@ -694,10 +701,12 @@ impl Ready {
             top_bar::Message::Tab(tab) => self.show(tab, None),
             top_bar::Message::Prev => {
                 self.selected = top_bar::step(self.tab, self.selected, -1);
+                self.date_picker = None;
                 self.update_week_reports()
             }
             top_bar::Message::Next => {
                 self.selected = top_bar::step(self.tab, self.selected, 1);
+                self.date_picker = None;
                 self.update_week_reports()
             }
             top_bar::Message::Today => {
@@ -732,7 +741,8 @@ impl Ready {
                 self.update_week_reports()
             }
             top_bar::Message::Lock => {
-                if self.keys.any_open() {
+                self.date_picker = None;
+                if self.keys.any_key_state() == KeyState::Unlocked {
                     self.lock();
                     Task::none()
                 } else {
@@ -751,6 +761,7 @@ impl Ready {
     /// Closes the unlock prompt, by any route, wiping what was typed.
     fn close_unlock(&mut self) {
         self.unlocking = false;
+        self.unlock_seq += 1;
         self.unlock_view.reset();
     }
 

@@ -211,7 +211,7 @@ fn all_markdown(
         if !notes.is_empty() {
             out.push_str(&format!("_{}_\n\n", notes.join(" · ")));
         }
-        push_report_body(&mut out, latest);
+        push_report_body(&mut out, latest, tasks);
     }
     out
 }
@@ -284,17 +284,23 @@ fn push_task(out: &mut String, task: &Task, logs: Option<&Vec<&Event>>, tz: &Tim
 fn report_heading(report: &Report) -> String {
     let kind = match report.kind {
         ReportKind::Summary => "Summary",
-        ReportKind::Plan => "Advice",
+        ReportKind::Plan => "Recommended tasks",
     };
     format!("{kind} for the week of {}", report.week_start)
 }
 
 /// The report's text (edit preferred), or its error if it failed.
-fn push_report_body(out: &mut String, report: &Report) {
+/// Plan reports store JSON and are rendered as a numbered list against `tasks`.
+fn push_report_body(out: &mut String, report: &Report, tasks: &[Task]) {
     let text = report.text().filter(|t| !t.trim().is_empty());
     match text {
         Some(text) => {
-            out.push_str(text.trim_end());
+            let rendered = if report.kind == ReportKind::Plan {
+                crate::report::recommendations_markdown(text, tasks)
+            } else {
+                text.to_string()
+            };
+            out.push_str(rendered.trim_end());
             out.push('\n');
         }
         None if report.status != ReportStatus::Failed => out.push_str("_No text._\n"),
@@ -645,7 +651,10 @@ mod tests {
             &TimeZone::UTC,
         );
         let reports_md = &md[pos(&md, "## Reports")..];
-        let newer = pos(reports_md, "### Advice for the week of 2026-11-16");
+        let newer = pos(
+            reports_md,
+            "### Recommended tasks for the week of 2026-11-16",
+        );
         let older = pos(reports_md, "### Summary for the week of 2026-11-09");
         assert!(newer < older);
         assert!(reports_md.contains("my edited text"));
@@ -653,6 +662,29 @@ mod tests {
         assert!(!reports_md.contains("model text v1"));
         assert!(reports_md.contains("1 earlier version"));
         assert!(reports_md.contains("**Failed:** endpoint returned 500"));
+    }
+
+    #[test]
+    fn plan_report_renders_recommendations_as_markdown_list() {
+        let tasks = vec![task(1, "Write spec"), task(2, "Call the bank")];
+        let plan = report(
+            1,
+            ReportKind::Plan,
+            date(2026, 11, 16),
+            "2026-11-16T08:00:00Z",
+            r#"{"tasks":[{"id":2,"why":"urgent"},{"id":1,"why":"due soon"}]}"#,
+        );
+        let md = export_all(
+            ExportFormat::Markdown,
+            &tasks,
+            &[],
+            &[plan],
+            TODAY,
+            &TimeZone::UTC,
+        );
+        assert!(md.contains("### Recommended tasks for the week of 2026-11-16"));
+        assert!(md.contains("1. Call the bank: urgent\n2. Write spec: due soon\n"));
+        assert!(!md.contains(r#"{"tasks""#));
     }
 
     #[test]

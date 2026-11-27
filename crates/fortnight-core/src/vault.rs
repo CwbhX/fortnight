@@ -232,12 +232,14 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
     let file_name = path
         .file_name()
         .ok_or_else(|| VaultError::Io(format!("invalid key file path {}", path.display())))?;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
     let tmp = dir.join(format!(
-        ".{}.tmp-{}-{nanos}",
+        ".{}.tmp-{}-{seq}-{nanos}",
         file_name.to_string_lossy(),
         std::process::id()
     ));

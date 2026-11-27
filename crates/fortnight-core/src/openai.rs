@@ -448,8 +448,8 @@ impl SseReader {
         match choice.finish_reason.as_deref() {
             Some("length") => return Some(Err(LlmError::Truncated)),
             Some("content_filter") => return Some(Err(LlmError::Refused)),
-            Some(_) => self.finished = true,
-            None => {}
+            Some(r) if !r.is_empty() => self.finished = true,
+            _ => {}
         }
         let delta = choice.delta?;
         if delta.refusal.is_some_and(|r| !r.is_empty()) {
@@ -685,7 +685,9 @@ fn parse_body(text: &str, requested_model: &str) -> Result<ChatResponse, LlmErro
         .next()
         .ok_or_else(|| LlmError::Malformed("no choices in response".into()))?;
     let message = choice.message;
-    let refused = message.as_ref().is_some_and(|m| m.refusal.is_some());
+    let refused = message
+        .as_ref()
+        .is_some_and(|m| m.refusal.as_deref().is_some_and(|r| !r.is_empty()));
     match choice.finish_reason.as_deref() {
         Some("content_filter") => return Err(LlmError::Refused),
         _ if refused => return Err(LlmError::Refused),
@@ -1795,5 +1797,30 @@ mod tests {
         assert_eq!(local.timeout, LOCAL_TIMEOUT);
         let remote = OpenAiClient::new(config("https://api.openai.com/v1", None)).unwrap();
         assert_eq!(remote.timeout, DEFAULT_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn empty_refusal_and_empty_finish_reason_are_ignored() {
+        let body = json!({
+            "model": "proxy-model",
+            "choices": [{
+                "message": { "role": "assistant", "content": "Hello", "refusal": "" },
+                "finish_reason": "stop"
+            }]
+        });
+        assert_eq!(result_for_body(body).await.unwrap().text, "Hello");
+
+        let server = MockServer::start().await;
+        let partial = json!({
+            "model": "proxy-model",
+            "choices": [{ "delta": { "content": "Hi" }, "finish_reason": "" }]
+        })
+        .to_string();
+        mount(&server, sse(&[&partial])).await;
+        let c = client(&format!("{}/v1", server.uri()), None);
+        assert_eq!(
+            stream_items(&c).await,
+            vec![delta("Hi"), Err(LlmError::Truncated)]
+        );
     }
 }

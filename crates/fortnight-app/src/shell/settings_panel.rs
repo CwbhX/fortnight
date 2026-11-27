@@ -21,6 +21,7 @@ impl Ready {
     /// Opens Settings, checks for a local Ollama and loads both blocks'
     /// model lists.
     pub(crate) fn open_settings(&mut self) -> Task<Message> {
+        self.date_picker = None;
         self.settings_open = true;
         Task::batch([crate::unfocus(), detect_ollama(), load_models()])
     }
@@ -41,22 +42,31 @@ impl Ready {
             }
             settings::Action::Save(s) => {
                 let now = Timestamp::now();
-                if report::summary_prompt(&s) != report::summary_prompt(&self.settings)
-                    || s.summary_instructions != self.settings.summary_instructions
-                {
-                    self.reports.note_prompt_change(ReportKind::Summary, now);
-                }
+                let summary_prompt_changed = report::summary_prompt(&s)
+                    != report::summary_prompt(&self.settings)
+                    || s.summary_instructions != self.settings.summary_instructions;
+                let summary_changed = summary_prompt_changed || s.llm != self.settings.llm;
                 // Recommend overdue tasks changes the prompt's rules too.
-                let prompt_changed = report::plan_prompt(&s) != report::plan_prompt(&self.settings)
+                let plan_prompt_changed = report::plan_prompt(&s)
+                    != report::plan_prompt(&self.settings)
                     || s.recommend_overdue != self.settings.recommend_overdue;
-                let plan_changed = prompt_changed
+                let plan_changed = plan_prompt_changed
                     || s.llm != self.settings.llm
                     || s.decision_llm != self.settings.decision_llm;
-                if prompt_changed {
-                    self.reports.note_prompt_change(ReportKind::Plan, now);
-                }
                 match self.store.save_settings(&s) {
                     Ok(()) => {
+                        if summary_prompt_changed {
+                            self.reports.note_prompt_change(ReportKind::Summary, now);
+                        }
+                        if summary_changed {
+                            self.reports.abort_kind(ReportKind::Summary);
+                        }
+                        if plan_prompt_changed {
+                            self.reports.note_prompt_change(ReportKind::Plan, now);
+                        }
+                        if plan_changed {
+                            self.reports.abort_kind(ReportKind::Plan);
+                        }
                         theme::set_accent(s.accent);
                         theme::set_today_width(s.today_width);
                         // A fixed endpoint is tried again at once.
@@ -80,6 +90,11 @@ impl Ready {
             }
             settings::Action::Test(llm, which) => match self.settings_client(&llm, which) {
                 Ok((client, _)) => {
+                    for handle in self.key_requests.drain(..) {
+                        handle.abort();
+                    }
+                    self.test_seq += 1;
+                    let seq = self.test_seq;
                     self.testing = true;
                     self.test_result = None;
                     let (task, handle) = Task::perform(
@@ -90,7 +105,7 @@ impl Ready {
                                 .map(|r| format!("{} replied: {}", r.model, r.text.trim()))
                                 .map_err(|e| e.to_string())
                         },
-                        Message::Tested,
+                        move |result| Message::Tested(seq, result),
                     )
                     .abortable();
                     self.key_requests.push(handle);
@@ -127,6 +142,8 @@ impl Ready {
         if let Some(old) = self.model_requests.get_mut(which).take() {
             old.abort();
         }
+        *self.model_seq.get_mut(which) += 1;
+        let seq = *self.model_seq.get(which);
         // Ollama (keyless, or a decision model): ask it directly, which
         // also says what each model can do. A keyless server that isn't
         // Ollama (LM Studio) answers the endpoint's own model list instead.
@@ -169,7 +186,7 @@ impl Ready {
                     },
                 }
             },
-            move |result| Message::Models(which, result),
+            move |result| Message::Models(which, seq, result),
         )
         .abortable();
         *self.model_requests.get_mut(which) = Some(handle);
@@ -177,7 +194,11 @@ impl Ready {
     }
 
     /// A Test connection request answered (`Message::Tested`).
-    pub(crate) fn tested(&mut self, result: Result<String, String>) -> Task<Message> {
+    pub(crate) fn tested(&mut self, seq: u64, result: Result<String, String>) -> Task<Message> {
+        if seq != self.test_seq {
+            self.local = true;
+            return Task::none();
+        }
         self.testing = false;
         self.key_requests.clear();
         self.test_result = Some(result);
@@ -197,8 +218,13 @@ impl Ready {
     pub(crate) fn models_listed(
         &mut self,
         which: settings::Which,
+        seq: u64,
         result: Result<Vec<OllamaModel>, String>,
     ) -> Task<Message> {
+        if seq != *self.model_seq.get(which) {
+            self.local = true;
+            return Task::none();
+        }
         *self.model_requests.get_mut(which) = None;
         let list = self.models.get_mut(which);
         list.loading = false;
@@ -209,6 +235,7 @@ impl Ready {
     /// Lock: stops the model-list requests (they hold the key).
     pub(crate) fn abort_model_requests(&mut self) {
         for which in settings::Which::BOTH {
+            *self.model_seq.get_mut(which) += 1;
             if let Some(handle) = self.model_requests.get_mut(which).take() {
                 handle.abort();
             }

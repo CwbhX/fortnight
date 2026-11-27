@@ -122,6 +122,9 @@ pub enum Action {
     /// A card was dragged: plan it for `Date` (if it isn't already its
     /// day) and set its position to the `f64`.
     Move(TaskId, Date, f64),
+    /// A card was dragged between tasks whose positions collided: plan it
+    /// for `Date` (if needed) and renumber the day's open tasks.
+    MoveAndReorder(TaskId, Date, Vec<(TaskId, f64)>),
     /// Open the new-task dialog for this day.
     NewTask(Date),
     /// A card was clicked: open the task dialog to edit it.
@@ -246,10 +249,8 @@ impl WeekView {
                 let Some(task) = data.tasks.iter().find(|t| t.id == drag.id) else {
                     return Action::None;
                 };
-                match drop_position(task, &self.layout.tasks(&data.tasks, day), day, before) {
-                    Some(position) => Action::Move(drag.id, day, position),
-                    None => Action::None,
-                }
+                drop_action(task, &self.layout.tasks(&data.tasks, day), day, before)
+                    .unwrap_or(Action::None)
             }
         }
     }
@@ -788,11 +789,12 @@ fn slot<'a>(line: bool) -> Element<'a, Message> {
     container(inner).width(Fill).height(8).center_y(8).into()
 }
 
-/// Where `task` goes when dropped on `day`, before the open task `before`
-/// (or after the day's open tasks): its new `position`, between its new
-/// neighbours. `None` when nothing would change (same day, same place).
-/// `on_day` is the day's tasks (`Layout::tasks`).
-fn drop_position(task: &Task, on_day: &[&Task], day: Date, before: Option<TaskId>) -> Option<f64> {
+/// What dropping `task` on `day`, before the open task `before` (or after
+/// the day's open tasks), should do: `Move` with a midpoint position when
+/// there is room between its neighbours, or `MoveAndReorder` renumbering
+/// the day's open tasks when adjacent positions collide. `None` when nothing
+/// would change (same day, same place).
+fn drop_action(task: &Task, on_day: &[&Task], day: Date, before: Option<TaskId>) -> Option<Action> {
     let id = task.id;
     let open: Vec<&Task> = on_day
         .iter()
@@ -814,13 +816,40 @@ fn drop_position(task: &Task, on_day: &[&Task], day: Date, before: Option<TaskId
             return None;
         }
     }
-    let position = match (index.checked_sub(1).map(|i| others[i]), others.get(index)) {
-        (Some(prev), Some(next)) => (prev.position + next.position) / 2.0,
-        (None, Some(next)) => next.position - 1.0,
-        (Some(prev), None) => prev.position + 1.0,
-        (None, None) => task.position,
-    };
-    Some(position)
+    match (index.checked_sub(1).map(|i| others[i]), others.get(index)) {
+        (Some(prev), Some(next)) => {
+            let mid = (prev.position + next.position) / 2.0;
+            if prev.position < mid && mid < next.position {
+                Some(Action::Move(id, day, mid))
+            } else {
+                let mut order: Vec<TaskId> = others.iter().map(|t| t.id).collect();
+                order.insert(index, id);
+                let positions = order
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, tid)| (tid, (i + 1) as f64))
+                    .collect();
+                Some(Action::MoveAndReorder(id, day, positions))
+            }
+        }
+        (None, Some(next)) => Some(Action::Move(id, day, next.position - 1.0)),
+        (Some(prev), None) => Some(Action::Move(id, day, prev.position + 1.0)),
+        (None, None) => Some(Action::Move(id, day, task.position)),
+    }
+}
+
+/// Where `task` goes when dropped on `day`, before the open task `before`
+/// (or after the day's open tasks): its new `position`, or `None` when
+/// nothing would change.
+fn drop_position(task: &Task, on_day: &[&Task], day: Date, before: Option<TaskId>) -> Option<f64> {
+    match drop_action(task, on_day, day, before)? {
+        Action::Move(_, _, pos) => Some(pos),
+        Action::MoveAndReorder(id, _, positions) => positions
+            .into_iter()
+            .find(|(tid, _)| *tid == id)
+            .map(|(_, p)| p),
+        _ => None,
+    }
 }
 
 /// The card itself: checkbox, priority, title and the meta line.
@@ -1299,6 +1328,24 @@ mod tests {
         v.update(Message::Hover(tue, Some(1)));
         let _ = v.view();
         assert_eq!(v.update(Message::EndDrag), Action::Move(2, tue, 0.0));
+
+        // Adjacent tasks sharing the same position trigger a renumber instead
+        // of computing a colliding midpoint.
+        let mut a = task(1, Some(tue), TaskStatus::Todo);
+        let mut b = task(2, Some(tue), TaskStatus::Todo);
+        let mut c = task(3, Some(tue), TaskStatus::Todo);
+        a.position = 1.0;
+        b.position = 1.0;
+        c.position = 2.0;
+        let on_day = [&a, &b, &c];
+        assert_eq!(
+            drop_action(&c, &on_day, tue, Some(2)),
+            Some(Action::MoveAndReorder(
+                3,
+                tue,
+                vec![(1, 1.0), (3, 2.0), (2, 3.0)]
+            ))
+        );
     }
 
     #[test]

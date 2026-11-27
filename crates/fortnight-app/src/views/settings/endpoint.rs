@@ -208,16 +208,25 @@ impl SettingsView {
     }
 
     /// The block's endpoint takes a saved key and there is none it could
-    /// use. The recommendations block may borrow the main key
-    /// (`fallback::decision_config`).
+    /// use. The recommendations block may borrow the main key only on the
+    /// main endpoint's host (`fallback::decision_config`).
     fn needs_key(&self, which: Which) -> bool {
+        let llm = self.form.endpoint(which).llm();
         let none = match which {
             Which::Main => self.key_state == KeyState::NoKey,
             Which::Decision => {
-                self.decision_key_state == KeyState::NoKey && self.key_state == KeyState::NoKey
+                let main_host =
+                    fortnight_core::llm::LlmConfig::from_settings(&self.form.main.llm(), None)
+                        .endpoint_host();
+                let decision_host =
+                    fortnight_core::llm::LlmConfig::from_settings(&llm, None).endpoint_host();
+                let borrows_main = main_host.is_some()
+                    && decision_host == main_host
+                    && self.key_state != KeyState::NoKey;
+                self.decision_key_state == KeyState::NoKey && !borrows_main
             }
         };
-        none && secure::needs_saved_key(&self.form.endpoint(which).llm())
+        none && secure::needs_saved_key(&llm)
     }
 
     /// The models this block can pick from: its last fetch, or the local
@@ -640,10 +649,15 @@ mod tests {
     #[test]
     fn recommendations_can_list_with_the_main_key() {
         let mut v = loaded(KeyState::Locked);
+        v.update(Message::Provider(Which::Main, Provider::OpenAi));
         v.update(Message::Separate(true));
         v.update(Message::Provider(Which::Decision, Provider::OpenAi));
         assert!(v.can_list_models(Which::Decision));
+        // A different host cannot borrow the main key.
+        v.update(Message::Provider(Which::Decision, Provider::Anthropic));
+        assert_eq!(v.models_state(Which::Decision), ModelsState::NeedsKey);
         let mut v = loaded(KeyState::NoKey);
+        v.update(Message::Provider(Which::Main, Provider::OpenAi));
         v.update(Message::Separate(true));
         v.update(Message::Provider(Which::Decision, Provider::OpenAi));
         assert_eq!(v.models_state(Which::Decision), ModelsState::NeedsKey);

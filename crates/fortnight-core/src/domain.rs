@@ -105,16 +105,18 @@ impl Task {
         self.status.is_open() && self.due_on.is_some_and(|d| d < today)
     }
 
-    /// On today's list: open and planned for `today` or an earlier day
-    /// (carried over). The one rule for "today's list"; the report facts'
-    /// `on_today_list` and the Today tab's recommendations use it.
+    /// On today's list: open and planned for `today`, carried over from an
+    /// earlier day, or with no planned day (e.g. added from the CLI without
+    /// a date). The one rule for "today's list"; the Today tab, CLI
+    /// `list --today`, report facts' `on_today_list`, and recommendations
+    /// all use it.
     ///
-    /// Overdue is a separate test (`is_overdue`): an overdue task is not on
-    /// the list by its deadline alone (it may be undated or planned later),
-    /// so "today's list or overdue" is `on_today_list(t) || is_overdue(t)`.
+    /// Overdue is a separate test (`is_overdue`): an overdue task planned
+    /// for a later day is not on today's list by its deadline alone, so
+    /// "today's list or overdue" is `on_today_list(t) || is_overdue(t)`.
     /// Done and deleted tasks are never on it.
     pub fn on_today_list(&self, today: Date) -> bool {
-        self.status.is_open() && self.day().is_some_and(|d| d <= today)
+        self.status.is_open() && self.day().is_none_or(|d| d <= today)
     }
 }
 
@@ -644,18 +646,19 @@ mod tests {
         let wed = Some(today);
         let fri = Some(Date::constant(2026, 11, 20));
         use TaskStatus::*;
-        // Planned for today, or carried over from an earlier day.
+        // Planned for today, carried over from an earlier day, or undated.
         assert!(task(Todo, wed, None).on_today_list(today));
         assert!(task(Doing, mon, None).on_today_list(today));
         assert!(task(Todo, mon, fri).on_today_list(today));
-        // Later, undated, or not open: not on it.
+        assert!(task(Todo, None, None).on_today_list(today));
+        // Later or not open: not on it.
         assert!(!task(Todo, fri, None).on_today_list(today));
-        assert!(!task(Todo, None, None).on_today_list(today));
         assert!(!task(Done, wed, None).on_today_list(today));
+        assert!(!task(Done, None, None).on_today_list(today));
         assert!(!task(Dropped, mon, None).on_today_list(today));
-        // A passed deadline alone does not put it there; that is overdue.
+        // A passed deadline alone does not put a later-planned task there; that is overdue.
         let undated_overdue = task(Todo, None, mon);
-        assert!(!undated_overdue.on_today_list(today));
+        assert!(undated_overdue.on_today_list(today));
         assert!(undated_overdue.is_overdue(today));
         assert!(!task(Todo, fri, mon).on_today_list(today));
     }

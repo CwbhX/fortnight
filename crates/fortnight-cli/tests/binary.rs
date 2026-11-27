@@ -97,9 +97,21 @@ fn facts_work_without_an_llm_and_llm_commands_exit_2_when_unconfigured() {
     assert!(stdout(&plan).is_empty());
 
     // run-due with something due but no LLM: nothing fails (PLAN.md 8).
-    let due = run_on(&dir, "2026-11-20", &["run-due"]);
+    // `add` records the task's `created_at` at real wall-clock time, so run
+    // `run-due` at the end of the real current week (after Friday 16:00) so
+    // the summary for this week is due and includes the task just added.
+    let real_today = jiff::Timestamp::now()
+        .to_zoned_datetime(jiff::tz::TimeZone::system())
+        .date();
+    let week_end =
+        fortnight_core::week::week_containing(real_today, jiff::civil::Weekday::Sunday).end();
+    let due = run_on(&dir, &week_end.to_string(), &["run-due"]);
     assert_eq!(due.status.code(), Some(0), "{}", stderr(&due));
-    assert!(stdout(&due).contains("nothing was generated"));
+    assert!(
+        stdout(&due).contains("nothing was generated"),
+        "{}",
+        stdout(&due)
+    );
 
     let bad = run(&dir, &["summary", "--week", "someday"]);
     assert_eq!(bad.status.code(), Some(2));
