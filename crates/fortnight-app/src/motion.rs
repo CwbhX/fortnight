@@ -1586,9 +1586,9 @@ impl<'a, M: 'a, T: 'a, R: renderer::Renderer + 'a> From<Expand<'a, M, T, R>>
 
 // ------------------------------------------------------------------ slide
 
-/// A side-by-side horizontal page carousel for switching periods (such as
-/// weeks in the Week view). When `page` changes, `previous` slides smoothly
-/// off to the side while `current` glides in right beside it using pure GPU
+/// A side-by-side page carousel for switching periods (horizontal for weeks,
+/// or `.vertical()` for months). When `page` changes, `previous` slides
+/// smoothly out while `current` glides in right beside it using pure GPU
 /// translation (zero per-frame relayout, zero blank flash). Rapid clicks and
 /// mid-slide reversals pick up seamlessly from the exact current offset.
 pub fn slide<'a, M: 'a, T: 'a, R: renderer::Renderer + 'a>(
@@ -1602,6 +1602,8 @@ pub fn slide<'a, M: 'a, T: 'a, R: renderer::Renderer + 'a>(
         children: [current.into(), previous],
         page,
         has_previous,
+        vertical: false,
+        gap: 0.0,
         veil: None,
     }
 }
@@ -1611,10 +1613,26 @@ pub struct Slide<'a, M, T, R> {
     children: [Element<'a, M, T, R>; 2],
     page: i64,
     has_previous: bool,
+    vertical: bool,
+    gap: f32,
     veil: Option<Behind<'a, T>>,
 }
 
 impl<'a, M, T, R> Slide<'a, M, T, R> {
+    /// Slides vertically (next page enters from below, previous from above)
+    /// instead of horizontally.
+    pub fn vertical(mut self) -> Self {
+        self.vertical = true;
+        self
+    }
+
+    /// Adds a visual gutter in logical pixels between the outgoing and
+    /// incoming pages as they slide past each other.
+    pub fn gap(mut self, gap: f32) -> Self {
+        self.gap = gap.max(0.0);
+        self
+    }
+
     /// Gently recedes the outgoing page into `behind` as it slides away.
     pub fn fade_from(mut self, behind: impl Fn(&T) -> Color + 'a) -> Self {
         self.veil = Some(Box::new(behind));
@@ -1625,26 +1643,27 @@ impl<'a, M, T, R> Slide<'a, M, T, R> {
 struct SlideState {
     run: Run,
     page: i64,
-    /// +1.0 when moving forward (entering from the right), -1.0 backward.
+    /// +1.0 when moving forward (entering from right / bottom), -1.0 backward.
     dir: f32,
-    /// Horizontal offset of `current` at the start of the active slide.
-    from_x: f32,
-    /// Last laid-out width of the carousel.
-    width: f32,
+    /// Offset of `current` along the slide axis at the start of the active slide.
+    from: f32,
+    /// Last laid-out extent of the carousel along the slide axis.
+    extent: f32,
 }
 
 impl SlideState {
-    /// Current horizontal offset of `current` (0.0 at rest), and progress 0–1.
+    /// Current offset of `current` along the slide axis (0.0 at rest), and
+    /// progress 0–1.
     fn offset(&self) -> Option<(f32, f32)> {
         let p = self.run.progress(PAGE_SLIDE);
-        if p >= 1.0 || self.width <= 0.0 {
+        if p >= 1.0 || self.extent <= 0.0 {
             return None;
         }
         let eased = ease_out_quart(p);
-        let raw = self.from_x * (1.0 - eased);
+        let raw = self.from * (1.0 - eased);
         // Half-pixel steps (whole physical pixels on 2x displays).
-        let x = (raw * 2.0).round() * 0.5;
-        Some((x, eased))
+        let off = (raw * 2.0).round() * 0.5;
+        Some((off, eased))
     }
 }
 
@@ -1658,8 +1677,8 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Slide<'_, M, T, R> {
             run: Run::finished(),
             page: self.page,
             dir: 1.0,
-            from_x: 0.0,
-            width: 0.0,
+            from: 0.0,
+            extent: 0.0,
         })
     }
 
@@ -1671,17 +1690,18 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Slide<'_, M, T, R> {
         let state = tree.state.downcast_mut::<SlideState>();
         if self.page != state.page {
             let dir = if self.page > state.page { 1.0 } else { -1.0 };
-            let cur_x = state.offset().map_or(0.0, |(x, _)| x);
+            let cur = state.offset().map_or(0.0, |(off, _)| off);
             state.page = self.page;
             state.dir = dir;
-            if state.width > 0.0 {
+            if state.extent > 0.0 {
                 // Keep the outgoing page glued to the exact pixel it already
                 // occupied (even on rapid clicks or mid-slide reversals).
-                let max = state.width * 1.5;
-                state.from_x = (cur_x + dir * state.width).clamp(-max, max);
+                let stride = state.extent + self.gap;
+                let max = stride * 1.5;
+                state.from = (cur + dir * stride).clamp(-max, max);
                 state.run.restart();
             } else {
-                state.from_x = 0.0;
+                state.from = 0.0;
                 state.run.skip();
             }
             // Move the outgoing page's widget tree into slot 1 so it keeps
@@ -1711,7 +1731,11 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Slide<'_, M, T, R> {
                 .as_widget_mut()
                 .layout(&mut tree.children[1], renderer, limits);
         let size = current.size();
-        tree.state.downcast_mut::<SlideState>().width = size.width;
+        tree.state.downcast_mut::<SlideState>().extent = if self.vertical {
+            size.height
+        } else {
+            size.width
+        };
         layout::Node::with_children(size, vec![current, previous])
     }
 
@@ -1762,7 +1786,7 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Slide<'_, M, T, R> {
             return;
         };
         let state = tree.state.downcast_ref::<SlideState>();
-        let Some((curr_x, eased)) = state.offset() else {
+        let Some((curr_off, eased)) = state.offset() else {
             self.children[0].as_widget().draw(
                 &tree.children[0],
                 renderer,
@@ -1776,38 +1800,76 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Slide<'_, M, T, R> {
         };
 
         let bounds = layout.bounds();
-        // Clip horizontally to the slide container and vertically to the
-        // visible viewport so a taller outgoing week never clips abruptly.
-        let horiz = Rectangle {
-            x: bounds.x,
-            width: bounds.width,
-            y: viewport.y,
-            height: viewport.height,
+        // Horizontal slides clip vertically to the viewport so a taller
+        // outgoing week never clips abruptly; vertical slides clip strictly
+        // to `bounds` so rows glide cleanly underneath a pinned header.
+        let clip_region = if self.vertical {
+            bounds
+        } else {
+            Rectangle {
+                x: bounds.x,
+                width: bounds.width,
+                y: viewport.y,
+                height: viewport.height,
+            }
         };
-        let Some(clip) = horiz.intersection(viewport) else {
+        let Some(clip) = clip_region.intersection(viewport) else {
             return;
         };
 
-        let prev_x = curr_x - state.dir * bounds.width;
-        let local_viewport = |dx: f32| Rectangle {
-            x: clip.x - dx,
-            y: clip.y,
-            width: clip.width,
-            height: clip.height,
+        let extent = if self.vertical {
+            bounds.height
+        } else {
+            bounds.width
+        };
+        let stride = extent + self.gap;
+        let prev_off = curr_off - state.dir * stride;
+        let translation = |off: f32| {
+            if self.vertical {
+                Vector::new(0.0, off)
+            } else {
+                Vector::new(off, 0.0)
+            }
+        };
+        let local_viewport = |off: f32| {
+            if self.vertical {
+                Rectangle {
+                    x: clip.x,
+                    y: clip.y - off,
+                    width: clip.width,
+                    height: clip.height,
+                }
+            } else {
+                Rectangle {
+                    x: clip.x - off,
+                    y: clip.y,
+                    width: clip.width,
+                    height: clip.height,
+                }
+            }
         };
 
         renderer.with_layer(clip, |renderer| {
             // Outgoing page slides smoothly away beside the incoming page.
             if self.has_previous {
-                let prev_rect = Rectangle {
-                    x: bounds.x + prev_x,
-                    width: bounds.width,
-                    y: clip.y,
-                    height: clip.height,
+                let prev_rect = if self.vertical {
+                    Rectangle {
+                        x: clip.x,
+                        width: clip.width,
+                        y: bounds.y + prev_off,
+                        height: bounds.height,
+                    }
+                } else {
+                    Rectangle {
+                        x: bounds.x + prev_off,
+                        width: bounds.width,
+                        y: clip.y,
+                        height: clip.height,
+                    }
                 };
                 if let Some(prev_clip) = prev_rect.intersection(&clip) {
-                    let prev_vp = local_viewport(prev_x);
-                    renderer.with_translation(Vector::new(prev_x, 0.0), |renderer| {
+                    let prev_vp = local_viewport(prev_off);
+                    renderer.with_translation(translation(prev_off), |renderer| {
                         self.children[1].as_widget().draw(
                             &tree.children[1],
                             renderer,
@@ -1836,8 +1898,8 @@ impl<M, T, R: renderer::Renderer> Widget<M, T, R> for Slide<'_, M, T, R> {
             }
 
             // Incoming page glides crisply into place.
-            let curr_vp = local_viewport(curr_x);
-            renderer.with_translation(Vector::new(curr_x, 0.0), |renderer| {
+            let curr_vp = local_viewport(curr_off);
+            renderer.with_translation(translation(curr_off), |renderer| {
                 self.children[0].as_widget().draw(
                     &tree.children[0],
                     renderer,
@@ -2468,5 +2530,27 @@ mod tests {
         assert!(!stage.frame(t2 + PAGE_SLIDE));
         assert_eq!(stage.state::<SlideState>().offset(), None);
         assert_eq!(stage.layouts, layouts_before);
+    }
+
+    #[test]
+    fn vertical_slide_uses_height_plus_gap() {
+        let make = |page: i64, has_prev: bool| -> El<'static> {
+            let cur = space().width(400).height(200);
+            let prev = has_prev.then(|| space().width(400).height(200).into());
+            slide(page, cur, prev).vertical().gap(6.0).into()
+        };
+        let mut stage = Stage::new(make(1, false));
+        let t0 = Instant::now();
+        assert!(!stage.frame(t0));
+        // Next month enters from below (`height + gap = 206`).
+        stage.set(make(2, true));
+        assert_eq!(stage.state::<SlideState>().offset().unwrap().0, 206.0);
+        let t1 = t0 + ms(1000);
+        assert!(stage.frame(t1));
+        assert!(!stage.frame(t1 + PAGE_SLIDE));
+        assert_eq!(stage.state::<SlideState>().offset(), None);
+        // Previous month enters from above (`-(height + gap) = -206`).
+        stage.set(make(1, true));
+        assert_eq!(stage.state::<SlideState>().offset().unwrap().0, -206.0);
     }
 }

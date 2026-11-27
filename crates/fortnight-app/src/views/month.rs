@@ -27,6 +27,7 @@
 //! Skipped (prototype scope): keyboard navigation inside the grid and hover
 //! tooltips with full titles.
 
+use crate::motion;
 use crate::theme;
 use fortnight_core::domain::{Priority, Task, TaskStatus, WeekRef};
 use fortnight_core::report::short_weekday;
@@ -80,12 +81,26 @@ pub struct MonthData {
     pub summary_weeks: Vec<Date>,
 }
 
+/// How long the outgoing month is kept after a month switch so the vertical
+/// slide finishes cleanly before it is dropped.
+const SLIDE_LINGER: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// The month that just scrolled out, kept briefly for [`motion::slide`].
+#[derive(Debug)]
+struct PreviousMonth {
+    data: MonthData,
+    by_day: ByDay,
+    at: std::time::Instant,
+}
+
 #[derive(Debug, Default)]
 pub struct MonthView {
     data: Option<MonthData>,
     /// `data`'s tasks by day, worked out by `load`: the grid is rebuilt on
     /// every layout.
     by_day: ByDay,
+    /// The previous month, kept briefly so switching months scrolls smoothly.
+    previous: Option<PreviousMonth>,
     /// The day whose due-tasks dropdown is open.
     open_due: Option<Date>,
 }
@@ -101,8 +116,21 @@ impl MonthView {
         if self.data.as_ref() == Some(&data) {
             return;
         }
-        if self.data.as_ref().map(|d| d.month) != Some(data.month) {
+        if let Some(old_data) = self.data.take()
+            && old_data.month != data.month
+        {
             self.open_due = None;
+            self.previous = Some(PreviousMonth {
+                data: old_data,
+                by_day: std::mem::take(&mut self.by_day),
+                at: std::time::Instant::now(),
+            });
+        } else if self
+            .previous
+            .as_ref()
+            .is_some_and(|p| p.at.elapsed() >= SLIDE_LINGER)
+        {
+            self.previous = None;
         }
         self.by_day = ByDay::new(&data.tasks);
         self.data = Some(data);
@@ -136,7 +164,8 @@ impl MonthView {
         };
         let open = self.open_due;
         let by_day = &self.by_day;
-        responsive(move |size| grid(data, by_day, open, size)).into()
+        let previous = self.previous.as_ref();
+        responsive(move |size| grid(data, by_day, previous, open, size)).into()
     }
 }
 
@@ -196,9 +225,15 @@ const DROPDOWN_WIDTH: f32 = 230.0;
 /// Text size of the completion badge.
 const BADGE_SIZE: f32 = 11.0;
 
-/// The grid for `size` (the content area below the top bar), with the
-/// due-tasks dropdown of `open` over it.
-fn grid<'a>(
+/// Monotonic ordinal for a month, used by [`motion::slide`] to decide scroll
+/// direction.
+fn month_ordinal(d: Date) -> i64 {
+    i64::from(d.year()) * 12 + i64::from(d.month())
+}
+
+/// The rows of one month for a container of `size` (the whole tab below the
+/// top bar), with the due-tasks dropdown of `open` over it.
+fn month_rows<'a>(
     data: &'a MonthData,
     by_day: &ByDay,
     open: Option<Date>,
@@ -220,17 +255,6 @@ fn grid<'a>(
     // pixels into the card's right padding, so one more letter fits rather
     // than leaving a visible gap before the marks.
     let max_width = cell_width - CELL_PAD_X * 2.0 - PILL_PAD_X * 2.0 + TITLE_OVERHANG;
-
-    let mut header = Row::new()
-        .spacing(GAP)
-        .push(Space::new().width(LABEL_WIDTH));
-    for day in weekday_order(data.week_start) {
-        header = header.push(
-            container(text(short_weekday(day)).size(DATE_SIZE).style(theme::muted))
-                .padding([0.0, CELL_PAD_X])
-                .width(Fill),
-        );
-    }
 
     let mut body = Column::new().spacing(GAP);
     // Where the open dropdown goes, in the body's coordinates.
@@ -277,11 +301,39 @@ fn grid<'a>(
         }
     };
 
-    let body: Element<'_, Message> = if scrolls {
-        scrollable(body).height(Fill).into()
+    if scrolls {
+        scrollable(body).width(Fill).height(Fill).into()
     } else {
-        body
-    };
+        container(body).width(Fill).height(Fill).into()
+    }
+}
+
+/// The grid for `size` (the content area below the top bar): a pinned weekday
+/// header over a vertically sliding carousel of month grids.
+fn grid<'a>(
+    data: &'a MonthData,
+    by_day: &ByDay,
+    previous: Option<&'a PreviousMonth>,
+    open: Option<Date>,
+    size: Size,
+) -> Element<'a, Message> {
+    let mut header = Row::new()
+        .spacing(GAP)
+        .push(Space::new().width(LABEL_WIDTH));
+    for day in weekday_order(data.week_start) {
+        header = header.push(
+            container(text(short_weekday(day)).size(DATE_SIZE).style(theme::muted))
+                .padding([0.0, CELL_PAD_X])
+                .width(Fill),
+        );
+    }
+
+    let current = month_rows(data, by_day, open, size);
+    let prev = previous.map(|p| month_rows(&p.data, &p.by_day, None, size));
+    let body = motion::slide(month_ordinal(data.month), current, prev)
+        .vertical()
+        .gap(GAP)
+        .fade_from(|theme: &Theme| theme.palette().background);
 
     column![container(header).height(HEADER_HEIGHT), body]
         .padding([OUTER_PAD_Y, OUTER_PAD_X])
@@ -1021,6 +1073,7 @@ mod tests {
         let _ = grid(
             &data(),
             &ByDay::default(),
+            None,
             Some(d),
             Size::new(1000.0, 700.0),
         );
@@ -1041,13 +1094,21 @@ mod tests {
         assert!(v.data.is_none());
         v.load(data());
         assert_eq!(v.data, Some(data()));
+        assert!(v.previous.is_none());
         // Same data again: unchanged.
         v.load(data());
         assert_eq!(v.data, Some(data()));
-        // New data replaces it.
+        assert!(v.previous.is_none());
+        // New month replaces it, saves the outgoing month for the slide, and closes any open dropdown.
+        v.update(Message::ToggleDue(date(2026, 11, 18)));
         let mut next = data();
         next.month = date(2026, 12, 1);
         v.load(next.clone());
         assert_eq!(v.data, Some(next));
+        assert_eq!(
+            v.previous.as_ref().map(|p| p.data.month),
+            Some(date(2026, 11, 1))
+        );
+        assert_eq!(v.open_due, None);
     }
 }
